@@ -1,0 +1,14 @@
+[package]
+name = "ns-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nsengine"
+
+[dependencies]
+ns-core = { path = "../core" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

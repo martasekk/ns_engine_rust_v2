@@ -1,0 +1,15 @@
+[package]
+name = "ns-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ns-app"
+path = "src/main.rs"
+
+[dependencies]
+ns-core = { path = "../crates/core" }
+ns-engine = { path = "../crates/engine" }
+ns-channel-cli = { path = "../crates/channel-cli" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
