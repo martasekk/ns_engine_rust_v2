@@ -14,9 +14,15 @@ pub struct Timestamp(pub u64);
 #[serde(tag = "type")]
 pub enum EventKind {
     UserSaid { text: String },
+    Proposed { proposal: crate::action::Proposal },
+    Rejected { proposal_of: EventId, reason: crate::action::RejectReason },
+    ToolCalled { action: String, args: Vec<(String, crate::value::TaggedValue)> },
+    ToolReturned { call: EventId, outcome: crate::action::ToolOutcome },
+    PendingConfirmation { proposal_of: EventId, staged: Option<crate::action::StagedEffect> },
+    Confirmed { pending: EventId },
+    Corrected { target: Option<EventId>, text: String },
+    Settled { policy: crate::action::ReplyPolicy },
     Replied { text: String },
-    // Extended in Task 3 with: Proposed, Rejected, ToolCalled, ToolReturned,
-    // PendingConfirmation, Confirmed, Corrected, Settled.
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
