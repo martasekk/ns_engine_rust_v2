@@ -51,7 +51,7 @@ impl Tool for HttpTool {
     async fn call(
         &self,
         args: &serde_json::Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         let (status, body) = self
             .transport
@@ -64,7 +64,17 @@ impl Tool for HttpTool {
                 detail: body.to_string(),
             });
         }
-        let mut summary = body.to_string();
+        let full = body.to_string();
+        // Oversized bodies are kept whole as content-addressed artifacts
+        // (spec §4); the summary stays bounded either way. Store errors
+        // degrade gracefully — the summary is still useful.
+        let mut artifact = None;
+        if full.len() > MAX_SUMMARY {
+            if let Some(store) = &ctx.artifacts {
+                artifact = store.put_artifact(full.clone().into_bytes()).await.ok();
+            }
+        }
+        let mut summary = full;
         if summary.len() > MAX_SUMMARY {
             // truncate on a char boundary
             let mut end = MAX_SUMMARY;
@@ -75,7 +85,7 @@ impl Tool for HttpTool {
         }
         Ok(ToolOutput {
             summary,
-            artifact: None,
+            artifact,
             // Spec: tools fetching external content MUST return External trust.
             trust: Trust::External,
         })
@@ -114,7 +124,7 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()) },
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
             )
             .await
             .unwrap();
@@ -132,7 +142,7 @@ mod tests {
         let err = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()) },
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
             )
             .await
             .unwrap_err();
@@ -146,11 +156,83 @@ mod tests {
         let err = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()) },
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
             )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Failed { ref kind, .. } if kind == "network"));
+    }
+
+    struct ArtifactSink(std::sync::Mutex<Vec<Vec<u8>>>);
+    #[async_trait]
+    impl nscore::MemoryStore for ArtifactSink {
+        async fn append(
+            &self,
+            _s: &nscore::SessionId,
+            _e: &[nscore::Event],
+        ) -> Result<(), nscore::StoreError> {
+            Ok(())
+        }
+        async fn load(
+            &self,
+            _s: &nscore::SessionId,
+        ) -> Result<Vec<nscore::Event>, nscore::StoreError> {
+            Ok(vec![])
+        }
+        async fn facts(&self, _p: &str) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
+            Ok(vec![])
+        }
+        async fn put_fact(&self, _f: nscore::Fact) -> Result<(), nscore::StoreError> {
+            Ok(())
+        }
+        async fn artifact(&self, _id: &nscore::ArtifactId) -> Result<Vec<u8>, nscore::StoreError> {
+            Err(nscore::StoreError::NotFound)
+        }
+        async fn put_artifact(
+            &self,
+            content: Vec<u8>,
+        ) -> Result<nscore::ArtifactId, nscore::StoreError> {
+            let id = nscore::ArtifactId::for_content(&content);
+            self.0.lock().unwrap().push(content);
+            Ok(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_stored_as_content_addressed_artifact() {
+        let big = "x".repeat(5000);
+        let mock = MockToolTransport::new(vec![Ok((200, serde_json::json!({"blob": big})))]);
+        let sink = std::sync::Arc::new(ArtifactSink(std::sync::Mutex::new(Vec::new())));
+        let t = HttpTool::new(cfg(), mock);
+        let out = t
+            .call(
+                &serde_json::json!({"product": "widget"}),
+                &ToolCtx { session: SessionId("s".into()), artifacts: Some(sink.clone()) },
+            )
+            .await
+            .unwrap();
+        assert!(out.summary.len() <= 2000, "summary still truncated");
+        let stored = sink.0.lock().unwrap();
+        assert_eq!(stored.len(), 1, "full body stored once");
+        let expected_id = nscore::ArtifactId::for_content(&stored[0]);
+        assert_eq!(out.artifact, Some(expected_id), "artifact id is the content hash");
+        assert!(stored[0].len() > 5000, "the FULL body was stored");
+    }
+
+    #[tokio::test]
+    async fn small_body_stores_no_artifact() {
+        let mock = MockToolTransport::new(vec![Ok((200, serde_json::json!({"ok": true})))]);
+        let sink = std::sync::Arc::new(ArtifactSink(std::sync::Mutex::new(Vec::new())));
+        let t = HttpTool::new(cfg(), mock);
+        let out = t
+            .call(
+                &serde_json::json!({"product": "widget"}),
+                &ToolCtx { session: SessionId("s".into()), artifacts: Some(sink.clone()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.artifact, None);
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -161,7 +243,7 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()) },
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
             )
             .await
             .unwrap();

@@ -8,6 +8,8 @@ use async_trait::async_trait;
 
 pub struct ToolCtx {
     pub session: SessionId,
+    /// Artifact store for oversized tool content; None in unit tests.
+    pub artifacts: Option<std::sync::Arc<dyn MemoryStore>>,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -69,7 +69,10 @@ mod tests {
         assert_eq!(t.spec().name, "get_time");
         assert_eq!(t.spec().side_effect, SideEffect::Pure);
         let out = t
-            .call(&serde_json::json!({}), &ToolCtx { session: SessionId("s".into()) })
+            .call(
+                &serde_json::json!({}),
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+            )
             .await
             .unwrap();
         assert_eq!(out.summary, "current unix time (ms): 1756700000000");

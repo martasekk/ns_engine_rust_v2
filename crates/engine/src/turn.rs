@@ -400,7 +400,7 @@ impl Engine {
                     // Dry-run when the tool supports it; show the user what
                     // would happen (spec §5.4, §9).
                     let staged =
-                        tool.stage(&proposal.args, &ToolCtx { session: sid.clone() }).await;
+                        tool.stage(&proposal.args, &ToolCtx { session: sid.clone(), artifacts: Some(self.parts.memory.clone()) }).await;
                     let mut text = prompt;
                     if let Some(s) = &staged {
                         text.push_str(&format!("\nPlanned: {}", s.description));
@@ -425,7 +425,7 @@ impl Engine {
                     EventKind::ToolCalled { action: proposal.action.clone(), args: classified_args },
                 )
                 .id;
-            let outcome = match tool.call(&proposal.args, &ToolCtx { session: sid.clone() }).await {
+            let outcome = match tool.call(&proposal.args, &ToolCtx { session: sid.clone(), artifacts: Some(self.parts.memory.clone()) }).await {
                 Ok(output) => ToolOutcome::Ok { output },
                 Err(nscore::ToolError::Failed { kind, detail }) => {
                     ToolOutcome::Err { kind, detail }

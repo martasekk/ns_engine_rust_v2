@@ -144,7 +144,7 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"text":"ahoj"}),
-                &ToolCtx { session: SessionId("s".into()) },
+                &ToolCtx { session: SessionId("s".into()), artifacts: None },
             )
             .await
             .unwrap();
