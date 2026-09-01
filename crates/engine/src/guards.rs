@@ -81,6 +81,25 @@ impl Guard for DedupeGate {
     }
 }
 
+/// Irreversible actions require a Confirmed event this turn; otherwise the
+/// proposal is staged and the user is asked (spec §5.4, §9).
+pub struct SideEffectGate;
+
+impl Guard for SideEffectGate {
+    fn name(&self) -> &str {
+        "side_effect_gate"
+    }
+    fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict {
+        if ctx.spec.side_effect == SideEffect::Irreversible && !ctx.confirmed_this_turn {
+            Verdict::NeedsConfirmation {
+                prompt: format!("'{}' is irreversible. Confirm to proceed.", p.proposal.action),
+            }
+        } else {
+            Verdict::Allow
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +233,23 @@ mod tests {
         assert!(matches!(
             TaintPolicy.check(&p, &ctx(&s, &fired, false)),
             Verdict::NeedsConfirmation { .. }
+        ));
+    }
+
+    #[test]
+    fn side_effect_gate_blocks_unconfirmed_irreversible() {
+        let s = spec(SideEffect::Irreversible, &[], None);
+        let fired = HashSet::new();
+        let p = proposal("wipe", vec![]);
+        assert!(matches!(
+            SideEffectGate.check(&p, &ctx(&s, &fired, false)),
+            Verdict::NeedsConfirmation { .. }
+        ));
+        assert!(matches!(SideEffectGate.check(&p, &ctx(&s, &fired, true)), Verdict::Allow));
+        let reversible = spec(SideEffect::Reversible, &[], None);
+        assert!(matches!(
+            SideEffectGate.check(&p, &ctx(&reversible, &fired, false)),
+            Verdict::Allow
         ));
     }
 

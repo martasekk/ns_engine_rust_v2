@@ -255,3 +255,82 @@ async fn real_classification_tags_user_input_and_residual() {
     );
     assert_eq!(tv.trust, Trust::User);
 }
+
+struct WipeTool {
+    spec: ActionSpec,
+}
+
+impl WipeTool {
+    fn new() -> Self {
+        Self {
+            spec: ActionSpec {
+                name: "wipe".into(),
+                description: "wipe the database".into(),
+                args_schema: serde_json::json!({"type": "object", "properties": {}}),
+                side_effect: SideEffect::Irreversible,
+                residual_policy: Default::default(),
+                dedupe_tag: None,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WipeTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.spec
+    }
+    async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput { summary: "wiped".into(), artifact: None, trust: Trust::System })
+    }
+    async fn stage(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Option<StagedEffect> {
+        Some(StagedEffect { description: "would delete 3 rows".into() })
+    }
+}
+
+fn engine_with_tools(
+    proposals: Vec<Proposal>,
+    tools: Vec<Arc<dyn Tool>>,
+    store: Arc<InMemoryStore>,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    for t in tools {
+        b.add_tool(t);
+    }
+    Engine::with_clock(b.build().unwrap(), EngineConfig::default(), Box::new(|| Timestamp(42)))
+}
+
+#[tokio::test]
+async fn irreversible_action_is_staged_not_executed() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with_tools(
+        vec![Proposal {
+            rationale: "wipe".into(),
+            action: "wipe".into(),
+            args: serde_json::json!({}),
+        }],
+        vec![Arc::new(WipeTool::new())],
+        store.clone(),
+    );
+    let sid = SessionId("se1".into());
+    let reply =
+        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
+    assert!(reply.contains("irreversible"), "user is asked to confirm, got: {reply}");
+    assert!(reply.contains("would delete 3 rows"), "staged effect is shown, got: {reply}");
+
+    let events = store.load(&sid).await.unwrap();
+    assert!(
+        !events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
+        "the tool must NOT run before confirmation"
+    );
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::PendingConfirmation { staged: Some(s), .. } if s.description == "would delete 3 rows"
+    )));
+    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+}

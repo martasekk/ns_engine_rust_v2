@@ -64,6 +64,7 @@ impl Engine {
                 Box::new(crate::guards::ResidualPolicy),
                 Box::new(crate::guards::TaintPolicy),
                 Box::new(crate::guards::DedupeGate),
+                Box::new(crate::guards::SideEffectGate),
             ],
         }
     }
@@ -213,12 +214,20 @@ impl Engine {
                     continue;
                 }
                 Verdict::NeedsConfirmation { prompt } => {
+                    // Dry-run when the tool supports it; show the user what
+                    // would happen (spec §5.4, §9).
+                    let staged =
+                        tool.stage(&proposal.args, &ToolCtx { session: sid.clone() }).await;
+                    let mut text = prompt;
+                    if let Some(s) = &staged {
+                        text.push_str(&format!("\nPlanned: {}", s.description));
+                    }
                     log.append(
                         turn,
                         now(),
-                        EventKind::PendingConfirmation { proposal_of: pid, staged: None },
+                        EventKind::PendingConfirmation { proposal_of: pid, staged },
                     );
-                    let policy = ReplyPolicy::Verbatim { text: prompt };
+                    let policy = ReplyPolicy::Verbatim { text };
                     log.append(turn, now(), EventKind::Settled { policy: policy.clone() });
                     settled = Some(policy);
                     break;
