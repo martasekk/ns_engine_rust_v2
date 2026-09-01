@@ -19,7 +19,9 @@ fn find_user_span(
     index: &ValueIndex,
     current_turn: u32,
 ) -> Option<(Provenance, Trust)> {
-    if needle.is_empty() {
+    // Grounding requires substance: pure punctuation/whitespace substring
+    // matches (seen live from degenerate emitter output) prove nothing.
+    if needle.is_empty() || !needle.chars().any(|c| c.is_alphanumeric()) {
         return None;
     }
     let current = index.user_texts.iter().rev().filter(|(t, _)| *t == current_turn);
@@ -211,5 +213,27 @@ mod tests {
             classify_args(&serde_json::json!({"product": "widget"}), &spec_with_enum(), &idx, 2);
         let (_, tv) = &out[0];
         assert!(matches!(&tv.prov, Provenance::UserInput { turn: 2, .. }));
+    }
+
+    #[test]
+    fn trivial_punctuation_spans_do_not_ground() {
+        // Seen live: a degenerate emitter output of ", " substring-matched the
+        // user's text and was blessed as UserInput. Grounding requires at
+        // least one alphanumeric character.
+        let mut idx = index();
+        idx.user_texts.push((2, "well, so be it! ?".into()));
+        for junk in [", ", ",", " ", "!?", "! ?"] {
+            let out =
+                classify_args(&serde_json::json!({"product": junk}), &spec_with_enum(), &idx, 2);
+            let (_, tv) = &out[0];
+            assert!(
+                matches!(tv.prov, Provenance::Residual),
+                "junk {junk:?} must stay Residual, got {:?}",
+                tv.prov
+            );
+        }
+        // single meaningful characters still ground
+        let out = classify_args(&serde_json::json!({"product": "b"}), &spec_with_enum(), &idx, 2);
+        assert!(matches!(&out[0].1.prov, Provenance::UserInput { .. }));
     }
 }

@@ -393,6 +393,28 @@ impl Engine {
                     rejections_this_turn.push("remember_fact missing key/value".into());
                     continue;
                 };
+                // Keys are dotted identifiers (spec of the action). Degenerate
+                // model outputs (seen live: key ", ") must not become facts.
+                let key_ok = !key.is_empty()
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
+                if !key_ok || value.trim().is_empty() {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: format!(
+                                    "remember_fact key must be a dotted identifier and value \
+                                     non-empty (got key {key:?})"
+                                ),
+                            },
+                        },
+                    );
+                    rejections_this_turn
+                        .push(format!("remember_fact rejected malformed key {key:?}"));
+                    continue;
+                }
                 let fact_spec = remember_fact_spec();
                 let index = nsprovenance::index::ValueIndex::from_events(log.events());
                 let classified_args = nsprovenance::classify::classify_args(

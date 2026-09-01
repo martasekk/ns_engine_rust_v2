@@ -602,6 +602,31 @@ async fn remember_fact_without_value_is_malformed() {
     assert!(store.facts("").await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn remember_fact_with_junk_key_is_malformed() {
+    // Degenerate model outputs (seen live: key ", ") must not become facts.
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: ", ".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": ", ", "value": ","}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let sid = SessionId("facts3".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
+        .await
+        .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::Malformed { .. }, .. }
+    )));
+    assert!(store.facts("").await.unwrap().is_empty(), "junk key must not be stored");
+}
+
 struct FailingEmitter;
 #[async_trait::async_trait]
 impl Emitter for FailingEmitter {
