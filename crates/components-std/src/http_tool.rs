@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 /// The Windmill/n8n escape hatch (spec §8): an external HTTP endpoint exposed
 /// as a tool without recompiling.
-#[derive(Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct HttpToolConfig {
     pub name: String,
     pub description: String,

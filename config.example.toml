@@ -1,0 +1,26 @@
+# Copy to config.toml and adjust. The API key comes from the
+# OPENROUTER_API_KEY environment variable, never from this file.
+
+[llm.emitter]
+model = "anthropic/claude-haiku-4.5"
+
+[llm.replier]
+model = "anthropic/claude-sonnet-5"
+
+[engine]
+max_iterations = 5
+max_emit_retries = 3
+
+[persona]
+text = "You are a helpful, concise assistant."
+
+[store]
+path = "ns.sqlite"
+
+# External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
+# [[http_component]]
+# name = "check_stock"
+# description = "Check stock level for a product"
+# url = "https://example.com/api/stock"
+# side_effect = "Pure"
+# args_schema = { type = "object", properties = { product = { type = "string" } }, required = ["product"] }
