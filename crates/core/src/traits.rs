@@ -25,11 +25,22 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Typed view of session state for guards — replaces M1's serde_json::Value.
+pub struct GuardCtx<'a> {
+    /// Spec of the proposed action (synthetic actions get synthetic specs).
+    pub spec: &'a ActionSpec,
+    pub turn: u32,
+    /// A Confirmed event was appended this turn (unlocks SideEffectGate).
+    pub confirmed_this_turn: bool,
+    /// Action names that have ToolCalled at least once this session.
+    pub fired_actions: &'a std::collections::HashSet<String>,
+    /// Active (non-expired) pending confirmation, if any.
+    pub pending_confirmation: Option<crate::event::EventId>,
+}
+
 pub trait Guard: Send + Sync {
     fn name(&self) -> &str;
-    /// M1 note: `state` is the projected state as JSON; a typed SessionState view
-    /// replaces this parameter in M3 when guards need real structure.
-    fn check(&self, p: &ClassifiedProposal, state: &serde_json::Value) -> Verdict;
+    fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> crate::action::Verdict;
 }
 
 pub struct EmitterContext {
@@ -143,8 +154,49 @@ mod tests {
             args_schema: serde_json::json!({}),
             side_effect: SideEffect::Pure,
             residual_policy: Default::default(),
+            dedupe_tag: None,
         };
         let t: Box<dyn Tool> = Box::new(Dummy(spec));
         assert_eq!(t.spec().name, "dummy");
+    }
+
+    struct AlwaysDeny;
+    impl Guard for AlwaysDeny {
+        fn name(&self) -> &str {
+            "always_deny"
+        }
+        fn check(&self, _p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict {
+            Verdict::Deny { reason: format!("turn {}", ctx.turn) }
+        }
+    }
+
+    #[test]
+    fn guard_sees_typed_ctx() {
+        let spec = ActionSpec {
+            name: "x".into(),
+            description: "d".into(),
+            args_schema: serde_json::json!({}),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        };
+        let fired = std::collections::HashSet::new();
+        let ctx = GuardCtx {
+            spec: &spec,
+            turn: 3,
+            confirmed_this_turn: false,
+            fired_actions: &fired,
+            pending_confirmation: None,
+        };
+        let p = ClassifiedProposal {
+            proposal: Proposal {
+                rationale: "".into(),
+                action: "x".into(),
+                args: serde_json::json!({}),
+            },
+            args: vec![],
+        };
+        let g: Box<dyn Guard> = Box::new(AlwaysDeny);
+        assert!(matches!(g.check(&p, &ctx), Verdict::Deny { reason } if reason == "turn 3"));
     }
 }

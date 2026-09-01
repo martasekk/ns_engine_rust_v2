@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use nscore::{
-    ActionSpec, ClassifiedProposal, EmitError, Emitter, EmitterContext, Guard, LegalActionSet,
-    Proposal, Replier, ReplyContext, ReplyError, SideEffect, Tool, ToolCtx, ToolError,
-    ToolOutput, Trust, Verdict,
+    ActionSpec, ClassifiedProposal, EmitError, Emitter, EmitterContext, Guard, GuardCtx,
+    LegalActionSet, Proposal, Replier, ReplyContext, ReplyError, SideEffect, Tool, ToolCtx,
+    ToolError, ToolOutput, Trust, Verdict,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -64,6 +64,7 @@ impl EchoTool {
                 }),
                 side_effect: SideEffect::Pure,
                 residual_policy: Default::default(),
+                dedupe_tag: None,
             },
         }
     }
@@ -101,7 +102,7 @@ impl Guard for DenyAction {
         "deny_action"
     }
 
-    fn check(&self, p: &ClassifiedProposal, _state: &serde_json::Value) -> Verdict {
+    fn check(&self, p: &ClassifiedProposal, _ctx: &GuardCtx) -> Verdict {
         if p.proposal.action == self.action {
             Verdict::Deny { reason: self.reason.clone() }
         } else {
@@ -154,6 +155,15 @@ mod tests {
     #[test]
     fn deny_guard_denies_only_named_action() {
         let g = DenyAction { action: "echo".into(), reason: "not today".into() };
+        let tool = EchoTool::new();
+        let fired = std::collections::HashSet::new();
+        let ctx = GuardCtx {
+            spec: tool.spec(),
+            turn: 1,
+            confirmed_this_turn: false,
+            fired_actions: &fired,
+            pending_confirmation: None,
+        };
         let cp = |action: &str| ClassifiedProposal {
             proposal: Proposal {
                 rationale: "".into(),
@@ -162,7 +172,7 @@ mod tests {
             },
             args: vec![],
         };
-        assert!(matches!(g.check(&cp("echo"), &serde_json::json!({})), Verdict::Deny { .. }));
-        assert!(matches!(g.check(&cp("other"), &serde_json::json!({})), Verdict::Allow));
+        assert!(matches!(g.check(&cp("echo"), &ctx), Verdict::Deny { .. }));
+        assert!(matches!(g.check(&cp("other"), &ctx), Verdict::Allow));
     }
 }

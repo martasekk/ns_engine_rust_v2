@@ -12,6 +12,9 @@ pub struct HttpToolConfig {
     pub url: String,
     pub side_effect: SideEffect,
     pub args_schema: serde_json::Value,
+    /// When set, this tool fires at most once per session (DedupeGate).
+    #[serde(default)]
+    pub dedupe_tag: Option<String>,
 }
 
 pub struct HttpTool {
@@ -29,6 +32,7 @@ impl HttpTool {
                 args_schema: cfg.args_schema,
                 side_effect: cfg.side_effect,
                 residual_policy: Default::default(),
+                dedupe_tag: cfg.dedupe_tag,
             },
             url: cfg.url,
             transport,
@@ -95,6 +99,7 @@ mod tests {
                 "properties": {"product": {"type": "string"}},
                 "required": ["product"]
             }),
+            dedupe_tag: None,
         }
     }
 

@@ -168,15 +168,25 @@ impl Engine {
             let classified =
                 ClassifiedProposal { proposal: proposal.clone(), args: classified_args.clone() };
 
-            // h. guards
-            let state_json = serde_json::json!({
-                "turn": state.turn,
-                "messages": state.history.len(),
-            });
+            // h. guards (typed ctx; real confirmation wiring lands later in M3)
+            let tool = self
+                .parts
+                .tools
+                .iter()
+                .find(|t| t.spec().name == proposal.action)
+                .expect("legality checked above")
+                .clone();
+            let guard_ctx = nscore::GuardCtx {
+                spec: tool.spec(),
+                turn,
+                confirmed_this_turn: false,
+                fired_actions: &state.fired_tags,
+                pending_confirmation: state.pending_confirmation,
+            };
             let mut verdict = Verdict::Allow;
             let mut guard_name = String::new();
             for g in &self.parts.guards {
-                match g.check(&classified, &state_json) {
+                match g.check(&classified, &guard_ctx) {
                     Verdict::Allow => continue,
                     v => {
                         guard_name = g.name().to_string();
@@ -216,13 +226,6 @@ impl Engine {
             }
 
             // i. perform
-            let tool = self
-                .parts
-                .tools
-                .iter()
-                .find(|t| t.spec().name == proposal.action)
-                .expect("legality checked above")
-                .clone();
             let call_id = log
                 .append(
                     turn,

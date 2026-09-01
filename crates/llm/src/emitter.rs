@@ -120,6 +120,7 @@ mod tests {
                 }),
                 side_effect: SideEffect::Pure,
                 residual_policy: Default::default(),
+                dedupe_tag: None,
             }],
         }
     }

@@ -23,6 +23,9 @@ pub struct ActionSpec {
     pub args_schema: serde_json::Value,
     pub side_effect: SideEffect,
     pub residual_policy: HashMap<String, ResidualRule>,
+    /// When set, this action fires at most once per session (DedupeGate).
+    #[serde(default)]
+    pub dedupe_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +130,7 @@ mod tests {
                 args_schema: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
                 side_effect: SideEffect::Pure,
                 residual_policy: Default::default(),
+                dedupe_tag: None,
             }],
         };
         assert!(set.contains("echo"));

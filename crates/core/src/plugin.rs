@@ -202,6 +202,7 @@ mod tests {
                 args_schema: serde_json::json!({}),
                 side_effect: SideEffect::Pure,
                 residual_policy: Default::default(),
+                dedupe_tag: None,
             })
         }
     }
