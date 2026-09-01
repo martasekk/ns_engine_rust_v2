@@ -21,6 +21,9 @@ pub struct Engine {
     parts: HarnessParts,
     cfg: EngineConfig,
     clock: Box<dyn Fn() -> Timestamp + Send + Sync>,
+    /// Always-on guard chain, checked before plugin guards. Plugins cannot
+    /// remove these (spec §5.4).
+    builtin_guards: Vec<Box<dyn nscore::Guard>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +56,16 @@ impl Engine {
         cfg: EngineConfig,
         clock: Box<dyn Fn() -> Timestamp + Send + Sync>,
     ) -> Self {
-        Self { parts, cfg, clock }
+        Self {
+            parts,
+            cfg,
+            clock,
+            builtin_guards: vec![
+                Box::new(crate::guards::ResidualPolicy),
+                Box::new(crate::guards::TaintPolicy),
+                Box::new(crate::guards::DedupeGate),
+            ],
+        }
     }
 
     /// Full turn: load log, run pipeline, persist NEW events, return reply text.
@@ -173,7 +185,7 @@ impl Engine {
             };
             let mut verdict = Verdict::Allow;
             let mut guard_name = String::new();
-            for g in &self.parts.guards {
+            for g in self.builtin_guards.iter().chain(self.parts.guards.iter()) {
                 match g.check(&classified, &guard_ctx) {
                     Verdict::Allow => continue,
                     v => {
