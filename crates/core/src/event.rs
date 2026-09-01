@@ -59,9 +59,96 @@ pub(crate) mod hash_serde {
     }
 }
 
+fn event_hash(e: &Event) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_vec(e).expect("event serialization is infallible");
+    let mut h = Sha256::new();
+    h.update(&json);
+    h.finalize().into()
+}
+
+#[derive(Debug, Clone)]
+pub struct EventLog {
+    session: SessionId,
+    events: Vec<Event>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ChainError {
+    #[error("hash chain broken at event {id:?}")]
+    BrokenAt { id: EventId },
+}
+
+impl EventLog {
+    pub fn new(session: SessionId) -> Self {
+        Self { session, events: Vec::new() }
+    }
+
+    pub fn from_events(session: SessionId, events: Vec<Event>) -> Self {
+        Self { session, events }
+    }
+
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    pub fn next_id(&self) -> EventId {
+        EventId(self.events.last().map(|e| e.id.0 + 1).unwrap_or(1))
+    }
+
+    pub fn append(&mut self, turn: u32, at: Timestamp, kind: EventKind) -> &Event {
+        let prev_hash = self.events.last().map(event_hash).unwrap_or([0u8; 32]);
+        let e = Event { id: self.next_id(), parent: None, prev_hash, turn, at, kind };
+        self.events.push(e);
+        self.events.last().unwrap()
+    }
+
+    pub fn verify_chain(&self) -> Result<(), ChainError> {
+        let mut prev: Option<&Event> = None;
+        for e in &self.events {
+            let expected = prev.map(event_hash).unwrap_or([0u8; 32]);
+            if e.prev_hash != expected {
+                return Err(ChainError::BrokenAt { id: e.id });
+            }
+            prev = Some(e);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_chains_hashes_and_verifies() {
+        let mut log = EventLog::new(SessionId("s1".into()));
+        log.append(0, Timestamp(1), EventKind::UserSaid { text: "a".into() });
+        log.append(0, Timestamp(2), EventKind::Replied { text: "b".into() });
+        log.append(1, Timestamp(3), EventKind::UserSaid { text: "c".into() });
+        assert_eq!(log.events().len(), 3);
+        assert_eq!(log.events()[0].prev_hash, [0u8; 32]);
+        assert_ne!(log.events()[1].prev_hash, [0u8; 32]);
+        assert!(log.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn tampering_breaks_the_chain() {
+        let mut log = EventLog::new(SessionId("s1".into()));
+        log.append(0, Timestamp(1), EventKind::UserSaid { text: "a".into() });
+        log.append(0, Timestamp(2), EventKind::Replied { text: "b".into() });
+        let mut events = log.events().to_vec();
+        events[0].kind = EventKind::UserSaid { text: "TAMPERED".into() };
+        let tampered = EventLog::from_events(SessionId("s1".into()), events);
+        assert!(matches!(
+            tampered.verify_chain(),
+            Err(ChainError::BrokenAt { id: EventId(2) })
+        ));
+    }
 
     #[test]
     fn event_serde_round_trip() {
