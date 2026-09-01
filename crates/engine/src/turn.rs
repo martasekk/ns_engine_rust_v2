@@ -135,6 +135,12 @@ impl Engine {
     }
 
     /// Full turn: load log, run pipeline, persist NEW events, return reply text.
+    /// Identity of a call within a turn: action plus its args as JSON
+    /// (serde_json's Map is ordered, so equal objects serialize identically).
+    fn call_key(p: &nscore::Proposal) -> String {
+        format!("{}\u{0}{}", p.action, p.args)
+    }
+
     pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
         let sid = incoming.session.clone();
         let stored = self.parts.memory.load(&sid).await?;
@@ -147,6 +153,7 @@ impl Engine {
 
         let mut rejections_this_turn: Vec<String> = Vec::new();
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
+        let mut calls_this_turn: std::collections::HashSet<String> = Default::default();
         let mut never_residual_this_turn = false;
         let mut emit_failures: u32 = 0;
         let mut settled: Option<ReplyPolicy> = None;
@@ -176,7 +183,9 @@ impl Engine {
                     .filter(|s| !denied_this_turn.contains(&s.name))
                     .collect();
                 actions.push(ask_clarification_spec());
-                actions.push(remember_fact_spec());
+                if !denied_this_turn.contains(REMEMBER_FACT) {
+                    actions.push(remember_fact_spec());
+                }
                 if active_pending.is_some() {
                     actions.push(confirm_pending_spec());
                 }
@@ -253,6 +262,30 @@ impl Engine {
                 let reason = RejectReason::IllegalAction { action: proposal.action.clone() };
                 log.append(turn, now(), EventKind::Rejected { proposal_of: pid, reason });
                 rejections_this_turn.push(format!("illegal action: {}", proposal.action));
+                denied_this_turn.insert(proposal.action.clone());
+                continue;
+            }
+
+            // f1. repeat gate (engine-owned): an identical (action, args) call
+            // already executed this turn yields no new information. Seen live
+            // with small models that ignore "never repeat a completed action"
+            // in the prompt. Recorded as a guard denial so the narrowed schema
+            // drops the action for the rest of the turn.
+            if calls_this_turn.contains(&Self::call_key(&proposal)) {
+                let reason =
+                    format!("identical call to '{}' already executed this turn", proposal.action);
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::Rejected {
+                        proposal_of: pid,
+                        reason: RejectReason::GuardDenied {
+                            guard: "repeat_gate".into(),
+                            reason: reason.clone(),
+                        },
+                    },
+                );
+                rejections_this_turn.push(format!("guard repeat_gate: {reason}"));
                 denied_this_turn.insert(proposal.action.clone());
                 continue;
             }
@@ -451,6 +484,7 @@ impl Engine {
                         },
                     )
                     .id;
+                calls_this_turn.insert(Self::call_key(&proposal));
                 let outcome = match self.parts.memory.put_fact(fact).await {
                     Ok(()) => ToolOutcome::Ok {
                         output: nscore::ToolOutput {
@@ -549,6 +583,7 @@ impl Engine {
                     EventKind::ToolCalled { action: proposal.action.clone(), args: classified_args },
                 )
                 .id;
+            calls_this_turn.insert(Self::call_key(&proposal));
             let outcome = match tool.call(&proposal.args, &ToolCtx { session: sid.clone(), artifacts: Some(self.parts.memory.clone()) }).await {
                 Ok(output) => ToolOutcome::Ok { output },
                 Err(nscore::ToolError::Failed { kind, detail }) => {

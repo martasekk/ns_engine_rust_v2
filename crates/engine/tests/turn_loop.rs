@@ -625,6 +625,84 @@ async fn remember_fact_trims_stray_punctuation_from_key() {
     assert_eq!(stored[0].key, "user.name");
 }
 
+fn rejection_reasons(events: &[Event]) -> Vec<&RejectReason> {
+    events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::Rejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_calls(events: &[Event], action: &str) -> usize {
+    events
+        .iter()
+        .filter(|ev| matches!(&ev.kind, EventKind::ToolCalled { action: a, .. } if a == action))
+        .count()
+}
+
+#[tokio::test]
+async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
+    // Seen live with qwen2.5:3b: the emitter re-proposes the exact completed
+    // call until max_iterations exhausts. An identical (action, args) pair
+    // yields no new information — the engine must refuse it, and the
+    // narrowed schema must then remove the action entirely.
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(
+        vec![echo_proposal("hi"), echo_proposal("hi"), echo_proposal("hi")],
+        vec![],
+        store.clone(),
+    );
+    let sid = SessionId("rep1".into());
+    let reply = e.run_turn(Incoming { session: sid.clone(), text: "say hi".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(tool_calls(&events, "echo"), 1, "the tool runs exactly once");
+    let reasons = rejection_reasons(&events);
+    assert!(
+        matches!(reasons[0], RejectReason::GuardDenied { guard, .. } if guard == "repeat_gate"),
+        "first repeat is denied by the repeat gate, got {:?}",
+        reasons[0]
+    );
+    assert!(
+        matches!(reasons[1], RejectReason::IllegalAction { .. }),
+        "second repeat is illegal under the narrowed set, got {:?}",
+        reasons[1]
+    );
+    assert!(reply.contains("echo: hi"), "turn still ends in a trace-based reply: {reply}");
+    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+}
+
+#[tokio::test]
+async fn same_action_with_different_args_is_not_a_repeat() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(vec![echo_proposal("a"), echo_proposal("b")], vec![], store.clone());
+    let sid = SessionId("rep2".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "x".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(tool_calls(&events, "echo"), 2);
+    assert!(rejection_reasons(&events).is_empty());
+}
+
+#[tokio::test]
+async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
+    let fact = || Proposal {
+        rationale: "remember".into(),
+        action: "remember_fact".into(),
+        args: serde_json::json!({"key": "user.name", "value": "Martin"}),
+    };
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
+    let sid = SessionId("rep3".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(tool_calls(&events, "remember_fact"), 1);
+    let reasons = rejection_reasons(&events);
+    assert!(matches!(reasons[0], RejectReason::GuardDenied { guard, .. } if guard == "repeat_gate"));
+    assert!(matches!(reasons[1], RejectReason::IllegalAction { .. }));
+    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+}
+
 #[tokio::test]
 async fn remember_fact_with_junk_key_is_malformed() {
     // Degenerate model outputs (seen live: key ", ") must not become facts.
