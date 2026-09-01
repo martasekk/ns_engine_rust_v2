@@ -6,6 +6,7 @@ members = [
     "crates/channel-cli",
     "crates/memory-sqlite",
     "crates/llm",
+    "crates/provenance",
     "crates/components-std",
     "app",
 ]
