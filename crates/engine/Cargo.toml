@@ -8,6 +8,7 @@ name = "nsengine"
 
 [dependencies]
 ns-core = { path = "../core" }
+ns-provenance = { path = "../provenance" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

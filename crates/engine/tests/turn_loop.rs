@@ -223,3 +223,35 @@ async fn persona_flows_from_config_to_reply_context() {
         .unwrap();
     assert_eq!(reply, "persona was: Tomáš the salesbot");
 }
+
+#[tokio::test]
+async fn real_classification_tags_user_input_and_residual() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "echo".into(),
+            action: "echo".into(),
+            args: serde_json::json!({"text": "say hi"}), // exact substring of the user turn
+        }],
+        vec![],
+        store.clone(),
+    );
+    let sid = SessionId("cls1".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "please say hi now".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    let called_args = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolCalled { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .expect("a ToolCalled event");
+    let (name, tv) = &called_args[0];
+    assert_eq!(name, "text");
+    assert!(
+        matches!(tv.prov, Provenance::UserInput { .. }),
+        "'say hi' comes from the user's words, got {:?}",
+        tv.prov
+    );
+    assert_eq!(tv.trust, Trust::User);
+}

@@ -1,8 +1,8 @@
 use crate::state::{fold, state_summary};
 use nscore::{
     ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming,
-    LegalActionSet, Provenance, RejectReason, ReplyContext, ReplyPolicy, TaggedValue,
-    Timestamp, ToolCtx, ToolOutcome, Trust, Verdict,
+    LegalActionSet, RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome,
+    Verdict,
 };
 
 pub struct EngineConfig {
@@ -145,30 +145,7 @@ impl Engine {
                 continue;
             }
 
-            // g. classification stub (real provenance lands in M3):
-            // every top-level arg is tagged Residual / Trust::User.
-            let classified_args: Vec<(String, TaggedValue)> = proposal
-                .args
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                TaggedValue {
-                                    value: v.clone(),
-                                    prov: Provenance::Residual,
-                                    trust: Trust::User,
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let classified =
-                ClassifiedProposal { proposal: proposal.clone(), args: classified_args.clone() };
-
-            // h. guards (typed ctx; real confirmation wiring lands later in M3)
+            // g. classify args against the session's history (spec §5.4)
             let tool = self
                 .parts
                 .tools
@@ -176,12 +153,23 @@ impl Engine {
                 .find(|t| t.spec().name == proposal.action)
                 .expect("legality checked above")
                 .clone();
+            let index = nsprovenance::index::ValueIndex::from_events(log.events());
+            let classified_args =
+                nsprovenance::classify::classify_args(&proposal.args, tool.spec(), &index, turn);
+            let classified =
+                ClassifiedProposal { proposal: proposal.clone(), args: classified_args.clone() };
+
+            // h. guards
+            let active_pending = state.pending_confirmation.filter(|_| {
+                state.pending_turn == Some(turn)
+                    || state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false)
+            });
             let guard_ctx = nscore::GuardCtx {
                 spec: tool.spec(),
                 turn,
-                confirmed_this_turn: false,
+                confirmed_this_turn: state.confirmed_this_turn_of == Some(turn),
                 fired_actions: &state.fired_tags,
-                pending_confirmation: state.pending_confirmation,
+                pending_confirmation: active_pending,
             };
             let mut verdict = Verdict::Allow;
             let mut guard_name = String::new();

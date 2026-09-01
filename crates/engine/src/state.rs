@@ -9,7 +9,11 @@ pub struct SessionState {
     pub history: Vec<(String, String)>,
     /// Last unconfirmed PendingConfirmation.
     pub pending_confirmation: Option<EventId>,
-    /// DedupeGate substrate (used from M3 on).
+    /// Turn on which the pending confirmation was created (expiry substrate).
+    pub pending_turn: Option<u32>,
+    /// Turn of the most recent Confirmed event.
+    pub confirmed_this_turn_of: Option<u32>,
+    /// DedupeGate substrate: action names that have ToolCalled this session.
     pub fired_tags: HashSet<String>,
 }
 
@@ -22,11 +26,17 @@ pub fn fold(events: &[Event]) -> SessionState {
         match &e.kind {
             EventKind::UserSaid { text } => s.history.push(("user".into(), text.clone())),
             EventKind::Replied { text } => s.history.push(("assistant".into(), text.clone())),
-            EventKind::PendingConfirmation { .. } => s.pending_confirmation = Some(e.id),
-            EventKind::Confirmed { pending }
-                if s.pending_confirmation == Some(*pending) =>
-            {
+            EventKind::ToolCalled { action, .. } => {
+                s.fired_tags.insert(action.clone());
+            }
+            EventKind::PendingConfirmation { .. } => {
+                s.pending_confirmation = Some(e.id);
+                s.pending_turn = Some(e.turn);
+            }
+            EventKind::Confirmed { pending } if s.pending_confirmation == Some(*pending) => {
                 s.pending_confirmation = None;
+                s.pending_turn = None;
+                s.confirmed_this_turn_of = Some(e.turn);
             }
             _ => {}
         }
@@ -65,5 +75,31 @@ mod tests {
         log2.append(3, Timestamp(5), EventKind::Confirmed { pending: pending_id });
         let s2 = fold(log2.events());
         assert_eq!(s2.pending_confirmation, None);
+    }
+
+    #[test]
+    fn fold_tracks_fired_actions_pending_turn_and_confirmation_turn() {
+        let mut log = EventLog::new(SessionId("s".into()));
+        log.append(1, Timestamp(1), EventKind::UserSaid { text: "go".into() });
+        log.append(1, Timestamp(2), EventKind::ToolCalled { action: "echo".into(), args: vec![] });
+        let pending = log
+            .append(
+                1,
+                Timestamp(3),
+                EventKind::PendingConfirmation { proposal_of: EventId(1), staged: None },
+            )
+            .id;
+        let s = fold(log.events());
+        assert!(s.fired_tags.contains("echo"));
+        assert_eq!(s.pending_confirmation, Some(pending));
+        assert_eq!(s.pending_turn, Some(1));
+        assert_eq!(s.confirmed_this_turn_of, None);
+
+        log.append(2, Timestamp(4), EventKind::UserSaid { text: "yes".into() });
+        log.append(2, Timestamp(5), EventKind::Confirmed { pending });
+        let s2 = fold(log.events());
+        assert_eq!(s2.pending_confirmation, None);
+        assert_eq!(s2.pending_turn, None);
+        assert_eq!(s2.confirmed_this_turn_of, Some(2));
     }
 }
