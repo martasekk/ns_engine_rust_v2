@@ -52,10 +52,19 @@ impl HttpTransport for ReqwestTransport {
         headers: &[(String, String)],
         body: &serde_json::Value,
     ) -> Result<HttpResponse, TransportError> {
-        let mut req = self.client.post(url).json(body);
+        let mut map = reqwest::header::HeaderMap::new();
         for (k, v) in headers {
-            req = req.header(k, v);
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| TransportError::Network(format!("invalid header name {k}: {e}")))?;
+            let value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|e| TransportError::Network(format!("invalid header value for {k}: {e}")))?;
+            map.insert(name, value);
         }
+        // `.json()` already sets content-type. `.headers()` replaces
+        // same-named headers rather than appending (unlike `.header()`), so a
+        // caller-supplied content-type can't produce a duplicate — strict
+        // providers (Mistral) reject the body as a string on duplicates.
+        let req = self.client.post(url).json(body).headers(map);
         let resp = req.send().await.map_err(|e| TransportError::Network(e.to_string()))?;
         let status = resp.status().as_u16();
         let body: serde_json::Value =
@@ -102,6 +111,64 @@ impl HttpTransport for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One-shot HTTP server on a std thread: captures the raw request and
+    /// answers `{}`. No tokio `net` feature needed.
+    fn one_shot_server() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+            tx.send(String::from_utf8_lossy(&raw).to_string()).unwrap();
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn reqwest_transport_sends_content_type_exactly_once() {
+        // `.json()` already sets content-type; a caller-supplied one must
+        // replace it, not duplicate it — Mistral answers 422 on duplicates.
+        let (addr, rx) = one_shot_server();
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-title".to_string(), "ns-harness".to_string()),
+        ];
+        let resp = ReqwestTransport::new()
+            .post(&format!("http://{addr}/v1/chat/completions"), &headers, &serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let raw = rx.recv().unwrap();
+        let content_types =
+            raw.lines().filter(|l| l.to_ascii_lowercase().starts_with("content-type:")).count();
+        assert_eq!(content_types, 1, "raw request:\n{raw}");
+        assert!(raw.to_ascii_lowercase().contains("x-title: ns-harness"));
+    }
 
     #[tokio::test]
     async fn mock_pops_in_order_and_records_requests() {
