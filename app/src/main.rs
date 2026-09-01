@@ -65,6 +65,7 @@ async fn main() {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
         persona: cfg.persona.text.clone(),
+        templates: Default::default(), // wired to [templates] config in Task 5
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M2 — type text, /quit to exit");

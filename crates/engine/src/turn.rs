@@ -9,11 +9,19 @@ pub struct EngineConfig {
     pub max_iterations: u32,
     pub max_emit_retries: u32,
     pub persona: String,
+    /// Template registry for ReplyPolicy::Template; a registered "cant_help"
+    /// replaces the hardcoded fallback text.
+    pub templates: std::collections::HashMap<String, String>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { max_iterations: 5, max_emit_retries: 3, persona: String::new() }
+        Self {
+            max_iterations: 5,
+            max_emit_retries: 3,
+            persona: String::new(),
+            templates: Default::default(),
+        }
     }
 }
 
@@ -524,9 +532,13 @@ impl Engine {
             // loop: the emitter decides what happens next (typically respond_directly)
         }
 
-        // 3. fallback settle
+        // 3. fallback settle (a registered cant_help template wins)
         let policy = settled.unwrap_or_else(|| {
-            let p = ReplyPolicy::Verbatim { text: FALLBACK_REPLY.into() };
+            let p = if self.cfg.templates.contains_key("cant_help") {
+                ReplyPolicy::Template { id: "cant_help".into(), vars: serde_json::json!({}) }
+            } else {
+                ReplyPolicy::Verbatim { text: FALLBACK_REPLY.into() }
+            };
             log.append(turn, now(), EventKind::Settled { policy: p.clone() });
             p
         });
@@ -534,7 +546,10 @@ impl Engine {
         // 4. reply
         let text = match policy {
             ReplyPolicy::Verbatim { text } => text,
-            ReplyPolicy::Template { id, vars } => format!("[{id}] {vars}"),
+            ReplyPolicy::Template { id, vars } => match self.cfg.templates.get(&id) {
+                Some(template) => render_template(template, &vars),
+                None => format!("[{id}] {vars}"),
+            },
             ReplyPolicy::Generate => {
                 let state = fold(log.events());
                 let trace = turn_trace(&log, turn);
@@ -585,6 +600,22 @@ impl Engine {
     }
 }
 
+/// Replace "{name}" with vars["name"] (strings unquoted); unknown
+/// placeholders are left verbatim. Deterministic fill-in, no escaping (M4).
+fn render_template(template: &str, vars: &serde_json::Value) -> String {
+    let mut out = template.to_string();
+    if let Some(map) = vars.as_object() {
+        for (k, v) in map {
+            let replacement = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            out = out.replace(&format!("{{{k}}}"), &replacement);
+        }
+    }
+    out
+}
+
 /// One human-readable line per this-turn event: outcomes AND refusal reasons.
 fn turn_trace(log: &EventLog, turn: u32) -> String {
     log.events()
@@ -611,4 +642,18 @@ fn turn_trace(log: &EventLog, turn: u32) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_substitutes_known_placeholders_only() {
+        let vars = serde_json::json!({"name": "Martin", "n": 3});
+        assert_eq!(
+            render_template("Hi {name}, {n} items, {missing} stays", &vars),
+            "Hi Martin, 3 items, {missing} stays"
+        );
+    }
 }

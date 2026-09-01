@@ -601,3 +601,39 @@ async fn remember_fact_without_value_is_malformed() {
     )));
     assert!(store.facts("").await.unwrap().is_empty());
 }
+
+struct FailingEmitter;
+#[async_trait::async_trait]
+impl Emitter for FailingEmitter {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Err(EmitError::Transport("down".into()))
+    }
+}
+
+#[tokio::test]
+async fn registered_cant_help_template_replaces_fallback() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(FailingEmitter));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        templates: [("cant_help".to_string(), "Promiň, to nezvládnu.".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let reply = e
+        .run_turn(Incoming { session: SessionId("tpl1".into()), text: "x".into() })
+        .await
+        .unwrap();
+    assert_eq!(reply, "Promiň, to nezvládnu.");
+}
