@@ -6,6 +6,7 @@ pub struct CloudReplier {
     client: OpenRouterClient,
     model: String,
     max_tokens: u32,
+    prompt_cache: bool,
 }
 
 impl CloudReplier {
@@ -13,7 +14,15 @@ impl CloudReplier {
         // 4096, not 1024: models with reasoning enabled by default (e.g.
         // Claude Sonnet 5) spend output tokens on reasoning before content;
         // a tight cap yields finish_reason "length" with null content.
-        Self { client, model, max_tokens: 4096 }
+        Self { client, model, max_tokens: 4096, prompt_cache: true }
+    }
+
+    /// Whether to mark the persona block with an Anthropic `cache_control`
+    /// breakpoint. Only OpenRouter forwards it; other OpenAI-compatible
+    /// providers may reject the unknown field, so pass `false` for them.
+    pub fn with_prompt_cache(mut self, on: bool) -> Self {
+        self.prompt_cache = on;
+        self
     }
 }
 
@@ -49,13 +58,18 @@ impl Replier for CloudReplier {
         // facts (stable) → session summary → this turn's trace (dynamic).
         // Content-parts form lets the cache_control breakpoint pass through
         // OpenRouter to Anthropic prompt caching. Never send sampling params.
+        let system_content = if self.prompt_cache {
+            serde_json::json!([
+                {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
+            ])
+        } else {
+            serde_json::Value::String(persona)
+        };
         let request = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": [
-                {"role": "system", "content": [
-                    {"type": "text", "text": persona, "cache_control": {"type": "ephemeral"}}
-                ]},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": render_context(&ctx)},
             ],
         });
@@ -138,6 +152,23 @@ mod tests {
         let summary_at = content.find("turn 2, 3 messages").unwrap();
         let trace_at = content.find("Proposed(echo)").unwrap();
         assert!(facts_at < summary_at && summary_at < trace_at, "stable-first block order");
+    }
+
+    #[tokio::test]
+    async fn without_prompt_cache_system_content_is_a_plain_string() {
+        // Providers other than OpenRouter (Mistral, Ollama, Groq) don't know
+        // the Anthropic cache_control extension; some 400 on unknown fields.
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })]);
+        let client = OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1);
+        let r = CloudReplier::new(client, "mistral-small-latest".into()).with_prompt_cache(false);
+        r.reply(ctx()).await.unwrap();
+        let reqs = mock.requests.lock().unwrap();
+        let system = &reqs[0]["messages"][0];
+        assert_eq!(system["role"], "system");
+        assert_eq!(system["content"], "You are Tomáš, a friendly sales assistant.");
+        assert!(!reqs[0].to_string().contains("cache_control"));
     }
 
     #[tokio::test]

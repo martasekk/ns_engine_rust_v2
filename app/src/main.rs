@@ -57,10 +57,10 @@ async fn main() {
         mk_client(),
         cfg.llm.emitter.model.clone(),
     )));
-    b.set_replier(Box::new(nsllm::replier::CloudReplier::new(
-        mk_client(),
-        cfg.llm.replier.model.clone(),
-    )));
+    b.set_replier(Box::new(
+        nsllm::replier::CloudReplier::new(mk_client(), cfg.llm.replier.model.clone())
+            .with_prompt_cache(cfg.llm.prompt_cache()),
+    ));
     b.set_memory(Arc::new(
         nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
             .expect("open sqlite store"),

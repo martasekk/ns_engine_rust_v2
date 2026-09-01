@@ -231,7 +231,6 @@ pub async fn replay_session(
 mod tests {
     use super::*;
     use crate::script::{DenyAction, EchoTool, ScriptedReplier};
-    use nscore::*;
 
     struct ClosedChannel;
     #[async_trait::async_trait]

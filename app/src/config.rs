@@ -25,6 +25,14 @@ pub struct LlmConfig {
     pub replier: ReplierSection,
 }
 
+impl LlmConfig {
+    /// Anthropic prompt-cache breakpoints are only forwarded by OpenRouter;
+    /// other OpenAI-compatible providers may reject the unknown field.
+    pub fn prompt_cache(&self) -> bool {
+        self.base_url.as_deref().is_none_or(|u| u.contains("openrouter.ai"))
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ModelSection {
     pub model: String,
@@ -118,6 +126,18 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
+    }
+
+    #[test]
+    fn prompt_cache_is_enabled_only_for_openrouter() {
+        let default = AppConfig::parse("").unwrap();
+        assert!(default.llm.prompt_cache(), "default base_url is OpenRouter");
+        let explicit = AppConfig::parse("[llm]\nbase_url = \"https://openrouter.ai/api\"").unwrap();
+        assert!(explicit.llm.prompt_cache());
+        let mistral = AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"").unwrap();
+        assert!(!mistral.llm.prompt_cache());
+        let ollama = AppConfig::parse("[llm]\nbase_url = \"http://localhost:11434\"").unwrap();
+        assert!(!ollama.llm.prompt_cache());
     }
 
     #[test]

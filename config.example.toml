@@ -1,5 +1,25 @@
 # Copy to config.toml and adjust. The API key comes from the
 # OPENROUTER_API_KEY environment variable, never from this file.
+#
+# Any provider that speaks POST {base_url}/v1/chat/completions with
+# OpenAI-style function tools works. Presets (uncomment one block and
+# put that provider's key in OPENROUTER_API_KEY):
+#
+#   Mistral (free Experiment tier, ~1 req/s, 500K TPM):
+#     [llm]
+#     base_url = "https://api.mistral.ai"
+#     [llm.emitter]
+#     model = "mistral-small-latest"
+#     [llm.replier]
+#     model = "mistral-small-latest"
+#
+#   Ollama (local, unlimited; key can be any non-empty string):
+#     [llm]
+#     base_url = "http://localhost:11434"
+#     [llm.emitter]
+#     model = "qwen3:4b"
+#     [llm.replier]
+#     model = "qwen3:4b"
 
 [llm.emitter]
 model = "openrouter/free"
