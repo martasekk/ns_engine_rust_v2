@@ -32,7 +32,7 @@ pub struct ModelSection {
 
 impl Default for ModelSection {
     fn default() -> Self {
-        Self { model: "anthropic/claude-haiku-4.5".into() }
+        Self { model: "z-ai/glm-5.2:free".into() }
     }
 }
 
@@ -43,7 +43,7 @@ pub struct ReplierSection {
 
 impl Default for ReplierSection {
     fn default() -> Self {
-        Self { model: "anthropic/claude-sonnet-5".into() }
+        Self { model: "z-ai/glm-5.2:free".into() }
     }
 }
 
@@ -123,8 +123,8 @@ mod tests {
     #[test]
     fn empty_config_gets_all_defaults() {
         let cfg = AppConfig::parse("").unwrap();
-        assert_eq!(cfg.llm.emitter.model, "anthropic/claude-haiku-4.5");
-        assert_eq!(cfg.llm.replier.model, "anthropic/claude-sonnet-5");
+        assert_eq!(cfg.llm.emitter.model, "z-ai/glm-5.2:free");
+        assert_eq!(cfg.llm.replier.model, "z-ai/glm-5.2:free");
         assert_eq!(cfg.engine.max_iterations, 5);
         assert_eq!(cfg.engine.max_emit_retries, 3);
         assert_eq!(cfg.store.path, "ns.sqlite");

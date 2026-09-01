@@ -2,10 +2,10 @@
 # OPENROUTER_API_KEY environment variable, never from this file.
 
 [llm.emitter]
-model = "anthropic/claude-haiku-4.5"
+model = "z-ai/glm-5.2:free"
 
 [llm.replier]
-model = "anthropic/claude-sonnet-5"
+model = "z-ai/glm-5.2:free"
 
 [engine]
 max_iterations = 5
