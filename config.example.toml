@@ -2,10 +2,10 @@
 # OPENROUTER_API_KEY environment variable, never from this file.
 
 [llm.emitter]
-model = "z-ai/glm-5.2:free"
+model = "openrouter/free"
 
 [llm.replier]
-model = "z-ai/glm-5.2:free"
+model = "openrouter/free"
 
 [engine]
 max_iterations = 5
