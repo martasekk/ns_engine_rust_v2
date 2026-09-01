@@ -40,7 +40,7 @@ pub struct GuardCtx<'a> {
 
 pub trait Guard: Send + Sync {
     fn name(&self) -> &str;
-    fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> crate::action::Verdict;
+    fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict;
 }
 
 pub struct EmitterContext {
