@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/engine", "crates/channel-cli", "app"]
+members = ["crates/core", "crates/engine", "crates/channel-cli", "crates/memory-sqlite", "app"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -9,3 +9,5 @@ async-trait = "0.1"
 thiserror = "2"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"

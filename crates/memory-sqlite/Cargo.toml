@@ -1,0 +1,17 @@
+[package]
+name = "ns-memory-sqlite"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nsmemory_sqlite"
+
+[dependencies]
+ns-core = { path = "../core" }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
