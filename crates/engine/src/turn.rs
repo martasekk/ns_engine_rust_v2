@@ -393,8 +393,13 @@ impl Engine {
                     rejections_this_turn.push("remember_fact missing key/value".into());
                     continue;
                 };
-                // Keys are dotted identifiers (spec of the action). Degenerate
-                // model outputs (seen live: key ", ") must not become facts.
+                // Keys are dotted identifiers (spec of the action). Normalize
+                // stray edge punctuation first (seen live: a model reliably
+                // emitting ":user.name" — same spirit as the trim normalizer),
+                // then reject what remains degenerate (seen live: key ", ").
+                let key = key
+                    .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .to_string();
                 let key_ok = !key.is_empty()
                     && key.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
                 if !key_ok || value.trim().is_empty() {

@@ -603,6 +603,29 @@ async fn remember_fact_without_value_is_malformed() {
 }
 
 #[tokio::test]
+async fn remember_fact_trims_stray_punctuation_from_key() {
+    // Seen live: a model that reliably emits ":user.name". Edge punctuation
+    // is normalized away (like the trim normalizer); the identifier survives.
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "remember".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": ":user.name", "value": "Martin"}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let sid = SessionId("facts4".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
+        .await
+        .unwrap();
+    let stored = store.facts("user.name").await.unwrap();
+    assert_eq!(stored.len(), 1, "colon-prefixed key stored under the clean identifier");
+    assert_eq!(stored[0].key, "user.name");
+}
+
+#[tokio::test]
 async fn remember_fact_with_junk_key_is_malformed() {
     // Degenerate model outputs (seen live: key ", ") must not become facts.
     let store = Arc::new(InMemoryStore::new());
