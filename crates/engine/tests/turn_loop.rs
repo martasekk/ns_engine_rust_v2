@@ -334,3 +334,104 @@ async fn irreversible_action_is_staged_not_executed() {
     )));
     assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
 }
+
+#[tokio::test]
+async fn denied_action_is_removed_from_next_legal_set() {
+    // Emitter proposes "echo" twice; a plugin guard denies it. The second
+    // proposal must be rejected as ILLEGAL (narrowed schema), not guard-denied.
+    let store = Arc::new(InMemoryStore::new());
+    let guard: Box<dyn Guard> = Box::new(DenyAction { action: "echo".into(), reason: "no".into() });
+    let mut e =
+        engine_with(vec![echo_proposal("a"), echo_proposal("b")], vec![guard], store.clone());
+    let sid = SessionId("nar1".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "x".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    let reasons: Vec<&RejectReason> = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::Rejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(reasons[0], RejectReason::GuardDenied { .. }));
+    assert!(
+        matches!(reasons[1], RejectReason::IllegalAction { .. }),
+        "second identical proposal must be illegal under the narrowed set, got {:?}",
+        reasons[1]
+    );
+}
+
+struct OrderTool {
+    spec: ActionSpec,
+}
+
+impl OrderTool {
+    fn new() -> Self {
+        Self {
+            spec: ActionSpec {
+                name: "cancel_order".into(),
+                description: "cancel an order".into(),
+                args_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"]
+                }),
+                side_effect: SideEffect::Reversible,
+                residual_policy: [("order_id".to_string(), ResidualRule::Never)]
+                    .into_iter()
+                    .collect(),
+                dedupe_tag: None,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for OrderTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.spec
+    }
+    async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput { summary: "ordered".into(), artifact: None, trust: Trust::System })
+    }
+}
+
+#[tokio::test]
+async fn never_residual_rejection_forces_clarification() {
+    // The emitter invents an order id the user never gave, then obediently
+    // asks a clarification question (the only remaining legal action).
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with_tools(
+        vec![
+            Proposal {
+                rationale: "cancel".into(),
+                action: "cancel_order".into(),
+                args: serde_json::json!({"order_id": "ORD-99"}), // invented
+            },
+            Proposal {
+                rationale: "need the id".into(),
+                action: "ask_clarification".into(),
+                args: serde_json::json!({"question": "Which order should I cancel?"}),
+            },
+        ],
+        vec![Arc::new(OrderTool::new())],
+        store.clone(),
+    );
+    let sid = SessionId("clar1".into());
+    let reply = e
+        .run_turn(Incoming { session: sid.clone(), text: "cancel my order".into() })
+        .await
+        .unwrap();
+    assert_eq!(reply, "Which order should I cancel?");
+
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::GuardDenied { reason, .. }, .. }
+            if reason.contains("NeverResidual")
+    )));
+    assert!(
+        !events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
+        "cancel_order must not run on an invented id"
+    );
+}

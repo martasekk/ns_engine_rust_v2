@@ -36,6 +36,26 @@ pub enum EngineError {
 
 const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
 
+/// Engine-owned synthetic action: ask the user one question (spec §5.1).
+pub const ASK_CLARIFICATION: &str = "ask_clarification";
+
+fn ask_clarification_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: ASK_CLARIFICATION.into(),
+        description: "Ask the user one short question to resolve missing or ungrounded \
+                      information required by the next action."
+            .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "question": { "type": "string" } },
+            "required": ["question"]
+        }),
+        side_effect: nscore::SideEffect::Pure,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
 impl Engine {
     pub fn new(parts: HarnessParts, cfg: EngineConfig) -> Self {
         Self::with_clock(
@@ -81,14 +101,31 @@ impl Engine {
         log.append(turn, now(), EventKind::UserSaid { text: incoming.text.clone() });
 
         let mut rejections_this_turn: Vec<String> = Vec::new();
+        let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
+        let mut never_residual_this_turn = false;
         let mut emit_failures: u32 = 0;
         let mut settled: Option<ReplyPolicy> = None;
 
         for _ in 0..self.cfg.max_iterations {
             // a. project
             let state = fold(log.events());
-            let legal = LegalActionSet {
-                actions: self.parts.tools.iter().map(|t| t.spec().clone()).collect(),
+            let legal = if never_residual_this_turn {
+                // Forced clarification (spec §5.1): a NeverResidual rejection
+                // occurred and nothing grounds the arg — the only way forward
+                // is to ask (respond_directly stays available at schema level).
+                LegalActionSet { actions: vec![ask_clarification_spec()] }
+            } else {
+                // Narrowed schema (spec §2): actions rejected this turn are
+                // removed from the set the emitter sees next.
+                let mut actions: Vec<_> = self
+                    .parts
+                    .tools
+                    .iter()
+                    .map(|t| t.spec().clone())
+                    .filter(|s| !denied_this_turn.contains(&s.name))
+                    .collect();
+                actions.push(ask_clarification_spec());
+                LegalActionSet { actions }
             };
 
             // b. emitter context
@@ -155,7 +192,81 @@ impl Engine {
                 let reason = RejectReason::IllegalAction { action: proposal.action.clone() };
                 log.append(turn, now(), EventKind::Rejected { proposal_of: pid, reason });
                 rejections_this_turn.push(format!("illegal action: {}", proposal.action));
+                denied_this_turn.insert(proposal.action.clone());
                 continue;
+            }
+
+            // f2. clarification: the question IS the reply (spec §5.1). Runs
+            // through classification and guards — TaintPolicy applies to
+            // questions; a gated question is re-emitted, not asked.
+            if proposal.action == ASK_CLARIFICATION {
+                let question =
+                    proposal.args.get("question").and_then(|v| v.as_str()).map(String::from);
+                let Some(question) = question else {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: "ask_clarification without question".into(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push("ask_clarification missing question".into());
+                    continue;
+                };
+                let ask_spec = ask_clarification_spec();
+                let index = nsprovenance::index::ValueIndex::from_events(log.events());
+                let classified_args = nsprovenance::classify::classify_args(
+                    &proposal.args,
+                    &ask_spec,
+                    &index,
+                    turn,
+                );
+                let classified =
+                    ClassifiedProposal { proposal: proposal.clone(), args: classified_args };
+                let guard_ctx = nscore::GuardCtx {
+                    spec: &ask_spec,
+                    turn,
+                    confirmed_this_turn: state.confirmed_this_turn_of == Some(turn),
+                    fired_actions: &state.fired_tags,
+                    pending_confirmation: None,
+                };
+                let mut denied: Option<(String, String)> = None;
+                for g in self.builtin_guards.iter().chain(self.parts.guards.iter()) {
+                    match g.check(&classified, &guard_ctx) {
+                        Verdict::Allow => continue,
+                        Verdict::Deny { reason } => {
+                            denied = Some((g.name().to_string(), reason));
+                            break;
+                        }
+                        Verdict::NeedsConfirmation { prompt } => {
+                            denied = Some((g.name().to_string(), prompt));
+                            break;
+                        }
+                    }
+                }
+                if let Some((guard, reason)) = denied {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::GuardDenied {
+                                guard: guard.clone(),
+                                reason: reason.clone(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push(format!("guard {guard}: {reason}"));
+                    denied_this_turn.insert(ASK_CLARIFICATION.to_string());
+                    continue;
+                }
+                let policy = ReplyPolicy::Verbatim { text: question };
+                log.append(turn, now(), EventKind::Settled { policy: policy.clone() });
+                settled = Some(policy);
+                break;
             }
 
             // g. classify args against the session's history (spec §5.4)
@@ -211,6 +322,10 @@ impl Engine {
                         },
                     );
                     rejections_this_turn.push(format!("guard {guard_name}: {reason}"));
+                    if reason.contains("NeverResidual") {
+                        never_residual_this_turn = true;
+                    }
+                    denied_this_turn.insert(proposal.action.clone());
                     continue;
                 }
                 Verdict::NeedsConfirmation { prompt } => {
