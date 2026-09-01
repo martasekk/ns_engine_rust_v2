@@ -10,6 +10,9 @@ pub struct AppConfig {
     pub store: StoreSection,
     #[serde(default, rename = "http_component")]
     pub http_components: Vec<nscomponents_std::http_tool::HttpToolConfig>,
+    /// [templates] table: id = "text with {placeholders}".
+    #[serde(default)]
+    pub templates: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -131,5 +134,12 @@ mod tests {
     #[test]
     fn bad_toml_is_a_readable_error() {
         assert!(AppConfig::parse("[llm").is_err());
+    }
+
+    #[test]
+    fn templates_section_parses_and_defaults_empty() {
+        let cfg = AppConfig::parse("[templates]\ncant_help = \"Sorry.\"\n").unwrap();
+        assert_eq!(cfg.templates.get("cant_help").map(String::as_str), Some("Sorry."));
+        assert!(AppConfig::parse("").unwrap().templates.is_empty());
     }
 }

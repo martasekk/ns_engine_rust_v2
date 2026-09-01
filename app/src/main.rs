@@ -17,6 +17,23 @@ async fn main() {
         }
     };
 
+    // `ns-app dump <session_id>`: print the session log as JSONL and exit.
+    // Needs no API key — the log is local.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("dump") {
+        let Some(session) = args.get(2) else {
+            eprintln!("usage: ns-app dump <session_id>");
+            std::process::exit(2);
+        };
+        let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
+            .expect("open sqlite store");
+        let events = nscore::MemoryStore::load(&store, &SessionId(session.clone()))
+            .await
+            .expect("load session");
+        println!("{}", render_dump(&events));
+        return;
+    }
+
     let api_key = match std::env::var("OPENROUTER_API_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => {
@@ -65,11 +82,37 @@ async fn main() {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
         persona: cfg.persona.text.clone(),
-        templates: Default::default(), // wired to [templates] config in Task 5
+        templates: cfg.templates.clone(),
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M2 — type text, /quit to exit");
     if let Err(e) = engine.run().await {
         eprintln!("engine stopped: {e}");
+    }
+}
+
+/// JSONL: one serialized event per line (spec §7 — eyeball any session).
+fn render_dump(events: &[nscore::Event]) -> String {
+    events
+        .iter()
+        .map(|e| serde_json::to_string(e).expect("event serialization is infallible"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_dump_is_one_json_line_per_event() {
+        let mut log = nscore::EventLog::new(nscore::SessionId("d".into()));
+        log.append(1, nscore::Timestamp(1), nscore::EventKind::UserSaid { text: "hi".into() });
+        log.append(1, nscore::Timestamp(2), nscore::EventKind::Replied { text: "ho".into() });
+        let out = render_dump(log.events());
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["kind"]["type"], "UserSaid");
     }
 }
