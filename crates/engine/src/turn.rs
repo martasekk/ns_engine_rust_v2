@@ -44,6 +44,40 @@ pub enum EngineError {
 
 const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
 
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+/// Turn a model-side error detail into a short, user-facing cause. Recognizes
+/// the client's "status NNN: <body>" shape and quotes the provider's own
+/// message when the body carries one (OpenAI/OpenRouter `error.message`,
+/// Mistral `message`), so a 429/402 says why instead of a bare "Sorry".
+fn explain_error(detail: &str) -> String {
+    let detail = detail.strip_prefix("transport: ").unwrap_or(detail);
+    if let Some(rest) = detail.strip_prefix("malformed: ") {
+        return format!("the model's answer was unusable ({})", truncate_chars(rest, 120));
+    }
+    if let Some(rest) = detail.strip_prefix("status ") {
+        let (code, body) = rest.split_once(':').unwrap_or((rest, ""));
+        let (code, body) = (code.trim(), body.trim());
+        let message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
+            [&v["error"]["message"], &v["message"]]
+                .into_iter()
+                .find_map(|m| m.as_str().map(str::to_string))
+        });
+        return match message {
+            Some(m) => format!("the model provider answered HTTP {code}: {}", truncate_chars(&m, 160)),
+            None => format!("the model provider answered HTTP {code}"),
+        };
+    }
+    format!("couldn't reach the model provider ({})", truncate_chars(detail, 120))
+}
+
 /// Engine-owned synthetic action: ask the user one question (spec §5.1).
 pub const ASK_CLARIFICATION: &str = "ask_clarification";
 
@@ -156,6 +190,7 @@ impl Engine {
         let mut calls_this_turn: std::collections::HashSet<String> = Default::default();
         let mut never_residual_this_turn = false;
         let mut emit_failures: u32 = 0;
+        let mut last_emit_error: Option<String> = None;
         let mut settled: Option<ReplyPolicy> = None;
 
         for _ in 0..self.cfg.max_iterations {
@@ -234,6 +269,7 @@ impl Engine {
                         },
                     );
                     rejections_this_turn.push(format!("emitter failure: {e}"));
+                    last_emit_error = Some(e.to_string());
                     emit_failures += 1;
                     if emit_failures >= self.cfg.max_emit_retries {
                         break;
@@ -594,12 +630,32 @@ impl Engine {
             // loop: the emitter decides what happens next (typically respond_directly)
         }
 
-        // 3. fallback settle (a registered cant_help template wins)
+        // 3. fallback settle (a registered cant_help template wins). The
+        // reply names the cause — the user shouldn't need the event log to
+        // learn it was a rate limit rather than a refusal.
         let policy = settled.unwrap_or_else(|| {
-            let p = if self.cfg.templates.contains_key("cant_help") {
-                ReplyPolicy::Template { id: "cant_help".into(), vars: serde_json::json!({}) }
+            let reason = if emit_failures >= self.cfg.max_emit_retries {
+                last_emit_error
+                    .as_deref()
+                    .map(explain_error)
+                    .unwrap_or_else(|| "the model was unavailable".into())
             } else {
-                ReplyPolicy::Verbatim { text: FALLBACK_REPLY.into() }
+                let mut r = format!(
+                    "ran out of steps after {} actions without reaching an answer",
+                    self.cfg.max_iterations
+                );
+                if let Some(last) = rejections_this_turn.last() {
+                    r.push_str(&format!("; last problem: {last}"));
+                }
+                r
+            };
+            let p = if self.cfg.templates.contains_key("cant_help") {
+                ReplyPolicy::Template {
+                    id: "cant_help".into(),
+                    vars: serde_json::json!({ "reason": reason }),
+                }
+            } else {
+                ReplyPolicy::Verbatim { text: format!("{FALLBACK_REPLY} Reason: {reason}.") }
             };
             log.append(turn, now(), EventKind::Settled { policy: p.clone() });
             p
@@ -632,7 +688,10 @@ impl Engine {
                 };
                 match self.parts.replier.reply(ctx).await {
                     Ok(t) => t,
-                    Err(_) => FALLBACK_REPLY.into(),
+                    Err(e) => format!(
+                        "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
+                        explain_error(&e.to_string())
+                    ),
                 }
             }
         };

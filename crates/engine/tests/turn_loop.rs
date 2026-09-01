@@ -740,6 +740,108 @@ impl Emitter for FailingEmitter {
     }
 }
 
+/// Emitter that always fails with the given transport detail.
+struct EmitFailsWith(&'static str);
+
+#[async_trait::async_trait]
+impl Emitter for EmitFailsWith {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Err(EmitError::Transport(self.0.to_string()))
+    }
+}
+
+/// Replier that always fails with the given transport detail.
+struct ReplyFailsWith(&'static str);
+
+#[async_trait::async_trait]
+impl Replier for ReplyFailsWith {
+    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
+        Err(ReplyError::Transport(self.0.to_string()))
+    }
+}
+
+fn engine_from(
+    emitter: Box<dyn Emitter>,
+    replier: Box<dyn Replier>,
+    cfg: EngineConfig,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(emitter);
+    b.set_replier(replier);
+    b.set_memory(Arc::new(InMemoryStore::new()));
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)))
+}
+
+const RATE_LIMITED: &str =
+    "status 429: {\"error\":{\"code\":429,\"message\":\"Rate limit exceeded: free-models-per-day\"}}";
+
+#[tokio::test]
+async fn fallback_reply_explains_provider_error() {
+    // Seen live: a 429/402 from the provider surfaced as a bare "Sorry" and
+    // the cause was only visible in the event log.
+    let mut e = engine_from(
+        Box::new(EmitFailsWith(RATE_LIMITED)),
+        Box::new(ScriptedReplier),
+        EngineConfig::default(),
+    );
+    let reply =
+        e.run_turn(Incoming { session: SessionId("why1".into()), text: "hi".into() }).await.unwrap();
+    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
+    assert!(reply.contains("429"), "status code is named: {reply}");
+    assert!(reply.contains("Rate limit exceeded"), "provider message is quoted: {reply}");
+}
+
+#[tokio::test]
+async fn fallback_reply_explains_step_exhaustion() {
+    let proposals = ["a", "b", "c", "d", "e"].iter().map(|t| echo_proposal(t)).collect();
+    let mut e = engine_from(
+        Box::new(ScriptedEmitter::new(proposals)),
+        Box::new(ScriptedReplier),
+        EngineConfig::default(), // max_iterations = 5
+    );
+    let reply =
+        e.run_turn(Incoming { session: SessionId("why2".into()), text: "go".into() }).await.unwrap();
+    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
+    assert!(reply.contains("ran out of steps"), "{reply}");
+}
+
+#[tokio::test]
+async fn generate_fallback_explains_replier_error() {
+    let mut e = engine_from(
+        Box::new(ScriptedEmitter::new(vec![])), // respond_directly immediately
+        Box::new(ReplyFailsWith(
+            "status 402: {\"error\":{\"message\":\"This request requires more credits\"}}",
+        )),
+        EngineConfig::default(),
+    );
+    let reply =
+        e.run_turn(Incoming { session: SessionId("why3".into()), text: "hi".into() }).await.unwrap();
+    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
+    assert!(reply.contains("402") && reply.contains("more credits"), "{reply}");
+}
+
+#[tokio::test]
+async fn cant_help_template_receives_reason_var() {
+    let cfg = EngineConfig {
+        templates: [("cant_help".to_string(), "Nezvládnu: {reason}".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let mut e = engine_from(Box::new(EmitFailsWith(RATE_LIMITED)), Box::new(ScriptedReplier), cfg);
+    let reply =
+        e.run_turn(Incoming { session: SessionId("why4".into()), text: "hi".into() }).await.unwrap();
+    assert!(reply.starts_with("Nezvládnu: "), "{reply}");
+    assert!(reply.contains("429") && reply.contains("Rate limit exceeded"), "{reply}");
+}
+
 #[tokio::test]
 async fn registered_cant_help_template_replaces_fallback() {
     let store = Arc::new(InMemoryStore::new());
