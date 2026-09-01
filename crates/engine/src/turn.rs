@@ -8,11 +8,12 @@ use nscore::{
 pub struct EngineConfig {
     pub max_iterations: u32,
     pub max_emit_retries: u32,
+    pub persona: String,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { max_iterations: 5, max_emit_retries: 3 }
+        Self { max_iterations: 5, max_emit_retries: 3, persona: String::new() }
     }
 }
 
@@ -246,7 +247,7 @@ impl Engine {
                 let state = fold(log.events());
                 let trace = turn_trace(&log, turn);
                 let ctx = ReplyContext {
-                    persona: String::new(),
+                    persona: self.cfg.persona.clone(),
                     facts: vec![],
                     session_summary: state_summary(&state),
                     turn_trace: trace,

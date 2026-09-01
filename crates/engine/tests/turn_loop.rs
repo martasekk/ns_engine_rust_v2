@@ -129,3 +129,30 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Replied { .. } => "Replied",
     }
 }
+
+struct PersonaProbe;
+#[async_trait::async_trait]
+impl Replier for PersonaProbe {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        Ok(format!("persona was: {}", ctx.persona))
+    }
+}
+
+#[tokio::test]
+async fn persona_flows_from_config_to_reply_context() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly immediately
+    b.set_replier(Box::new(PersonaProbe));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig { persona: "Tomáš the salesbot".into(), ..Default::default() };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let reply = e
+        .run_turn(Incoming { session: SessionId("p1".into()), text: "hi".into() })
+        .await
+        .unwrap();
+    assert_eq!(reply, "persona was: Tomáš the salesbot");
+}
