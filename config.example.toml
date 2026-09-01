@@ -14,14 +14,16 @@
 #     [llm.replier]
 #     model = "mistral-small-latest"
 #
-#   Ollama (local, unlimited; the key can be any non-empty string):
+#   Ollama (local, unlimited; the key can be any non-empty string).
+#   Pick a non-thinking model: Ollama's OpenAI endpoint ignores `think`,
+#   so qwen3 burns the whole output budget on reasoning (minutes on CPU).
 #     [llm]
 #     base_url = "http://localhost:11434"
 #     api_key_env = "OLLAMA_API_KEY"
 #     [llm.emitter]
-#     model = "qwen3:4b"
+#     model = "qwen2.5:3b"
 #     [llm.replier]
-#     model = "qwen3:4b"
+#     model = "qwen2.5:3b"
 
 [llm.emitter]
 model = "openrouter/free"
