@@ -23,10 +23,10 @@ pub fn fold(events: &[Event]) -> SessionState {
             EventKind::UserSaid { text } => s.history.push(("user".into(), text.clone())),
             EventKind::Replied { text } => s.history.push(("assistant".into(), text.clone())),
             EventKind::PendingConfirmation { .. } => s.pending_confirmation = Some(e.id),
-            EventKind::Confirmed { pending } => {
-                if s.pending_confirmation == Some(*pending) {
-                    s.pending_confirmation = None;
-                }
+            EventKind::Confirmed { pending }
+                if s.pending_confirmation == Some(*pending) =>
+            {
+                s.pending_confirmation = None;
             }
             _ => {}
         }
