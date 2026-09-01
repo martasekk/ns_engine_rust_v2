@@ -130,6 +130,73 @@ fn kind_name(k: &EventKind) -> &'static str {
     }
 }
 
+/// Proposes a tool on the first call, respond_directly after — recording the
+/// state_summary it was shown each time.
+struct CtxProbe {
+    calls: std::sync::Mutex<u32>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for CtxProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        self.seen.lock().unwrap().push(ctx.state_summary.clone());
+        if *n == 1 {
+            Ok(Proposal {
+                rationale: "r".into(),
+                action: "echo".into(),
+                args: serde_json::json!({"text": "hi"}),
+            })
+        } else {
+            Ok(Proposal {
+                rationale: "done".into(),
+                action: "respond_directly".into(),
+                args: serde_json::json!({}),
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn emitter_context_includes_this_turn_actions() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(CtxProbe { calls: std::sync::Mutex::new(0), seen: seen.clone() }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming { session: SessionId("c1".into()), text: "say hi".into() })
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 2, "emitter consulted at least twice");
+    assert!(
+        !seen[0].contains("ToolReturned"),
+        "first consult predates any tool call, got: {}",
+        seen[0]
+    );
+    assert!(
+        seen[1].contains("ToolReturned(ok: echo: hi)"),
+        "second consult must show this turn's outcomes so the emitter can settle, got: {}",
+        seen[1]
+    );
+}
+
 struct PersonaProbe;
 #[async_trait::async_trait]
 impl Replier for PersonaProbe {

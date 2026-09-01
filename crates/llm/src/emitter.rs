@@ -5,7 +5,9 @@ use nscore::{EmitError, Emitter, EmitterContext, LegalActionSet, Proposal};
 
 const SYSTEM: &str = "You translate the user's latest message into exactly one action call \
 from the provided tools. Choose respond_directly when no tool applies. Never invent argument \
-values the user did not supply.";
+values the user did not supply. The context lists actions already performed this turn with \
+their results; never repeat a completed action — when those results answer the user, choose \
+respond_directly.";
 
 pub struct CloudEmitter {
     client: OpenRouterClient,
@@ -15,7 +17,10 @@ pub struct CloudEmitter {
 
 impl CloudEmitter {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
-        Self { client, model, max_tokens: 1024 }
+        // 4096, not 1024: reasoning models spend output tokens on reasoning
+        // before the tool call; a tight cap yields finish_reason "length"
+        // with null content and no tool_calls.
+        Self { client, model, max_tokens: 4096 }
     }
 }
 
@@ -59,10 +64,26 @@ impl Emitter for CloudEmitter {
             }
         })?;
 
-        let tool_call = body["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .and_then(|calls| calls.first())
-            .ok_or_else(|| EmitError::Malformed("no tool_calls in response".into()))?;
+        let message = &body["choices"][0]["message"];
+        let tool_call = match message["tool_calls"].as_array().and_then(|calls| calls.first()) {
+            Some(call) => call,
+            None => {
+                // Models that ignore tool_choice "required" answer in plain
+                // text; treat that as respond_directly — the engine stays in
+                // control, and the replier narrates from the trace as usual.
+                let text = message["content"].as_str().unwrap_or_default().trim();
+                if text.is_empty() {
+                    return Err(EmitError::Malformed("no tool_calls in response".into()));
+                }
+                let mut rationale = format!("model answered in text: {text}");
+                rationale.truncate(300);
+                return Ok(Proposal {
+                    rationale,
+                    action: crate::schema::RESPOND_DIRECTLY.to_string(),
+                    args: serde_json::json!({}),
+                });
+            }
+        };
 
         let action = tool_call["function"]["name"]
             .as_str()
@@ -168,12 +189,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_tool_call_is_malformed() {
+    async fn text_only_response_maps_to_respond_directly() {
+        // Models that ignore tool_choice "required" (common on free tiers)
+        // answer in plain text; that is a respond_directly proposal, not an
+        // error — the engine stays in control either way.
         let mock = MockTransport::ok(vec![serde_json::json!({
             "id": "gen_1",
             "choices": [{
                 "finish_reason": "stop",
-                "message": {"role": "assistant", "content": "just chatting"}
+                "message": {"role": "assistant", "content": "The time is noon."}
+            }]
+        })]);
+        let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
+        assert_eq!(p.action, "respond_directly");
+        assert!(p.rationale.contains("The time is noon."));
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_malformed() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "id": "gen_1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": null}
             }]
         })]);
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();

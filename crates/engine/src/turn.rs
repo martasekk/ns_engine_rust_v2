@@ -87,8 +87,16 @@ impl Engine {
                 .rev()
                 .cloned()
                 .collect();
+            // The emitter must see what this turn has already done — otherwise
+            // it re-proposes completed actions until max_iterations exhausts.
+            let mut summary = state_summary(&state);
+            let trace_so_far = turn_trace(&log, turn);
+            if !trace_so_far.is_empty() {
+                summary.push_str("\nThis turn so far:\n");
+                summary.push_str(&trace_so_far);
+            }
             let ctx = nscore::EmitterContext {
-                state_summary: state_summary(&state),
+                state_summary: summary,
                 recent_turns: recent,
                 rejections_this_turn: rejections_this_turn.clone(),
             };

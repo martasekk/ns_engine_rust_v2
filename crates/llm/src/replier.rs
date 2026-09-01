@@ -10,7 +10,10 @@ pub struct CloudReplier {
 
 impl CloudReplier {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
-        Self { client, model, max_tokens: 1024 }
+        // 4096, not 1024: models with reasoning enabled by default (e.g.
+        // Claude Sonnet 5) spend output tokens on reasoning before content;
+        // a tight cap yields finish_reason "length" with null content.
+        Self { client, model, max_tokens: 4096 }
     }
 }
 
