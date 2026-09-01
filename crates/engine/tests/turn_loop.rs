@@ -435,3 +435,91 @@ async fn never_residual_rejection_forces_clarification() {
         "cancel_order must not run on an invented id"
     );
 }
+
+#[tokio::test]
+async fn confirmation_flow_executes_on_next_turn_yes() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("cf1".into());
+    // Turn 1: propose wipe -> staged, asks for confirmation.
+    {
+        let mut e = engine_with_tools(
+            vec![Proposal {
+                rationale: "wipe".into(),
+                action: "wipe".into(),
+                args: serde_json::json!({}),
+            }],
+            vec![Arc::new(WipeTool::new())],
+            store.clone(),
+        );
+        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
+    }
+    // Turn 2: user says yes; emitter proposes confirm_pending.
+    {
+        let mut e = engine_with_tools(
+            vec![Proposal {
+                rationale: "user confirmed".into(),
+                action: "confirm_pending".into(),
+                args: serde_json::json!({}),
+            }],
+            vec![Arc::new(WipeTool::new())],
+            store.clone(),
+        );
+        let reply =
+            e.run_turn(Incoming { session: sid.clone(), text: "yes".into() }).await.unwrap();
+        assert!(reply.contains("wiped"), "trace reply reports execution, got: {reply}");
+    }
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert!(kinds.contains(&"Confirmed"));
+    assert!(kinds.contains(&"ToolCalled"), "the staged action ran after Confirmed");
+    // paper trail order: PendingConfirmation before Confirmed before ToolCalled
+    let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+    assert!(pos("PendingConfirmation") < pos("Confirmed"));
+    assert!(pos("Confirmed") < pos("ToolCalled"));
+}
+
+#[tokio::test]
+async fn pending_confirmation_expires_after_one_turn() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("cf2".into());
+    {
+        let mut e = engine_with_tools(
+            vec![Proposal {
+                rationale: "wipe".into(),
+                action: "wipe".into(),
+                args: serde_json::json!({}),
+            }],
+            vec![Arc::new(WipeTool::new())],
+            store.clone(),
+        );
+        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
+    }
+    // Turn 2: user changes the subject; scripted emitter falls through to respond_directly.
+    {
+        let mut e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
+        e.run_turn(Incoming { session: sid.clone(), text: "actually, what time is it?".into() })
+            .await
+            .unwrap();
+    }
+    // Turn 3: a late confirm_pending must be rejected as illegal and nothing runs.
+    {
+        let mut e = engine_with_tools(
+            vec![Proposal {
+                rationale: "late yes".into(),
+                action: "confirm_pending".into(),
+                args: serde_json::json!({}),
+            }],
+            vec![Arc::new(WipeTool::new())],
+            store.clone(),
+        );
+        e.run_turn(Incoming { session: sid.clone(), text: "yes do it".into() }).await.unwrap();
+    }
+    let events = store.load(&sid).await.unwrap();
+    assert!(!events.iter().any(|ev| matches!(ev.kind, EventKind::Confirmed { .. })));
+    assert!(!events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })));
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::IllegalAction { action }, .. }
+            if action == "confirm_pending"
+    )));
+}

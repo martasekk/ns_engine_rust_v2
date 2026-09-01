@@ -56,6 +56,20 @@ fn ask_clarification_spec() -> nscore::ActionSpec {
     }
 }
 
+/// Engine-owned synthetic action: the user just confirmed the staged action.
+pub const CONFIRM_PENDING: &str = "confirm_pending";
+
+fn confirm_pending_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: CONFIRM_PENDING.into(),
+        description: "The user has just confirmed the pending action; execute it.".into(),
+        args_schema: serde_json::json!({"type": "object", "properties": {}}),
+        side_effect: nscore::SideEffect::Pure,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
 impl Engine {
     pub fn new(parts: HarnessParts, cfg: EngineConfig) -> Self {
         Self::with_clock(
@@ -109,6 +123,12 @@ impl Engine {
         for _ in 0..self.cfg.max_iterations {
             // a. project
             let state = fold(log.events());
+            // A pending confirmation is active only on the turn immediately
+            // following its creation (expiry rule, spec §9).
+            let active_pending = state.pending_confirmation.filter(|_| {
+                state.pending_turn == Some(turn)
+                    || state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false)
+            });
             let legal = if never_residual_this_turn {
                 // Forced clarification (spec §5.1): a NeverResidual rejection
                 // occurred and nothing grounds the arg — the only way forward
@@ -125,6 +145,9 @@ impl Engine {
                     .filter(|s| !denied_this_turn.contains(&s.name))
                     .collect();
                 actions.push(ask_clarification_spec());
+                if active_pending.is_some() {
+                    actions.push(confirm_pending_spec());
+                }
                 LegalActionSet { actions }
             };
 
@@ -145,6 +168,11 @@ impl Engine {
                 summary.push_str("\nThis turn so far:\n");
                 summary.push_str(&trace_so_far);
             }
+            if active_pending.is_some() {
+                summary.push_str(
+                    "\nPending confirmation: awaiting the user's yes/no on the staged action.",
+                );
+            }
             let ctx = nscore::EmitterContext {
                 state_summary: summary,
                 recent_turns: recent,
@@ -152,7 +180,8 @@ impl Engine {
             };
 
             // c. propose
-            let proposal = match self.parts.emitter.propose(ctx, &legal).await {
+            let mut confirmed_now = false;
+            let mut proposal = match self.parts.emitter.propose(ctx, &legal).await {
                 Ok(p) => p,
                 Err(e) => {
                     log.append(
@@ -194,6 +223,49 @@ impl Engine {
                 rejections_this_turn.push(format!("illegal action: {}", proposal.action));
                 denied_this_turn.insert(proposal.action.clone());
                 continue;
+            }
+
+            // f3. confirmation: legality already guaranteed an ACTIVE pending
+            // exists (confirm_pending is legal only then). Append the Confirmed
+            // event and swap in the original staged proposal — it re-enters the
+            // normal classify→guards→perform pipeline with the gate unlocked.
+            if proposal.action == CONFIRM_PENDING {
+                let pending_id = active_pending.expect("legality guaranteed an active pending");
+                log.append(turn, now(), EventKind::Confirmed { pending: pending_id });
+                let original = log
+                    .events()
+                    .iter()
+                    .find(|e| e.id == pending_id)
+                    .and_then(|e| match &e.kind {
+                        EventKind::PendingConfirmation { proposal_of, .. } => Some(*proposal_of),
+                        _ => None,
+                    })
+                    .and_then(|orig_id| log.events().iter().find(|e| e.id == orig_id))
+                    .and_then(|e| match &e.kind {
+                        EventKind::Proposed { proposal } => Some(proposal.clone()),
+                        _ => None,
+                    });
+                match original {
+                    Some(orig) => {
+                        proposal = orig;
+                        confirmed_now = true;
+                        // fall through to g with the staged proposal
+                    }
+                    None => {
+                        log.append(
+                            turn,
+                            now(),
+                            EventKind::Rejected {
+                                proposal_of: pid,
+                                reason: RejectReason::Malformed {
+                                    detail: "pending confirmation chain is broken".into(),
+                                },
+                            },
+                        );
+                        rejections_this_turn.push("broken confirmation chain".into());
+                        continue;
+                    }
+                }
             }
 
             // f2. clarification: the question IS the reply (spec §5.1). Runs
@@ -284,14 +356,10 @@ impl Engine {
                 ClassifiedProposal { proposal: proposal.clone(), args: classified_args.clone() };
 
             // h. guards
-            let active_pending = state.pending_confirmation.filter(|_| {
-                state.pending_turn == Some(turn)
-                    || state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false)
-            });
             let guard_ctx = nscore::GuardCtx {
                 spec: tool.spec(),
                 turn,
-                confirmed_this_turn: state.confirmed_this_turn_of == Some(turn),
+                confirmed_this_turn: confirmed_now || state.confirmed_this_turn_of == Some(turn),
                 fired_actions: &state.fired_tags,
                 pending_confirmation: active_pending,
             };
