@@ -523,3 +523,81 @@ async fn pending_confirmation_expires_after_one_turn() {
             if action == "confirm_pending"
     )));
 }
+
+struct FactsProbe;
+#[async_trait::async_trait]
+impl Replier for FactsProbe {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let lines: Vec<String> =
+            ctx.facts.iter().map(|f| format!("{}={} uses={}", f.key, f.value, f.uses)).collect();
+        Ok(format!("FACTS[{}]", lines.join(";")))
+    }
+}
+
+#[tokio::test]
+async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("facts1".into());
+    // Turn 1: remember the user's name (value is a span of the user's words).
+    {
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+            rationale: "durable".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": "user.name", "value": "Martin"}),
+        }])));
+        b.set_replier(Box::new(FactsProbe));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let mut e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig::default(),
+            Box::new(|| Timestamp(42)),
+        );
+        let reply = e
+            .run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
+            .await
+            .unwrap();
+        // Generate path recalls the just-stored fact (uses already bumped to 1)
+        assert!(reply.contains("user.name=\"Martin\" uses=1"), "got: {reply}");
+    }
+    let stored = store.facts("user").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(
+        matches!(stored[0].prov, Provenance::UserInput { .. }),
+        "fact provenance comes from classification, got {:?}",
+        stored[0].prov
+    );
+    assert_eq!(stored[0].uses, 1, "recall bumped lifecycle metadata");
+
+    // The log carries the paper trail.
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ToolCalled { action, .. } if action == "remember_fact"
+    )));
+}
+
+#[tokio::test]
+async fn remember_fact_without_value_is_malformed() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "bad".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": "user.name"}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let sid = SessionId("facts2".into());
+    e.run_turn(Incoming { session: sid.clone(), text: "hi".into() }).await.unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::Malformed { .. }, .. }
+    )));
+    assert!(store.facts("").await.unwrap().is_empty());
+}

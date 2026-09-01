@@ -70,6 +70,29 @@ fn confirm_pending_spec() -> nscore::ActionSpec {
     }
 }
 
+/// Engine-owned synthetic action: store one durable fact.
+pub const REMEMBER_FACT: &str = "remember_fact";
+
+fn remember_fact_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: REMEMBER_FACT.into(),
+        description: "Store one durable fact about the user or task as key/value \
+                      (dotted keys, e.g. user.name)."
+            .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["key", "value"]
+        }),
+        side_effect: nscore::SideEffect::Reversible,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
 impl Engine {
     pub fn new(parts: HarnessParts, cfg: EngineConfig) -> Self {
         Self::with_clock(
@@ -145,6 +168,7 @@ impl Engine {
                     .filter(|s| !denied_this_turn.contains(&s.name))
                     .collect();
                 actions.push(ask_clarification_spec());
+                actions.push(remember_fact_spec());
                 if active_pending.is_some() {
                     actions.push(confirm_pending_spec());
                 }
@@ -341,6 +365,71 @@ impl Engine {
                 break;
             }
 
+            // f4. remember_fact: classify (the stored provenance IS the
+            // classification of the value), write the fact, log the paper
+            // trail, and let the emitter decide what happens next.
+            if proposal.action == REMEMBER_FACT {
+                let key = proposal.args.get("key").and_then(|v| v.as_str()).map(String::from);
+                let value = proposal.args.get("value").and_then(|v| v.as_str()).map(String::from);
+                let (Some(key), Some(value)) = (key, value) else {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: "remember_fact needs string key and value".into(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push("remember_fact missing key/value".into());
+                    continue;
+                };
+                let fact_spec = remember_fact_spec();
+                let index = nsprovenance::index::ValueIndex::from_events(log.events());
+                let classified_args = nsprovenance::classify::classify_args(
+                    &proposal.args,
+                    &fact_spec,
+                    &index,
+                    turn,
+                );
+                let prov = classified_args
+                    .iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, tv)| tv.prov.clone())
+                    .unwrap_or(nscore::Provenance::Residual);
+                let fact = nscore::Fact {
+                    key: key.clone(),
+                    value: serde_json::json!(value),
+                    confidence: 1.0,
+                    uses: 0,
+                    last_validated: now(),
+                    prov,
+                };
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: REMEMBER_FACT.into(),
+                            args: classified_args,
+                        },
+                    )
+                    .id;
+                let outcome = match self.parts.memory.put_fact(fact).await {
+                    Ok(()) => ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: format!("remembered {key}"),
+                            artifact: None,
+                            trust: nscore::Trust::System,
+                        },
+                    },
+                    Err(e) => ToolOutcome::Err { kind: "store".into(), detail: e.to_string() },
+                };
+                log.append(turn, now(), EventKind::ToolReturned { call: call_id, outcome });
+                continue;
+            }
+
             // g. classify args against the session's history (spec §5.4)
             let tool = self
                 .parts
@@ -449,9 +538,18 @@ impl Engine {
             ReplyPolicy::Generate => {
                 let state = fold(log.events());
                 let trace = turn_trace(&log, turn);
+                // Implicit recall (spec §5): standing facts enter the reply
+                // context; each recall bumps `uses` (lifecycle metadata for
+                // the future consolidation pass).
+                let mut facts = self.parts.memory.facts("").await.unwrap_or_default();
+                facts.truncate(20);
+                for f in facts.iter_mut() {
+                    f.uses += 1;
+                    let _ = self.parts.memory.put_fact(f.clone()).await;
+                }
                 let ctx = ReplyContext {
                     persona: self.cfg.persona.clone(),
-                    facts: vec![],
+                    facts,
                     session_summary: state_summary(&state),
                     turn_trace: trace,
                 };
