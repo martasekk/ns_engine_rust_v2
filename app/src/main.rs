@@ -34,11 +34,12 @@ async fn main() {
         return;
     }
 
-    let api_key = match std::env::var("OPENROUTER_API_KEY") {
+    let key_env = &cfg.llm.api_key_env;
+    let api_key = match std::env::var(key_env) {
         Ok(k) if !k.is_empty() => k,
         _ => {
-            eprintln!("OPENROUTER_API_KEY is not set — the M2 harness needs real models.");
-            eprintln!("export OPENROUTER_API_KEY=... and run again.");
+            eprintln!("{key_env} is not set — the harness needs a provider API key.");
+            eprintln!("export {key_env}=... and run again (see [llm] api_key_env in config.toml).");
             std::process::exit(1);
         }
     };

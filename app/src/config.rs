@@ -15,14 +15,33 @@ pub struct AppConfig {
     pub templates: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Name of the environment variable holding the provider API key.
+    /// The key itself never lives in config.
+    #[serde(default = "default_api_key_env")]
+    pub api_key_env: String,
     #[serde(default)]
     pub emitter: ModelSection,
     #[serde(default)]
     pub replier: ReplierSection,
+}
+
+fn default_api_key_env() -> String {
+    "OPENROUTER_API_KEY".into()
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            api_key_env: default_api_key_env(),
+            emitter: ModelSection::default(),
+            replier: ReplierSection::default(),
+        }
+    }
 }
 
 impl LlmConfig {
@@ -126,6 +145,14 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
+    }
+
+    #[test]
+    fn api_key_env_defaults_to_openrouter_and_is_configurable() {
+        let d = AppConfig::parse("").unwrap();
+        assert_eq!(d.llm.api_key_env, "OPENROUTER_API_KEY");
+        let m = AppConfig::parse("[llm]\napi_key_env = \"MISTRAL_API_KEY\"").unwrap();
+        assert_eq!(m.llm.api_key_env, "MISTRAL_API_KEY");
     }
 
     #[test]
