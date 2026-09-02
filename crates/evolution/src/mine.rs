@@ -167,6 +167,7 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
                 ReplyPolicy::Generate => "Settled: generate".into(),
             },
             EventKind::Replied { text } => format!("Replied: {text}"),
+            EventKind::ReplyFailed { detail } => format!("ReplyFailed: {detail}"),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -243,6 +244,8 @@ pub fn mine(session: &SessionId, events: &[Event], known_specs: &[ActionSpec]) -
             EventKind::Settled { policy } if is_fallback(policy) => {
                 out.push(sig(e, SignatureKind::FallbackReply))
             }
+            // A failed reply is a fallback the user saw (F7); same lane.
+            EventKind::ReplyFailed { .. } => out.push(sig(e, SignatureKind::FallbackReply)),
             EventKind::ToolReturned {
                 call,
                 outcome: ToolOutcome::Err { kind, detail },

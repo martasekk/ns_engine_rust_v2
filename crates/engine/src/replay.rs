@@ -32,41 +32,51 @@ pub enum ReplayError {
     Engine(String),
 }
 
-/// One normalized line per event: kind + salient payload. Timestamps and
-/// hashes are legitimately different on replay and excluded.
+/// One normalized line per behavioral event: kind + salient payload.
+/// Timestamps and hashes are legitimately different on replay and excluded;
+/// so are infrastructure events (`ReplyFailed`), which a replay with recorded
+/// doubles cannot reproduce.
 pub fn normalize(events: &[Event]) -> Vec<String> {
     events
         .iter()
-        .map(|e| match &e.kind {
-            EventKind::UserSaid { text } => format!("UserSaid {text}"),
-            EventKind::Proposed { proposal } => format!("Proposed {}", proposal.action),
-            EventKind::Rejected { reason, .. } => {
-                let variant = match reason {
-                    nscore::RejectReason::Malformed { .. } => "Malformed",
-                    nscore::RejectReason::IllegalAction { .. } => "IllegalAction",
-                    nscore::RejectReason::GuardDenied { .. } => "GuardDenied",
-                };
-                format!("Rejected {variant}")
-            }
-            EventKind::ToolCalled { action, .. } => format!("ToolCalled {action}"),
-            EventKind::ToolReturned { outcome, .. } => match outcome {
-                ToolOutcome::Ok { .. } => "ToolReturned Ok".into(),
-                ToolOutcome::Err { .. } => "ToolReturned Err".into(),
-            },
-            EventKind::PendingConfirmation { .. } => "PendingConfirmation".into(),
-            EventKind::Confirmed { .. } => "Confirmed".into(),
-            EventKind::Corrected { .. } => "Corrected".into(),
-            EventKind::Settled { policy } => {
-                let p = match policy {
-                    ReplyPolicy::Verbatim { .. } => "Verbatim",
-                    ReplyPolicy::Template { .. } => "Template",
-                    ReplyPolicy::Generate => "Generate",
-                };
-                format!("Settled {p}")
-            }
-            EventKind::Replied { text } => format!("Replied {text}"),
+        .filter_map(|e| match &e.kind {
+            EventKind::ReplyFailed { .. } => None,
+            other => Some(normalize_kind(other)),
         })
         .collect()
+}
+
+fn normalize_kind(kind: &EventKind) -> String {
+    match kind {
+        EventKind::ReplyFailed { .. } => unreachable!("filtered by normalize"),
+        EventKind::UserSaid { text } => format!("UserSaid {text}"),
+        EventKind::Proposed { proposal } => format!("Proposed {}", proposal.action),
+        EventKind::Rejected { reason, .. } => {
+            let variant = match reason {
+                nscore::RejectReason::Malformed { .. } => "Malformed",
+                nscore::RejectReason::IllegalAction { .. } => "IllegalAction",
+                nscore::RejectReason::GuardDenied { .. } => "GuardDenied",
+            };
+            format!("Rejected {variant}")
+        }
+        EventKind::ToolCalled { action, .. } => format!("ToolCalled {action}"),
+        EventKind::ToolReturned { outcome, .. } => match outcome {
+            ToolOutcome::Ok { .. } => "ToolReturned Ok".into(),
+            ToolOutcome::Err { .. } => "ToolReturned Err".into(),
+        },
+        EventKind::PendingConfirmation { .. } => "PendingConfirmation".into(),
+        EventKind::Confirmed { .. } => "Confirmed".into(),
+        EventKind::Corrected { .. } => "Corrected".into(),
+        EventKind::Settled { policy } => {
+            let p = match policy {
+                ReplyPolicy::Verbatim { .. } => "Verbatim",
+                ReplyPolicy::Template { .. } => "Template",
+                ReplyPolicy::Generate => "Generate",
+            };
+            format!("Settled {p}")
+        }
+        EventKind::Replied { text } => format!("Replied {text}"),
+    }
 }
 
 /// What a replay runs with, beyond the recording itself (spec M5 §4.1).

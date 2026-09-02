@@ -13,16 +13,47 @@ pub struct Timestamp(pub u64);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
-    UserSaid { text: String },
-    Proposed { proposal: crate::action::Proposal },
-    Rejected { proposal_of: EventId, reason: crate::action::RejectReason },
-    ToolCalled { action: String, args: Vec<(String, crate::value::TaggedValue)> },
-    ToolReturned { call: EventId, outcome: crate::action::ToolOutcome },
-    PendingConfirmation { proposal_of: EventId, staged: Option<crate::action::StagedEffect> },
-    Confirmed { pending: EventId },
-    Corrected { target: Option<EventId>, text: String },
-    Settled { policy: crate::action::ReplyPolicy },
-    Replied { text: String },
+    UserSaid {
+        text: String,
+    },
+    Proposed {
+        proposal: crate::action::Proposal,
+    },
+    Rejected {
+        proposal_of: EventId,
+        reason: crate::action::RejectReason,
+    },
+    ToolCalled {
+        action: String,
+        args: Vec<(String, crate::value::TaggedValue)>,
+    },
+    ToolReturned {
+        call: EventId,
+        outcome: crate::action::ToolOutcome,
+    },
+    PendingConfirmation {
+        proposal_of: EventId,
+        staged: Option<crate::action::StagedEffect>,
+    },
+    Confirmed {
+        pending: EventId,
+    },
+    Corrected {
+        target: Option<EventId>,
+        text: String,
+    },
+    Settled {
+        policy: crate::action::ReplyPolicy,
+    },
+    Replied {
+        text: String,
+    },
+    /// The reply model failed after `Settled { Generate }`; the fallback
+    /// `Replied` follows. Infrastructure, not behavior: replay ignores it
+    /// (the recorded reply is replayed as if it had succeeded).
+    ReplyFailed {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,8 +83,8 @@ pub(crate) mod hash_serde {
         }
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
-                .map_err(serde::de::Error::custom)?;
+            *byte =
+                u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(serde::de::Error::custom)?;
         }
         Ok(out)
     }
@@ -81,7 +112,10 @@ pub enum ChainError {
 
 impl EventLog {
     pub fn new(session: SessionId) -> Self {
-        Self { session, events: Vec::new() }
+        Self {
+            session,
+            events: Vec::new(),
+        }
     }
 
     pub fn from_events(session: SessionId, events: Vec<Event>) -> Self {
@@ -102,7 +136,14 @@ impl EventLog {
 
     pub fn append(&mut self, turn: u32, at: Timestamp, kind: EventKind) -> &Event {
         let prev_hash = self.events.last().map(event_hash).unwrap_or([0u8; 32]);
-        let e = Event { id: self.next_id(), parent: None, prev_hash, turn, at, kind };
+        let e = Event {
+            id: self.next_id(),
+            parent: None,
+            prev_hash,
+            turn,
+            at,
+            kind,
+        };
         self.events.push(e);
         self.events.last().unwrap()
     }
@@ -142,7 +183,9 @@ mod tests {
         log.append(0, Timestamp(1), EventKind::UserSaid { text: "a".into() });
         log.append(0, Timestamp(2), EventKind::Replied { text: "b".into() });
         let mut events = log.events().to_vec();
-        events[0].kind = EventKind::UserSaid { text: "TAMPERED".into() };
+        events[0].kind = EventKind::UserSaid {
+            text: "TAMPERED".into(),
+        };
         let tampered = EventLog::from_events(SessionId("s1".into()), events);
         assert!(matches!(
             tampered.verify_chain(),
@@ -158,7 +201,9 @@ mod tests {
             prev_hash: [0u8; 32],
             turn: 0,
             at: Timestamp(1_756_700_000_000),
-            kind: EventKind::UserSaid { text: "ahoj".into() },
+            kind: EventKind::UserSaid {
+                text: "ahoj".into(),
+            },
         };
         let json = serde_json::to_string(&e).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();

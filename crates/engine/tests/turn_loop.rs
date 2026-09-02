@@ -189,6 +189,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Corrected { .. } => "Corrected",
         EventKind::Settled { .. } => "Settled",
         EventKind::Replied { .. } => "Replied",
+        EventKind::ReplyFailed { .. } => "ReplyFailed",
     }
 }
 
@@ -1057,17 +1058,26 @@ async fn fallback_reply_explains_step_exhaustion() {
 }
 
 #[tokio::test]
-async fn generate_fallback_explains_replier_error() {
-    let mut e = engine_from(
-        Box::new(ScriptedEmitter::new(vec![])), // respond_directly immediately
-        Box::new(ReplyFailsWith(
-            "status 402: {\"error\":{\"message\":\"This request requires more credits\"}}",
-        )),
+async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly immediately
+    b.set_replier(Box::new(ReplyFailsWith(
+        "status 402: {\"error\":{\"message\":\"This request requires more credits\"}}",
+    )));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
         EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
     );
+    let sid = SessionId("why3".into());
     let reply = e
         .run_turn(Incoming {
-            session: SessionId("why3".into()),
+            session: sid.clone(),
             text: "hi".into(),
         })
         .await
@@ -1080,6 +1090,21 @@ async fn generate_fallback_explains_replier_error() {
         reply.contains("402") && reply.contains("more credits"),
         "{reply}"
     );
+    // F7: the failure is an event, placed between Settled and the fallback Replied.
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert_eq!(
+        kinds,
+        vec!["UserSaid", "Proposed", "Settled", "ReplyFailed", "Replied"]
+    );
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ReplyFailed { detail } if detail.contains("402")
+    )));
+    // Replay ignores infrastructure events: the recording still replays clean.
+    nsengine::replay::replay_session(sid, &events, vec![])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

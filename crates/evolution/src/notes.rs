@@ -108,6 +108,7 @@ pub fn classify_turns(events: &[Event]) -> Vec<TurnOutcome> {
         let entry = per_turn.entry(e.turn).or_insert((false, 0));
         match &e.kind {
             EventKind::Settled { policy } if is_fallback(policy) => entry.0 = true,
+            EventKind::ReplyFailed { .. } => entry.0 = true,
             EventKind::Rejected { .. } => entry.1 += 1,
             _ => {}
         }

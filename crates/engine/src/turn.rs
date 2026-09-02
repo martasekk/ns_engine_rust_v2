@@ -837,10 +837,21 @@ impl Engine {
                 };
                 match self.parts.replier.reply(ctx).await {
                     Ok(t) => t,
-                    Err(e) => format!(
-                        "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
-                        explain_error(&e.to_string())
-                    ),
+                    Err(e) => {
+                        // F7: a replier failure is an event, not just a
+                        // fallback text — mining and audits must see it.
+                        log.append(
+                            turn,
+                            now(),
+                            EventKind::ReplyFailed {
+                                detail: e.to_string(),
+                            },
+                        );
+                        format!(
+                            "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
+                            explain_error(&e.to_string())
+                        )
+                    }
                 }
             }
         };
