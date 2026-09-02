@@ -41,6 +41,19 @@ text = "You are a helpful, concise assistant."
 [store]
 path = "ns.sqlite"
 
+# Evolution pass (self-improvement, spec 2026-09-02). Both drivers:
+#   batch:  ns-app evolve [--dry-run]      (cron-friendly; audit via git diff learned.toml)
+#   idle:   after idle_after_secs of silence while running (0 = off)
+[evolution]
+enabled = true
+learned_path = "learned.toml"
+ledger_path = "evolution-ledger.json"
+idle_after_secs = 300
+regression_budget = 0        # notes gate: negatives allowed to regress
+probe_budget_turns = 40      # live probe turns per pass (notes lane)
+max_notes = 20
+regression_replay_cap = 200  # newest sessions replayed by the symbolic gate
+
 # External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
 # [[http_component]]
 # name = "check_stock"

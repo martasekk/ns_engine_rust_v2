@@ -595,11 +595,13 @@ dependencies = [
 name = "ns-app"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "ns-channel-cli",
  "ns-components-std",
  "ns-core",
  "ns-engine",
+ "ns-evolution",
  "ns-llm",
  "ns-memory-sqlite",
  "serde",

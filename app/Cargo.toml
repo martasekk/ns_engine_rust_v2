@@ -14,6 +14,8 @@ ns-channel-cli = { path = "../crates/channel-cli" }
 ns-llm = { path = "../crates/llm" }
 ns-components-std = { path = "../crates/components-std" }
 ns-memory-sqlite = { path = "../crates/memory-sqlite" }
+ns-evolution = { path = "../crates/evolution" }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
