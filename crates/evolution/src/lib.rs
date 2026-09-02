@@ -2,3 +2,4 @@
 //! mine → propose → gate → apply → ledger. Pure library; ns-app drives it.
 pub mod files;
 pub mod ledger;
+pub mod mine;
