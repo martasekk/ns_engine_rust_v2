@@ -10,8 +10,8 @@ use crate::turn::{Engine, EngineConfig};
 use async_trait::async_trait;
 use nscore::{
     ActionSpec, Channel, ChannelError, Event, EventKind, EventLog, Guard, HarnessBuilder, Incoming,
-    MemoryStore, Proposal, Replier, ReplyContext, ReplyError, ReplyPolicy, SessionId, SideEffect,
-    Timestamp, Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput,
+    LearnedRules, MemoryStore, Proposal, Replier, ReplyContext, ReplyError, ReplyPolicy, SessionId,
+    SideEffect, Timestamp, Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput, Trust,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -69,24 +69,69 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
+/// What a replay runs with, beyond the recording itself (spec M5 §4.1).
+pub struct ReplayOptions {
+    /// Learned rules under test; default: none.
+    pub learned: Arc<LearnedRules>,
+    /// Plugin guards the recording ran with.
+    pub extra_guards: Vec<Box<dyn Guard>>,
+    /// Production tool specs: doubles carry the real spec so legality and
+    /// validation match production, even for tools the recording never called.
+    pub known_specs: Vec<ActionSpec>,
+    /// A call with no recorded outcome returns a synthetic Ok instead of
+    /// failing — used to check whether a candidate rule "flips" a failure.
+    pub synthetic_ok_for_new_calls: bool,
+}
+
+impl Default for ReplayOptions {
+    fn default() -> Self {
+        Self {
+            learned: Arc::new(LearnedRules::default()),
+            extra_guards: vec![],
+            known_specs: vec![],
+            synthetic_ok_for_new_calls: false,
+        }
+    }
+}
+
+pub struct Replayed {
+    pub events: Vec<Event>,
+}
+
+/// Scripted doubles reconstructed from a recording.
+pub struct Doubles {
+    pub user_inputs: Vec<String>,
+    pub proposals: Vec<Proposal>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub replier: Box<dyn Replier>,
+}
+
+/// Engine-synthetic actions never need tool doubles.
+const SYNTHETIC: [&str; 3] = ["remember_fact", "ask_clarification", "confirm_pending"];
+
 /// Replays one recorded tool: pops the recorded outcomes front-to-back.
 struct ReplayTool {
     spec: ActionSpec,
     outcomes: Mutex<VecDeque<ToolOutcome>>,
+    synthetic_ok: bool,
 }
 
 impl ReplayTool {
-    fn new(action: &str, outcomes: VecDeque<ToolOutcome>) -> Self {
+    fn new(spec: ActionSpec, outcomes: VecDeque<ToolOutcome>, synthetic_ok: bool) -> Self {
         Self {
-            spec: ActionSpec {
-                name: action.into(),
-                description: format!("replay double for {action}"),
-                args_schema: serde_json::json!({"type": "object", "properties": {}}),
-                side_effect: SideEffect::Pure,
-                residual_policy: Default::default(),
-                dedupe_tag: None,
-            },
+            spec,
             outcomes: Mutex::new(outcomes),
+            synthetic_ok,
+        }
+    }
+    fn dummy_spec(action: &str) -> ActionSpec {
+        ActionSpec {
+            name: action.into(),
+            description: format!("replay double for {action}"),
+            args_schema: serde_json::json!({"type": "object", "properties": {}}),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
         }
     }
 }
@@ -105,6 +150,11 @@ impl Tool for ReplayTool {
         {
             Some(ToolOutcome::Ok { output }) => Ok(output),
             Some(ToolOutcome::Err { kind, detail }) => Err(ToolError::Failed { kind, detail }),
+            None if self.synthetic_ok => Ok(ToolOutput {
+                summary: "(verified: synthetic ok)".into(),
+                artifact: None,
+                trust: Trust::System,
+            }),
             None => Err(ToolError::Failed {
                 kind: "replay".into(),
                 detail: "outcome queue exhausted".into(),
@@ -142,20 +192,10 @@ impl Channel for ReplayChannel {
     }
 }
 
-/// Re-feed a recorded session through the engine. Any behavioral change in
-/// the engine (guards, narrowing, settling) surfaces as a Divergence.
-/// `extra_guards` reproduces the plugin guards the recording ran with.
-pub async fn replay_session(
-    session: SessionId,
-    recorded: &[Event],
-    extra_guards: Vec<Box<dyn Guard>>,
-) -> Result<(), ReplayError> {
-    // 1. The recording itself must be intact.
-    EventLog::from_events(session.clone(), recorded.to_vec())
-        .verify_chain()
-        .map_err(|e| ReplayError::ChainBroken(e.to_string()))?;
-
-    // 2. Reconstruct the scripted doubles from the recording.
+/// Reconstruct scripted doubles from a recording. Every known spec gets a
+/// double carrying the REAL spec (legality/validation match production);
+/// recorded actions without a known spec get a permissive dummy spec.
+pub fn doubles_from(recorded: &[Event], known_specs: &[ActionSpec], synthetic_ok: bool) -> Doubles {
     let mut user_inputs: Vec<String> = Vec::new();
     let mut proposals: Vec<Proposal> = Vec::new();
     let mut call_actions: HashMap<u64, String> = HashMap::new(); // call event id -> action
@@ -191,33 +231,73 @@ pub async fn replay_session(
             _ => {}
         }
     }
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for spec in known_specs {
+        if SYNTHETIC.contains(&spec.name.as_str()) {
+            continue;
+        }
+        let queue = outcomes.remove(&spec.name).unwrap_or_default();
+        seen.insert(spec.name.clone());
+        tools.push(Arc::new(ReplayTool::new(spec.clone(), queue, synthetic_ok)));
+    }
+    for (action, queue) in outcomes {
+        if SYNTHETIC.contains(&action.as_str()) || seen.contains(&action) {
+            continue;
+        }
+        tools.push(Arc::new(ReplayTool::new(
+            ReplayTool::dummy_spec(&action),
+            queue,
+            synthetic_ok,
+        )));
+    }
+    Doubles {
+        user_inputs,
+        proposals,
+        tools,
+        replier: Box::new(QueueReplier {
+            texts: Mutex::new(generated_replies),
+        }),
+    }
+}
 
-    // 3. Assemble a fresh harness over the doubles.
+/// Re-feed a recorded session through the engine under `opts` and return
+/// the re-run events (no diff). Any behavioral change — engine, guards, or
+/// learned rules — shows up in the returned log.
+pub async fn replay_with(
+    session: SessionId,
+    recorded: &[Event],
+    opts: ReplayOptions,
+) -> Result<Replayed, ReplayError> {
+    // 1. The recording itself must be intact.
+    EventLog::from_events(session.clone(), recorded.to_vec())
+        .verify_chain()
+        .map_err(|e| ReplayError::ChainBroken(e.to_string()))?;
+
+    // 2. Assemble a fresh harness over the doubles.
+    let d = doubles_from(recorded, &opts.known_specs, opts.synthetic_ok_for_new_calls);
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(QueueReplier {
-        texts: Mutex::new(generated_replies),
-    }));
+    b.set_emitter(Box::new(ScriptedEmitter::new(d.proposals)));
+    b.set_replier(d.replier);
     b.set_memory(store.clone());
     b.set_channel(Box::new(ReplayChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
-    // remember_fact/ask_clarification/confirm_pending are engine-synthetic;
-    // only real tool calls need doubles.
-    let synthetic = ["remember_fact", "ask_clarification", "confirm_pending"];
-    for (action, queue) in outcomes {
-        if !synthetic.contains(&action.as_str()) {
-            b.add_tool(Arc::new(ReplayTool::new(&action, queue)));
-        }
+    for t in d.tools {
+        b.add_tool(t);
     }
-    for g in extra_guards {
+    for g in opts.extra_guards {
         b.add_guard(g);
     }
     let parts = b.build().map_err(|e| ReplayError::Engine(e.to_string()))?;
-    let mut engine = Engine::with_clock(parts, EngineConfig::default(), Box::new(|| Timestamp(0)));
+    let cfg = EngineConfig {
+        learned: Arc::new(arc_swap::ArcSwap::new(opts.learned)),
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
 
-    // 4. Re-feed the user inputs.
-    for text in user_inputs {
+    // 3. Re-feed the user inputs.
+    for text in d.user_inputs {
         engine
             .run_turn(Incoming {
                 session: session.clone(),
@@ -226,14 +306,17 @@ pub async fn replay_session(
             .await
             .map_err(|e| ReplayError::Engine(e.to_string()))?;
     }
-
-    // 5. Diff normalized lines.
-    let replayed = store
+    let events = store
         .load(&session)
         .await
         .map_err(|e| ReplayError::Engine(e.to_string()))?;
+    Ok(Replayed { events })
+}
+
+/// Diff normalized lines: first divergence wins, then length.
+pub fn diff(recorded: &[Event], replayed: &[Event]) -> Result<(), ReplayError> {
     let expected = normalize(recorded);
-    let got = normalize(&replayed);
+    let got = normalize(replayed);
     for (at, (want, have)) in expected.iter().zip(got.iter()).enumerate() {
         if want != have {
             return Err(ReplayError::Divergence {
@@ -250,6 +333,21 @@ pub async fn replay_session(
         });
     }
     Ok(())
+}
+
+/// Faithful replay: re-run under the recording's guards and no learned rules,
+/// then diff against the recording. This is the M4 regression check.
+pub async fn replay_session(
+    session: SessionId,
+    recorded: &[Event],
+    extra_guards: Vec<Box<dyn Guard>>,
+) -> Result<(), ReplayError> {
+    let opts = ReplayOptions {
+        extra_guards,
+        ..Default::default()
+    };
+    let r = replay_with(session, recorded, opts).await?;
+    diff(recorded, &r.events)
 }
 
 #[cfg(test)]
@@ -330,5 +428,97 @@ mod tests {
         }
         let err = replay_session(sid, &events, vec![]).await.unwrap_err();
         assert!(matches!(err, ReplayError::ChainBroken(_)));
+    }
+
+    #[tokio::test]
+    async fn replay_with_returns_events_and_replay_session_is_its_wrapper() {
+        let (sid, events) = record_session(vec![]).await;
+        let r = replay_with(sid.clone(), &events, ReplayOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(normalize(&r.events), normalize(&events));
+        assert!(diff(&events, &r.events).is_ok());
+        replay_session(sid, &events, vec![]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn learned_alias_flips_a_recorded_illegal_action_into_a_call() {
+        // Record a session where the emitter proposed "eko" (illegal) then gave up.
+        let store = Arc::new(InMemoryStore::new());
+        let sid = SessionId("flip".into());
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+            rationale: "typo".into(),
+            action: "eko".into(),
+            args: serde_json::json!({"text": "hi"}),
+        }])));
+        b.set_replier(Box::new(ScriptedReplier));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(ClosedChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let mut e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig::default(),
+            Box::new(|| Timestamp(1)),
+        );
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "say hi".into(),
+        })
+        .await
+        .unwrap();
+        let recorded = store.load(&sid).await.unwrap();
+        let rejected_at = normalize(&recorded)
+            .iter()
+            .position(|l| l == "Rejected IllegalAction")
+            .unwrap();
+
+        // echo was never called in the recording, so the double only exists
+        // because known_specs carries it; the call has no recorded outcome.
+        let opts = ReplayOptions {
+            learned: Arc::new(nscore::LearnedRules {
+                alias_action: vec![nscore::AliasAction {
+                    from: "eko".into(),
+                    to: "echo".into(),
+                }],
+                ..Default::default()
+            }),
+            known_specs: vec![EchoTool::new().spec().clone()],
+            synthetic_ok_for_new_calls: true,
+            ..Default::default()
+        };
+        let r = replay_with(sid, &recorded, opts).await.unwrap();
+        assert_eq!(normalize(&r.events)[rejected_at], "ToolCalled echo");
+        assert_eq!(normalize(&r.events)[rejected_at + 1], "ToolReturned Ok");
+    }
+
+    #[tokio::test]
+    async fn without_synthetic_ok_a_new_call_errors() {
+        let (_sid, events) = record_session(vec![]).await;
+        // Strip the recorded echo outcome so the double's queue is empty
+        // (the chain is broken now, so build doubles directly, no replay).
+        let stripped: Vec<Event> = events
+            .iter()
+            .filter(|e| !matches!(e.kind, EventKind::ToolReturned { .. }))
+            .cloned()
+            .collect();
+        let ctx = || ToolCtx {
+            session: SessionId("s".into()),
+            artifacts: None,
+        };
+        let d = doubles_from(&stripped, &[EchoTool::new().spec().clone()], false);
+        let echo = d.tools.iter().find(|t| t.spec().name == "echo").unwrap();
+        let out = echo.call(&serde_json::json!({"text": "x"}), &ctx()).await;
+        assert!(
+            matches!(out, Err(ToolError::Failed { ref detail, .. }) if detail.contains("exhausted"))
+        );
+        let d = doubles_from(&stripped, &[EchoTool::new().spec().clone()], true);
+        let echo = d.tools.iter().find(|t| t.spec().name == "echo").unwrap();
+        let out = echo
+            .call(&serde_json::json!({"text": "x"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.summary.contains("synthetic ok"));
     }
 }
