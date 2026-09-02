@@ -581,13 +581,45 @@ impl Engine {
                     .find(|(k, _)| k == "value")
                     .map(|(_, tv)| tv.prov.clone())
                     .unwrap_or(nscore::Provenance::Residual);
-                let fact = nscore::Fact {
-                    key: key.clone(),
-                    value: serde_json::json!(value),
-                    confidence: 1.0,
-                    uses: 0,
-                    last_validated: now(),
-                    prov,
+                // Lifecycle merge (M6 §6.1): a restatement keeps the usage
+                // count and re-validates; the same value gains confidence,
+                // a new value replaces it at full confidence. Seen live: every
+                // re-remember reset `uses` to 0, erasing the consolidation
+                // pass's only signal.
+                let value_json = serde_json::json!(value);
+                let existing = self
+                    .parts
+                    .memory
+                    .facts(&key)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|f| f.key == key);
+                let fact = match existing {
+                    Some(prev) if prev.value == value_json => nscore::Fact {
+                        key: key.clone(),
+                        value: value_json,
+                        confidence: (prev.confidence + 0.1).min(1.0),
+                        uses: prev.uses,
+                        last_validated: now(),
+                        prov,
+                    },
+                    Some(prev) => nscore::Fact {
+                        key: key.clone(),
+                        value: value_json,
+                        confidence: 1.0,
+                        uses: prev.uses,
+                        last_validated: now(),
+                        prov,
+                    },
+                    None => nscore::Fact {
+                        key: key.clone(),
+                        value: value_json,
+                        confidence: 1.0,
+                        uses: 0,
+                        last_validated: now(),
+                        prov,
+                    },
                 };
                 let call_id = log
                     .append(

@@ -749,6 +749,61 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
 }
 
 #[tokio::test]
+async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
+    // Seen live: user.name was re-remembered ten times and every write reset
+    // `uses` to 0. A restatement must keep the count, re-validate, and (for
+    // an unverified fact) raise confidence; a new value replaces the old one
+    // at full confidence without losing the count.
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .put_fact(Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            confidence: 0.5,
+            uses: 3,
+            last_validated: Timestamp(1),
+            prov: Provenance::Residual,
+        })
+        .await
+        .unwrap();
+    let remember = |v: &str| Proposal {
+        rationale: "remember".into(),
+        action: "remember_fact".into(),
+        args: serde_json::json!({"key": "user.name", "value": v}),
+    };
+    let sid = SessionId("facts5".into());
+
+    let mut e = engine_with(vec![remember("Martin")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "my name is Martin".into(),
+    })
+    .await
+    .unwrap();
+    let f = store.facts("user.name").await.unwrap().remove(0);
+    assert_eq!(f.uses, 4, "3 kept, then one recall bump in the reply path");
+    assert!((f.confidence - 0.6).abs() < 1e-6, "got {}", f.confidence);
+    assert_eq!(f.last_validated, Timestamp(42));
+    assert!(
+        matches!(f.prov, Provenance::UserInput { .. }),
+        "a restatement re-grounds the value, got {:?}",
+        f.prov
+    );
+
+    let mut e = engine_with(vec![remember("Peter")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "call me Peter".into(),
+    })
+    .await
+    .unwrap();
+    let f = store.facts("user.name").await.unwrap().remove(0);
+    assert_eq!(f.value, serde_json::json!("Peter"));
+    assert_eq!(f.uses, 5);
+    assert!((f.confidence - 1.0).abs() < 1e-6);
+}
+
+#[tokio::test]
 async fn remember_fact_without_value_is_malformed() {
     let store = Arc::new(InMemoryStore::new());
     let mut e = engine_with(
