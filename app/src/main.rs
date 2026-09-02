@@ -37,12 +37,22 @@ fn api_key(cfg: &AppConfig) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
+/// One throttle per process: every role's client shares it, so the
+/// provider sees one paced stream (seen live: Mistral 429s on bursts).
+fn throttle(cfg: &AppConfig) -> Arc<nsllm::client::Throttle> {
+    static THROTTLE: std::sync::OnceLock<Arc<nsllm::client::Throttle>> = std::sync::OnceLock::new();
+    THROTTLE
+        .get_or_init(|| Arc::new(nsllm::client::Throttle::new(cfg.llm.min_interval_ms())))
+        .clone()
+}
+
 fn make_client(
     cfg: &AppConfig,
     transport: Arc<nsllm::transport::ReqwestTransport>,
     key: &str,
 ) -> nsllm::client::OpenRouterClient {
-    let c = nsllm::client::OpenRouterClient::new(transport, key.to_string());
+    let c = nsllm::client::OpenRouterClient::new(transport, key.to_string())
+        .with_throttle(throttle(cfg));
     match &cfg.llm.base_url {
         Some(url) => c.with_base_url(url.clone()),
         None => c,
@@ -90,9 +100,11 @@ fn build_pass(
             let model = cfg.llm.emitter.model.clone();
             let factory_cfg = (cfg.llm.base_url.clone(), key.to_string(), model.clone());
             let factory_transport = transport.clone();
+            let probe_throttle = throttle(cfg);
             let emitter: nsevolution::notes::EmitterFactory = Arc::new(move || {
                 let (base_url, key, model) = factory_cfg.clone();
-                let c = nsllm::client::OpenRouterClient::new(factory_transport.clone(), key);
+                let c = nsllm::client::OpenRouterClient::new(factory_transport.clone(), key)
+                    .with_throttle(probe_throttle.clone());
                 let c = match base_url {
                     Some(u) => c.with_base_url(u),
                     None => c,
@@ -201,7 +213,8 @@ async fn main() {
         let (model, base_url, key_env) = cfg.llm.summarizer_role();
         match std::env::var(&key_env).ok().filter(|k| !k.is_empty()) {
             Some(role_key) => {
-                let c = nsllm::client::OpenRouterClient::new(transport.clone(), role_key);
+                let c = nsllm::client::OpenRouterClient::new(transport.clone(), role_key)
+                    .with_throttle(throttle(&cfg));
                 let c = match base_url {
                     Some(u) => c.with_base_url(u),
                     None => c,

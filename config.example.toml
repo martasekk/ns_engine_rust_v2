@@ -5,10 +5,13 @@
 # Any provider that speaks POST {base_url}/v1/chat/completions with
 # OpenAI-style function tools works. Presets (uncomment one block):
 #
-#   Mistral (free Experiment tier, ~1 req/s, 500K TPM):
+#   Mistral (free Experiment tier, ~1 req/s, 500K TPM). Requests are spaced
+#   1100 ms apart automatically for api.mistral.ai; set min_interval_ms to
+#   override (0 = no spacing).
 #     [llm]
 #     base_url = "https://api.mistral.ai"
 #     api_key_env = "MISTRAL_API_KEY"
+#     min_interval_ms = 1100
 #     [llm.emitter]
 #     model = "mistral-small-latest"
 #     [llm.replier]

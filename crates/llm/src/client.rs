@@ -1,12 +1,50 @@
 use crate::transport::{HttpTransport, TransportError};
 use std::sync::Arc;
 
+/// Minimum spacing between requests, shared by every client of one
+/// provider (emitter, replier, summarizer, probes). Free tiers rate-limit
+/// per second; a turn with a tool call fires several requests back to back.
+pub struct Throttle {
+    min_interval: std::time::Duration,
+    last: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Throttle {
+    pub fn new(min_interval_ms: u64) -> Self {
+        Self {
+            min_interval: std::time::Duration::from_millis(min_interval_ms),
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Sleep until the interval since the previous request has elapsed,
+    /// then claim the slot.
+    pub async fn wait(&self) {
+        if self.min_interval.is_zero() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let due = self
+            .last
+            .lock()
+            .expect("throttle lock")
+            .map(|last| last + self.min_interval);
+        if let Some(due) = due {
+            if due > now {
+                tokio::time::sleep_until(due).await;
+            }
+        }
+        *self.last.lock().expect("throttle lock") = Some(tokio::time::Instant::now());
+    }
+}
+
 pub struct OpenRouterClient {
     transport: Arc<dyn HttpTransport>,
     api_key: String,
     base_url: String,
     max_attempts: u32,
     backoff_base_ms: u64,
+    throttle: Option<Arc<Throttle>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -28,11 +66,18 @@ impl OpenRouterClient {
             base_url: "https://openrouter.ai/api".into(),
             max_attempts: 4,
             backoff_base_ms: 1000,
+            throttle: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
+        self
+    }
+
+    /// Share one throttle across every client of the same provider.
+    pub fn with_throttle(mut self, throttle: Arc<Throttle>) -> Self {
+        self.throttle = Some(throttle);
         self
     }
 
@@ -60,6 +105,9 @@ impl OpenRouterClient {
             if attempt > 0 {
                 let delay = self.backoff_base_ms * (1 << (attempt - 1));
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            if let Some(t) = &self.throttle {
+                t.wait().await;
             }
             match self.transport.post(&url, &headers, &request).await {
                 Ok(resp) if (200..300).contains(&resp.status) => return Ok(resp.body),
@@ -142,6 +190,28 @@ mod tests {
             3,
             "exactly max_attempts tries"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_throttle_spaces_requests_across_clients() {
+        let mock = MockTransport::ok(vec![
+            serde_json::json!({"id": "a"}),
+            serde_json::json!({"id": "b"}),
+            serde_json::json!({"id": "c"}),
+        ]);
+        let throttle = Arc::new(Throttle::new(60));
+        let a = client(mock.clone()).with_throttle(throttle.clone());
+        let b = client(mock.clone()).with_throttle(throttle);
+        let started = std::time::Instant::now();
+        a.chat(serde_json::json!({})).await.unwrap();
+        b.chat(serde_json::json!({})).await.unwrap();
+        a.chat(serde_json::json!({})).await.unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(120),
+            "three requests need two intervals: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

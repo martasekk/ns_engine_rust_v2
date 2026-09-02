@@ -163,6 +163,11 @@ pub struct LlmConfig {
     /// The key itself never lives in config.
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
+    /// Minimum spacing between requests to the provider, shared by every
+    /// role. Unset: 1100 ms for api.mistral.ai (free tier is ~1 req/s), 0
+    /// elsewhere.
+    #[serde(default)]
+    pub min_interval_ms: Option<u64>,
     #[serde(default)]
     pub emitter: ModelSection,
     #[serde(default)]
@@ -183,10 +188,29 @@ impl Default for LlmConfig {
         Self {
             base_url: None,
             api_key_env: default_api_key_env(),
+            min_interval_ms: None,
             emitter: ModelSection::default(),
             replier: ReplierSection::default(),
             summarizer: SummarizerSection::default(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// Explicit value, else a provider default (seen live: Mistral's free
+    /// tier 429s on back-to-back requests).
+    pub fn min_interval_ms(&self) -> u64 {
+        self.min_interval_ms.unwrap_or_else(|| {
+            if self
+                .base_url
+                .as_deref()
+                .is_some_and(|u| u.contains("mistral.ai"))
+            {
+                1100
+            } else {
+                0
+            }
+        })
     }
 }
 
@@ -424,6 +448,17 @@ mod tests {
         assert_eq!(d.llm.api_key_env, "OPENROUTER_API_KEY");
         let m = AppConfig::parse("[llm]\napi_key_env = \"MISTRAL_API_KEY\"").unwrap();
         assert_eq!(m.llm.api_key_env, "MISTRAL_API_KEY");
+    }
+
+    #[test]
+    fn min_interval_defaults_per_provider_and_is_configurable() {
+        assert_eq!(AppConfig::parse("").unwrap().llm.min_interval_ms(), 0);
+        let mistral = AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"").unwrap();
+        assert_eq!(mistral.llm.min_interval_ms(), 1100);
+        let explicit =
+            AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"\nmin_interval_ms = 0")
+                .unwrap();
+        assert_eq!(explicit.llm.min_interval_ms(), 0);
     }
 
     #[test]

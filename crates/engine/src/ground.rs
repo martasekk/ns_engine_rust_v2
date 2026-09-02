@@ -30,8 +30,11 @@ impl Material {
             ctx.user_text.clone(),
             ctx.turn_trace.clone(),
         ];
+        // The same rendering the replier gets, markers included: a
+        // superseded value shown as "(was …)" is legitimate material (seen
+        // live: "Your name was Martin." flagged against a bare key: value).
         for f in &ctx.facts {
-            parts.push(format!("{}: {}", f.key, f.value));
+            parts.push(nscore::render_fact(f));
         }
         if let Some(s) = &ctx.summary {
             parts.push(nscore::render_summary(s));
@@ -314,5 +317,32 @@ mod tests {
         let m = Material::from_context(&ctx);
         let reply = "Hi Jana, Tomáš here. Brno gets 7 Widgetron units to Karlova 12; Praha too. Not 99 to Ostrava.";
         assert_eq!(ungrounded(reply, &m), vec!["99", "Ostrava"]);
+    }
+
+    #[test]
+    fn superseded_fact_values_are_material() {
+        let mut view: nscore::FactView = nscore::Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Peter"),
+            ..Default::default()
+        }
+        .into();
+        view.previous = Some((serde_json::json!("Martin"), nscore::Timestamp(1)));
+        let ctx = ReplyContext {
+            persona: String::new(),
+            facts: vec![view],
+            summary: None,
+            window: vec![],
+            caps: Default::default(),
+            user_text: "what was my name before?".into(),
+            turn_trace: String::new(),
+            guidance: vec![],
+            do_not_state: vec![],
+        };
+        let m = Material::from_context(&ctx);
+        assert_eq!(
+            ungrounded("Your name was Martin.", &m),
+            Vec::<String>::new()
+        );
     }
 }
