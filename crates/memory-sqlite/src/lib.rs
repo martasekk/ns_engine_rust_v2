@@ -94,9 +94,38 @@ impl SqliteStore {
         )
         .map_err(io_err)?;
         Self::migrate_facts(&conn)?;
+        Self::ensure_events_fts(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// M6 §7: full-text index over the event log (external-content FTS5 on
+    /// `events.kind_json`, kept in sync by an insert trigger; events are
+    /// append-only). Built once for a pre-existing log.
+    fn ensure_events_fts(conn: &Connection) -> Result<(), StoreError> {
+        let existed: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events_fts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(io_err)?
+            > 0;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                 kind_json, content='events', content_rowid='rowid'
+             );
+             CREATE TRIGGER IF NOT EXISTS events_fts_ai AFTER INSERT ON events BEGIN
+                 INSERT INTO events_fts(rowid, kind_json) VALUES (new.rowid, new.kind_json);
+             END;",
+        )
+        .map_err(io_err)?;
+        if !existed {
+            conn.execute_batch("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
+                .map_err(io_err)?;
+        }
+        Ok(())
     }
 
     /// M6 §6.1: facts are versioned by `(scope, key, valid_from)`. A pre-M6
@@ -160,6 +189,22 @@ impl SqliteStore {
     }
 }
 
+/// FTS5 MATCH expression: each 3+ char token quoted, OR-joined. None when
+/// nothing is worth matching.
+fn fts_query(query: &str) -> Option<String> {
+    let tokens = nscore::query_tokens(query);
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn append(&self, session: &SessionId, events: &[Event]) -> Result<(), StoreError> {
@@ -221,6 +266,58 @@ impl MemoryStore for SqliteStore {
                 turn,
                 at: Timestamp(at),
                 kind: serde_json::from_str(&kind_json).map_err(io_err)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn search_turns(
+        &self,
+        session: &SessionId,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::TurnHit>, StoreError> {
+        let Some(expr) = fts_query(query) else {
+            return Ok(vec![]);
+        };
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.turn, e.kind_json, bm25(events_fts) AS score
+                 FROM events_fts JOIN events e ON e.rowid = events_fts.rowid
+                 WHERE events_fts MATCH ?1 AND e.session_id = ?2
+                   AND (e.kind_json LIKE '{\"type\":\"UserSaid\"%'
+                        OR e.kind_json LIKE '{\"type\":\"Replied\"%')
+                 ORDER BY score, e.turn DESC LIMIT ?3",
+            )
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![expr, session.0, k as i64], |r| {
+                Ok((
+                    r.get::<_, u32>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(io_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (turn, kind_json, score) = row.map_err(io_err)?;
+            let kind: nscore::EventKind = serde_json::from_str(&kind_json).map_err(io_err)?;
+            let (speaker, text) = match kind {
+                nscore::EventKind::UserSaid { text } => ("user", text),
+                nscore::EventKind::Replied { text } => ("bot", text),
+                _ => continue,
+            };
+            out.push(nscore::TurnHit {
+                turn,
+                speaker,
+                text,
+                // bm25 is negative, lower = better; flip so higher is better.
+                score: -score,
             });
         }
         Ok(out)
@@ -563,6 +660,61 @@ mod tests {
         assert_eq!(store.purge_facts("global").await.unwrap(), 4);
         assert!(store.facts("global", "").await.unwrap().is_empty());
         assert_eq!(store.facts("chat42", "").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_turns_uses_fts5_and_indexes_a_pre_existing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fts.sqlite");
+        let sid = SessionId("cli".into());
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let mut log = EventLog::new(sid.clone());
+            for (turn, user, bot) in [
+                (1, "what time is it", "It is noon."),
+                (2, "remember my name is Martin", "Got it."),
+                (3, "and the time again, please?", "Still noon."),
+            ] {
+                log.append(
+                    turn,
+                    Timestamp(turn as u64),
+                    EventKind::UserSaid { text: user.into() },
+                );
+                log.append(
+                    turn,
+                    Timestamp(turn as u64),
+                    EventKind::Replied { text: bot.into() },
+                );
+            }
+            store.append(&sid, log.events()).await.unwrap();
+            let hits = store.search_turns(&sid, "what time?", 5).await.unwrap();
+            assert_eq!(hits[0].turn, 1, "{hits:?}");
+            assert_eq!(hits[0].speaker, "user");
+            assert!(hits.iter().all(|h| h.text.contains("time")));
+            assert!(store.search_turns(&sid, "hi", 5).await.unwrap().is_empty());
+            assert!(store
+                .search_turns(&SessionId("other".into()), "time", 5)
+                .await
+                .unwrap()
+                .is_empty());
+            // proposals / tool outputs are not returned as turns
+            assert!(store
+                .search_turns(&sid, "martin", 5)
+                .await
+                .unwrap()
+                .iter()
+                .all(|h| h.speaker == "user"));
+        }
+        // A log written before the index existed is indexed on open.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TRIGGER events_fts_ai; DROP TABLE events_fts;")
+                .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let hits = store.search_turns(&sid, "noon", 5).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.speaker == "bot"));
     }
 
     #[tokio::test]

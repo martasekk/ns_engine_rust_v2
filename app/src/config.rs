@@ -62,6 +62,13 @@ pub struct MemorySection {
     pub summary_max_chars: usize,
     #[serde(default = "default_summary_input_max_chars")]
     pub summary_input_max_chars: usize,
+    /// Hits per source the `recall` action returns (M6 §7).
+    #[serde(default = "default_recall_top_k")]
+    pub recall_top_k: usize,
+}
+
+fn default_recall_top_k() -> usize {
+    5
 }
 
 fn default_summary_every_turns() -> usize {
@@ -123,6 +130,7 @@ impl Default for MemorySection {
             summary_rebuild_every: default_summary_rebuild_every(),
             summary_max_chars: default_summary_max_chars(),
             summary_input_max_chars: default_summary_input_max_chars(),
+            recall_top_k: default_recall_top_k(),
         }
     }
 }

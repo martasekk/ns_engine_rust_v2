@@ -62,12 +62,13 @@ pub struct Signature {
     pub kind: SignatureKind,
 }
 
-pub const SYNTHETIC_ACTIONS: [&str; 5] = [
+pub const SYNTHETIC_ACTIONS: [&str; 6] = [
     "respond_directly",
     "ask_clarification",
     "remember_fact",
     "forget_fact",
     "forget_all",
+    "recall",
 ];
 
 /// Lowercase ASCII alphanumerics only: "getTime" and "get_time" squash equal.

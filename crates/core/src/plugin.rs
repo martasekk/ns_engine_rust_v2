@@ -208,6 +208,14 @@ mod tests {
         async fn load(&self, _s: &SessionId) -> Result<Vec<Event>, StoreError> {
             Ok(vec![])
         }
+        async fn search_turns(
+            &self,
+            _s: &SessionId,
+            _q: &str,
+            _k: usize,
+        ) -> Result<Vec<crate::traits::TurnHit>, StoreError> {
+            Ok(vec![])
+        }
         async fn facts(&self, _s: &str, _p: &str) -> Result<Vec<Fact>, StoreError> {
             Ok(vec![])
         }

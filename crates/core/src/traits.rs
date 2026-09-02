@@ -174,10 +174,29 @@ pub enum StoreError {
     Io(String),
 }
 
+/// One verbatim line of a recorded turn matched by `recall` (M6 §7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnHit {
+    pub turn: u32,
+    /// "user" or "bot".
+    pub speaker: &'static str,
+    pub text: String,
+    /// Higher is better; comparable only within one query.
+    pub score: f64,
+}
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn append(&self, session: &SessionId, events: &[Event]) -> Result<(), StoreError>;
     async fn load(&self, session: &SessionId) -> Result<Vec<Event>, StoreError>;
+    /// Full-text search over what was said in `session` (UserSaid and
+    /// Replied text), best first, at most `k` (M6 §7: verbatim first).
+    async fn search_turns(
+        &self,
+        session: &SessionId,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<TurnHit>, StoreError>;
     /// Live facts (`current` or `cold`) in `scope` whose key starts with
     /// `key_prefix`, key order. Superseded and forgotten versions are
     /// reachable through `fact_history` only.

@@ -43,6 +43,47 @@ impl MemoryStore for InMemoryStore {
             .unwrap_or_default())
     }
 
+    /// Token-count ranking over UserSaid/Replied text; ties newest first.
+    async fn search_turns(
+        &self,
+        session: &SessionId,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::TurnHit>, StoreError> {
+        let tokens = nscore::query_tokens(query);
+        if tokens.is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        let events = self.load(session).await?;
+        let mut hits: Vec<nscore::TurnHit> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                nscore::EventKind::UserSaid { text } => Some((e.turn, "user", text)),
+                nscore::EventKind::Replied { text } => Some((e.turn, "bot", text)),
+                _ => None,
+            })
+            .map(|(turn, speaker, text)| {
+                let hay = text.to_lowercase();
+                let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as f64;
+                nscore::TurnHit {
+                    turn,
+                    speaker,
+                    text: text.clone(),
+                    score,
+                }
+            })
+            .filter(|h| h.score > 0.0)
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.turn.cmp(&a.turn))
+        });
+        hits.truncate(k);
+        Ok(hits)
+    }
+
     async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
         let all = self.facts.lock().await;
         let mut out: Vec<Fact> = all
@@ -278,6 +319,40 @@ mod tests {
             store.load(&SessionId("other".into())).await.unwrap(),
             vec![]
         );
+    }
+
+    #[tokio::test]
+    async fn search_turns_ranks_by_token_hits_newest_first() {
+        let store = InMemoryStore::new();
+        let sid = SessionId("s".into());
+        let mut log = EventLog::new(sid.clone());
+        for (turn, user, bot) in [
+            (1, "what time is it", "It is noon."),
+            (2, "remember my name is Martin", "Got it."),
+            (3, "and the time again?", "Still noon."),
+        ] {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::UserSaid { text: user.into() },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Replied { text: bot.into() },
+            );
+        }
+        store.append(&sid, log.events()).await.unwrap();
+        let hits = store.search_turns(&sid, "what time", 5).await.unwrap();
+        assert_eq!(hits[0].turn, 1, "both tokens hit turn 1's user text");
+        assert_eq!(hits[0].speaker, "user");
+        assert_eq!(hits[1].turn, 3, "one token, newer first");
+        assert!(store.search_turns(&sid, "hi", 5).await.unwrap().is_empty());
+        assert!(store
+            .search_turns(&SessionId("other".into()), "time", 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

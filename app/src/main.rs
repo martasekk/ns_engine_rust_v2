@@ -256,6 +256,7 @@ async fn main() {
         summary_rebuild_every: cfg.memory.summary_rebuild_every,
         summary_max_chars: cfg.memory.summary_max_chars,
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
+        recall_top_k: cfg.memory.recall_top_k,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M5 — type text, /quit to exit");

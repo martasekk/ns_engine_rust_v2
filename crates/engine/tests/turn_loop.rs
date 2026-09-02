@@ -1294,6 +1294,114 @@ async fn summarizer_failure_appends_nothing_and_zero_cadence_disables() {
 }
 
 #[tokio::test]
+async fn recall_searches_turns_beyond_the_window_and_facts() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("recall".into());
+    store
+        .put_fact(Fact {
+            key: "user.previous_name".into(),
+            value: serde_json::json!("Tomas"),
+            valid_from: Timestamp(1),
+            trust: Trust::User,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Eight plain turns; the first mentions the budget.
+    let mut e = engine_with(vec![], vec![], store.clone());
+    for turn in 1..=8 {
+        let text = if turn == 1 {
+            "our budget is 2000 crowns".to_string()
+        } else {
+            format!("chatter {turn}")
+        };
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text,
+        })
+        .await
+        .unwrap();
+    }
+    // Turn 9: the emitter recalls; the window (6) hides turns 1–2.
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "".into(),
+            action: "recall".into(),
+            args: serde_json::json!({"query": "budget and my previous name"}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "what was the budget and my previous name?".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply.contains("t1 user: our budget is 2000 crowns"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("fact user.previous_name = \\\"Tomas\\\""),
+        "{reply}"
+    );
+    let events = store.load(&sid).await.unwrap();
+    let called = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolCalled { action, args } if action == "recall" => Some(args.clone()),
+            _ => None,
+        })
+        .expect("recall was called");
+    assert!(
+        matches!(called[0].1.prov, Provenance::UserInput { .. }),
+        "the query is grounded in the user's words"
+    );
+    let returned = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(returned.trust, Trust::User, "lowest trust among the hits");
+    assert!(
+        !returned.summary.contains("chatter"),
+        "turns inside the window are not returned: {}",
+        returned.summary
+    );
+
+    // No matches is a legitimate, grounded answer (abstention).
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "".into(),
+            action: "recall".into(),
+            args: serde_json::json!({"query": "spaceship"}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "did I mention a spaceship?".into(),
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("ToolReturned(ok: no matches)"), "{reply}");
+    // Replay stays clean with the synthetic action.
+    let events = store.load(&sid).await.unwrap();
+    nsengine::replay::replay_session(sid, &events, vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();

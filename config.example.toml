@@ -73,6 +73,7 @@ summary_every_turns = 4       # 0 = off
 summary_rebuild_every = 3
 summary_max_chars = 800
 summary_input_max_chars = 6000
+recall_top_k = 5              # hits per source for the recall action (FTS5 over the log)
 
 # The summary model defaults to the emitter's model and provider; override
 # any field to swap the role, e.g. a local Ollama model:

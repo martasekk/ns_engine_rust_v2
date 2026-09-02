@@ -45,6 +45,8 @@ pub struct EngineConfig {
     pub summary_max_chars: usize,
     /// Verbatim input cap; the oldest records are dropped first.
     pub summary_input_max_chars: usize,
+    /// M6 §7: hits per source the `recall` action returns.
+    pub recall_top_k: usize,
 }
 
 impl Default for EngineConfig {
@@ -71,6 +73,7 @@ impl Default for EngineConfig {
             summary_rebuild_every: 3,
             summary_max_chars: 800,
             summary_input_max_chars: 6000,
+            recall_top_k: 5,
         }
     }
 }
@@ -228,6 +231,27 @@ fn forget_all_spec() -> nscore::ActionSpec {
             .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Irreversible,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// Engine-owned synthetic action: search memory beyond the context (M6 §7).
+pub const RECALL: &str = "recall";
+
+fn recall_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: RECALL.into(),
+        description: "Search earlier turns of this conversation and stored facts for words the \
+                      user is asking about. Use when the answer is not in the recent turns \
+                      or facts shown."
+            .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        }),
+        side_effect: nscore::SideEffect::Pure,
         residual_policy: Default::default(),
         dedupe_tag: None,
     }
@@ -497,6 +521,9 @@ impl Engine {
                 actions.push(ask_clarification_spec());
                 if !denied_this_turn.contains(REMEMBER_FACT) {
                     actions.push(remember_fact_spec());
+                }
+                if !denied_this_turn.contains(RECALL) {
+                    actions.push(recall_spec());
                 }
                 // Forgetting is legal only while it can mean something: not
                 // after a fact was written this turn (seen live: "my name is
@@ -969,6 +996,105 @@ impl Engine {
                     Err(e) => ToolOutcome::Err {
                         kind: "store".into(),
                         detail: e.to_string(),
+                    },
+                };
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+                continue;
+            }
+
+            // f7. recall (M6 §7): progressive disclosure. Verbatim turns
+            // beyond the window first, then live facts; results become
+            // CopiedOutput sources with the lowest trust among them.
+            if proposal.action == RECALL {
+                let query = proposal
+                    .args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                    .map(String::from);
+                let Some(query) = query else {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: "recall needs a non-empty query".into(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push("recall missing query".into());
+                    continue;
+                };
+                let spec = recall_spec();
+                let index = nsprovenance::index::ValueIndex::from_events(log.events());
+                let classified_args =
+                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: RECALL.into(),
+                            args: classified_args,
+                        },
+                    )
+                    .id;
+                calls_this_turn.insert(Self::call_key(&proposal));
+                let k = self.cfg.recall_top_k;
+                // Turns already visible in the window (and this one) add nothing.
+                let visible_from = turn.saturating_sub(self.cfg.window_turns as u32);
+                let mut lines: Vec<String> = Vec::new();
+                let mut trusts: Vec<nscore::Trust> = Vec::new();
+                let mut failure: Option<String> = None;
+                match self.parts.memory.search_turns(&sid, &query, k * 3).await {
+                    Ok(hits) => {
+                        for h in hits.into_iter().filter(|h| h.turn < visible_from).take(k) {
+                            trusts.push(if h.speaker == "user" {
+                                nscore::Trust::User
+                            } else {
+                                nscore::Trust::System
+                            });
+                            lines.push(format!("t{} {}: {}", h.turn, h.speaker, h.text));
+                        }
+                    }
+                    Err(e) => failure = Some(e.to_string()),
+                }
+                match self.parts.memory.search_facts(&scope, &query, k).await {
+                    Ok(facts) => {
+                        for f in facts {
+                            trusts.push(f.trust);
+                            lines.push(format!("fact {} = {}", f.key, f.value));
+                        }
+                    }
+                    Err(e) => failure = Some(e.to_string()),
+                }
+                let outcome = match failure {
+                    Some(detail) => ToolOutcome::Err {
+                        kind: "store".into(),
+                        detail,
+                    },
+                    None if lines.is_empty() => ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: "no matches".into(),
+                            artifact: None,
+                            trust: nscore::Trust::System,
+                        },
+                    },
+                    None => ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: serde_json::to_string(&lines).unwrap_or_default(),
+                            artifact: None,
+                            trust: nscore::min_trust(&trusts),
+                        },
                     },
                 };
                 log.append(
