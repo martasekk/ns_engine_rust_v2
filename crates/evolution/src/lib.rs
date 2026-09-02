@@ -5,3 +5,4 @@ pub mod ledger;
 pub mod mine;
 pub mod symbolic;
 pub mod notes;
+pub mod pass;
