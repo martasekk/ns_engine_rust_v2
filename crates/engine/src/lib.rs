@@ -1,3 +1,5 @@
+pub use arc_swap;
+
 pub mod guards;
 pub mod replay;
 pub mod script;

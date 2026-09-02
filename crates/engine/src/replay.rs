@@ -9,9 +9,9 @@ use crate::store::{InMemoryStore, NoopConsolidator};
 use crate::turn::{Engine, EngineConfig};
 use async_trait::async_trait;
 use nscore::{
-    ActionSpec, Channel, ChannelError, Event, EventKind, EventLog, Guard, HarnessBuilder,
-    Incoming, MemoryStore, Proposal, Replier, ReplyContext, ReplyError, ReplyPolicy, SessionId,
-    SideEffect, Timestamp, Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput,
+    ActionSpec, Channel, ChannelError, Event, EventKind, EventLog, Guard, HarnessBuilder, Incoming,
+    MemoryStore, Proposal, Replier, ReplyContext, ReplyError, ReplyPolicy, SessionId, SideEffect,
+    Timestamp, Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,11 @@ pub enum ReplayError {
     #[error("recorded chain broken: {0}")]
     ChainBroken(String),
     #[error("divergence at line {at}: expected `{expected}`, got `{got}`")]
-    Divergence { at: usize, expected: String, got: String },
+    Divergence {
+        at: usize,
+        expected: String,
+        got: String,
+    },
     #[error("replay produced {got} lines, recording has {expected}")]
     LengthMismatch { expected: usize, got: usize },
     #[error("engine error during replay: {0}")]
@@ -93,7 +97,12 @@ impl Tool for ReplayTool {
         &self.spec
     }
     async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        match self.outcomes.lock().expect("replay outcomes lock").pop_front() {
+        match self
+            .outcomes
+            .lock()
+            .expect("replay outcomes lock")
+            .pop_front()
+        {
             Some(ToolOutcome::Ok { output }) => Ok(output),
             Some(ToolOutcome::Err { kind, detail }) => Err(ToolError::Failed { kind, detail }),
             None => Err(ToolError::Failed {
@@ -162,14 +171,20 @@ pub async fn replay_session(
             }
             EventKind::ToolReturned { call, outcome } => {
                 if let Some(action) = call_actions.get(&call.0) {
-                    outcomes.entry(action.clone()).or_default().push_back(outcome.clone());
+                    outcomes
+                        .entry(action.clone())
+                        .or_default()
+                        .push_back(outcome.clone());
                 }
             }
             EventKind::Settled { policy } => {
                 last_settled_per_turn.insert(e.turn, policy.clone());
             }
             EventKind::Replied { text } => {
-                if matches!(last_settled_per_turn.get(&e.turn), Some(ReplyPolicy::Generate)) {
+                if matches!(
+                    last_settled_per_turn.get(&e.turn),
+                    Some(ReplyPolicy::Generate)
+                ) {
                     generated_replies.push_back(text.clone());
                 }
             }
@@ -181,7 +196,9 @@ pub async fn replay_session(
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(QueueReplier { texts: Mutex::new(generated_replies) }));
+    b.set_replier(Box::new(QueueReplier {
+        texts: Mutex::new(generated_replies),
+    }));
     b.set_memory(store.clone());
     b.set_channel(Box::new(ReplayChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -197,19 +214,24 @@ pub async fn replay_session(
         b.add_guard(g);
     }
     let parts = b.build().map_err(|e| ReplayError::Engine(e.to_string()))?;
-    let mut engine =
-        Engine::with_clock(parts, EngineConfig::default(), Box::new(|| Timestamp(0)));
+    let mut engine = Engine::with_clock(parts, EngineConfig::default(), Box::new(|| Timestamp(0)));
 
     // 4. Re-feed the user inputs.
     for text in user_inputs {
         engine
-            .run_turn(Incoming { session: session.clone(), text })
+            .run_turn(Incoming {
+                session: session.clone(),
+                text,
+            })
             .await
             .map_err(|e| ReplayError::Engine(e.to_string()))?;
     }
 
     // 5. Diff normalized lines.
-    let replayed = store.load(&session).await.map_err(|e| ReplayError::Engine(e.to_string()))?;
+    let replayed = store
+        .load(&session)
+        .await
+        .map_err(|e| ReplayError::Engine(e.to_string()))?;
     let expected = normalize(recorded);
     let got = normalize(&replayed);
     for (at, (want, have)) in expected.iter().zip(got.iter()).enumerate() {
@@ -222,7 +244,10 @@ pub async fn replay_session(
         }
     }
     if expected.len() != got.len() {
-        return Err(ReplayError::LengthMismatch { expected: expected.len(), got: got.len() });
+        return Err(ReplayError::LengthMismatch {
+            expected: expected.len(),
+            got: got.len(),
+        });
     }
     Ok(())
 }
@@ -265,9 +290,12 @@ mod tests {
             EngineConfig::default(),
             Box::new(|| Timestamp(42)),
         );
-        e.run_turn(Incoming { session: sid.clone(), text: "please replay me".into() })
-            .await
-            .unwrap();
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "please replay me".into(),
+        })
+        .await
+        .unwrap();
         let events = store.load(&sid).await.unwrap();
         (sid, events)
     }
@@ -282,8 +310,10 @@ mod tests {
     async fn replay_detects_behavioral_divergence() {
         // Recorded WITH a guard that denied echo; replayed WITHOUT it,
         // the engine now executes echo instead of rejecting -> divergence.
-        let guard: Box<dyn Guard> =
-            Box::new(DenyAction { action: "echo".into(), reason: "no".into() });
+        let guard: Box<dyn Guard> = Box::new(DenyAction {
+            action: "echo".into(),
+            reason: "no".into(),
+        });
         let (sid, events) = record_session(vec![guard]).await;
         let err = replay_session(sid, &events, vec![]).await.unwrap_err();
         assert!(matches!(

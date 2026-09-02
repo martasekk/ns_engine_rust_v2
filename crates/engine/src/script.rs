@@ -16,7 +16,9 @@ pub struct ScriptedEmitter {
 
 impl ScriptedEmitter {
     pub fn new(proposals: Vec<Proposal>) -> Self {
-        Self { queue: Mutex::new(proposals.into()) }
+        Self {
+            queue: Mutex::new(proposals.into()),
+        }
     }
 }
 
@@ -27,7 +29,11 @@ impl Emitter for ScriptedEmitter {
         _ctx: EmitterContext,
         _legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
-        let popped = self.queue.lock().expect("scripted emitter lock").pop_front();
+        let popped = self
+            .queue
+            .lock()
+            .expect("scripted emitter lock")
+            .pop_front();
         Ok(popped.unwrap_or_else(|| Proposal {
             rationale: "nothing left to do".into(),
             action: "respond_directly".into(),
@@ -82,12 +88,23 @@ impl Tool for EchoTool {
         &self.spec
     }
 
-    async fn call(&self, args: &serde_json::Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let text = args.get("text").and_then(|v| v.as_str()).ok_or(ToolError::Failed {
-            kind: "bad_args".into(),
-            detail: "missing text".into(),
-        })?;
-        Ok(ToolOutput { summary: format!("echo: {text}"), artifact: None, trust: Trust::System })
+    async fn call(
+        &self,
+        args: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or(ToolError::Failed {
+                kind: "bad_args".into(),
+                detail: "missing text".into(),
+            })?;
+        Ok(ToolOutput {
+            summary: format!("echo: {text}"),
+            artifact: None,
+            trust: Trust::System,
+        })
     }
 }
 
@@ -104,7 +121,9 @@ impl Guard for DenyAction {
 
     fn check(&self, p: &ClassifiedProposal, _ctx: &GuardCtx) -> Verdict {
         if p.proposal.action == self.action {
-            Verdict::Deny { reason: self.reason.clone() }
+            Verdict::Deny {
+                reason: self.reason.clone(),
+            }
         } else {
             Verdict::Allow
         }
@@ -117,7 +136,9 @@ mod tests {
     use nscore::*;
 
     fn legal_echo() -> LegalActionSet {
-        LegalActionSet { actions: vec![EchoTool::new().spec().clone()] }
+        LegalActionSet {
+            actions: vec![EchoTool::new().spec().clone()],
+        }
     }
 
     #[tokio::test]
@@ -145,7 +166,10 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"text":"ahoj"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: None,
+                },
             )
             .await
             .unwrap();
@@ -155,7 +179,10 @@ mod tests {
 
     #[test]
     fn deny_guard_denies_only_named_action() {
-        let g = DenyAction { action: "echo".into(), reason: "not today".into() };
+        let g = DenyAction {
+            action: "echo".into(),
+            reason: "not today".into(),
+        };
         let tool = EchoTool::new();
         let fired = std::collections::HashSet::new();
         let ctx = GuardCtx {

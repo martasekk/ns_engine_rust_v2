@@ -57,13 +57,28 @@ mod tests {
     fn fold_builds_history_and_tracks_confirmation() {
         let mut log = EventLog::new(SessionId("s".into()));
         log.append(1, Timestamp(1), EventKind::UserSaid { text: "hi".into() });
-        log.append(1, Timestamp(2), EventKind::Replied { text: "hello".into() });
-        log.append(2, Timestamp(3), EventKind::UserSaid { text: "delete it".into() });
+        log.append(
+            1,
+            Timestamp(2),
+            EventKind::Replied {
+                text: "hello".into(),
+            },
+        );
+        log.append(
+            2,
+            Timestamp(3),
+            EventKind::UserSaid {
+                text: "delete it".into(),
+            },
+        );
         let pending_id = log
             .append(
                 2,
                 Timestamp(4),
-                EventKind::PendingConfirmation { proposal_of: EventId(3), staged: None },
+                EventKind::PendingConfirmation {
+                    proposal_of: EventId(3),
+                    staged: None,
+                },
             )
             .id;
         let s = fold(log.events());
@@ -72,7 +87,13 @@ mod tests {
         assert_eq!(s.pending_confirmation, Some(pending_id));
 
         let mut log2 = EventLog::from_events(SessionId("s".into()), log.events().to_vec());
-        log2.append(3, Timestamp(5), EventKind::Confirmed { pending: pending_id });
+        log2.append(
+            3,
+            Timestamp(5),
+            EventKind::Confirmed {
+                pending: pending_id,
+            },
+        );
         let s2 = fold(log2.events());
         assert_eq!(s2.pending_confirmation, None);
     }
@@ -81,12 +102,22 @@ mod tests {
     fn fold_tracks_fired_actions_pending_turn_and_confirmation_turn() {
         let mut log = EventLog::new(SessionId("s".into()));
         log.append(1, Timestamp(1), EventKind::UserSaid { text: "go".into() });
-        log.append(1, Timestamp(2), EventKind::ToolCalled { action: "echo".into(), args: vec![] });
+        log.append(
+            1,
+            Timestamp(2),
+            EventKind::ToolCalled {
+                action: "echo".into(),
+                args: vec![],
+            },
+        );
         let pending = log
             .append(
                 1,
                 Timestamp(3),
-                EventKind::PendingConfirmation { proposal_of: EventId(1), staged: None },
+                EventKind::PendingConfirmation {
+                    proposal_of: EventId(1),
+                    staged: None,
+                },
             )
             .id;
         let s = fold(log.events());

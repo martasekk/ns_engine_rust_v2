@@ -84,6 +84,7 @@ async fn main() {
         max_emit_retries: cfg.engine.max_emit_retries,
         persona: cfg.persona.text.clone(),
         templates: cfg.templates.clone(),
+        learned: Default::default(),
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M2 — type text, /quit to exit");
@@ -108,8 +109,16 @@ mod tests {
     #[test]
     fn render_dump_is_one_json_line_per_event() {
         let mut log = nscore::EventLog::new(nscore::SessionId("d".into()));
-        log.append(1, nscore::Timestamp(1), nscore::EventKind::UserSaid { text: "hi".into() });
-        log.append(1, nscore::Timestamp(2), nscore::EventKind::Replied { text: "ho".into() });
+        log.append(
+            1,
+            nscore::Timestamp(1),
+            nscore::EventKind::UserSaid { text: "hi".into() },
+        );
+        log.append(
+            1,
+            nscore::Timestamp(2),
+            nscore::EventKind::Replied { text: "ho".into() },
+        );
         let out = render_dump(log.events());
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);

@@ -1164,3 +1164,184 @@ async fn tool_args_failing_schema_are_rejected_as_malformed_not_called() {
     // The action stays legal: the repaired second proposal runs.
     assert_eq!(tool_calls(&events, "echo"), 1);
 }
+
+fn rules_handle(rules: LearnedRules) -> Arc<nsengine::arc_swap::ArcSwap<LearnedRules>> {
+    Arc::new(nsengine::arc_swap::ArcSwap::from_pointee(rules))
+}
+
+fn engine_with_rules(
+    proposals: Vec<Proposal>,
+    store: Arc<InMemoryStore>,
+    rules: LearnedRules,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        learned: rules_handle(rules),
+        ..EngineConfig::default()
+    };
+    Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)))
+}
+
+#[tokio::test]
+async fn alias_action_rewrites_a_near_miss_name_but_proposed_event_keeps_the_raw_name() {
+    let store = Arc::new(InMemoryStore::new());
+    let rules = LearnedRules {
+        alias_action: vec![AliasAction {
+            from: "eko".into(),
+            to: "echo".into(),
+        }],
+        ..Default::default()
+    };
+    let p = Proposal {
+        rationale: "r".into(),
+        action: "eko".into(),
+        args: serde_json::json!({"text": "hi"}),
+    };
+    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let sid = SessionId("alias".into());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "go".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::Proposed { proposal } if proposal.action == "eko")));
+    assert_eq!(tool_calls(&events, "echo"), 1);
+    assert!(rejection_reasons(&events).is_empty());
+}
+
+#[tokio::test]
+async fn normalize_arg_repairs_args_before_validation() {
+    let store = Arc::new(InMemoryStore::new());
+    let rules = LearnedRules {
+        normalize_arg: vec![NormalizeArg {
+            action: "echo".into(),
+            arg: "text".into(),
+            ops: vec![Op::Trim, Op::StripPunct],
+        }],
+        ..Default::default()
+    };
+    let p = Proposal {
+        rationale: "r".into(),
+        action: "echo".into(),
+        args: serde_json::json!({"text": " \"hi\" "}),
+    };
+    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let sid = SessionId("norm".into());
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "go".into(),
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("echo: hi"), "{reply}");
+}
+
+#[tokio::test]
+async fn aliased_action_still_goes_through_guards() {
+    let store = Arc::new(InMemoryStore::new());
+    let rules = LearnedRules {
+        alias_action: vec![AliasAction {
+            from: "eko".into(),
+            to: "echo".into(),
+        }],
+        ..Default::default()
+    };
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+        rationale: "r".into(),
+        action: "eko".into(),
+        args: serde_json::json!({"text": "hi"}),
+    }])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    b.add_guard(Box::new(DenyAction {
+        action: "echo".into(),
+        reason: "no".into(),
+    }));
+    let cfg = EngineConfig {
+        learned: rules_handle(rules),
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let sid = SessionId("alias-guard".into());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "go".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(tool_calls(&events, "echo"), 0);
+    assert!(matches!(
+        rejection_reasons(&events)[0],
+        RejectReason::GuardDenied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn guidance_reaches_the_emitter_scoped_to_legal_actions() {
+    let store = Arc::new(InMemoryStore::new());
+    let rules = LearnedRules {
+        notes: vec![
+            Note::new("global", "G", 0.0),
+            Note::new("action:echo", "E", 0.0),
+            Note::new("action:wipe", "W", 0.0),
+        ],
+        ..Default::default()
+    };
+    let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let probe = GuidanceProbe(seen.clone());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(probe));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        learned: rules_handle(rules),
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    e.run_turn(Incoming {
+        session: SessionId("g".into()),
+        text: "go".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        seen.lock().unwrap()[0],
+        vec!["G".to_string(), "E".to_string()]
+    );
+}
+
+struct GuidanceProbe(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+#[async_trait::async_trait]
+impl Emitter for GuidanceProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.0.lock().unwrap().push(ctx.guidance.clone());
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}

@@ -11,6 +11,9 @@ pub struct EngineConfig {
     /// Template registry for ReplyPolicy::Template; a registered "cant_help"
     /// replaces the hardcoded fallback text.
     pub templates: std::collections::HashMap<String, String>,
+    /// Learned input repairs + guidance (spec M5). Hot-swappable: a driver
+    /// replaces the set; each turn loads one snapshot at its start.
+    pub learned: std::sync::Arc<arc_swap::ArcSwap<nscore::LearnedRules>>,
 }
 
 impl Default for EngineConfig {
@@ -20,6 +23,9 @@ impl Default for EngineConfig {
             max_emit_retries: 3,
             persona: String::new(),
             templates: Default::default(),
+            learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                nscore::LearnedRules::default(),
+            )),
         }
     }
 }
@@ -41,7 +47,7 @@ pub enum EngineError {
     Channel(String),
 }
 
-const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
+pub const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
 
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -193,6 +199,8 @@ impl Engine {
 
         let turn = fold(log.events()).turn + 1;
         let now = &self.clock;
+        // One rules snapshot per turn: a driver may swap the set mid-session.
+        let rules = self.cfg.learned.load_full();
         log.append(
             turn,
             now(),
@@ -261,11 +269,12 @@ impl Engine {
                     "\nPending confirmation: awaiting the user's yes/no on the staged action.",
                 );
             }
+            let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
             let ctx = nscore::EmitterContext {
                 state_summary: summary,
                 recent_turns: recent,
                 rejections_this_turn: rejections_this_turn.clone(),
-                guidance: vec![],
+                guidance: rules.guidance_for(&legal_names),
             };
 
             // c. propose
@@ -303,6 +312,15 @@ impl Engine {
                     },
                 )
                 .id;
+
+            // f0. learned input repairs (spec M5 §3.2). The Proposed event above
+            // keeps the raw model output; ToolCalled records what actually ran.
+            // Repairs only rewrite the proposal — legality, validation and
+            // guards below judge the rewritten proposal exactly as raw output.
+            if let Some(to) = rules.alias(&proposal.action) {
+                proposal.action = to.to_string();
+            }
+            rules.normalize(&proposal.action, &mut proposal.args);
 
             // e. direct reply
             if proposal.action == "respond_directly" {

@@ -74,7 +74,9 @@ impl Guard for DedupeGate {
     }
     fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict {
         if ctx.spec.dedupe_tag.is_some() && ctx.fired_actions.contains(&p.proposal.action) {
-            Verdict::Deny { reason: format!("'{}' already done this session", p.proposal.action) }
+            Verdict::Deny {
+                reason: format!("'{}' already done this session", p.proposal.action),
+            }
         } else {
             Verdict::Allow
         }
@@ -92,7 +94,10 @@ impl Guard for SideEffectGate {
     fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict {
         if ctx.spec.side_effect == SideEffect::Irreversible && !ctx.confirmed_this_turn {
             Verdict::NeedsConfirmation {
-                prompt: format!("'{}' is irreversible. Confirm to proceed.", p.proposal.action),
+                prompt: format!(
+                    "'{}' is irreversible. Confirm to proceed.",
+                    p.proposal.action
+                ),
             }
         } else {
             Verdict::Allow
@@ -131,7 +136,14 @@ mod tests {
             args: args
                 .into_iter()
                 .map(|(k, prov, trust)| {
-                    (k.to_string(), TaggedValue { value: serde_json::json!("v"), prov, trust })
+                    (
+                        k.to_string(),
+                        TaggedValue {
+                            value: serde_json::json!("v"),
+                            prov,
+                            trust,
+                        },
+                    )
                 })
                 .collect(),
         }
@@ -151,7 +163,10 @@ mod tests {
     fn residual_policy_denies_never_residual_args() {
         let s = spec(SideEffect::Pure, &[("order_id", ResidualRule::Never)], None);
         let fired = HashSet::new();
-        let p = proposal("act", vec![("order_id", Provenance::Residual, Trust::System)]);
+        let p = proposal(
+            "act",
+            vec![("order_id", Provenance::Residual, Trust::System)],
+        );
         match ResidualPolicy.check(&p, &ctx(&s, &fired, false)) {
             Verdict::Deny { reason } => {
                 assert!(reason.contains("NeverResidual"));
@@ -167,7 +182,15 @@ mod tests {
         let fired = HashSet::new();
         let grounded = proposal(
             "act",
-            vec![("order_id", Provenance::UserInput { turn: 1, start: 0, end: 2 }, Trust::User)],
+            vec![(
+                "order_id",
+                Provenance::UserInput {
+                    turn: 1,
+                    start: 0,
+                    end: 2,
+                },
+                Trust::User,
+            )],
         );
         assert!(matches!(
             ResidualPolicy.check(&grounded, &ctx(&s, &fired, false)),
@@ -188,11 +211,17 @@ mod tests {
             "act",
             vec![(
                 "order_id",
-                Provenance::Transform { func: "trim".into(), inputs: vec![Provenance::Residual] },
+                Provenance::Transform {
+                    func: "trim".into(),
+                    inputs: vec![Provenance::Residual],
+                },
                 Trust::System,
             )],
         );
-        assert!(matches!(ResidualPolicy.check(&p, &ctx(&s, &fired, false)), Verdict::Deny { .. }));
+        assert!(matches!(
+            ResidualPolicy.check(&p, &ctx(&s, &fired, false)),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]
@@ -203,7 +232,10 @@ mod tests {
             "act",
             vec![(
                 "target",
-                Provenance::CopiedOutput { call: EventId(3), path: "$.x".into() },
+                Provenance::CopiedOutput {
+                    call: EventId(3),
+                    path: "$.x".into(),
+                },
                 Trust::External,
             )],
         );
@@ -212,10 +244,16 @@ mod tests {
             Verdict::NeedsConfirmation { .. }
         ));
         // confirmed this turn -> allowed
-        assert!(matches!(TaintPolicy.check(&p, &ctx(&s, &fired, true)), Verdict::Allow));
+        assert!(matches!(
+            TaintPolicy.check(&p, &ctx(&s, &fired, true)),
+            Verdict::Allow
+        ));
         // pure action -> not gated
         let pure = spec(SideEffect::Pure, &[], None);
-        assert!(matches!(TaintPolicy.check(&p, &ctx(&pure, &fired, false)), Verdict::Allow));
+        assert!(matches!(
+            TaintPolicy.check(&p, &ctx(&pure, &fired, false)),
+            Verdict::Allow
+        ));
     }
 
     #[test]
@@ -226,7 +264,10 @@ mod tests {
             "ask_clarification",
             vec![(
                 "question",
-                Provenance::CopiedOutput { call: EventId(3), path: "$".into() },
+                Provenance::CopiedOutput {
+                    call: EventId(3),
+                    path: "$".into(),
+                },
                 Trust::External,
             )],
         );
@@ -245,7 +286,10 @@ mod tests {
             SideEffectGate.check(&p, &ctx(&s, &fired, false)),
             Verdict::NeedsConfirmation { .. }
         ));
-        assert!(matches!(SideEffectGate.check(&p, &ctx(&s, &fired, true)), Verdict::Allow));
+        assert!(matches!(
+            SideEffectGate.check(&p, &ctx(&s, &fired, true)),
+            Verdict::Allow
+        ));
         let reversible = spec(SideEffect::Reversible, &[], None);
         assert!(matches!(
             SideEffectGate.check(&p, &ctx(&reversible, &fired, false)),
@@ -258,11 +302,20 @@ mod tests {
         let s = spec(SideEffect::Pure, &[], Some("greeting"));
         let mut fired = HashSet::new();
         let p = proposal("act", vec![]);
-        assert!(matches!(DedupeGate.check(&p, &ctx(&s, &fired, false)), Verdict::Allow));
+        assert!(matches!(
+            DedupeGate.check(&p, &ctx(&s, &fired, false)),
+            Verdict::Allow
+        ));
         fired.insert("act".into());
-        assert!(matches!(DedupeGate.check(&p, &ctx(&s, &fired, false)), Verdict::Deny { .. }));
+        assert!(matches!(
+            DedupeGate.check(&p, &ctx(&s, &fired, false)),
+            Verdict::Deny { .. }
+        ));
         // untagged spec never gated
         let untagged = spec(SideEffect::Pure, &[], None);
-        assert!(matches!(DedupeGate.check(&p, &ctx(&untagged, &fired, false)), Verdict::Allow));
+        assert!(matches!(
+            DedupeGate.check(&p, &ctx(&untagged, &fired, false)),
+            Verdict::Allow
+        ));
     }
 }
