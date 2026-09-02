@@ -1,0 +1,22 @@
+[package]
+name = "ns-evolution"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nsevolution"
+
+[dependencies]
+ns-core = { path = "../core" }
+ns-engine = { path = "../engine" }
+ns-llm = { path = "../llm" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+strsim = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+arc-swap = { workspace = true }
