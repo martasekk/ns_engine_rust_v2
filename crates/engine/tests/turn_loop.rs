@@ -30,7 +30,11 @@ fn engine_with(
     for g in guards {
         b.add_guard(g);
     }
-    Engine::with_clock(b.build().unwrap(), EngineConfig::default(), Box::new(|| Timestamp(42)))
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    )
 }
 
 fn echo_proposal(text: &str) -> Proposal {
@@ -47,16 +51,30 @@ async fn happy_path_tool_then_reply() {
     let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
     let sid = SessionId("s1".into());
     let reply = e
-        .run_turn(Incoming { session: sid.clone(), text: "say hi".into() })
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "say hi".into(),
+        })
         .await
         .unwrap();
-    assert!(reply.contains("echo: hi"), "trace-based reply mentions tool outcome, got: {reply}");
+    assert!(
+        reply.contains("echo: hi"),
+        "trace-based reply mentions tool outcome, got: {reply}"
+    );
 
     let events = store.load(&sid).await.unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
     assert_eq!(
         kinds,
-        vec!["UserSaid", "Proposed", "ToolCalled", "ToolReturned", "Proposed", "Settled", "Replied"]
+        vec![
+            "UserSaid",
+            "Proposed",
+            "ToolCalled",
+            "ToolReturned",
+            "Proposed",
+            "Settled",
+            "Replied"
+        ]
     );
     assert!(EventLog::from_events(sid, events).verify_chain().is_ok());
 }
@@ -64,51 +82,95 @@ async fn happy_path_tool_then_reply() {
 #[tokio::test]
 async fn guard_denial_is_logged_and_turn_still_replies() {
     let store = Arc::new(InMemoryStore::new());
-    let guard: Box<dyn Guard> =
-        Box::new(DenyAction { action: "echo".into(), reason: "blocked".into() });
+    let guard: Box<dyn Guard> = Box::new(DenyAction {
+        action: "echo".into(),
+        reason: "blocked".into(),
+    });
     let mut e = engine_with(vec![echo_proposal("hi")], vec![guard], store.clone());
     let sid = SessionId("s2".into());
     let reply = e
-        .run_turn(Incoming { session: sid.clone(), text: "say hi".into() })
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "say hi".into(),
+        })
         .await
         .unwrap();
-    assert!(reply.contains("Rejected"), "reply trace shows the refusal, got: {reply}");
+    assert!(
+        reply.contains("Rejected"),
+        "reply trace shows the refusal, got: {reply}"
+    );
     let events = store.load(&sid).await.unwrap();
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
-        EventKind::Rejected { reason: RejectReason::GuardDenied { .. }, .. }
+        EventKind::Rejected {
+            reason: RejectReason::GuardDenied { .. },
+            ..
+        }
     )));
-    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+    assert!(matches!(
+        &events.last().unwrap().kind,
+        EventKind::Replied { .. }
+    ));
 }
 
 #[tokio::test]
 async fn illegal_action_is_rejected_then_falls_through() {
     let store = Arc::new(InMemoryStore::new());
-    let bad = Proposal { rationale: "hm".into(), action: "nuke".into(), args: serde_json::json!({}) };
+    let bad = Proposal {
+        rationale: "hm".into(),
+        action: "nuke".into(),
+        args: serde_json::json!({}),
+    };
     let mut e = engine_with(vec![bad], vec![], store.clone());
     let sid = SessionId("s3".into());
     let _ = e
-        .run_turn(Incoming { session: sid.clone(), text: "x".into() })
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "x".into(),
+        })
         .await
         .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
-        EventKind::Rejected { reason: RejectReason::IllegalAction { .. }, .. }
+        EventKind::Rejected {
+            reason: RejectReason::IllegalAction { .. },
+            ..
+        }
     )));
-    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+    assert!(matches!(
+        &events.last().unwrap().kind,
+        EventKind::Replied { .. }
+    ));
 }
 
 #[tokio::test]
 async fn second_turn_continues_same_log() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![echo_proposal("a"), echo_proposal("b")], vec![], store.clone());
+    let mut e = engine_with(
+        vec![echo_proposal("a"), echo_proposal("b")],
+        vec![],
+        store.clone(),
+    );
     let sid = SessionId("s4".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "one".into() }).await.unwrap();
-    e.run_turn(Incoming { session: sid.clone(), text: "two".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "one".into(),
+    })
+    .await
+    .unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "two".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert_eq!(
-        events.iter().filter(|ev| matches!(ev.kind, EventKind::UserSaid { .. })).count(),
+        events
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::UserSaid { .. }))
+            .count(),
         2
     );
     assert_eq!(events.last().unwrap().turn, 2);
@@ -168,7 +230,10 @@ async fn emitter_context_includes_this_turn_actions() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(CtxProbe { calls: std::sync::Mutex::new(0), seen: seen.clone() }));
+    b.set_emitter(Box::new(CtxProbe {
+        calls: std::sync::Mutex::new(0),
+        seen: seen.clone(),
+    }));
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
@@ -179,9 +244,12 @@ async fn emitter_context_includes_this_turn_actions() {
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
     );
-    e.run_turn(Incoming { session: SessionId("c1".into()), text: "say hi".into() })
-        .await
-        .unwrap();
+    e.run_turn(Incoming {
+        session: SessionId("c1".into()),
+        text: "say hi".into(),
+    })
+    .await
+    .unwrap();
 
     let seen = seen.lock().unwrap();
     assert!(seen.len() >= 2, "emitter consulted at least twice");
@@ -215,10 +283,16 @@ async fn persona_flows_from_config_to_reply_context() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let cfg = EngineConfig { persona: "Tomáš the salesbot".into(), ..Default::default() };
+    let cfg = EngineConfig {
+        persona: "Tomáš the salesbot".into(),
+        ..Default::default()
+    };
     let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
-        .run_turn(Incoming { session: SessionId("p1".into()), text: "hi".into() })
+        .run_turn(Incoming {
+            session: SessionId("p1".into()),
+            text: "hi".into(),
+        })
         .await
         .unwrap();
     assert_eq!(reply, "persona was: Tomáš the salesbot");
@@ -237,7 +311,12 @@ async fn real_classification_tags_user_input_and_residual() {
         store.clone(),
     );
     let sid = SessionId("cls1".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "please say hi now".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "please say hi now".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     let called_args = events
         .iter()
@@ -281,10 +360,16 @@ impl Tool for WipeTool {
         &self.spec
     }
     async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput { summary: "wiped".into(), artifact: None, trust: Trust::System })
+        Ok(ToolOutput {
+            summary: "wiped".into(),
+            artifact: None,
+            trust: Trust::System,
+        })
     }
     async fn stage(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Option<StagedEffect> {
-        Some(StagedEffect { description: "would delete 3 rows".into() })
+        Some(StagedEffect {
+            description: "would delete 3 rows".into(),
+        })
     }
 }
 
@@ -302,7 +387,11 @@ fn engine_with_tools(
     for t in tools {
         b.add_tool(t);
     }
-    Engine::with_clock(b.build().unwrap(), EngineConfig::default(), Box::new(|| Timestamp(42)))
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    )
 }
 
 #[tokio::test]
@@ -318,21 +407,37 @@ async fn irreversible_action_is_staged_not_executed() {
         store.clone(),
     );
     let sid = SessionId("se1".into());
-    let reply =
-        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
-    assert!(reply.contains("irreversible"), "user is asked to confirm, got: {reply}");
-    assert!(reply.contains("would delete 3 rows"), "staged effect is shown, got: {reply}");
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "wipe it".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply.contains("irreversible"),
+        "user is asked to confirm, got: {reply}"
+    );
+    assert!(
+        reply.contains("would delete 3 rows"),
+        "staged effect is shown, got: {reply}"
+    );
 
     let events = store.load(&sid).await.unwrap();
     assert!(
-        !events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
+        !events
+            .iter()
+            .any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
         "the tool must NOT run before confirmation"
     );
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
         EventKind::PendingConfirmation { staged: Some(s), .. } if s.description == "would delete 3 rows"
     )));
-    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+    assert!(matches!(
+        &events.last().unwrap().kind,
+        EventKind::Replied { .. }
+    ));
 }
 
 #[tokio::test]
@@ -340,11 +445,22 @@ async fn denied_action_is_removed_from_next_legal_set() {
     // Emitter proposes "echo" twice; a plugin guard denies it. The second
     // proposal must be rejected as ILLEGAL (narrowed schema), not guard-denied.
     let store = Arc::new(InMemoryStore::new());
-    let guard: Box<dyn Guard> = Box::new(DenyAction { action: "echo".into(), reason: "no".into() });
-    let mut e =
-        engine_with(vec![echo_proposal("a"), echo_proposal("b")], vec![guard], store.clone());
+    let guard: Box<dyn Guard> = Box::new(DenyAction {
+        action: "echo".into(),
+        reason: "no".into(),
+    });
+    let mut e = engine_with(
+        vec![echo_proposal("a"), echo_proposal("b")],
+        vec![guard],
+        store.clone(),
+    );
     let sid = SessionId("nar1".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "x".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "x".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     let reasons: Vec<&RejectReason> = events
         .iter()
@@ -392,7 +508,11 @@ impl Tool for OrderTool {
         &self.spec
     }
     async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput { summary: "ordered".into(), artifact: None, trust: Trust::System })
+        Ok(ToolOutput {
+            summary: "ordered".into(),
+            artifact: None,
+            trust: Trust::System,
+        })
     }
 }
 
@@ -419,7 +539,10 @@ async fn never_residual_rejection_forces_clarification() {
     );
     let sid = SessionId("clar1".into());
     let reply = e
-        .run_turn(Incoming { session: sid.clone(), text: "cancel my order".into() })
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "cancel my order".into(),
+        })
         .await
         .unwrap();
     assert_eq!(reply, "Which order should I cancel?");
@@ -431,7 +554,9 @@ async fn never_residual_rejection_forces_clarification() {
             if reason.contains("NeverResidual")
     )));
     assert!(
-        !events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
+        !events
+            .iter()
+            .any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })),
         "cancel_order must not run on an invented id"
     );
 }
@@ -451,7 +576,12 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
             vec![Arc::new(WipeTool::new())],
             store.clone(),
         );
-        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "wipe it".into(),
+        })
+        .await
+        .unwrap();
     }
     // Turn 2: user says yes; emitter proposes confirm_pending.
     {
@@ -464,14 +594,25 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
             vec![Arc::new(WipeTool::new())],
             store.clone(),
         );
-        let reply =
-            e.run_turn(Incoming { session: sid.clone(), text: "yes".into() }).await.unwrap();
-        assert!(reply.contains("wiped"), "trace reply reports execution, got: {reply}");
+        let reply = e
+            .run_turn(Incoming {
+                session: sid.clone(),
+                text: "yes".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply.contains("wiped"),
+            "trace reply reports execution, got: {reply}"
+        );
     }
     let events = store.load(&sid).await.unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
     assert!(kinds.contains(&"Confirmed"));
-    assert!(kinds.contains(&"ToolCalled"), "the staged action ran after Confirmed");
+    assert!(
+        kinds.contains(&"ToolCalled"),
+        "the staged action ran after Confirmed"
+    );
     // paper trail order: PendingConfirmation before Confirmed before ToolCalled
     let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
     assert!(pos("PendingConfirmation") < pos("Confirmed"));
@@ -492,14 +633,22 @@ async fn pending_confirmation_expires_after_one_turn() {
             vec![Arc::new(WipeTool::new())],
             store.clone(),
         );
-        e.run_turn(Incoming { session: sid.clone(), text: "wipe it".into() }).await.unwrap();
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "wipe it".into(),
+        })
+        .await
+        .unwrap();
     }
     // Turn 2: user changes the subject; scripted emitter falls through to respond_directly.
     {
         let mut e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
-        e.run_turn(Incoming { session: sid.clone(), text: "actually, what time is it?".into() })
-            .await
-            .unwrap();
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "actually, what time is it?".into(),
+        })
+        .await
+        .unwrap();
     }
     // Turn 3: a late confirm_pending must be rejected as illegal and nothing runs.
     {
@@ -512,11 +661,20 @@ async fn pending_confirmation_expires_after_one_turn() {
             vec![Arc::new(WipeTool::new())],
             store.clone(),
         );
-        e.run_turn(Incoming { session: sid.clone(), text: "yes do it".into() }).await.unwrap();
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "yes do it".into(),
+        })
+        .await
+        .unwrap();
     }
     let events = store.load(&sid).await.unwrap();
-    assert!(!events.iter().any(|ev| matches!(ev.kind, EventKind::Confirmed { .. })));
-    assert!(!events.iter().any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })));
+    assert!(!events
+        .iter()
+        .any(|ev| matches!(ev.kind, EventKind::Confirmed { .. })));
+    assert!(!events
+        .iter()
+        .any(|ev| matches!(ev.kind, EventKind::ToolCalled { .. })));
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
         EventKind::Rejected { reason: RejectReason::IllegalAction { action }, .. }
@@ -528,8 +686,11 @@ struct FactsProbe;
 #[async_trait::async_trait]
 impl Replier for FactsProbe {
     async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        let lines: Vec<String> =
-            ctx.facts.iter().map(|f| format!("{}={} uses={}", f.key, f.value, f.uses)).collect();
+        let lines: Vec<String> = ctx
+            .facts
+            .iter()
+            .map(|f| format!("{}={} uses={}", f.key, f.value, f.uses))
+            .collect();
         Ok(format!("FACTS[{}]", lines.join(";")))
     }
 }
@@ -557,11 +718,17 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
             Box::new(|| Timestamp(42)),
         );
         let reply = e
-            .run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
+            .run_turn(Incoming {
+                session: sid.clone(),
+                text: "my name is Martin".into(),
+            })
             .await
             .unwrap();
         // Generate path recalls the just-stored fact (uses already bumped to 1)
-        assert!(reply.contains("user.name=\"Martin\" uses=1"), "got: {reply}");
+        assert!(
+            reply.contains("user.name=\"Martin\" uses=1"),
+            "got: {reply}"
+        );
     }
     let stored = store.facts("user").await.unwrap();
     assert_eq!(stored.len(), 1);
@@ -593,11 +760,19 @@ async fn remember_fact_without_value_is_malformed() {
         store.clone(),
     );
     let sid = SessionId("facts2".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "hi".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "hi".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
-        EventKind::Rejected { reason: RejectReason::Malformed { .. }, .. }
+        EventKind::Rejected {
+            reason: RejectReason::Malformed { .. },
+            ..
+        }
     )));
     assert!(store.facts("").await.unwrap().is_empty());
 }
@@ -617,11 +792,18 @@ async fn remember_fact_trims_stray_punctuation_from_key() {
         store.clone(),
     );
     let sid = SessionId("facts4".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
-        .await
-        .unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "my name is Martin".into(),
+    })
+    .await
+    .unwrap();
     let stored = store.facts("user.name").await.unwrap();
-    assert_eq!(stored.len(), 1, "colon-prefixed key stored under the clean identifier");
+    assert_eq!(
+        stored.len(),
+        1,
+        "colon-prefixed key stored under the clean identifier"
+    );
     assert_eq!(stored[0].key, "user.name");
 }
 
@@ -650,12 +832,22 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
     // narrowed schema must then remove the action entirely.
     let store = Arc::new(InMemoryStore::new());
     let mut e = engine_with(
-        vec![echo_proposal("hi"), echo_proposal("hi"), echo_proposal("hi")],
+        vec![
+            echo_proposal("hi"),
+            echo_proposal("hi"),
+            echo_proposal("hi"),
+        ],
         vec![],
         store.clone(),
     );
     let sid = SessionId("rep1".into());
-    let reply = e.run_turn(Incoming { session: sid.clone(), text: "say hi".into() }).await.unwrap();
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "say hi".into(),
+        })
+        .await
+        .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert_eq!(tool_calls(&events, "echo"), 1, "the tool runs exactly once");
     let reasons = rejection_reasons(&events);
@@ -669,16 +861,31 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
         "second repeat is illegal under the narrowed set, got {:?}",
         reasons[1]
     );
-    assert!(reply.contains("echo: hi"), "turn still ends in a trace-based reply: {reply}");
-    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+    assert!(
+        reply.contains("echo: hi"),
+        "turn still ends in a trace-based reply: {reply}"
+    );
+    assert!(matches!(
+        &events.last().unwrap().kind,
+        EventKind::Replied { .. }
+    ));
 }
 
 #[tokio::test]
 async fn same_action_with_different_args_is_not_a_repeat() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![echo_proposal("a"), echo_proposal("b")], vec![], store.clone());
+    let mut e = engine_with(
+        vec![echo_proposal("a"), echo_proposal("b")],
+        vec![],
+        store.clone(),
+    );
     let sid = SessionId("rep2".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "x".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "x".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert_eq!(tool_calls(&events, "echo"), 2);
     assert!(rejection_reasons(&events).is_empty());
@@ -694,13 +901,23 @@ async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
     let store = Arc::new(InMemoryStore::new());
     let mut e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
     let sid = SessionId("rep3".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() }).await.unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "my name is Martin".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert_eq!(tool_calls(&events, "remember_fact"), 1);
     let reasons = rejection_reasons(&events);
-    assert!(matches!(reasons[0], RejectReason::GuardDenied { guard, .. } if guard == "repeat_gate"));
+    assert!(
+        matches!(reasons[0], RejectReason::GuardDenied { guard, .. } if guard == "repeat_gate")
+    );
     assert!(matches!(reasons[1], RejectReason::IllegalAction { .. }));
-    assert!(matches!(&events.last().unwrap().kind, EventKind::Replied { .. }));
+    assert!(matches!(
+        &events.last().unwrap().kind,
+        EventKind::Replied { .. }
+    ));
 }
 
 #[tokio::test]
@@ -717,15 +934,24 @@ async fn remember_fact_with_junk_key_is_malformed() {
         store.clone(),
     );
     let sid = SessionId("facts3".into());
-    e.run_turn(Incoming { session: sid.clone(), text: "my name is Martin".into() })
-        .await
-        .unwrap();
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "my name is Martin".into(),
+    })
+    .await
+    .unwrap();
     let events = store.load(&sid).await.unwrap();
     assert!(events.iter().any(|ev| matches!(
         &ev.kind,
-        EventKind::Rejected { reason: RejectReason::Malformed { .. }, .. }
+        EventKind::Rejected {
+            reason: RejectReason::Malformed { .. },
+            ..
+        }
     )));
-    assert!(store.facts("").await.unwrap().is_empty(), "junk key must not be stored");
+    assert!(
+        store.facts("").await.unwrap().is_empty(),
+        "junk key must not be stored"
+    );
 }
 
 struct FailingEmitter;
@@ -764,11 +990,7 @@ impl Replier for ReplyFailsWith {
     }
 }
 
-fn engine_from(
-    emitter: Box<dyn Emitter>,
-    replier: Box<dyn Replier>,
-    cfg: EngineConfig,
-) -> Engine {
+fn engine_from(emitter: Box<dyn Emitter>, replier: Box<dyn Replier>, cfg: EngineConfig) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(emitter);
     b.set_replier(replier);
@@ -791,24 +1013,46 @@ async fn fallback_reply_explains_provider_error() {
         Box::new(ScriptedReplier),
         EngineConfig::default(),
     );
-    let reply =
-        e.run_turn(Incoming { session: SessionId("why1".into()), text: "hi".into() }).await.unwrap();
-    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("why1".into()),
+            text: "hi".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply.starts_with("Sorry, I couldn't complete that."),
+        "{reply}"
+    );
     assert!(reply.contains("429"), "status code is named: {reply}");
-    assert!(reply.contains("Rate limit exceeded"), "provider message is quoted: {reply}");
+    assert!(
+        reply.contains("Rate limit exceeded"),
+        "provider message is quoted: {reply}"
+    );
 }
 
 #[tokio::test]
 async fn fallback_reply_explains_step_exhaustion() {
-    let proposals = ["a", "b", "c", "d", "e"].iter().map(|t| echo_proposal(t)).collect();
+    let proposals = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|t| echo_proposal(t))
+        .collect();
     let mut e = engine_from(
         Box::new(ScriptedEmitter::new(proposals)),
         Box::new(ScriptedReplier),
         EngineConfig::default(), // max_iterations = 5
     );
-    let reply =
-        e.run_turn(Incoming { session: SessionId("why2".into()), text: "go".into() }).await.unwrap();
-    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("why2".into()),
+            text: "go".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply.starts_with("Sorry, I couldn't complete that."),
+        "{reply}"
+    );
     assert!(reply.contains("ran out of steps"), "{reply}");
 }
 
@@ -821,10 +1065,21 @@ async fn generate_fallback_explains_replier_error() {
         )),
         EngineConfig::default(),
     );
-    let reply =
-        e.run_turn(Incoming { session: SessionId("why3".into()), text: "hi".into() }).await.unwrap();
-    assert!(reply.starts_with("Sorry, I couldn't complete that."), "{reply}");
-    assert!(reply.contains("402") && reply.contains("more credits"), "{reply}");
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("why3".into()),
+            text: "hi".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply.starts_with("Sorry, I couldn't complete that."),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("402") && reply.contains("more credits"),
+        "{reply}"
+    );
 }
 
 #[tokio::test]
@@ -835,11 +1090,23 @@ async fn cant_help_template_receives_reason_var() {
             .collect(),
         ..Default::default()
     };
-    let mut e = engine_from(Box::new(EmitFailsWith(RATE_LIMITED)), Box::new(ScriptedReplier), cfg);
-    let reply =
-        e.run_turn(Incoming { session: SessionId("why4".into()), text: "hi".into() }).await.unwrap();
+    let mut e = engine_from(
+        Box::new(EmitFailsWith(RATE_LIMITED)),
+        Box::new(ScriptedReplier),
+        cfg,
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("why4".into()),
+            text: "hi".into(),
+        })
+        .await
+        .unwrap();
     assert!(reply.starts_with("Nezvládnu: "), "{reply}");
-    assert!(reply.contains("429") && reply.contains("Rate limit exceeded"), "{reply}");
+    assert!(
+        reply.contains("429") && reply.contains("Rate limit exceeded"),
+        "{reply}"
+    );
 }
 
 #[tokio::test]
@@ -860,8 +1127,40 @@ async fn registered_cant_help_template_replaces_fallback() {
     };
     let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
-        .run_turn(Incoming { session: SessionId("tpl1".into()), text: "x".into() })
+        .run_turn(Incoming {
+            session: SessionId("tpl1".into()),
+            text: "x".into(),
+        })
         .await
         .unwrap();
     assert_eq!(reply, "Promiň, to nezvládnu.");
+}
+
+#[tokio::test]
+async fn tool_args_failing_schema_are_rejected_as_malformed_not_called() {
+    let store = Arc::new(InMemoryStore::new());
+    // echo requires a string "text"; an integer must be rejected before the tool runs.
+    let bad = Proposal {
+        rationale: "r".into(),
+        action: "echo".into(),
+        args: serde_json::json!({"text": 42}),
+    };
+    let mut e = engine_with(vec![bad, echo_proposal("ok")], vec![], store.clone());
+    let sid = SessionId("val".into());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "go".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    let reasons = rejection_reasons(&events);
+    assert_eq!(reasons.len(), 1);
+    assert!(
+        matches!(reasons[0], RejectReason::Malformed { detail } if detail.contains("must be string")),
+        "got {:?}",
+        reasons[0]
+    );
+    // The action stays legal: the repaired second proposal runs.
+    assert_eq!(tool_calls(&events, "echo"), 1);
 }

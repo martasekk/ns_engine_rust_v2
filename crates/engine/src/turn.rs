@@ -1,8 +1,7 @@
 use crate::state::{fold, state_summary};
 use nscore::{
-    ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming,
-    LegalActionSet, RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome,
-    Verdict,
+    ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming, LegalActionSet,
+    RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome, Verdict,
 };
 
 pub struct EngineConfig {
@@ -60,22 +59,33 @@ fn truncate_chars(s: &str, max: usize) -> String {
 fn explain_error(detail: &str) -> String {
     let detail = detail.strip_prefix("transport: ").unwrap_or(detail);
     if let Some(rest) = detail.strip_prefix("malformed: ") {
-        return format!("the model's answer was unusable ({})", truncate_chars(rest, 120));
+        return format!(
+            "the model's answer was unusable ({})",
+            truncate_chars(rest, 120)
+        );
     }
     if let Some(rest) = detail.strip_prefix("status ") {
         let (code, body) = rest.split_once(':').unwrap_or((rest, ""));
         let (code, body) = (code.trim(), body.trim());
-        let message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
-            [&v["error"]["message"], &v["message"]]
-                .into_iter()
-                .find_map(|m| m.as_str().map(str::to_string))
-        });
+        let message = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                [&v["error"]["message"], &v["message"]]
+                    .into_iter()
+                    .find_map(|m| m.as_str().map(str::to_string))
+            });
         return match message {
-            Some(m) => format!("the model provider answered HTTP {code}: {}", truncate_chars(&m, 160)),
+            Some(m) => format!(
+                "the model provider answered HTTP {code}: {}",
+                truncate_chars(&m, 160)
+            ),
             None => format!("the model provider answered HTTP {code}"),
         };
     }
-    format!("couldn't reach the model provider ({})", truncate_chars(detail, 120))
+    format!(
+        "couldn't reach the model provider ({})",
+        truncate_chars(detail, 120)
+    )
 }
 
 /// Engine-owned synthetic action: ask the user one question (spec §5.1).
@@ -183,7 +193,13 @@ impl Engine {
 
         let turn = fold(log.events()).turn + 1;
         let now = &self.clock;
-        log.append(turn, now(), EventKind::UserSaid { text: incoming.text.clone() });
+        log.append(
+            turn,
+            now(),
+            EventKind::UserSaid {
+                text: incoming.text.clone(),
+            },
+        );
 
         let mut rejections_this_turn: Vec<String> = Vec::new();
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
@@ -206,7 +222,9 @@ impl Engine {
                 // Forced clarification (spec §5.1): a NeverResidual rejection
                 // occurred and nothing grounds the arg — the only way forward
                 // is to ask (respond_directly stays available at schema level).
-                LegalActionSet { actions: vec![ask_clarification_spec()] }
+                LegalActionSet {
+                    actions: vec![ask_clarification_spec()],
+                }
             } else {
                 // Narrowed schema (spec §2): actions rejected this turn are
                 // removed from the set the emitter sees next.
@@ -228,14 +246,8 @@ impl Engine {
             };
 
             // b. emitter context
-            let recent: Vec<(String, String)> = state
-                .history
-                .iter()
-                .rev()
-                .take(6)
-                .rev()
-                .cloned()
-                .collect();
+            let recent: Vec<(String, String)> =
+                state.history.iter().rev().take(6).rev().cloned().collect();
             // The emitter must see what this turn has already done — otherwise
             // it re-proposes completed actions until max_iterations exhausts.
             let mut summary = state_summary(&state);
@@ -265,7 +277,9 @@ impl Engine {
                         now(),
                         EventKind::Rejected {
                             proposal_of: nscore::EventId(0),
-                            reason: RejectReason::Malformed { detail: e.to_string() },
+                            reason: RejectReason::Malformed {
+                                detail: e.to_string(),
+                            },
                         },
                     );
                     rejections_this_turn.push(format!("emitter failure: {e}"));
@@ -280,12 +294,24 @@ impl Engine {
 
             // d. record proposal
             let pid = log
-                .append(turn, now(), EventKind::Proposed { proposal: proposal.clone() })
+                .append(
+                    turn,
+                    now(),
+                    EventKind::Proposed {
+                        proposal: proposal.clone(),
+                    },
+                )
                 .id;
 
             // e. direct reply
             if proposal.action == "respond_directly" {
-                let e = log.append(turn, now(), EventKind::Settled { policy: ReplyPolicy::Generate });
+                let e = log.append(
+                    turn,
+                    now(),
+                    EventKind::Settled {
+                        policy: ReplyPolicy::Generate,
+                    },
+                );
                 settled = Some(match &e.kind {
                     EventKind::Settled { policy } => policy.clone(),
                     _ => unreachable!(),
@@ -295,8 +321,17 @@ impl Engine {
 
             // f. legality
             if !legal.contains(&proposal.action) {
-                let reason = RejectReason::IllegalAction { action: proposal.action.clone() };
-                log.append(turn, now(), EventKind::Rejected { proposal_of: pid, reason });
+                let reason = RejectReason::IllegalAction {
+                    action: proposal.action.clone(),
+                };
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::Rejected {
+                        proposal_of: pid,
+                        reason,
+                    },
+                );
                 rejections_this_turn.push(format!("illegal action: {}", proposal.action));
                 denied_this_turn.insert(proposal.action.clone());
                 continue;
@@ -308,8 +343,10 @@ impl Engine {
             // in the prompt. Recorded as a guard denial so the narrowed schema
             // drops the action for the rest of the turn.
             if calls_this_turn.contains(&Self::call_key(&proposal)) {
-                let reason =
-                    format!("identical call to '{}' already executed this turn", proposal.action);
+                let reason = format!(
+                    "identical call to '{}' already executed this turn",
+                    proposal.action
+                );
                 log.append(
                     turn,
                     now(),
@@ -332,7 +369,13 @@ impl Engine {
             // normal classify→guards→perform pipeline with the gate unlocked.
             if proposal.action == CONFIRM_PENDING {
                 let pending_id = active_pending.expect("legality guaranteed an active pending");
-                log.append(turn, now(), EventKind::Confirmed { pending: pending_id });
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::Confirmed {
+                        pending: pending_id,
+                    },
+                );
                 let original = log
                     .events()
                     .iter()
@@ -373,8 +416,11 @@ impl Engine {
             // through classification and guards — TaintPolicy applies to
             // questions; a gated question is re-emitted, not asked.
             if proposal.action == ASK_CLARIFICATION {
-                let question =
-                    proposal.args.get("question").and_then(|v| v.as_str()).map(String::from);
+                let question = proposal
+                    .args
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let Some(question) = question else {
                     log.append(
                         turn,
@@ -391,14 +437,12 @@ impl Engine {
                 };
                 let ask_spec = ask_clarification_spec();
                 let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args = nsprovenance::classify::classify_args(
-                    &proposal.args,
-                    &ask_spec,
-                    &index,
-                    turn,
-                );
-                let classified =
-                    ClassifiedProposal { proposal: proposal.clone(), args: classified_args };
+                let classified_args =
+                    nsprovenance::classify::classify_args(&proposal.args, &ask_spec, &index, turn);
+                let classified = ClassifiedProposal {
+                    proposal: proposal.clone(),
+                    args: classified_args,
+                };
                 let guard_ctx = nscore::GuardCtx {
                     spec: &ask_spec,
                     turn,
@@ -437,7 +481,13 @@ impl Engine {
                     continue;
                 }
                 let policy = ReplyPolicy::Verbatim { text: question };
-                log.append(turn, now(), EventKind::Settled { policy: policy.clone() });
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::Settled {
+                        policy: policy.clone(),
+                    },
+                );
                 settled = Some(policy);
                 break;
             }
@@ -446,8 +496,16 @@ impl Engine {
             // classification of the value), write the fact, log the paper
             // trail, and let the emitter decide what happens next.
             if proposal.action == REMEMBER_FACT {
-                let key = proposal.args.get("key").and_then(|v| v.as_str()).map(String::from);
-                let value = proposal.args.get("value").and_then(|v| v.as_str()).map(String::from);
+                let key = proposal
+                    .args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let value = proposal
+                    .args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let (Some(key), Some(value)) = (key, value) else {
                     log.append(
                         turn,
@@ -470,7 +528,9 @@ impl Engine {
                     .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .to_string();
                 let key_ok = !key.is_empty()
-                    && key.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
                 if !key_ok || value.trim().is_empty() {
                     log.append(
                         turn,
@@ -491,12 +551,8 @@ impl Engine {
                 }
                 let fact_spec = remember_fact_spec();
                 let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args = nsprovenance::classify::classify_args(
-                    &proposal.args,
-                    &fact_spec,
-                    &index,
-                    turn,
-                );
+                let classified_args =
+                    nsprovenance::classify::classify_args(&proposal.args, &fact_spec, &index, turn);
                 let prov = classified_args
                     .iter()
                     .find(|(k, _)| k == "value")
@@ -529,13 +585,23 @@ impl Engine {
                             trust: nscore::Trust::System,
                         },
                     },
-                    Err(e) => ToolOutcome::Err { kind: "store".into(), detail: e.to_string() },
+                    Err(e) => ToolOutcome::Err {
+                        kind: "store".into(),
+                        detail: e.to_string(),
+                    },
                 };
-                log.append(turn, now(), EventKind::ToolReturned { call: call_id, outcome });
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
                 continue;
             }
 
-            // g. classify args against the session's history (spec §5.4)
+            // g0. find the tool (legality guaranteed it exists)
             let tool = self
                 .parts
                 .tools
@@ -543,11 +609,34 @@ impl Engine {
                 .find(|t| t.spec().name == proposal.action)
                 .expect("legality checked above")
                 .clone();
+
+            // g1. schema validation (spec M5 §3.2): malformed args are
+            // rejected before classification; the action stays legal so the
+            // emitter can retry with repaired args.
+            if let Err(detail) = nscore::validate_args(&tool.spec().args_schema, &proposal.args) {
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::Rejected {
+                        proposal_of: pid,
+                        reason: RejectReason::Malformed {
+                            detail: format!("{}: {detail}", proposal.action),
+                        },
+                    },
+                );
+                rejections_this_turn
+                    .push(format!("malformed args for {}: {detail}", proposal.action));
+                continue;
+            }
+
+            // g. classify args against the session's history (spec §5.4)
             let index = nsprovenance::index::ValueIndex::from_events(log.events());
             let classified_args =
                 nsprovenance::classify::classify_args(&proposal.args, tool.spec(), &index, turn);
-            let classified =
-                ClassifiedProposal { proposal: proposal.clone(), args: classified_args.clone() };
+            let classified = ClassifiedProposal {
+                proposal: proposal.clone(),
+                args: classified_args.clone(),
+            };
 
             // h. guards
             let guard_ctx = nscore::GuardCtx {
@@ -593,8 +682,15 @@ impl Engine {
                 Verdict::NeedsConfirmation { prompt } => {
                     // Dry-run when the tool supports it; show the user what
                     // would happen (spec §5.4, §9).
-                    let staged =
-                        tool.stage(&proposal.args, &ToolCtx { session: sid.clone(), artifacts: Some(self.parts.memory.clone()) }).await;
+                    let staged = tool
+                        .stage(
+                            &proposal.args,
+                            &ToolCtx {
+                                session: sid.clone(),
+                                artifacts: Some(self.parts.memory.clone()),
+                            },
+                        )
+                        .await;
                     let mut text = prompt;
                     if let Some(s) = &staged {
                         text.push_str(&format!("\nPlanned: {}", s.description));
@@ -602,10 +698,19 @@ impl Engine {
                     log.append(
                         turn,
                         now(),
-                        EventKind::PendingConfirmation { proposal_of: pid, staged },
+                        EventKind::PendingConfirmation {
+                            proposal_of: pid,
+                            staged,
+                        },
                     );
                     let policy = ReplyPolicy::Verbatim { text };
-                    log.append(turn, now(), EventKind::Settled { policy: policy.clone() });
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Settled {
+                            policy: policy.clone(),
+                        },
+                    );
                     settled = Some(policy);
                     break;
                 }
@@ -616,17 +721,36 @@ impl Engine {
                 .append(
                     turn,
                     now(),
-                    EventKind::ToolCalled { action: proposal.action.clone(), args: classified_args },
+                    EventKind::ToolCalled {
+                        action: proposal.action.clone(),
+                        args: classified_args,
+                    },
                 )
                 .id;
             calls_this_turn.insert(Self::call_key(&proposal));
-            let outcome = match tool.call(&proposal.args, &ToolCtx { session: sid.clone(), artifacts: Some(self.parts.memory.clone()) }).await {
+            let outcome = match tool
+                .call(
+                    &proposal.args,
+                    &ToolCtx {
+                        session: sid.clone(),
+                        artifacts: Some(self.parts.memory.clone()),
+                    },
+                )
+                .await
+            {
                 Ok(output) => ToolOutcome::Ok { output },
                 Err(nscore::ToolError::Failed { kind, detail }) => {
                     ToolOutcome::Err { kind, detail }
                 }
             };
-            log.append(turn, now(), EventKind::ToolReturned { call: call_id, outcome });
+            log.append(
+                turn,
+                now(),
+                EventKind::ToolReturned {
+                    call: call_id,
+                    outcome,
+                },
+            );
             // loop: the emitter decides what happens next (typically respond_directly)
         }
 
@@ -655,7 +779,9 @@ impl Engine {
                     vars: serde_json::json!({ "reason": reason }),
                 }
             } else {
-                ReplyPolicy::Verbatim { text: format!("{FALLBACK_REPLY} Reason: {reason}.") }
+                ReplyPolicy::Verbatim {
+                    text: format!("{FALLBACK_REPLY} Reason: {reason}."),
+                }
             };
             log.append(turn, now(), EventKind::Settled { policy: p.clone() });
             p
@@ -698,7 +824,10 @@ impl Engine {
 
         // 5. record + persist new events only
         log.append(turn, now(), EventKind::Replied { text: text.clone() });
-        self.parts.memory.append(&sid, &log.events()[n_loaded..]).await?;
+        self.parts
+            .memory
+            .append(&sid, &log.events()[n_loaded..])
+            .await?;
         Ok(text)
     }
 
