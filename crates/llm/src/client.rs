@@ -19,12 +19,15 @@ pub enum ApiError {
 
 impl OpenRouterClient {
     pub fn new(transport: Arc<dyn HttpTransport>, api_key: String) -> Self {
+        // 1 s, 2 s, 4 s between attempts: a turn with a tool call makes
+        // three or four requests back to back, and free tiers rate-limit per
+        // second (seen live with Mistral: 429 on every retry at 0.5 s).
         Self {
             transport,
             api_key,
             base_url: "https://openrouter.ai/api".into(),
-            max_attempts: 3,
-            backoff_base_ms: 500,
+            max_attempts: 4,
+            backoff_base_ms: 1000,
         }
     }
 
@@ -45,7 +48,10 @@ impl OpenRouterClient {
     pub async fn chat(&self, request: serde_json::Value) -> Result<serde_json::Value, ApiError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let headers = vec![
-            ("authorization".to_string(), format!("Bearer {}", self.api_key)),
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.api_key),
+            ),
             ("content-type".to_string(), "application/json".to_string()),
             ("x-title".to_string(), "ns-harness".to_string()),
         ];
@@ -58,8 +64,10 @@ impl OpenRouterClient {
             match self.transport.post(&url, &headers, &request).await {
                 Ok(resp) if (200..300).contains(&resp.status) => return Ok(resp.body),
                 Ok(resp) if resp.status == 429 || resp.status >= 500 => {
-                    last_err =
-                        ApiError::Status { status: resp.status, detail: resp.body.to_string() };
+                    last_err = ApiError::Status {
+                        status: resp.status,
+                        detail: resp.body.to_string(),
+                    };
                 }
                 Ok(resp) => {
                     return Err(ApiError::Status {
@@ -96,10 +104,19 @@ mod tests {
     #[tokio::test]
     async fn retries_on_429_then_succeeds() {
         let mock = MockTransport::new(vec![
-            Ok(HttpResponse { status: 429, body: serde_json::json!({"error": "rate"}) }),
-            Ok(HttpResponse { status: 200, body: serde_json::json!({"id": "msg_2"}) }),
+            Ok(HttpResponse {
+                status: 429,
+                body: serde_json::json!({"error": "rate"}),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({"id": "msg_2"}),
+            }),
         ]);
-        let body = client(mock.clone()).chat(serde_json::json!({})).await.unwrap();
+        let body = client(mock.clone())
+            .chat(serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(body["id"], "msg_2");
         assert_eq!(mock.requests.lock().unwrap().len(), 2);
     }
@@ -110,11 +127,21 @@ mod tests {
             Err(TransportError::Network("down".into())),
             Err(TransportError::Network("down".into())),
             Err(TransportError::Network("down".into())),
-            Ok(HttpResponse { status: 200, body: serde_json::json!({"id": "never"}) }),
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({"id": "never"}),
+            }),
         ]);
-        let err = client(mock.clone()).chat(serde_json::json!({})).await.unwrap_err();
+        let err = client(mock.clone())
+            .chat(serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApiError::Transport(_)));
-        assert_eq!(mock.requests.lock().unwrap().len(), 3, "exactly max_attempts tries");
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            3,
+            "exactly max_attempts tries"
+        );
     }
 
     #[tokio::test]
@@ -123,7 +150,10 @@ mod tests {
             status: 400,
             body: serde_json::json!({"error": {"message": "bad request"}}),
         })]);
-        let err = client(mock.clone()).chat(serde_json::json!({})).await.unwrap_err();
+        let err = client(mock.clone())
+            .chat(serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApiError::Status { status: 400, .. }));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
