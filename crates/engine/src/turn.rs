@@ -265,6 +265,7 @@ impl Engine {
                 state_summary: summary,
                 recent_turns: recent,
                 rejections_this_turn: rejections_this_turn.clone(),
+                guidance: vec![],
             };
 
             // c. propose

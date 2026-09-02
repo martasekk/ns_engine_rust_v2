@@ -50,6 +50,8 @@ pub struct EmitterContext {
     /// (speaker, text), speaker: "user" | "assistant"
     pub recent_turns: Vec<(String, String)>,
     pub rejections_this_turn: Vec<String>,
+    /// Learned guidance notes (spec M5 §3.3): global + scoped to legal actions.
+    pub guidance: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -144,7 +146,11 @@ mod tests {
             _a: &serde_json::Value,
             _c: &ToolCtx,
         ) -> Result<ToolOutput, ToolError> {
-            Ok(ToolOutput { summary: "ok".into(), artifact: None, trust: Trust::System })
+            Ok(ToolOutput {
+                summary: "ok".into(),
+                artifact: None,
+                trust: Trust::System,
+            })
         }
     }
 
@@ -168,7 +174,9 @@ mod tests {
             "always_deny"
         }
         fn check(&self, _p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict {
-            Verdict::Deny { reason: format!("turn {}", ctx.turn) }
+            Verdict::Deny {
+                reason: format!("turn {}", ctx.turn),
+            }
         }
     }
 

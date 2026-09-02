@@ -20,7 +20,11 @@ impl CloudEmitter {
         // 4096, not 1024: reasoning models spend output tokens on reasoning
         // before the tool call; a tight cap yields finish_reason "length"
         // with null content and no tool_calls.
-        Self { client, model, max_tokens: 4096 }
+        Self {
+            client,
+            model,
+            max_tokens: 4096,
+        }
     }
 }
 
@@ -33,6 +37,12 @@ fn render_context(ctx: &EmitterContext) -> String {
         s.push_str("Rejected this turn:\n");
         for r in &ctx.rejections_this_turn {
             s.push_str(&format!("- {r}\n"));
+        }
+    }
+    if !ctx.guidance.is_empty() {
+        s.push_str("Guidance:\n");
+        for g in &ctx.guidance {
+            s.push_str(&format!("- {g}\n"));
         }
     }
     s.push_str("Propose the next action.");
@@ -65,7 +75,10 @@ impl Emitter for CloudEmitter {
         })?;
 
         let message = &body["choices"][0]["message"];
-        let tool_call = match message["tool_calls"].as_array().and_then(|calls| calls.first()) {
+        let tool_call = match message["tool_calls"]
+            .as_array()
+            .and_then(|calls| calls.first())
+        {
             Some(call) => call,
             None => {
                 // Models that ignore tool_choice "required" answer in plain
@@ -97,7 +110,11 @@ impl Emitter for CloudEmitter {
             .remove("rationale")
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
-        Ok(Proposal { rationale, action, args: serde_json::Value::Object(input) })
+        Ok(Proposal {
+            rationale,
+            action,
+            args: serde_json::Value::Object(input),
+        })
     }
 }
 
@@ -130,6 +147,7 @@ mod tests {
             state_summary: "turn 1, 1 messages".into(),
             recent_turns: vec![("user".into(), "say hi".into())],
             rejections_this_turn: vec!["guard g: nope".into()],
+            guidance: vec![],
         }
     }
 
@@ -161,7 +179,10 @@ mod tests {
             "echo",
             serde_json::json!({"rationale": "user asked", "text": "hi"}),
         )]);
-        let p = emitter(mock.clone()).propose(ctx(), &legal()).await.unwrap();
+        let p = emitter(mock.clone())
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
         assert_eq!(p.action, "echo");
         assert_eq!(p.rationale, "user asked");
         assert_eq!(p.args, serde_json::json!({"text": "hi"}));
@@ -173,7 +194,10 @@ mod tests {
             "respond_directly",
             serde_json::json!({"rationale": "chat"}),
         )]);
-        let p = emitter(mock.clone()).propose(ctx(), &legal()).await.unwrap();
+        let p = emitter(mock.clone())
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
         assert_eq!(p.action, "respond_directly");
 
         let reqs = mock.requests.lock().unwrap();
@@ -181,7 +205,11 @@ mod tests {
         assert_eq!(req["model"], "anthropic/claude-haiku-4.5");
         assert_eq!(req["temperature"], 0);
         assert_eq!(req["tool_choice"], "required");
-        assert_eq!(req["tools"].as_array().unwrap().len(), 2, "echo + respond_directly");
+        assert_eq!(
+            req["tools"].as_array().unwrap().len(),
+            2,
+            "echo + respond_directly"
+        );
         assert_eq!(req["messages"][0]["role"], "system");
         let text = req["messages"][1]["content"].as_str().unwrap();
         assert!(text.contains("turn 1, 1 messages"));
@@ -253,5 +281,26 @@ mod tests {
         })]);
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
         assert!(matches!(err, nscore::EmitError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn guidance_notes_are_rendered_in_the_user_message_not_the_system_prompt() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"text": "x"}),
+        )]);
+        let e = emitter(mock.clone());
+        let mut c = ctx();
+        c.guidance = vec!["Call get_time before answering time questions.".into()];
+        e.propose(c, &legal()).await.unwrap();
+        let reqs = mock.requests.lock().unwrap();
+        let req = &reqs[0];
+        let user = req["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            user.contains("Guidance:\n- Call get_time before answering time questions."),
+            "{user}"
+        );
+        let system = req["messages"][0]["content"].as_str().unwrap();
+        assert!(!system.contains("Guidance"));
     }
 }

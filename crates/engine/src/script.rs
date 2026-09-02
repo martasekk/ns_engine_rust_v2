@@ -131,6 +131,7 @@ mod tests {
             state_summary: "".into(),
             recent_turns: vec![],
             rejections_this_turn: vec![],
+            guidance: vec![],
         };
         let p1 = e.propose(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(p1.action, "echo");
