@@ -47,7 +47,7 @@ impl MemoryStore for InMemoryStore {
         let all = self.facts.lock().await;
         let mut out: Vec<Fact> = all
             .iter()
-            .filter(|f| f.scope == scope && f.state == FactState::Current)
+            .filter(|f| f.scope == scope && matches!(f.state, FactState::Current | FactState::Cold))
             .filter(|f| f.key.starts_with(key_prefix))
             .cloned()
             .collect();
@@ -75,10 +75,11 @@ impl MemoryStore for InMemoryStore {
             *row = fact;
             return Ok(());
         }
-        for row in all
-            .iter_mut()
-            .filter(|f| f.scope == fact.scope && f.key == fact.key && f.state == FactState::Current)
-        {
+        for row in all.iter_mut().filter(|f| {
+            f.scope == fact.scope
+                && f.key == fact.key
+                && matches!(f.state, FactState::Current | FactState::Cold)
+        }) {
             row.state = FactState::Superseded;
             row.valid_to = Some(fact.valid_from);
         }

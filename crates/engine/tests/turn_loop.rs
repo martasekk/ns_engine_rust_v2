@@ -1018,6 +1018,90 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     );
 }
 
+/// Renders the fact views exactly as the cloud replier would.
+struct FactLinesProbe;
+#[async_trait::async_trait]
+impl Replier for FactLinesProbe {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        Ok(ctx
+            .facts
+            .iter()
+            .map(nscore::render_fact)
+            .collect::<Vec<_>>()
+            .join(" | "))
+    }
+}
+
+#[tokio::test]
+async fn facts_in_context_are_pinned_plus_relevant_with_previous_values() {
+    // Seen live: 20 facts by alphabet, and "what was my name before" was
+    // unanswerable because the old value had been overwritten.
+    let store = Arc::new(InMemoryStore::new());
+    let put = |key: String, value: &'static str, at: u64| {
+        let store = store.clone();
+        async move {
+            store
+                .put_fact(Fact {
+                    key,
+                    value: serde_json::json!(value),
+                    last_validated: Timestamp(at),
+                    valid_from: Timestamp(at),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    };
+    put("user.name".into(), "Martin", 10).await;
+    put("user.name".into(), "Peter", 20).await; // supersedes
+    put("user.age".into(), "17", 15).await;
+    put("order.42.status".into(), "shipped", 5).await;
+    for i in 0..12 {
+        put(format!("misc.{i:02}"), "noise", 1).await;
+    }
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
+    b.set_replier(Box::new(FactLinesProbe));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("sel".into()),
+            text: "is my order shipped?".into(),
+        })
+        .await
+        .unwrap();
+    // pinned user.* first (newest validated first), the superseded value
+    // shown, then the fact relevant to the question; the noise stays out.
+    assert!(
+        reply.starts_with(
+            "user.name: \"Peter\" (was \"Martin\" until 00:00 UTC) | user.age: \"17\""
+        ),
+        "{reply}"
+    );
+    assert!(reply.contains("order.42.status: \"shipped\""), "{reply}");
+    assert!(
+        !reply.contains("misc."),
+        "irrelevant facts are not shown: {reply}"
+    );
+    assert!(
+        reply.matches(" | ").count() <= 9,
+        "at most facts_in_context: {reply}"
+    );
+    // the shown facts were used; the noise was not
+    let name = store.facts("global", "user.name").await.unwrap().remove(0);
+    assert_eq!((name.uses, name.last_used), (1, Timestamp(42)));
+    let noise = store.facts("global", "misc.00").await.unwrap().remove(0);
+    assert_eq!(noise.uses, 0);
+}
+
 #[tokio::test]
 async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
     let store = Arc::new(InMemoryStore::new());

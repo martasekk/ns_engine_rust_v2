@@ -60,7 +60,11 @@ regression_replay_cap = 200  # newest sessions replayed by the symbolic gate
 window_turns = 6
 record_max_chars = 300
 line_max_chars = 120
-facts_in_context = 20
+facts_in_context = 10         # pinned core + facts relevant to the current message
+pinned_prefixes = ["user."]   # always shown, newest first, with the value they replaced
+pinned_max = 5
+relevant_max = 5
+fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 remember_residual = "flag"    # "never": refuse remembered values the user never said
 

@@ -157,6 +157,9 @@ pub struct Fact {
     pub valid_to: Option<Timestamp>,
     #[serde(default)]
     pub state: FactState,
+    /// Last time the fact was shown to a model (decay input, M6 §6.2).
+    #[serde(default)]
+    pub last_used: Timestamp,
 }
 
 fn default_scope() -> String {
@@ -181,6 +184,7 @@ impl Default for Fact {
             valid_from: Timestamp(0),
             valid_to: None,
             state: FactState::Current,
+            last_used: Timestamp(0),
         }
     }
 }

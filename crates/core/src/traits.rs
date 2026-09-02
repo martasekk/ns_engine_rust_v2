@@ -49,7 +49,7 @@ pub trait Guard: Send + Sync {
 /// of the log the replier sees, rendered for choosing an action.
 pub struct EmitterContext {
     /// Standing facts in scope, already ranked and budgeted (M6 §6.5).
-    pub facts: Vec<Fact>,
+    pub facts: Vec<crate::memory::FactView>,
     /// Rolling summary of the turns outside the window (M6 §5.1).
     pub summary: Option<crate::memory::SessionSummary>,
     /// The last few completed turns, verbatim, oldest first (M6 §4.1).
@@ -87,7 +87,7 @@ pub trait Emitter: Send + Sync {
 /// for prefix caching: persona → facts → summary → window → current turn.
 pub struct ReplyContext {
     pub persona: String,
-    pub facts: Vec<Fact>,
+    pub facts: Vec<crate::memory::FactView>,
     pub summary: Option<crate::memory::SessionSummary>,
     pub window: Vec<crate::memory::TurnRecord>,
     pub caps: crate::memory::Caps,
@@ -140,7 +140,9 @@ pub enum StoreError {
 pub trait MemoryStore: Send + Sync {
     async fn append(&self, session: &SessionId, events: &[Event]) -> Result<(), StoreError>;
     async fn load(&self, session: &SessionId) -> Result<Vec<Event>, StoreError>;
-    /// Current facts in `scope` whose key starts with `key_prefix`, key order.
+    /// Live facts (`current` or `cold`) in `scope` whose key starts with
+    /// `key_prefix`, key order. Superseded and forgotten versions are
+    /// reachable through `fact_history` only.
     async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError>;
     /// Every version of one fact, newest `valid_from` first (M6 §6.1).
     async fn fact_history(&self, scope: &str, key: &str) -> Result<Vec<Fact>, StoreError>;

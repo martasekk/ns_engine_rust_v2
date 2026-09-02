@@ -149,7 +149,8 @@ mod tests {
                 last_validated: Timestamp(1),
                 prov: Provenance::Constant,
                 ..Default::default()
-            }],
+            }
+            .into()],
             summary: Some(nscore::SessionSummary {
                 through_turn: 1,
                 topic: "greeting".into(),

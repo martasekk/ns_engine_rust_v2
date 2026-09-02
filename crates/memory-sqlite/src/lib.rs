@@ -48,7 +48,7 @@ fn parse_trust(s: &str) -> Trust {
 
 const FACT_COLUMNS: &str =
     "scope, key, valid_from, valid_to, state, value_json, confidence, uses, \
-                            last_validated, prov_json, trust";
+                            last_validated, prov_json, trust, last_used";
 
 fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     let value_json: String = r.get(5)?;
@@ -67,6 +67,7 @@ fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         last_validated: Timestamp(r.get::<_, u64>(8)?),
         prov: serde_json::from_str(&prov_json).unwrap_or(nscore::Provenance::Residual),
         trust: parse_trust(&trust),
+        last_used: Timestamp(r.get::<_, u64>(11)?),
     })
 }
 
@@ -138,6 +139,7 @@ impl SqliteStore {
                  last_validated INTEGER NOT NULL,
                  prov_json      TEXT NOT NULL,
                  trust          TEXT NOT NULL DEFAULT 'System',
+                 last_used      INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (scope, key, valid_from)
              );
              CREATE INDEX IF NOT EXISTS facts_current ON facts(scope, state, key);",
@@ -146,9 +148,9 @@ impl SqliteStore {
         if has_facts && !versioned {
             conn.execute_batch(
                 "INSERT INTO facts (scope, key, valid_from, valid_to, state, value_json, confidence,
-                                    uses, last_validated, prov_json, trust)
+                                    uses, last_validated, prov_json, trust, last_used)
                  SELECT 'global', key, last_validated, NULL, 'current', value_json, confidence,
-                        uses, last_validated, prov_json, 'System'
+                        uses, last_validated, prov_json, 'System', last_validated
                  FROM facts_v1;
                  DROP TABLE facts_v1;",
             )
@@ -229,7 +231,8 @@ impl MemoryStore for SqliteStore {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {FACT_COLUMNS} FROM facts
-                 WHERE scope = ?1 AND state = 'current' AND key >= ?2 AND key < ?2 || x'7F'
+                 WHERE scope = ?1 AND state IN ('current', 'cold')
+                   AND key >= ?2 AND key < ?2 || x'7F'
                  ORDER BY key"
             ))
             .map_err(io_err)?;
@@ -268,7 +271,7 @@ impl MemoryStore for SqliteStore {
         if exists.is_some() {
             conn.execute(
                 "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
-                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11
+                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12
                  WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
                 rusqlite::params![
                     fact.scope,
@@ -282,6 +285,7 @@ impl MemoryStore for SqliteStore {
                     fact.last_validated.0,
                     prov_json,
                     trust_str(fact.trust),
+                    fact.last_used.0,
                 ],
             )
             .map_err(io_err)?;
@@ -289,14 +293,14 @@ impl MemoryStore for SqliteStore {
         }
         conn.execute(
             "UPDATE facts SET state = 'superseded', valid_to = ?3
-             WHERE scope = ?1 AND key = ?2 AND state = 'current'",
+             WHERE scope = ?1 AND key = ?2 AND state IN ('current', 'cold')",
             rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
         )
         .map_err(io_err)?;
         conn.execute(
             &format!(
                 "INSERT INTO facts ({FACT_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
             rusqlite::params![
                 fact.scope,
@@ -310,6 +314,7 @@ impl MemoryStore for SqliteStore {
                 fact.last_validated.0,
                 prov_json,
                 trust_str(fact.trust),
+                fact.last_used.0,
             ],
         )
         .map_err(io_err)?;
@@ -584,6 +589,11 @@ mod tests {
         assert_eq!(name.valid_from, Timestamp(1788370524628));
         assert_eq!(name.state, FactState::Current);
         assert_eq!(name.trust, Trust::System);
+        assert_eq!(
+            name.last_used,
+            Timestamp(1788370524628),
+            "migrated rows count as just used"
+        );
         // reopening is a no-op
         drop(store);
         let store = SqliteStore::open(&path).unwrap();

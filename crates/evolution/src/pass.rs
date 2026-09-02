@@ -29,6 +29,8 @@ pub struct PassConfig {
     pub regression_replay_cap: usize,
     /// Report only: no file writes, no hot swap, no facts.
     pub dry_run: bool,
+    /// M6 §6.2: a live fact neither validated nor used this long goes cold.
+    pub fact_stale_days: u64,
 }
 
 impl Default for PassConfig {
@@ -39,6 +41,7 @@ impl Default for PassConfig {
             max_notes: 20,
             regression_replay_cap: 200,
             dry_run: false,
+            fact_stale_days: 90,
         }
     }
 }
@@ -69,6 +72,8 @@ pub struct Report {
     pub probe_turns_used: u32,
     pub facts_written: usize,
     pub written: bool,
+    /// M6 §6.4 fact consolidation numbers.
+    pub consolidation: crate::consolidate::ConsolidationReport,
 }
 
 impl std::fmt::Display for Report {
@@ -93,6 +98,7 @@ impl std::fmt::Display for Report {
         }
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
+        writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
 }
@@ -262,6 +268,18 @@ impl EvolutionPass {
                 }
             }
         }
+
+        // 6b. Fact consolidation (M6 §6.4): decay, safety purge, duplicate
+        //     keys. Deterministic; dry run only counts.
+        report.consolidation = crate::consolidate::consolidate_facts(
+            store,
+            crate::consolidate::ConsolidateConfig {
+                stale_ms: self.cfg.fact_stale_days.saturating_mul(86_400_000),
+                dry_run: self.cfg.dry_run,
+            },
+            Timestamp(now),
+        )
+        .await?;
 
         // 7. Notes lane (only with a live probe and a proposer).
         if let (Some(probe), Some(proposer)) = (&self.probe, &self.proposer) {

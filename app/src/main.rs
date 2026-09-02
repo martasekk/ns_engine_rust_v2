@@ -74,7 +74,8 @@ fn build_pass(
         specs.clone(),
         std::path::PathBuf::from(&cfg.evolution.learned_path),
         std::path::PathBuf::from(&cfg.evolution.ledger_path),
-        cfg.evolution.pass_config(dry_run),
+        cfg.evolution
+            .pass_config(dry_run, cfg.memory.fact_stale_days),
     );
     match key {
         None => {
@@ -232,6 +233,9 @@ async fn main() {
         // The CLI is single-user: every session shares the global scope.
         scope_for: Arc::new(|_| "global".to_string()),
         remember_residual,
+        pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
+        pinned_max: cfg.memory.pinned_max,
+        relevant_max: cfg.memory.relevant_max,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M5 — type text, /quit to exit");

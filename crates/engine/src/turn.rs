@@ -31,6 +31,11 @@ pub struct EngineConfig {
     pub scope_for: std::sync::Arc<dyn Fn(&nscore::SessionId) -> String + Send + Sync>,
     /// M6 §6.3: policy for `remember_fact` values with no grounding.
     pub remember_residual: RememberResidual,
+    /// M6 §6.5: keys with these prefixes are always shown (newest first).
+    pub pinned_prefixes: Vec<String>,
+    pub pinned_max: usize,
+    /// M6 §6.5: facts lexically relevant to the current message.
+    pub relevant_max: usize,
 }
 
 impl Default for EngineConfig {
@@ -46,10 +51,13 @@ impl Default for EngineConfig {
             idle_after: None,
             window_turns: 6,
             caps: nscore::Caps::default(),
-            facts_in_context: 20,
+            facts_in_context: 10,
             reply_grounding_check: true,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
+            pinned_prefixes: vec!["user.".into()],
+            pinned_max: 5,
+            relevant_max: 5,
         }
     }
 }
@@ -252,11 +260,85 @@ impl Engine {
         }
     }
 
-    /// Full turn: load log, run pipeline, persist NEW events, return reply text.
     /// Identity of a call within a turn: action plus its args as JSON
     /// (serde_json's Map is ordered, so equal objects serialize identically).
     fn call_key(p: &nscore::Proposal) -> String {
         format!("{}\u{0}{}", p.action, p.args)
+    }
+
+    /// M6 §6.5: the facts a turn shows both models — a pinned core (keys
+    /// under `pinned_prefixes`, newest validated first, never cold) plus the
+    /// facts lexically relevant to the current message, within
+    /// `facts_in_context`. Dumping the whole store masks precision failures
+    /// and irrelevant facts measurably degrade replies (findings §1).
+    async fn select_facts(&self, scope: &str, user_text: &str) -> Vec<nscore::Fact> {
+        let live = self.parts.memory.facts(scope, "").await.unwrap_or_default();
+        let mut pinned: Vec<nscore::Fact> = live
+            .iter()
+            .filter(|f| f.state == nscore::FactState::Current)
+            .filter(|f| {
+                self.cfg
+                    .pinned_prefixes
+                    .iter()
+                    .any(|p| f.key.starts_with(p))
+            })
+            .cloned()
+            .collect();
+        pinned.sort_by(|a, b| {
+            b.last_validated
+                .cmp(&a.last_validated)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        pinned.truncate(self.cfg.pinned_max);
+        let relevant = self
+            .parts
+            .memory
+            .search_facts(scope, user_text, self.cfg.relevant_max + pinned.len())
+            .await
+            .unwrap_or_default();
+        let mut out = pinned;
+        for f in relevant {
+            if out.len() >= self.cfg.facts_in_context
+                || out.iter().filter(|o| !self.is_pinned(o)).count() >= self.cfg.relevant_max
+            {
+                break;
+            }
+            if !out.iter().any(|o| o.key == f.key) {
+                out.push(f);
+            }
+        }
+        out.truncate(self.cfg.facts_in_context);
+        out
+    }
+
+    fn is_pinned(&self, f: &nscore::Fact) -> bool {
+        self.cfg
+            .pinned_prefixes
+            .iter()
+            .any(|p| f.key.starts_with(p))
+    }
+
+    /// Views of `facts` for the contexts; pinned keys carry the value they
+    /// superseded (M6 §6.1: "what was my name before" from context alone).
+    async fn fact_views(&self, scope: &str, facts: &[nscore::Fact]) -> Vec<nscore::FactView> {
+        let mut views = Vec::with_capacity(facts.len());
+        for f in facts {
+            let mut view: nscore::FactView = f.into();
+            if self.is_pinned(f) {
+                let history = self
+                    .parts
+                    .memory
+                    .fact_history(scope, &f.key)
+                    .await
+                    .unwrap_or_default();
+                view.previous = history
+                    .iter()
+                    .find(|h| h.state == nscore::FactState::Superseded && h.value != f.value)
+                    .and_then(|h| h.valid_to.map(|t| (h.value.clone(), t)));
+            }
+            views.push(view);
+        }
+        views
     }
 
     pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
@@ -335,13 +417,8 @@ impl Engine {
             // re-remembers them every turn (seen live).
             let trace_so_far: Vec<String> =
                 turn_trace(&log, turn).lines().map(str::to_string).collect();
-            let mut facts = self
-                .parts
-                .memory
-                .facts(&scope, "")
-                .await
-                .unwrap_or_default();
-            facts.truncate(self.cfg.facts_in_context);
+            let selected = self.select_facts(&scope, &incoming.text).await;
+            let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
             let ctx = nscore::EmitterContext {
                 facts,
@@ -727,6 +804,8 @@ impl Engine {
                         last_validated: now(),
                         prov,
                         trust: value_trust,
+                        // a restated cold fact is current again (M6 §6.2)
+                        state: nscore::FactState::Current,
                         ..prev
                     },
                     Some(prev) => nscore::Fact {
@@ -741,6 +820,7 @@ impl Engine {
                         valid_from: version_at(&prev),
                         valid_to: None,
                         state: nscore::FactState::Current,
+                        last_used: prev.last_used,
                     },
                     None => nscore::Fact {
                         key: key.clone(),
@@ -1150,17 +1230,13 @@ impl Engine {
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
-                let mut facts = self
-                    .parts
-                    .memory
-                    .facts(&scope, "")
-                    .await
-                    .unwrap_or_default();
-                facts.truncate(self.cfg.facts_in_context);
-                for f in facts.iter_mut() {
+                let mut selected = self.select_facts(&scope, &incoming.text).await;
+                for f in selected.iter_mut() {
                     f.uses += 1;
+                    f.last_used = now();
                     let _ = self.parts.memory.put_fact(f.clone()).await;
                 }
+                let facts = self.fact_views(&scope, &selected).await;
                 // M6 §4.3: the reply model gets the user's message, the
                 // verbatim window and the summary — not a counter string.
                 let window = state.window(self.cfg.window_turns);

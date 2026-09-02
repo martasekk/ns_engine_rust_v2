@@ -180,7 +180,8 @@ mod tests {
                 last_validated: nscore::Timestamp(1),
                 prov: nscore::Provenance::Constant,
                 ..Default::default()
-            }],
+            }
+            .into()],
             summary: None,
             window: vec![nscore::TurnRecord {
                 turn: 1,

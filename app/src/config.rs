@@ -42,10 +42,33 @@ pub struct MemorySection {
     /// "never" refuses it (M6 §6.3).
     #[serde(default = "default_remember_residual")]
     pub remember_residual: String,
+    /// Keys with these prefixes are always shown, newest first (M6 §6.5).
+    #[serde(default = "default_pinned_prefixes")]
+    pub pinned_prefixes: Vec<String>,
+    #[serde(default = "default_pinned_max")]
+    pub pinned_max: usize,
+    /// Facts lexically relevant to the current message (M6 §6.5).
+    #[serde(default = "default_relevant_max")]
+    pub relevant_max: usize,
+    /// Days without use before a fact goes cold (M6 §6.2).
+    #[serde(default = "default_fact_stale_days")]
+    pub fact_stale_days: u64,
 }
 
 fn default_remember_residual() -> String {
     "flag".into()
+}
+fn default_pinned_prefixes() -> Vec<String> {
+    vec!["user.".into()]
+}
+fn default_pinned_max() -> usize {
+    5
+}
+fn default_relevant_max() -> usize {
+    5
+}
+fn default_fact_stale_days() -> u64 {
+    90
 }
 
 fn default_window_turns() -> usize {
@@ -58,7 +81,7 @@ fn default_line_max_chars() -> usize {
     120
 }
 fn default_facts_in_context() -> usize {
-    20
+    10
 }
 
 impl Default for MemorySection {
@@ -70,6 +93,10 @@ impl Default for MemorySection {
             facts_in_context: default_facts_in_context(),
             reply_grounding_check: true,
             remember_residual: default_remember_residual(),
+            pinned_prefixes: default_pinned_prefixes(),
+            pinned_max: default_pinned_max(),
+            relevant_max: default_relevant_max(),
+            fact_stale_days: default_fact_stale_days(),
         }
     }
 }
@@ -253,13 +280,18 @@ impl Default for EvolutionSection {
 }
 
 impl EvolutionSection {
-    pub fn pass_config(&self, dry_run: bool) -> nsevolution::pass::PassConfig {
+    pub fn pass_config(
+        &self,
+        dry_run: bool,
+        fact_stale_days: u64,
+    ) -> nsevolution::pass::PassConfig {
         nsevolution::pass::PassConfig {
             regression_budget: self.regression_budget,
             probe_budget_turns: self.probe_budget_turns,
             max_notes: self.max_notes,
             regression_replay_cap: self.regression_replay_cap,
             dry_run,
+            fact_stale_days,
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -353,7 +385,9 @@ mod tests {
     fn memory_section_defaults_and_parses() {
         let cfg = AppConfig::parse("").unwrap();
         assert_eq!(cfg.memory.window_turns, 6);
-        assert_eq!(cfg.memory.facts_in_context, 20);
+        assert_eq!(cfg.memory.facts_in_context, 10);
+        assert_eq!(cfg.memory.pinned_prefixes, vec!["user.".to_string()]);
+        assert_eq!(cfg.memory.fact_stale_days, 90);
         assert_eq!(cfg.memory.caps(), nscore::Caps::default());
         let cfg = AppConfig::parse("[memory]\nwindow_turns = 2\nrecord_max_chars = 50\n").unwrap();
         assert_eq!(cfg.memory.window_turns, 2);
@@ -397,8 +431,8 @@ mod tests {
         let cfg =
             AppConfig::parse("[evolution]\nenabled = false\nprobe_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
-        assert_eq!(cfg.evolution.pass_config(true).probe_budget_turns, 7);
-        assert!(cfg.evolution.pass_config(true).dry_run);
+        assert_eq!(cfg.evolution.pass_config(true, 90).probe_budget_turns, 7);
+        assert!(cfg.evolution.pass_config(true, 90).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
     }

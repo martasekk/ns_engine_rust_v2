@@ -288,7 +288,8 @@ mod tests {
                 last_validated: nscore::Timestamp(1),
                 prov: nscore::Provenance::Constant,
                 ..Default::default()
-            }],
+            }
+            .into()],
             summary: Some(nscore::SessionSummary {
                 through_turn: 3,
                 topic: "ordering Widgetron units".into(),

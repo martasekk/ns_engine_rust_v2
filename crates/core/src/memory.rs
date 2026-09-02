@@ -170,15 +170,55 @@ pub fn lexical_rank(
     scored.into_iter().take(k).map(|(_, f)| f.clone()).collect()
 }
 
-/// `user.name: "Peter"`, plus `(unverified)` below confidence 0.75 and
-/// `(stale)` for a cold fact (M6 §6.3, §6.5).
-pub fn render_fact(f: &crate::action::Fact) -> String {
+/// A fact as the models see it (M6 §6.5): the current version plus, for
+/// pinned keys, the value it superseded — "what was my name before" is
+/// answerable from the context alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FactView {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub confidence: f32,
+    pub uses: u32,
+    pub state: crate::action::FactState,
+    /// The superseded value and when it stopped being current.
+    #[serde(default)]
+    pub previous: Option<(serde_json::Value, crate::event::Timestamp)>,
+}
+
+impl From<&crate::action::Fact> for FactView {
+    fn from(f: &crate::action::Fact) -> Self {
+        Self {
+            key: f.key.clone(),
+            value: f.value.clone(),
+            confidence: f.confidence,
+            uses: f.uses,
+            state: f.state,
+            previous: None,
+        }
+    }
+}
+
+impl From<crate::action::Fact> for FactView {
+    fn from(f: crate::action::Fact) -> Self {
+        (&f).into()
+    }
+}
+
+/// `user.name: "Peter" (was "Martin" until 17:35 UTC)`, plus `(unverified)`
+/// below confidence 0.75 and `(stale)` for a cold fact (M6 §6.1, §6.3).
+pub fn render_fact(f: &FactView) -> String {
     let mut s = format!("{}: {}", f.key, f.value);
     if f.confidence < 0.75 {
         s.push_str(" (unverified)");
     }
     if f.state == crate::action::FactState::Cold {
         s.push_str(" (stale)");
+    }
+    if let Some((prev, until)) = &f.previous {
+        s.push_str(&format!(
+            " (was {prev} until {})",
+            crate::time::format_utc_short(until.0)
+        ));
     }
     s
 }
@@ -310,6 +350,31 @@ mod tests {
             lexical_rank(&facts, "brno", 5)[0].key,
             "user.city",
             "values match too"
+        );
+    }
+
+    #[test]
+    fn fact_view_renders_markers() {
+        let mut v: FactView = crate::action::Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Peter"),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(render_fact(&v), "user.name: \"Peter\"");
+        v.previous = Some((
+            serde_json::json!("Martin"),
+            crate::event::Timestamp(1_788_370_524_628),
+        ));
+        assert_eq!(
+            render_fact(&v),
+            "user.name: \"Peter\" (was \"Martin\" until 17:35 UTC)"
+        );
+        v.confidence = 0.5;
+        v.state = crate::action::FactState::Cold;
+        assert_eq!(
+            render_fact(&v),
+            "user.name: \"Peter\" (unverified) (stale) (was \"Martin\" until 17:35 UTC)"
         );
     }
 
