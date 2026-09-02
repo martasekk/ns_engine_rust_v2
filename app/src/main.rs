@@ -85,6 +85,7 @@ async fn main() {
         persona: cfg.persona.text.clone(),
         templates: cfg.templates.clone(),
         learned: Default::default(),
+        idle_after: None,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M2 — type text, /quit to exit");

@@ -14,6 +14,9 @@ pub struct EngineConfig {
     /// Learned input repairs + guidance (spec M5). Hot-swappable: a driver
     /// replaces the set; each turn loads one snapshot at its start.
     pub learned: std::sync::Arc<arc_swap::ArcSwap<nscore::LearnedRules>>,
+    /// Driver B (spec M5 §5): after this much silence on the channel, run the
+    /// consolidator once if any turn ran since the last pass. None = off.
+    pub idle_after: Option<std::time::Duration>,
 }
 
 impl Default for EngineConfig {
@@ -26,6 +29,7 @@ impl Default for EngineConfig {
             learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 nscore::LearnedRules::default(),
             )),
+            idle_after: None,
         }
     }
 }
@@ -851,15 +855,34 @@ impl Engine {
     }
 
     /// Outer loop: recv → run_turn → send, until the channel closes.
+    /// Outer loop: recv → run_turn → send, until the channel closes. With
+    /// `idle_after` set, a quiet period runs the consolidator once (driver B,
+    /// spec M5 §5) — only when at least one turn ran since the last pass, and
+    /// never interleaved with a turn (same task).
     pub async fn run(&mut self) -> Result<(), EngineError> {
+        let mut turns_since_pass: u32 = 0;
         loop {
-            let incoming = match self.parts.channel.recv().await {
-                Ok(i) => i,
-                Err(ChannelError::Closed) => return Ok(()),
-                Err(e) => return Err(EngineError::Channel(e.to_string())),
+            let received = match self.cfg.idle_after {
+                Some(d) => tokio::time::timeout(d, self.parts.channel.recv()).await,
+                None => Ok(self.parts.channel.recv().await),
+            };
+            let incoming = match received {
+                Ok(Ok(i)) => i,
+                Ok(Err(ChannelError::Closed)) => return Ok(()),
+                Ok(Err(e)) => return Err(EngineError::Channel(e.to_string())),
+                Err(_elapsed) => {
+                    if turns_since_pass > 0 {
+                        if let Err(e) = self.parts.consolidator.run(&*self.parts.memory).await {
+                            eprintln!("evolution pass failed: {e}");
+                        }
+                        turns_since_pass = 0;
+                    }
+                    continue;
+                }
             };
             let session = incoming.session.clone();
             let text = self.run_turn(incoming).await?;
+            turns_since_pass += 1;
             self.parts
                 .channel
                 .send(&session, &text)

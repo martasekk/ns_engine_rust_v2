@@ -1345,3 +1345,106 @@ impl Emitter for GuidanceProbe {
         })
     }
 }
+
+enum Step {
+    Say(&'static str),
+    Idle,
+}
+
+/// Channel double: pops one step per recv. `Idle` sleeps long enough for the
+/// engine's idle timeout to cancel the recv future (timeouts drop it).
+struct ScriptedChannel(std::sync::Mutex<std::collections::VecDeque<Step>>);
+#[async_trait::async_trait]
+impl Channel for ScriptedChannel {
+    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        let next = self.0.lock().unwrap().pop_front();
+        match next {
+            Some(Step::Say(t)) => Ok(Incoming {
+                session: SessionId("idle".into()),
+                text: t.into(),
+            }),
+            Some(Step::Idle) => {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Err(ChannelError::Closed)
+            }
+            None => Err(ChannelError::Closed),
+        }
+    }
+    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+/// Consolidator double: counts runs and swaps an alias into the shared handle.
+struct SwapIn {
+    rules: Arc<nsengine::arc_swap::ArcSwap<LearnedRules>>,
+    runs: Arc<std::sync::atomic::AtomicU32>,
+}
+#[async_trait::async_trait]
+impl Consolidator for SwapIn {
+    async fn run(&self, _store: &dyn MemoryStore) -> Result<(), StoreError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.rules.store(Arc::new(LearnedRules {
+            alias_action: vec![AliasAction {
+                from: "eko".into(),
+                to: "echo".into(),
+            }],
+            ..Default::default()
+        }));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns() {
+    let store = Arc::new(InMemoryStore::new());
+    let rules = rules_handle(LearnedRules::default());
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut b = HarnessBuilder::new();
+    // turn 1: respond directly; turn 2: propose the typo, which only works
+    // once the alias is swapped in.
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![
+        Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        },
+        Proposal {
+            rationale: "".into(),
+            action: "eko".into(),
+            args: serde_json::json!({"text": "hi"}),
+        },
+    ])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(ScriptedChannel(std::sync::Mutex::new(
+        [
+            Step::Say("one"),
+            Step::Idle,
+            Step::Say("two"),
+            Step::Idle,
+            Step::Idle,
+        ]
+        .into(),
+    ))));
+    b.set_consolidator(Box::new(SwapIn {
+        rules: rules.clone(),
+        runs: runs.clone(),
+    }));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        learned: rules,
+        idle_after: Some(std::time::Duration::from_millis(20)),
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(1)));
+    e.run().await.unwrap();
+    // pass after "one", pass after "two", and NOT a third time (no turn in between).
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let events = store.load(&SessionId("idle".into())).await.unwrap();
+    assert_eq!(
+        tool_calls(&events, "echo"),
+        1,
+        "turn two saw the swapped-in alias"
+    );
+}
