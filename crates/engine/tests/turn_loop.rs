@@ -190,7 +190,109 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Settled { .. } => "Settled",
         EventKind::Replied { .. } => "Replied",
         EventKind::ReplyFailed { .. } => "ReplyFailed",
+        EventKind::ReplyFlagged { .. } => "ReplyFlagged",
     }
+}
+
+/// First draft invents a count and a city; the second draft reports what it
+/// was told not to state.
+struct InventingReplier(std::sync::atomic::AtomicU32);
+#[async_trait::async_trait]
+impl Replier for InventingReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            assert!(ctx.do_not_state.is_empty());
+            Ok("You have 42 orders waiting in Oslo.".into())
+        } else {
+            Ok(format!(
+                "Nothing to report. Avoided: {}",
+                ctx.do_not_state.join(",")
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("ground".into());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
+    b.set_replier(Box::new(InventingReplier(Default::default())));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "anything new?".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply, "Nothing to report. Avoided: 42,Oslo");
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert_eq!(
+        kinds,
+        vec!["UserSaid", "Proposed", "Settled", "ReplyFlagged", "Replied"]
+    );
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ReplyFlagged { draft, spans }
+            if draft == "You have 42 orders waiting in Oslo." && spans == &["42", "Oslo"]
+    )));
+    // The recording replays clean: the interceptor is off under doubles and
+    // ReplyFlagged is not a behavioral line.
+    nsengine::replay::replay_session(sid, &events, vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("ground2".into());
+    // ScriptedReplier echoes the trace, which is material by definition.
+    let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "say hi".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(!events
+        .iter()
+        .any(|ev| matches!(ev.kind, EventKind::ReplyFlagged { .. })));
+
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(InventingReplier(Default::default())));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        reply_grounding_check: false,
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let reply = e
+        .run_turn(Incoming {
+            session: SessionId("off".into()),
+            text: "anything new?".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply, "You have 42 orders waiting in Oslo.");
 }
 
 /// Proposes a tool on the first call, respond_directly after — recording the

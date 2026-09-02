@@ -184,6 +184,9 @@ pub fn fold(events: &[Event]) -> SessionState {
             EventKind::ReplyFailed { detail } => {
                 push_line(&mut current, format!("reply failed: {detail}"));
             }
+            // A flagged first draft is audit material, not something the
+            // models need to see again: the final Replied is the record.
+            EventKind::ReplyFlagged { .. } => {}
             EventKind::Replied { text } => {
                 s.history.push(("assistant".into(), text.clone()));
                 if let Some(mut r) = current.take() {

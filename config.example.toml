@@ -61,6 +61,7 @@ window_turns = 6
 record_max_chars = 300
 line_max_chars = 120
 facts_in_context = 20
+reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 
 # External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
 # [[http_component]]

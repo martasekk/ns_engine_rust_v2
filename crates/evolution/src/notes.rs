@@ -181,6 +181,7 @@ impl ProbeRunner for LiveProbe {
         let cfg = EngineConfig {
             persona: self.persona.clone(),
             learned: Arc::new(arc_swap::ArcSwap::new(rules)),
+            reply_grounding_check: false,
             ..EngineConfig::default()
         };
         let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));

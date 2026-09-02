@@ -54,6 +54,13 @@ pub enum EventKind {
     ReplyFailed {
         detail: String,
     },
+    /// The grounding interceptor (M6 §4.5) found `spans` in a first draft
+    /// that nothing in the reply context supports; the reply was generated
+    /// once more with them named. Infrastructure: replay ignores it.
+    ReplyFlagged {
+        draft: String,
+        spans: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

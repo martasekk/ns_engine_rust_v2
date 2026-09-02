@@ -34,6 +34,10 @@ pub struct MemorySection {
     /// Standing facts shown to both models per turn.
     #[serde(default = "default_facts_in_context")]
     pub facts_in_context: usize,
+    /// Flag and regenerate once a reply that states numbers, quotes or
+    /// names absent from everything the model was shown (M6 §4.5).
+    #[serde(default = "default_true")]
+    pub reply_grounding_check: bool,
 }
 
 fn default_window_turns() -> usize {
@@ -56,6 +60,7 @@ impl Default for MemorySection {
             record_max_chars: default_record_max_chars(),
             line_max_chars: default_line_max_chars(),
             facts_in_context: default_facts_in_context(),
+            reply_grounding_check: true,
         }
     }
 }
@@ -334,6 +339,9 @@ mod tests {
         assert_eq!(cfg.memory.window_turns, 2);
         assert_eq!(cfg.memory.caps().record_max_chars, 50);
         assert_eq!(cfg.memory.caps().line_max_chars, 120);
+        assert!(cfg.memory.reply_grounding_check);
+        let cfg = AppConfig::parse("[memory]\nreply_grounding_check = false\n").unwrap();
+        assert!(!cfg.memory.reply_grounding_check);
     }
 
     #[test]

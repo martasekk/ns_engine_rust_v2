@@ -40,7 +40,7 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::ReplyFailed { .. } => None,
+            EventKind::ReplyFailed { .. } | EventKind::ReplyFlagged { .. } => None,
             other => Some(normalize_kind(other)),
         })
         .collect()
@@ -48,7 +48,9 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
 
 fn normalize_kind(kind: &EventKind) -> String {
     match kind {
-        EventKind::ReplyFailed { .. } => unreachable!("filtered by normalize"),
+        EventKind::ReplyFailed { .. } | EventKind::ReplyFlagged { .. } => {
+            unreachable!("filtered by normalize")
+        }
         EventKind::UserSaid { text } => format!("UserSaid {text}"),
         EventKind::Proposed { proposal } => format!("Proposed {}", proposal.action),
         EventKind::Rejected { reason, .. } => {
@@ -300,8 +302,12 @@ pub async fn replay_with(
         b.add_guard(g);
     }
     let parts = b.build().map_err(|e| ReplayError::Engine(e.to_string()))?;
+    // The interceptor is a live-only mechanism whose outcome the recording
+    // already carries (the final Replied); with doubles it must stay off or
+    // a re-flag would drain the reply queue.
     let cfg = EngineConfig {
         learned: Arc::new(arc_swap::ArcSwap::new(opts.learned)),
+        reply_grounding_check: false,
         ..EngineConfig::default()
     };
     let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));

@@ -22,6 +22,10 @@ pub struct EngineConfig {
     pub caps: nscore::Caps,
     /// M6 §6.5: standing facts shown to both models per turn.
     pub facts_in_context: usize,
+    /// M6 §4.5: flag and regenerate (once) a reply that states numbers,
+    /// quotes or names absent from everything the model was shown. Off in
+    /// replay and probes, where recorded doubles stand in for the replier.
+    pub reply_grounding_check: bool,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +42,7 @@ impl Default for EngineConfig {
             window_turns: 6,
             caps: nscore::Caps::default(),
             facts_in_context: 20,
+            reply_grounding_check: true,
         }
     }
 }
@@ -869,19 +874,45 @@ impl Engine {
                 }
                 // M6 §4.3: the reply model gets the user's message, the
                 // verbatim window and the summary — not a counter string.
-                let ctx = ReplyContext {
+                let window = state.window(self.cfg.window_turns);
+                let guidance = rules.guidance_for_reply();
+                let make_ctx = |do_not_state: Vec<String>| ReplyContext {
                     persona: self.cfg.persona.clone(),
-                    facts,
+                    facts: facts.clone(),
                     summary: state.summary.clone(),
-                    window: state.window(self.cfg.window_turns),
+                    window: window.clone(),
                     caps: self.cfg.caps,
                     user_text: incoming.text.clone(),
-                    turn_trace: trace,
-                    guidance: rules.guidance_for_reply(),
-                    do_not_state: vec![],
+                    turn_trace: trace.clone(),
+                    guidance: guidance.clone(),
+                    do_not_state,
                 };
-                match self.parts.replier.reply(ctx).await {
-                    Ok(t) => t,
+                match self.parts.replier.reply(make_ctx(vec![])).await {
+                    Ok(draft) if self.cfg.reply_grounding_check => {
+                        // M6 §4.5: claims nothing above supports are named
+                        // and the reply is generated once more; the second
+                        // draft stands whatever it says, and both are logged.
+                        let material = crate::ground::Material::from_context(&make_ctx(vec![]));
+                        let spans = crate::ground::ungrounded(&draft, &material);
+                        if spans.is_empty() {
+                            draft
+                        } else {
+                            log.append(
+                                turn,
+                                now(),
+                                EventKind::ReplyFlagged {
+                                    draft: draft.clone(),
+                                    spans: spans.clone(),
+                                },
+                            );
+                            self.parts
+                                .replier
+                                .reply(make_ctx(spans))
+                                .await
+                                .unwrap_or(draft)
+                        }
+                    }
+                    Ok(draft) => draft,
                     Err(e) => {
                         // F7: a replier failure is an event, not just a
                         // fallback text — mining and audits must see it.
