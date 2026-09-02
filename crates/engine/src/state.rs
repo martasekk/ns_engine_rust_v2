@@ -198,6 +198,14 @@ pub fn fold(events: &[Event]) -> SessionState {
     s
 }
 
+impl SessionState {
+    /// The last `k` completed turns, oldest first (M6 §4.1).
+    pub fn window(&self, k: usize) -> Vec<TurnRecord> {
+        let start = self.records.len().saturating_sub(k);
+        self.records[start..].to_vec()
+    }
+}
+
 pub fn state_summary(s: &SessionState) -> String {
     format!("turn {}, {} messages", s.turn, s.history.len())
 }

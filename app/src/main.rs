@@ -218,6 +218,9 @@ async fn main() {
         templates: cfg.templates.clone(),
         learned: rules,
         idle_after: cfg.evolution.idle_after(),
+        window_turns: cfg.memory.window_turns,
+        caps: cfg.memory.caps(),
+        facts_in_context: cfg.memory.facts_in_context,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M5 — type text, /quit to exit");

@@ -15,6 +15,58 @@ pub struct AppConfig {
     pub templates: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub evolution: EvolutionSection,
+    #[serde(default)]
+    pub memory: MemorySection,
+}
+
+/// [memory] — working memory sizes (M6 spec §4, §10).
+#[derive(Debug, serde::Deserialize)]
+pub struct MemorySection {
+    /// Completed turns rendered verbatim into both model contexts.
+    #[serde(default = "default_window_turns")]
+    pub window_turns: usize,
+    /// Whole rendered turn record, characters.
+    #[serde(default = "default_record_max_chars")]
+    pub record_max_chars: usize,
+    /// Each action line and the reply inside a record, characters.
+    #[serde(default = "default_line_max_chars")]
+    pub line_max_chars: usize,
+    /// Standing facts shown to both models per turn.
+    #[serde(default = "default_facts_in_context")]
+    pub facts_in_context: usize,
+}
+
+fn default_window_turns() -> usize {
+    6
+}
+fn default_record_max_chars() -> usize {
+    300
+}
+fn default_line_max_chars() -> usize {
+    120
+}
+fn default_facts_in_context() -> usize {
+    20
+}
+
+impl Default for MemorySection {
+    fn default() -> Self {
+        Self {
+            window_turns: default_window_turns(),
+            record_max_chars: default_record_max_chars(),
+            line_max_chars: default_line_max_chars(),
+            facts_in_context: default_facts_in_context(),
+        }
+    }
+}
+
+impl MemorySection {
+    pub fn caps(&self) -> nscore::Caps {
+        nscore::Caps {
+            record_max_chars: self.record_max_chars,
+            line_max_chars: self.line_max_chars,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -270,6 +322,18 @@ mod tests {
     #[test]
     fn bad_toml_is_a_readable_error() {
         assert!(AppConfig::parse("[llm").is_err());
+    }
+
+    #[test]
+    fn memory_section_defaults_and_parses() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.memory.window_turns, 6);
+        assert_eq!(cfg.memory.facts_in_context, 20);
+        assert_eq!(cfg.memory.caps(), nscore::Caps::default());
+        let cfg = AppConfig::parse("[memory]\nwindow_turns = 2\nrecord_max_chars = 50\n").unwrap();
+        assert_eq!(cfg.memory.window_turns, 2);
+        assert_eq!(cfg.memory.caps().record_max_chars, 50);
+        assert_eq!(cfg.memory.caps().line_max_chars, 120);
     }
 
     #[test]

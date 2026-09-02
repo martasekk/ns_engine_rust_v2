@@ -28,10 +28,38 @@ impl CloudEmitter {
     }
 }
 
+/// M6 §4.2/§4.4: facts → summary → verbatim window → current turn → this
+/// turn's actions → pending/rejections → guidance. Stable blocks first.
 fn render_context(ctx: &EmitterContext) -> String {
-    let mut s = format!("State: {}\nRecent turns:\n", ctx.state_summary);
-    for (speaker, text) in &ctx.recent_turns {
-        s.push_str(&format!("{speaker}: {text}\n"));
+    let mut s = String::new();
+    if !ctx.facts.is_empty() {
+        s.push_str("Facts:\n");
+        for f in &ctx.facts {
+            s.push_str(&format!("- {}: {}\n", f.key, f.value));
+        }
+    }
+    if let Some(summary) = &ctx.summary {
+        s.push_str(&nscore::render_summary(summary));
+        s.push('\n');
+    }
+    if !ctx.window.is_empty() {
+        s.push_str("Recent turns:\n");
+        s.push_str(&nscore::render_window(
+            &ctx.window,
+            ctx.window.len(),
+            &ctx.caps,
+        ));
+        s.push('\n');
+    }
+    s.push_str(&format!("Current turn:\nuser: {}\n", ctx.user_text));
+    if !ctx.trace_so_far.is_empty() {
+        s.push_str("This turn so far:\n");
+        for line in &ctx.trace_so_far {
+            s.push_str(&format!("- {line}\n"));
+        }
+    }
+    if ctx.pending_confirmation {
+        s.push_str("Pending confirmation: awaiting the user's yes/no on the staged action.\n");
     }
     if !ctx.rejections_this_turn.is_empty() {
         s.push_str("Rejected this turn:\n");
@@ -144,8 +172,26 @@ mod tests {
 
     fn ctx() -> EmitterContext {
         EmitterContext {
-            state_summary: "turn 1, 1 messages".into(),
-            recent_turns: vec![("user".into(), "say hi".into())],
+            facts: vec![nscore::Fact {
+                key: "user.name".into(),
+                value: serde_json::json!("Martin"),
+                confidence: 1.0,
+                uses: 0,
+                last_validated: nscore::Timestamp(1),
+                prov: nscore::Provenance::Constant,
+            }],
+            summary: None,
+            window: vec![nscore::TurnRecord {
+                turn: 1,
+                user: "earlier question".into(),
+                did: vec!["echo -> ok: echo: x".into()],
+                reply: "x".into(),
+                trust: nscore::Trust::User,
+            }],
+            caps: Default::default(),
+            user_text: "say hi".into(),
+            trace_so_far: vec!["ToolReturned(ok: echo: hi)".into()],
+            pending_confirmation: false,
             rejections_this_turn: vec!["guard g: nope".into()],
             guidance: vec![],
         }
@@ -212,9 +258,17 @@ mod tests {
         );
         assert_eq!(req["messages"][0]["role"], "system");
         let text = req["messages"][1]["content"].as_str().unwrap();
-        assert!(text.contains("turn 1, 1 messages"));
-        assert!(text.contains("user: say hi"));
-        assert!(text.contains("guard g: nope"));
+        // M6 §4.2: facts, verbatim window, the current message, this turn's
+        // actions and the rejections all reach the emitter, in that order.
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        assert!(at("Facts:\n- user.name: \"Martin\"") < at("[t1] user: earlier question"));
+        assert!(at("[t1] user: earlier question") < at("Current turn:\nuser: say hi"));
+        assert!(at("user: say hi") < at("This turn so far:\n- ToolReturned(ok: echo: hi)"));
+        assert!(at("ToolReturned(ok: echo: hi)") < at("guard g: nope"));
+        assert!(text.ends_with("Propose the next action."));
     }
 
     #[tokio::test]

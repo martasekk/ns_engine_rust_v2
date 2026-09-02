@@ -174,6 +174,15 @@ impl LearnedRules {
             .map(|n| n.text.clone())
             .collect()
     }
+
+    /// Notes scoped `reply` (M6 §8.5): rendered to the reply model only.
+    pub fn guidance_for_reply(&self) -> Vec<String> {
+        self.notes
+            .iter()
+            .filter(|n| n.scope == "reply")
+            .map(|n| n.text.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +278,22 @@ mod tests {
         assert_eq!(
             rules.guidance_for(&["echo".to_string()]),
             vec!["G".to_string(), "E".to_string()]
+        );
+        assert_eq!(rules.guidance_for(&[]), vec!["G".to_string()]);
+    }
+
+    #[test]
+    fn reply_scoped_notes_go_to_the_replier_only() {
+        let rules = LearnedRules {
+            notes: vec![
+                Note::new("global", "G", 0.0),
+                Note::new("reply", "Answer the question first.", 0.0),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            rules.guidance_for_reply(),
+            vec!["Answer the question first.".to_string()]
         );
         assert_eq!(rules.guidance_for(&[]), vec!["G".to_string()]);
     }

@@ -54,6 +54,14 @@ probe_budget_turns = 40      # live probe turns per pass (notes lane)
 max_notes = 20
 regression_replay_cap = 200  # newest sessions replayed by the symbolic gate
 
+# Working memory (M6 spec §4). Both models see the last window_turns turns
+# verbatim (user text, actions with outcomes, reply), capped per record.
+[memory]
+window_turns = 6
+record_max_chars = 300
+line_max_chars = 120
+facts_in_context = 20
+
 # External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
 # [[http_component]]
 # name = "check_stock"

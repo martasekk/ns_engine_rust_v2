@@ -209,7 +209,7 @@ impl Emitter for CtxProbe {
     ) -> Result<Proposal, EmitError> {
         let mut n = self.calls.lock().unwrap();
         *n += 1;
-        self.seen.lock().unwrap().push(ctx.state_summary.clone());
+        self.seen.lock().unwrap().push(ctx.trace_so_far.join("\n"));
         if *n == 1 {
             Ok(Proposal {
                 rationale: "r".into(),
@@ -297,6 +297,72 @@ async fn persona_flows_from_config_to_reply_context() {
         .await
         .unwrap();
     assert_eq!(reply, "persona was: Tomáš the salesbot");
+}
+
+/// Renders what the reply model can actually see: the current user text and
+/// the verbatim window of earlier turns.
+struct WindowProbe;
+#[async_trait::async_trait]
+impl Replier for WindowProbe {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        Ok(format!(
+            "USER={} | WINDOW={} | FACTS={}",
+            ctx.user_text,
+            nscore::render_window(&ctx.window, ctx.window.len(), &ctx.caps),
+            ctx.facts.len()
+        ))
+    }
+}
+
+#[tokio::test]
+async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
+    // Seen live (turns 63–117 of the recorded session): the replier received
+    // only facts, a counter and "Proposed(respond_directly)", never the
+    // user's message or earlier turns, and improvised greetings.
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("win".into());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal("first")])));
+    b.set_replier(Box::new(WindowProbe));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    );
+    let r1 = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "say first".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        r1.starts_with("USER=say first | WINDOW= |"),
+        "no completed turn yet: {r1}"
+    );
+    let r2 = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "what did you do before?".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        r2.starts_with("USER=what did you do before? | WINDOW=[t1] user: say first"),
+        "{r2}"
+    );
+    assert!(
+        r2.contains("did:  echo -> ok: echo: first"),
+        "outcomes travel with the window: {r2}"
+    );
+    assert!(
+        r2.contains("bot:  USER=say first"),
+        "the earlier reply is in the record: {r2}"
+    );
 }
 
 #[tokio::test]

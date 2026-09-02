@@ -149,8 +149,13 @@ mod tests {
             args: serde_json::json!({"text":"hi"}),
         }]);
         let ctx = || EmitterContext {
-            state_summary: "".into(),
-            recent_turns: vec![],
+            facts: vec![],
+            summary: None,
+            window: vec![],
+            caps: Default::default(),
+            user_text: "".into(),
+            trace_so_far: vec![],
+            pending_confirmation: false,
             rejections_this_turn: vec![],
             guidance: vec![],
         };

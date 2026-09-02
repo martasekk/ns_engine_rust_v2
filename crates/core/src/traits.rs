@@ -45,10 +45,22 @@ pub trait Guard: Send + Sync {
     fn check(&self, p: &ClassifiedProposal, ctx: &GuardCtx) -> Verdict;
 }
 
+/// What the action-selection model sees (M6 spec §4.2): the same projection
+/// of the log the replier sees, rendered for choosing an action.
 pub struct EmitterContext {
-    pub state_summary: String,
-    /// (speaker, text), speaker: "user" | "assistant"
-    pub recent_turns: Vec<(String, String)>,
+    /// Standing facts in scope, already ranked and budgeted (M6 §6.5).
+    pub facts: Vec<Fact>,
+    /// Rolling summary of the turns outside the window (M6 §5.1).
+    pub summary: Option<crate::memory::SessionSummary>,
+    /// The last few completed turns, verbatim, oldest first (M6 §4.1).
+    pub window: Vec<crate::memory::TurnRecord>,
+    pub caps: crate::memory::Caps,
+    /// The current user message.
+    pub user_text: String,
+    /// This turn's actions so far, one line each with outcomes and refusals.
+    pub trace_so_far: Vec<String>,
+    /// A staged action awaits the user's yes/no.
+    pub pending_confirmation: bool,
     pub rejections_this_turn: Vec<String>,
     /// Learned guidance notes (spec M5 §3.3): global + scoped to legal actions.
     pub guidance: Vec<String>,
@@ -71,12 +83,23 @@ pub trait Emitter: Send + Sync {
     ) -> Result<Proposal, EmitError>;
 }
 
+/// What the reply model sees (M6 spec §4.2–4.3). Block order is stable-first
+/// for prefix caching: persona → facts → summary → window → current turn.
 pub struct ReplyContext {
     pub persona: String,
     pub facts: Vec<Fact>,
-    pub session_summary: String,
+    pub summary: Option<crate::memory::SessionSummary>,
+    pub window: Vec<crate::memory::TurnRecord>,
+    pub caps: crate::memory::Caps,
+    /// The current user message — the one thing the reply must answer.
+    pub user_text: String,
     /// Outcomes AND refusal reasons, human-readable lines.
     pub turn_trace: String,
+    /// Reply-scoped learned notes (M6 §8.5).
+    pub guidance: Vec<String>,
+    /// Claims the grounding interceptor found unsupported in a first draft
+    /// (M6 §4.5); non-empty only on the single regeneration.
+    pub do_not_state: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

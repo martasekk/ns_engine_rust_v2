@@ -1,4 +1,4 @@
-use crate::state::{fold, state_summary};
+use crate::state::fold;
 use nscore::{
     ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming, LegalActionSet,
     RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome, Verdict,
@@ -17,6 +17,11 @@ pub struct EngineConfig {
     /// Driver B (spec M5 §5): after this much silence on the channel, run the
     /// consolidator once if any turn ran since the last pass. None = off.
     pub idle_after: Option<std::time::Duration>,
+    /// M6 §4.1: completed turns rendered verbatim into both model contexts.
+    pub window_turns: usize,
+    pub caps: nscore::Caps,
+    /// M6 §6.5: standing facts shown to both models per turn.
+    pub facts_in_context: usize,
 }
 
 impl Default for EngineConfig {
@@ -30,6 +35,9 @@ impl Default for EngineConfig {
                 nscore::LearnedRules::default(),
             )),
             idle_after: None,
+            window_turns: 6,
+            caps: nscore::Caps::default(),
+            facts_in_context: 20,
         }
     }
 }
@@ -257,26 +265,24 @@ impl Engine {
                 LegalActionSet { actions }
             };
 
-            // b. emitter context
-            let recent: Vec<(String, String)> =
-                state.history.iter().rev().take(6).rev().cloned().collect();
-            // The emitter must see what this turn has already done — otherwise
-            // it re-proposes completed actions until max_iterations exhausts.
-            let mut summary = state_summary(&state);
-            let trace_so_far = turn_trace(&log, turn);
-            if !trace_so_far.is_empty() {
-                summary.push_str("\nThis turn so far:\n");
-                summary.push_str(&trace_so_far);
-            }
-            if active_pending.is_some() {
-                summary.push_str(
-                    "\nPending confirmation: awaiting the user's yes/no on the staged action.",
-                );
-            }
+            // b. emitter context (M6 §4.2): the same projection of the log
+            // the replier sees. The emitter must see what this turn has
+            // already done — otherwise it re-proposes completed actions until
+            // max_iterations exhausts — and the standing facts, or it
+            // re-remembers them every turn (seen live).
+            let trace_so_far: Vec<String> =
+                turn_trace(&log, turn).lines().map(str::to_string).collect();
+            let mut facts = self.parts.memory.facts("").await.unwrap_or_default();
+            facts.truncate(self.cfg.facts_in_context);
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
             let ctx = nscore::EmitterContext {
-                state_summary: summary,
-                recent_turns: recent,
+                facts,
+                summary: state.summary.clone(),
+                window: state.window(self.cfg.window_turns),
+                caps: self.cfg.caps,
+                user_text: incoming.text.clone(),
+                trace_so_far,
+                pending_confirmation: active_pending.is_some(),
                 rejections_this_turn: rejections_this_turn.clone(),
                 guidance: rules.guidance_for(&legal_names),
             };
@@ -856,16 +862,23 @@ impl Engine {
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
                 let mut facts = self.parts.memory.facts("").await.unwrap_or_default();
-                facts.truncate(20);
+                facts.truncate(self.cfg.facts_in_context);
                 for f in facts.iter_mut() {
                     f.uses += 1;
                     let _ = self.parts.memory.put_fact(f.clone()).await;
                 }
+                // M6 §4.3: the reply model gets the user's message, the
+                // verbatim window and the summary — not a counter string.
                 let ctx = ReplyContext {
                     persona: self.cfg.persona.clone(),
                     facts,
-                    session_summary: state_summary(&state),
+                    summary: state.summary.clone(),
+                    window: state.window(self.cfg.window_turns),
+                    caps: self.cfg.caps,
+                    user_text: incoming.text.clone(),
                     turn_trace: trace,
+                    guidance: rules.guidance_for_reply(),
+                    do_not_state: vec![],
                 };
                 match self.parts.replier.reply(ctx).await {
                     Ok(t) => t,
