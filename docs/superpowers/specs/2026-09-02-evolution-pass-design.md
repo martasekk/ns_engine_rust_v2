@@ -277,3 +277,31 @@ All fields have the defaults shown; the section may be omitted entirely.
 - Note proposals from a different (cheaper) model than the production emitter — never,
   a note is model-specific by design.
 - Cross-replica ledger merge — when a second replica exists.
+
+## 11. Amendments (2026-09-02, plan time)
+
+Settled while writing the implementation plan
+(`docs/superpowers/plans/2026-09-02-m5-evolution-pass.md`, Global Constraints):
+
+1. **Tool-arg validation is new.** The engine had no schema check on tool args, so
+   `Rejected{Malformed}` never fired for them. `ns-core::validate_args` (required /
+   type / enum subset) now runs right before classification; a failure does not
+   narrow the legal set, so the emitter can retry with repaired args. This is what
+   makes the `normalize_arg` lane observable. `remember_fact`'s dotted-key rule stays
+   engine-custom.
+2. **Hashes are sha256, not blake3.** Note hash = `sha256:<hex>` of
+   `scope + "\n" + text`; patch hash = `sha256:<hex>` of the patch's canonical JSON.
+   `sha2` was already a workspace dependency.
+3. **`alias_action` mining uses the production specs.** The legal set is
+   `known_specs` (the app's tool specs) plus the synthetic actions, not a per-event
+   replay reconstruction. Replay doubles carry the real `ActionSpec` when known, so
+   legality and validation match production.
+4. **Baseline-divergent sessions are excluded from the regression check.** A session
+   that already diverges from its recording under the *current* rules cannot witness
+   a regression; it is counted as `skipped_baseline`, and only baseline-clean sessions
+   that diverge under the candidate count as regressions.
+
+Also: "attributable to args" for `ToolReturned{Err}` means `kind == "bad_args"`;
+a `Corrected` text of the form `key = value` becomes a `Fact` with
+`Provenance::Residual` and confidence 1.0; a note probe costs 2× the session's turns
+(one run without the note, one with).
