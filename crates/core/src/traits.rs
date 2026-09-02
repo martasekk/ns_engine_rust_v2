@@ -121,6 +121,8 @@ pub trait MemoryStore: Send + Sync {
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError>;
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError>;
     async fn put_artifact(&self, content: Vec<u8>) -> Result<ArtifactId, StoreError>;
+    /// All sessions with at least one event, most recently active first.
+    async fn sessions(&self) -> Result<Vec<SessionId>, StoreError>;
 }
 
 #[async_trait]

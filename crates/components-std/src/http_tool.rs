@@ -48,16 +48,15 @@ impl Tool for HttpTool {
         &self.spec
     }
 
-    async fn call(
-        &self,
-        args: &serde_json::Value,
-        ctx: &ToolCtx,
-    ) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let (status, body) = self
             .transport
             .post_json(&self.url, args)
             .await
-            .map_err(|detail| ToolError::Failed { kind: "network".into(), detail })?;
+            .map_err(|detail| ToolError::Failed {
+                kind: "network".into(),
+                detail,
+            })?;
         if !(200..300).contains(&status) {
             return Err(ToolError::Failed {
                 kind: format!("http_{status}"),
@@ -124,12 +123,19 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: None,
+                },
             )
             .await
             .unwrap();
         assert!(out.summary.contains("in_stock"));
-        assert_eq!(out.trust, Trust::External, "external content MUST be External trust");
+        assert_eq!(
+            out.trust,
+            Trust::External,
+            "external content MUST be External trust"
+        );
         let reqs = mock.requests.lock().unwrap();
         assert_eq!(reqs[0].0, "https://example.test/stock");
         assert_eq!(reqs[0].1, serde_json::json!({"product": "widget"}));
@@ -142,7 +148,10 @@ mod tests {
         let err = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: None,
+                },
             )
             .await
             .unwrap_err();
@@ -156,7 +165,10 @@ mod tests {
         let err = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: None,
+                },
             )
             .await
             .unwrap_err();
@@ -196,6 +208,9 @@ mod tests {
             self.0.lock().unwrap().push(content);
             Ok(id)
         }
+        async fn sessions(&self) -> Result<Vec<nscore::SessionId>, nscore::StoreError> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]
@@ -207,7 +222,10 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: Some(sink.clone()) },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: Some(sink.clone()),
+                },
             )
             .await
             .unwrap();
@@ -215,7 +233,11 @@ mod tests {
         let stored = sink.0.lock().unwrap();
         assert_eq!(stored.len(), 1, "full body stored once");
         let expected_id = nscore::ArtifactId::for_content(&stored[0]);
-        assert_eq!(out.artifact, Some(expected_id), "artifact id is the content hash");
+        assert_eq!(
+            out.artifact,
+            Some(expected_id),
+            "artifact id is the content hash"
+        );
         assert!(stored[0].len() > 5000, "the FULL body was stored");
     }
 
@@ -227,7 +249,10 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: Some(sink.clone()) },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: Some(sink.clone()),
+                },
             )
             .await
             .unwrap();
@@ -243,7 +268,10 @@ mod tests {
         let out = t
             .call(
                 &serde_json::json!({"product": "widget"}),
-                &ToolCtx { session: SessionId("s".into()), artifacts: None },
+                &ToolCtx {
+                    session: SessionId("s".into()),
+                    artifacts: None,
+                },
             )
             .await
             .unwrap();

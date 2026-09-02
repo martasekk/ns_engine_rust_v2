@@ -30,7 +30,8 @@ fn unhex32(s: &str) -> Result<[u8; 32], StoreError> {
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(io_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(io_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(io_err)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                  session_id TEXT NOT NULL,
@@ -56,7 +57,9 @@ impl SqliteStore {
              );",
         )
         .map_err(io_err)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -207,6 +210,24 @@ impl MemoryStore for SqliteStore {
         .map_err(io_err)?;
         Ok(id)
     }
+
+    async fn sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, MAX(at) AS last FROM events
+                 GROUP BY session_id ORDER BY last DESC, session_id DESC",
+            )
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(io_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(SessionId(row.map_err(io_err)?));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -226,13 +247,24 @@ mod tests {
         let sid = SessionId("s".into());
         let mut log = EventLog::new(sid.clone());
         log.append(1, Timestamp(1), EventKind::UserSaid { text: "hi".into() });
-        log.append(1, Timestamp(2), EventKind::Replied { text: "hello".into() });
+        log.append(
+            1,
+            Timestamp(2),
+            EventKind::Replied {
+                text: "hello".into(),
+            },
+        );
         store.append(&sid, log.events()).await.unwrap();
 
         let loaded = store.load(&sid).await.unwrap();
         assert_eq!(loaded, log.events().to_vec());
-        assert!(EventLog::from_events(sid.clone(), loaded).verify_chain().is_ok());
-        assert_eq!(store.load(&SessionId("other".into())).await.unwrap(), vec![]);
+        assert!(EventLog::from_events(sid.clone(), loaded)
+            .verify_chain()
+            .is_ok());
+        assert_eq!(
+            store.load(&SessionId("other".into())).await.unwrap(),
+            vec![]
+        );
     }
 
     #[tokio::test]
@@ -256,7 +288,13 @@ mod tests {
         {
             let store = SqliteStore::open(&path).unwrap();
             let mut log = EventLog::new(sid.clone());
-            log.append(1, Timestamp(1), EventKind::UserSaid { text: "persist me".into() });
+            log.append(
+                1,
+                Timestamp(1),
+                EventKind::UserSaid {
+                    text: "persist me".into(),
+                },
+            );
             store.append(&sid, log.events()).await.unwrap();
         }
         let store = SqliteStore::open(&path).unwrap();
@@ -289,6 +327,29 @@ mod tests {
         let id = store.put_artifact(b"payload".to_vec()).await.unwrap();
         assert_eq!(id, ArtifactId::for_content(b"payload"));
         assert_eq!(store.artifact(&id).await.unwrap(), b"payload".to_vec());
-        assert!(matches!(store.artifact(&ArtifactId([9u8; 32])).await, Err(StoreError::NotFound)));
+        assert!(matches!(
+            store.artifact(&ArtifactId([9u8; 32])).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sessions_lists_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("s.sqlite")).unwrap();
+        for (name, at) in [("old", 1u64), ("new", 9), ("mid", 5)] {
+            let sid = SessionId(name.into());
+            let mut log = EventLog::new(sid.clone());
+            log.append(1, Timestamp(at), EventKind::UserSaid { text: "x".into() });
+            store.append(&sid, log.events()).await.unwrap();
+        }
+        let names: Vec<String> = store
+            .sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, vec!["new", "mid", "old"]);
     }
 }

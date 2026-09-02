@@ -102,7 +102,9 @@ impl HarnessBuilder {
         let replier = self.replier.ok_or(BuildError::MissingSlot("replier"))?;
         let memory = self.memory.ok_or(BuildError::MissingSlot("memory"))?;
         let channel = self.channel.ok_or(BuildError::MissingSlot("channel"))?;
-        let consolidator = self.consolidator.ok_or(BuildError::MissingSlot("consolidator"))?;
+        let consolidator = self
+            .consolidator
+            .ok_or(BuildError::MissingSlot("consolidator"))?;
         let mut seen = HashSet::new();
         for t in &self.tools {
             let name = t.spec().name.clone();
@@ -183,6 +185,9 @@ mod tests {
         async fn put_artifact(&self, c: Vec<u8>) -> Result<ArtifactId, StoreError> {
             Ok(ArtifactId::for_content(&c))
         }
+        async fn sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+            Ok(vec![])
+        }
     }
 
     struct NullConsolidator;
@@ -216,7 +221,11 @@ mod tests {
             _a: &serde_json::Value,
             _c: &ToolCtx,
         ) -> Result<ToolOutput, ToolError> {
-            Ok(ToolOutput { summary: "".into(), artifact: None, trust: Trust::System })
+            Ok(ToolOutput {
+                summary: "".into(),
+                artifact: None,
+                trust: Trust::System,
+            })
         }
     }
 
@@ -256,7 +265,10 @@ mod tests {
         fill_all(&mut b);
         b.add_tool(Arc::new(NullTool::named("echo")));
         b.add_tool(Arc::new(NullTool::named("echo")));
-        assert_eq!(b.build().err(), Some(BuildError::DuplicateTool("echo".into())));
+        assert_eq!(
+            b.build().err(),
+            Some(BuildError::DuplicateTool("echo".into()))
+        );
     }
 
     #[test]

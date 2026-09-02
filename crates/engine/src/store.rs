@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use nscore::{
-    ArtifactId, Consolidator, Event, Fact, MemoryStore, SessionId, StoreError,
-};
+use nscore::{ArtifactId, Consolidator, Event, Fact, MemoryStore, SessionId, StoreError};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
@@ -33,7 +31,13 @@ impl MemoryStore for InMemoryStore {
     }
 
     async fn load(&self, session: &SessionId) -> Result<Vec<Event>, StoreError> {
-        Ok(self.events.lock().await.get(session).cloned().unwrap_or_default())
+        Ok(self
+            .events
+            .lock()
+            .await
+            .get(session)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn facts(&self, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
@@ -53,13 +57,29 @@ impl MemoryStore for InMemoryStore {
     }
 
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError> {
-        self.artifacts.lock().await.get(id).cloned().ok_or(StoreError::NotFound)
+        self.artifacts
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     async fn put_artifact(&self, content: Vec<u8>) -> Result<ArtifactId, StoreError> {
         let id = ArtifactId::for_content(&content);
         self.artifacts.lock().await.insert(id, content);
         Ok(id)
+    }
+
+    async fn sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+        let map = self.events.lock().await;
+        let mut v: Vec<(u64, SessionId)> = map
+            .iter()
+            .filter(|(_, evs)| !evs.is_empty())
+            .map(|(sid, evs)| (evs.iter().map(|e| e.at.0).max().unwrap_or(0), sid.clone()))
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1 .0.cmp(&a.1 .0)));
+        Ok(v.into_iter().map(|(_, s)| s).collect())
     }
 }
 
@@ -86,7 +106,10 @@ mod tests {
         store.append(&sid, log.events()).await.unwrap();
         let loaded = store.load(&sid).await.unwrap();
         assert_eq!(loaded, log.events().to_vec());
-        assert_eq!(store.load(&SessionId("other".into())).await.unwrap(), vec![]);
+        assert_eq!(
+            store.load(&SessionId("other".into())).await.unwrap(),
+            vec![]
+        );
     }
 
     #[tokio::test]
@@ -115,5 +138,24 @@ mod tests {
         store.put_fact(f.clone()).await.unwrap();
         assert_eq!(store.facts("user.prefs").await.unwrap(), vec![f]);
         assert_eq!(store.facts("orders").await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn sessions_lists_newest_first() {
+        let store = InMemoryStore::new();
+        for (name, at) in [("old", 1u64), ("new", 9), ("mid", 5)] {
+            let sid = SessionId(name.into());
+            let mut log = EventLog::new(sid.clone());
+            log.append(1, Timestamp(at), EventKind::UserSaid { text: "x".into() });
+            store.append(&sid, log.events()).await.unwrap();
+        }
+        let names: Vec<String> = store
+            .sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(names, vec!["new", "mid", "old"]);
     }
 }
