@@ -62,15 +62,16 @@ pub struct Signature {
     pub kind: SignatureKind,
 }
 
-pub const SYNTHETIC_ACTIONS: [&str; 3] = ["respond_directly", "ask_clarification", "remember_fact"];
+pub const SYNTHETIC_ACTIONS: [&str; 5] = [
+    "respond_directly",
+    "ask_clarification",
+    "remember_fact",
+    "forget_fact",
+    "forget_all",
+];
 
 /// Lowercase ASCII alphanumerics only: "getTime" and "get_time" squash equal.
-fn squash(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
+use nscore::squash;
 
 /// The legal name a near-miss most plausibly meant: exact squashed match,
 /// else the unique name within Damerau-Levenshtein 2. Ties yield nothing —

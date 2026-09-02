@@ -35,7 +35,7 @@ fn render_context(ctx: &EmitterContext) -> String {
     if !ctx.facts.is_empty() {
         s.push_str("Facts:\n");
         for f in &ctx.facts {
-            s.push_str(&format!("- {}: {}\n", f.key, f.value));
+            s.push_str(&format!("- {}\n", nscore::render_fact(f)));
         }
     }
     if let Some(summary) = &ctx.summary {
@@ -179,6 +179,7 @@ mod tests {
                 uses: 0,
                 last_validated: nscore::Timestamp(1),
                 prov: nscore::Provenance::Constant,
+                ..Default::default()
             }],
             summary: None,
             window: vec![nscore::TurnRecord {

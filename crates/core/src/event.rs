@@ -7,7 +7,7 @@ pub struct EventId(pub u64);
 pub struct SessionId(pub String);
 
 /// Unix milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

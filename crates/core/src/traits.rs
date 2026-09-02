@@ -140,8 +140,35 @@ pub enum StoreError {
 pub trait MemoryStore: Send + Sync {
     async fn append(&self, session: &SessionId, events: &[Event]) -> Result<(), StoreError>;
     async fn load(&self, session: &SessionId) -> Result<Vec<Event>, StoreError>;
-    async fn facts(&self, key_prefix: &str) -> Result<Vec<Fact>, StoreError>;
+    /// Current facts in `scope` whose key starts with `key_prefix`, key order.
+    async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError>;
+    /// Every version of one fact, newest `valid_from` first (M6 §6.1).
+    async fn fact_history(&self, scope: &str, key: &str) -> Result<Vec<Fact>, StoreError>;
+    /// Make `fact` the current version of `(scope, key)`: an existing row
+    /// with the same `valid_from` is updated in place; otherwise every
+    /// current row of that key is marked superseded (`valid_to =
+    /// fact.valid_from`) and the new row inserted. Never deletes.
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError>;
+    /// Soft-delete the current version (`state = forgotten`, `valid_to = at`).
+    /// Ok(false) when there is no current version.
+    async fn forget_fact(
+        &self,
+        scope: &str,
+        key: &str,
+        at: crate::event::Timestamp,
+    ) -> Result<bool, StoreError>;
+    /// Hard-delete every version of every fact in `scope`; rows removed.
+    async fn purge_facts(&self, scope: &str) -> Result<usize, StoreError>;
+    /// Current facts in `scope` relevant to `query`, best first, at most `k`
+    /// (M6 §6.5; lexical until FTS5 lands).
+    async fn search_facts(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError>;
+    /// Every scope holding at least one fact row.
+    async fn scopes(&self) -> Result<Vec<String>, StoreError>;
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError>;
     async fn put_artifact(&self, content: Vec<u8>) -> Result<ArtifactId, StoreError>;
     /// All sessions with at least one event, most recently active first.

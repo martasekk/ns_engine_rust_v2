@@ -26,6 +26,11 @@ pub struct EngineConfig {
     /// quotes or names absent from everything the model was shown. Off in
     /// replay and probes, where recorded doubles stand in for the replier.
     pub reply_grounding_check: bool,
+    /// M6 §6.6: the fact scope a session writes to and reads from. The CLI
+    /// maps everything to `global`; a multi-user channel maps its chat id.
+    pub scope_for: std::sync::Arc<dyn Fn(&nscore::SessionId) -> String + Send + Sync>,
+    /// M6 §6.3: policy for `remember_fact` values with no grounding.
+    pub remember_residual: RememberResidual,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +48,8 @@ impl Default for EngineConfig {
             caps: nscore::Caps::default(),
             facts_in_context: 20,
             reply_grounding_check: true,
+            scope_for: std::sync::Arc::new(|_| "global".to_string()),
+            remember_residual: RememberResidual::Flag,
         }
     }
 }
@@ -168,6 +175,50 @@ fn remember_fact_spec() -> nscore::ActionSpec {
     }
 }
 
+/// Engine-owned synthetic action: soft-delete one fact (M6 §6.2).
+pub const FORGET_FACT: &str = "forget_fact";
+
+fn forget_fact_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: FORGET_FACT.into(),
+        description: "Forget one stored fact by its key (e.g. user.name).".into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "key": { "type": "string" } },
+            "required": ["key"]
+        }),
+        side_effect: nscore::SideEffect::Reversible,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// Engine-owned synthetic action: purge every fact in the session's scope
+/// (M6 §6.2). Irreversible: staged behind the confirmation flow.
+pub const FORGET_ALL: &str = "forget_all";
+
+fn forget_all_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: FORGET_ALL.into(),
+        description: "Forget everything stored about the user (asks for confirmation first)."
+            .into(),
+        args_schema: serde_json::json!({"type": "object", "properties": {}}),
+        side_effect: nscore::SideEffect::Irreversible,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// What to do with a remembered value nothing in the session grounds
+/// (M6 §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RememberResidual {
+    /// Store at confidence 0.5, shown as `(unverified)`; restatement promotes.
+    Flag,
+    /// Deny like any NeverResidual arg; forced clarification follows.
+    Never,
+}
+
 impl Engine {
     pub fn new(parts: HarnessParts, cfg: EngineConfig) -> Self {
         Self::with_clock(
@@ -210,6 +261,7 @@ impl Engine {
 
     pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
         let sid = incoming.session.clone();
+        let scope = (self.cfg.scope_for)(&sid);
         let stored = self.parts.memory.load(&sid).await?;
         let n_loaded = stored.len();
         let mut log = EventLog::from_events(sid.clone(), stored);
@@ -264,6 +316,12 @@ impl Engine {
                 if !denied_this_turn.contains(REMEMBER_FACT) {
                     actions.push(remember_fact_spec());
                 }
+                if !denied_this_turn.contains(FORGET_FACT) {
+                    actions.push(forget_fact_spec());
+                }
+                if !denied_this_turn.contains(FORGET_ALL) {
+                    actions.push(forget_all_spec());
+                }
                 if active_pending.is_some() {
                     actions.push(confirm_pending_spec());
                 }
@@ -277,7 +335,12 @@ impl Engine {
             // re-remembers them every turn (seen live).
             let trace_so_far: Vec<String> =
                 turn_trace(&log, turn).lines().map(str::to_string).collect();
-            let mut facts = self.parts.memory.facts("").await.unwrap_or_default();
+            let mut facts = self
+                .parts
+                .memory
+                .facts(&scope, "")
+                .await
+                .unwrap_or_default();
             facts.truncate(self.cfg.facts_in_context);
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
             let ctx = nscore::EmitterContext {
@@ -598,38 +661,98 @@ impl Engine {
                 // re-remember reset `uses` to 0, erasing the consolidation
                 // pass's only signal.
                 let value_json = serde_json::json!(value);
-                let existing = self
+                let value_trust = classified_args
+                    .iter()
+                    .find(|(k, _)| k == "value")
+                    .map(|(_, tv)| tv.trust)
+                    .unwrap_or(nscore::Trust::System);
+                let residual = crate::guards::contains_residual(&prov);
+                // M6 §6.3: a value nothing grounds is either flagged
+                // (stored at half confidence, shown as unverified) or, for
+                // deployments where facts drive side effects, refused.
+                if residual && self.cfg.remember_residual == RememberResidual::Never {
+                    let reason = "NeverResidual: arg 'value' has no grounding in this session";
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::GuardDenied {
+                                guard: "residual_policy".into(),
+                                reason: reason.into(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push(format!("guard residual_policy: {reason}"));
+                    never_residual_this_turn = true;
+                    denied_this_turn.insert(REMEMBER_FACT.to_string());
+                    continue;
+                }
+                let grounded_confidence = if residual { 0.5 } else { 1.0 };
+                // Key canonicalization (M6 §6.1): a spelling variant of an
+                // existing key is that key (seen live: memory_reset_requested
+                // next to memory.reset.requested).
+                let current = self
                     .parts
                     .memory
-                    .facts(&key)
+                    .facts(&scope, "")
                     .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|f| f.key == key);
+                    .unwrap_or_default();
+                let key = match current.iter().find(|f| f.key == key) {
+                    Some(_) => key,
+                    None => current
+                        .iter()
+                        .find(|f| nscore::squash(&f.key) == nscore::squash(&key))
+                        .map(|f| f.key.clone())
+                        .unwrap_or(key),
+                };
+                let existing = current.into_iter().find(|f| f.key == key);
+                // A new version must sort after the one it supersedes even
+                // under a coarse clock.
+                let version_at = |prev: &nscore::Fact| {
+                    let t = now();
+                    if t > prev.valid_from {
+                        t
+                    } else {
+                        Timestamp(prev.valid_from.0 + 1)
+                    }
+                };
                 let fact = match existing {
                     Some(prev) if prev.value == value_json => nscore::Fact {
-                        key: key.clone(),
-                        value: value_json,
-                        confidence: (prev.confidence + 0.1).min(1.0),
-                        uses: prev.uses,
+                        confidence: if residual {
+                            (prev.confidence + 0.1).min(1.0)
+                        } else {
+                            1.0
+                        },
                         last_validated: now(),
                         prov,
+                        trust: value_trust,
+                        ..prev
                     },
                     Some(prev) => nscore::Fact {
                         key: key.clone(),
                         value: value_json,
-                        confidence: 1.0,
+                        confidence: grounded_confidence,
                         uses: prev.uses,
                         last_validated: now(),
                         prov,
+                        scope: scope.clone(),
+                        trust: value_trust,
+                        valid_from: version_at(&prev),
+                        valid_to: None,
+                        state: nscore::FactState::Current,
                     },
                     None => nscore::Fact {
                         key: key.clone(),
                         value: value_json,
-                        confidence: 1.0,
+                        confidence: grounded_confidence,
                         uses: 0,
                         last_validated: now(),
                         prov,
+                        scope: scope.clone(),
+                        trust: value_trust,
+                        valid_from: now(),
+                        ..Default::default()
                     },
                 };
                 let call_id = log
@@ -647,6 +770,167 @@ impl Engine {
                     Ok(()) => ToolOutcome::Ok {
                         output: nscore::ToolOutput {
                             summary: format!("remembered {key}"),
+                            artifact: None,
+                            trust: nscore::Trust::System,
+                        },
+                    },
+                    Err(e) => ToolOutcome::Err {
+                        kind: "store".into(),
+                        detail: e.to_string(),
+                    },
+                };
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+                continue;
+            }
+
+            // f5. forget_fact (M6 §6.2): soft-delete one current fact. An
+            // unknown key is malformed so the emitter can retry or ask.
+            if proposal.action == FORGET_FACT {
+                let key = proposal
+                    .args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(|k| {
+                        k.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                            .to_string()
+                    })
+                    .filter(|k| !k.is_empty());
+                let Some(key) = key else {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: "forget_fact needs a string key".into(),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push("forget_fact missing key".into());
+                    continue;
+                };
+                let current = self
+                    .parts
+                    .memory
+                    .facts(&scope, "")
+                    .await
+                    .unwrap_or_default();
+                let key = current
+                    .iter()
+                    .find(|f| f.key == key || nscore::squash(&f.key) == nscore::squash(&key))
+                    .map(|f| f.key.clone())
+                    .unwrap_or(key);
+                if !current.iter().any(|f| f.key == key) {
+                    let detail = format!("no current fact named {key}");
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: format!("forget_fact: {detail}"),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push(format!("forget_fact: {detail}"));
+                    continue;
+                }
+                let spec = forget_fact_spec();
+                let index = nsprovenance::index::ValueIndex::from_events(log.events());
+                let classified_args =
+                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: FORGET_FACT.into(),
+                            args: classified_args,
+                        },
+                    )
+                    .id;
+                calls_this_turn.insert(Self::call_key(&proposal));
+                let outcome = match self.parts.memory.forget_fact(&scope, &key, now()).await {
+                    Ok(_) => ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: format!("forgot {key}"),
+                            artifact: None,
+                            trust: nscore::Trust::System,
+                        },
+                    },
+                    Err(e) => ToolOutcome::Err {
+                        kind: "store".into(),
+                        detail: e.to_string(),
+                    },
+                };
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+                continue;
+            }
+
+            // f6. forget_all (M6 §6.2): irreversible, so it is staged behind
+            // the same two-turn confirmation as any irreversible tool, and
+            // purges the scope once confirmed.
+            if proposal.action == FORGET_ALL {
+                let confirmed = confirmed_now || state.confirmed_this_turn_of == Some(turn);
+                if !confirmed {
+                    // No count in the prompt: replay runs from a fresh store
+                    // and a Verbatim reply must be reproducible from the log.
+                    let description =
+                        format!("This will forget every stored fact in scope {scope}.");
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::PendingConfirmation {
+                            proposal_of: pid,
+                            staged: Some(nscore::StagedEffect {
+                                description: description.clone(),
+                            }),
+                        },
+                    );
+                    let policy = ReplyPolicy::Verbatim {
+                        text: format!(
+                            "'{FORGET_ALL}' is irreversible. Confirm to proceed.\nPlanned: {description}"
+                        ),
+                    };
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Settled {
+                            policy: policy.clone(),
+                        },
+                    );
+                    settled = Some(policy);
+                    break;
+                }
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: FORGET_ALL.into(),
+                            args: vec![],
+                        },
+                    )
+                    .id;
+                calls_this_turn.insert(Self::call_key(&proposal));
+                let outcome = match self.parts.memory.purge_facts(&scope).await {
+                    Ok(n) => ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: format!("forgot {n} facts"),
                             artifact: None,
                             trust: nscore::Trust::System,
                         },
@@ -866,7 +1150,12 @@ impl Engine {
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
-                let mut facts = self.parts.memory.facts("").await.unwrap_or_default();
+                let mut facts = self
+                    .parts
+                    .memory
+                    .facts(&scope, "")
+                    .await
+                    .unwrap_or_default();
                 facts.truncate(self.cfg.facts_in_context);
                 for f in facts.iter_mut() {
                     f.uses += 1;

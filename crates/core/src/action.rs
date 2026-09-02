@@ -100,6 +100,41 @@ pub struct StagedEffect {
     pub description: String,
 }
 
+/// Lifecycle state of one fact version (M6 spec §6.1–6.2). Facts are never
+/// overwritten: a new value supersedes the old row, a forgotten fact keeps
+/// its row with `valid_to` set, a cold fact is unused past the staleness
+/// window and drops out of the pinned slice but stays searchable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FactState {
+    #[default]
+    Current,
+    Superseded,
+    Cold,
+    Forgotten,
+}
+
+impl FactState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FactState::Current => "current",
+            FactState::Superseded => "superseded",
+            FactState::Cold => "cold",
+            FactState::Forgotten => "forgotten",
+        }
+    }
+    pub fn parse(s: &str) -> Option<FactState> {
+        match s {
+            "current" => Some(FactState::Current),
+            "superseded" => Some(FactState::Superseded),
+            "cold" => Some(FactState::Cold),
+            "forgotten" => Some(FactState::Forgotten),
+            _ => None,
+        }
+    }
+}
+
+/// One version of a durable fact. Identity is `(scope, key, valid_from)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fact {
     pub key: String,
@@ -108,6 +143,46 @@ pub struct Fact {
     pub uses: u32,
     pub last_validated: Timestamp,
     pub prov: Provenance,
+    /// Per-user / per-deployment isolation (M6 §6.6); `global` by default.
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    /// Trust of the value's origin at write time (M6 §6.7).
+    #[serde(default = "default_fact_trust")]
+    pub trust: Trust,
+    /// When this version became current.
+    #[serde(default)]
+    pub valid_from: Timestamp,
+    /// When it stopped being current (superseded or forgotten); None = current.
+    #[serde(default)]
+    pub valid_to: Option<Timestamp>,
+    #[serde(default)]
+    pub state: FactState,
+}
+
+fn default_scope() -> String {
+    "global".into()
+}
+
+fn default_fact_trust() -> Trust {
+    Trust::System
+}
+
+impl Default for Fact {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            value: serde_json::Value::Null,
+            confidence: 1.0,
+            uses: 0,
+            last_validated: Timestamp(0),
+            prov: Provenance::Residual,
+            scope: default_scope(),
+            trust: default_fact_trust(),
+            valid_from: Timestamp(0),
+            valid_to: None,
+            state: FactState::Current,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +214,35 @@ mod tests {
     }
 
     #[test]
+    fn fact_defaults_and_state_round_trip() {
+        let f = Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            ..Default::default()
+        };
+        assert_eq!(f.scope, "global");
+        assert_eq!(f.state, FactState::Current);
+        assert_eq!(f.valid_to, None);
+        assert_eq!(f.trust, crate::value::Trust::System);
+        // an old JSON row without the new fields still parses
+        let old: Fact = serde_json::from_str(
+            r#"{"key":"k","value":1,"confidence":1.0,"uses":2,"last_validated":5,"prov":{"type":"Constant"}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.scope, "global");
+        assert_eq!(old.state, FactState::Current);
+        for s in [
+            FactState::Current,
+            FactState::Superseded,
+            FactState::Cold,
+            FactState::Forgotten,
+        ] {
+            assert_eq!(FactState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(FactState::parse("nope"), None);
+    }
+
+    #[test]
     fn full_event_kind_serde() {
         let kinds = vec![
             EventKind::Proposed {
@@ -155,7 +259,9 @@ mod tests {
                     reason: "OrderId residual".into(),
                 },
             },
-            EventKind::Settled { policy: ReplyPolicy::Generate },
+            EventKind::Settled {
+                policy: ReplyPolicy::Generate,
+            },
         ];
         for k in kinds {
             let s = serde_json::to_string(&k).unwrap();

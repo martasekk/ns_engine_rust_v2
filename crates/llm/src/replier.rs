@@ -41,7 +41,7 @@ fn render_context(ctx: &ReplyContext) -> String {
     if !ctx.facts.is_empty() {
         s.push_str("Standing facts:\n");
         for f in &ctx.facts {
-            s.push_str(&format!("- {}: {}\n", f.key, f.value));
+            s.push_str(&format!("- {}\n", nscore::render_fact(f)));
         }
     }
     if let Some(summary) = &ctx.summary {
@@ -148,6 +148,7 @@ mod tests {
                 uses: 0,
                 last_validated: Timestamp(1),
                 prov: Provenance::Constant,
+                ..Default::default()
             }],
             summary: Some(nscore::SessionSummary {
                 through_turn: 1,

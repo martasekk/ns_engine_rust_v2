@@ -38,6 +38,14 @@ pub struct MemorySection {
     /// names absent from everything the model was shown (M6 §4.5).
     #[serde(default = "default_true")]
     pub reply_grounding_check: bool,
+    /// "flag" stores an ungrounded remembered value at half confidence;
+    /// "never" refuses it (M6 §6.3).
+    #[serde(default = "default_remember_residual")]
+    pub remember_residual: String,
+}
+
+fn default_remember_residual() -> String {
+    "flag".into()
 }
 
 fn default_window_turns() -> usize {
@@ -61,6 +69,7 @@ impl Default for MemorySection {
             line_max_chars: default_line_max_chars(),
             facts_in_context: default_facts_in_context(),
             reply_grounding_check: true,
+            remember_residual: default_remember_residual(),
         }
     }
 }
@@ -70,6 +79,17 @@ impl MemorySection {
         nscore::Caps {
             record_max_chars: self.record_max_chars,
             line_max_chars: self.line_max_chars,
+        }
+    }
+
+    /// Err names the bad value; config errors are fatal at startup.
+    pub fn remember_residual(&self) -> Result<nsengine::turn::RememberResidual, String> {
+        match self.remember_residual.as_str() {
+            "flag" => Ok(nsengine::turn::RememberResidual::Flag),
+            "never" => Ok(nsengine::turn::RememberResidual::Never),
+            other => Err(format!(
+                "[memory] remember_residual must be \"flag\" or \"never\", got {other:?}"
+            )),
         }
     }
 }
@@ -342,6 +362,17 @@ mod tests {
         assert!(cfg.memory.reply_grounding_check);
         let cfg = AppConfig::parse("[memory]\nreply_grounding_check = false\n").unwrap();
         assert!(!cfg.memory.reply_grounding_check);
+        assert_eq!(
+            cfg.memory.remember_residual().unwrap(),
+            nsengine::turn::RememberResidual::Flag
+        );
+        let cfg = AppConfig::parse("[memory]\nremember_residual = \"never\"\n").unwrap();
+        assert_eq!(
+            cfg.memory.remember_residual().unwrap(),
+            nsengine::turn::RememberResidual::Never
+        );
+        let cfg = AppConfig::parse("[memory]\nremember_residual = \"maybe\"\n").unwrap();
+        assert!(cfg.memory.remember_residual().is_err());
     }
 
     #[test]

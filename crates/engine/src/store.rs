@@ -1,12 +1,15 @@
 use async_trait::async_trait;
-use nscore::{ArtifactId, Consolidator, Event, Fact, MemoryStore, SessionId, StoreError};
+use nscore::{
+    ArtifactId, Consolidator, Event, Fact, FactState, MemoryStore, SessionId, StoreError, Timestamp,
+};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
 pub struct InMemoryStore {
     events: Mutex<HashMap<SessionId, Vec<Event>>>,
-    facts: Mutex<HashMap<String, Fact>>,
+    /// Every fact version, in insertion order (M6 §6.1: never overwritten).
+    facts: Mutex<Vec<Fact>>,
     artifacts: Mutex<HashMap<ArtifactId, Vec<u8>>>,
 }
 
@@ -40,10 +43,11 @@ impl MemoryStore for InMemoryStore {
             .unwrap_or_default())
     }
 
-    async fn facts(&self, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
-        let map = self.facts.lock().await;
-        let mut out: Vec<Fact> = map
-            .values()
+    async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
+        let all = self.facts.lock().await;
+        let mut out: Vec<Fact> = all
+            .iter()
+            .filter(|f| f.scope == scope && f.state == FactState::Current)
             .filter(|f| f.key.starts_with(key_prefix))
             .cloned()
             .collect();
@@ -51,9 +55,75 @@ impl MemoryStore for InMemoryStore {
         Ok(out)
     }
 
+    async fn fact_history(&self, scope: &str, key: &str) -> Result<Vec<Fact>, StoreError> {
+        let all = self.facts.lock().await;
+        let mut out: Vec<Fact> = all
+            .iter()
+            .filter(|f| f.scope == scope && f.key == key)
+            .cloned()
+            .collect();
+        out.sort_by_key(|f| std::cmp::Reverse(f.valid_from));
+        Ok(out)
+    }
+
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError> {
-        self.facts.lock().await.insert(fact.key.clone(), fact);
+        let mut all = self.facts.lock().await;
+        if let Some(row) = all
+            .iter_mut()
+            .find(|f| f.scope == fact.scope && f.key == fact.key && f.valid_from == fact.valid_from)
+        {
+            *row = fact;
+            return Ok(());
+        }
+        for row in all
+            .iter_mut()
+            .filter(|f| f.scope == fact.scope && f.key == fact.key && f.state == FactState::Current)
+        {
+            row.state = FactState::Superseded;
+            row.valid_to = Some(fact.valid_from);
+        }
+        all.push(fact);
         Ok(())
+    }
+
+    async fn forget_fact(&self, scope: &str, key: &str, at: Timestamp) -> Result<bool, StoreError> {
+        let mut all = self.facts.lock().await;
+        let mut hit = false;
+        for row in all
+            .iter_mut()
+            .filter(|f| f.scope == scope && f.key == key && f.state != FactState::Forgotten)
+            .filter(|f| f.state != FactState::Superseded)
+        {
+            row.state = FactState::Forgotten;
+            row.valid_to = Some(at);
+            hit = true;
+        }
+        Ok(hit)
+    }
+
+    async fn purge_facts(&self, scope: &str) -> Result<usize, StoreError> {
+        let mut all = self.facts.lock().await;
+        let before = all.len();
+        all.retain(|f| f.scope != scope);
+        Ok(before - all.len())
+    }
+
+    async fn search_facts(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        let current = self.facts(scope, "").await?;
+        Ok(nscore::lexical_rank(&current, query, k))
+    }
+
+    async fn scopes(&self) -> Result<Vec<String>, StoreError> {
+        let all = self.facts.lock().await;
+        let mut out: Vec<String> = all.iter().map(|f| f.scope.clone()).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError> {
@@ -90,6 +160,103 @@ impl Consolidator for NoopConsolidator {
     async fn run(&self, _store: &dyn MemoryStore) -> Result<(), StoreError> {
         Ok(())
     }
+}
+
+/// Shared conformance tests for `MemoryStore` fact semantics (M6 §6.1–6.2),
+/// run by every store implementation.
+pub async fn fact_conformance(store: &dyn MemoryStore) {
+    let f = |key: &str, value: &str, at: u64| Fact {
+        key: key.into(),
+        value: serde_json::json!(value),
+        confidence: 1.0,
+        uses: 0,
+        last_validated: Timestamp(at),
+        prov: nscore::Provenance::Constant,
+        valid_from: Timestamp(at),
+        ..Default::default()
+    };
+    // first version
+    store.put_fact(f("user.name", "Martin", 10)).await.unwrap();
+    // same valid_from: in-place update (a restatement / a uses bump)
+    let mut bumped = f("user.name", "Martin", 10);
+    bumped.uses = 3;
+    store.put_fact(bumped).await.unwrap();
+    let cur = store.facts("global", "user").await.unwrap();
+    assert_eq!(cur.len(), 1);
+    assert_eq!(cur[0].uses, 3);
+    // new value: supersedes, never overwrites
+    store.put_fact(f("user.name", "Peter", 20)).await.unwrap();
+    let cur = store.facts("global", "user.name").await.unwrap();
+    assert_eq!(cur.len(), 1, "one current version");
+    assert_eq!(cur[0].value, serde_json::json!("Peter"));
+    let hist = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(hist.len(), 2, "history keeps both");
+    assert_eq!(hist[0].value, serde_json::json!("Peter"), "newest first");
+    assert_eq!(hist[1].state, FactState::Superseded);
+    assert_eq!(hist[1].valid_to, Some(Timestamp(20)));
+    // scope isolation
+    let mut other = f("user.name", "Jana", 30);
+    other.scope = "chat42".into();
+    store.put_fact(other).await.unwrap();
+    assert_eq!(store.facts("global", "").await.unwrap().len(), 1);
+    assert_eq!(
+        store.facts("chat42", "").await.unwrap()[0].value,
+        serde_json::json!("Jana")
+    );
+    let mut scopes = store.scopes().await.unwrap();
+    scopes.sort();
+    assert_eq!(scopes, vec!["chat42".to_string(), "global".to_string()]);
+    // lexical search over current facts only
+    store.put_fact(f("user.city", "Brno", 40)).await.unwrap();
+    let hits = store.search_facts("global", "which city", 5).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key, "user.city");
+    assert!(
+        store
+            .search_facts("global", "martin", 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "superseded values are not searched"
+    );
+    // forget: soft, keeps history, Ok(false) when nothing is current
+    assert!(store
+        .forget_fact("global", "user.name", Timestamp(50))
+        .await
+        .unwrap());
+    assert!(store.facts("global", "user.name").await.unwrap().is_empty());
+    let hist = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(hist[0].state, FactState::Forgotten);
+    assert_eq!(hist[0].valid_to, Some(Timestamp(50)));
+    assert!(!store
+        .forget_fact("global", "user.name", Timestamp(51))
+        .await
+        .unwrap());
+    assert!(!store
+        .forget_fact("global", "nope", Timestamp(51))
+        .await
+        .unwrap());
+    // re-remember after forgetting: a fresh current version
+    store.put_fact(f("user.name", "Martin", 60)).await.unwrap();
+    assert_eq!(store.facts("global", "user.name").await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .fact_history("global", "user.name")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    // purge: hard delete of one scope only
+    let removed = store.purge_facts("global").await.unwrap();
+    assert_eq!(removed, 4, "3 name versions + city");
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+    assert!(store
+        .fact_history("global", "user.name")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.facts("chat42", "").await.unwrap().len(), 1);
 }
 
 #[cfg(test)]
@@ -130,14 +297,16 @@ mod tests {
         let f = Fact {
             key: "user.prefs.lang".into(),
             value: serde_json::json!("cs"),
-            confidence: 1.0,
-            uses: 0,
-            last_validated: Timestamp(1),
-            prov: Provenance::Constant,
+            ..Default::default()
         };
         store.put_fact(f.clone()).await.unwrap();
-        assert_eq!(store.facts("user.prefs").await.unwrap(), vec![f]);
-        assert_eq!(store.facts("orders").await.unwrap(), vec![]);
+        assert_eq!(store.facts("global", "user.prefs").await.unwrap(), vec![f]);
+        assert_eq!(store.facts("global", "orders").await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn fact_versions_scopes_search_forget_and_purge() {
+        fact_conformance(&InMemoryStore::new()).await;
     }
 
     #[tokio::test]

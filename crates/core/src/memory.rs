@@ -111,6 +111,78 @@ fn one() -> u32 {
     1
 }
 
+/// Lowercase ASCII alphanumerics only: `memory_reset_requested` and
+/// `Memory.Reset.Requested` squash equal. Used for key canonicalization at
+/// write time (M6 §6.1) and for near-miss action names (M5).
+pub fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Query tokens worth matching: lowercase alphanumeric runs of 3+ chars.
+pub fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Lexical relevance of current facts to a query (M6 §6.5 "query-relevant"):
+/// number of query tokens found in the key (dots and underscores read as
+/// spaces) or the value; zero-score facts are dropped; ties go to the most
+/// recently validated. Shared by both stores until FTS5 lands (Phase 4).
+pub fn lexical_rank(
+    facts: &[crate::action::Fact],
+    query: &str,
+    k: usize,
+) -> Vec<crate::action::Fact> {
+    let tokens = query_tokens(query);
+    if tokens.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, &crate::action::Fact)> = facts
+        .iter()
+        .map(|f| {
+            let hay = format!(
+                "{} {}",
+                f.key.replace(['.', '_', '-'], " ").to_lowercase(),
+                match &f.value {
+                    serde_json::Value::String(s) => s.to_lowercase(),
+                    other => other.to_string().to_lowercase(),
+                }
+            );
+            (
+                tokens.iter().filter(|t| hay.contains(t.as_str())).count(),
+                f,
+            )
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.last_validated.cmp(&a.1.last_validated))
+            .then_with(|| a.1.key.cmp(&b.1.key))
+    });
+    scored.into_iter().take(k).map(|(_, f)| f.clone()).collect()
+}
+
+/// `user.name: "Peter"`, plus `(unverified)` below confidence 0.75 and
+/// `(stale)` for a cold fact (M6 §6.3, §6.5).
+pub fn render_fact(f: &crate::action::Fact) -> String {
+    let mut s = format!("{}: {}", f.key, f.value);
+    if f.confidence < 0.75 {
+        s.push_str(" (unverified)");
+    }
+    if f.state == crate::action::FactState::Cold {
+        s.push_str(" (stale)");
+    }
+    s
+}
+
 /// One block: "Conversation so far (turns 1–8): …\nEstablished: …\nOpen: …".
 pub fn render_summary(s: &SessionSummary) -> String {
     let mut out = format!(
@@ -211,6 +283,34 @@ mod tests {
         let out = render_record(&r, &Caps::default());
         assert_eq!(out.lines().count(), 3);
         assert!(out.contains("user: line1 line2"));
+    }
+
+    #[test]
+    fn squash_and_lexical_rank() {
+        assert_eq!(squash("Memory.Reset-Requested"), "memoryresetrequested");
+        assert_eq!(squash("memory_reset_requested"), "memoryresetrequested");
+        let fact = |key: &str, value: &str, at: u64| crate::action::Fact {
+            key: key.into(),
+            value: serde_json::json!(value),
+            last_validated: crate::event::Timestamp(at),
+            ..Default::default()
+        };
+        let facts = vec![
+            fact("user.name", "Martin", 1),
+            fact("user.city", "Brno", 2),
+            fact("user.previous_name", "Tomas", 3),
+            fact("order.42.status", "shipped", 4),
+        ];
+        let hits = lexical_rank(&facts, "what was my previous name?", 5);
+        let keys: Vec<&str> = hits.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, vec!["user.previous_name", "user.name"]);
+        assert!(lexical_rank(&facts, "hi", 5).is_empty(), "no 3-char tokens");
+        assert_eq!(lexical_rank(&facts, "is my order shipped", 1).len(), 1);
+        assert_eq!(
+            lexical_rank(&facts, "brno", 5)[0].key,
+            "user.city",
+            "values match too"
+        );
     }
 
     #[test]

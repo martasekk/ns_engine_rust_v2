@@ -253,6 +253,8 @@ impl EvolutionPass {
                                 uses: 0,
                                 last_validated: Timestamp(now),
                                 prov: Provenance::Residual,
+                                valid_from: Timestamp(now),
+                                ..Default::default()
                             })
                             .await?;
                         report.facts_written += 1;
@@ -571,7 +573,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.facts_written, 1);
-        let facts = store.facts("user.city").await.unwrap();
+        let facts = store.facts("global", "user.city").await.unwrap();
         assert_eq!(facts[0].value, serde_json::json!("Brno"));
         assert_eq!(facts[0].confidence, 1.0);
     }

@@ -119,7 +119,13 @@ pub struct Doubles {
 }
 
 /// Engine-synthetic actions never need tool doubles.
-const SYNTHETIC: [&str; 3] = ["remember_fact", "ask_clarification", "confirm_pending"];
+const SYNTHETIC: [&str; 5] = [
+    "remember_fact",
+    "ask_clarification",
+    "confirm_pending",
+    "forget_fact",
+    "forget_all",
+];
 
 /// Replays one recorded tool: pops the recorded outcomes front-to-back.
 struct ReplayTool {

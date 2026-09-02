@@ -211,6 +211,13 @@ async fn main() {
     }
 
     let parts = b.build().expect("harness assembly");
+    let remember_residual = match cfg.memory.remember_residual() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
     let engine_cfg = EngineConfig {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
@@ -222,6 +229,9 @@ async fn main() {
         caps: cfg.memory.caps(),
         facts_in_context: cfg.memory.facts_in_context,
         reply_grounding_check: cfg.memory.reply_grounding_check,
+        // The CLI is single-user: every session shares the global scope.
+        scope_for: Arc::new(|_| "global".to_string()),
+        remember_residual,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M5 — type text, /quit to exit");

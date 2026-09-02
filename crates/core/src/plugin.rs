@@ -173,11 +173,36 @@ mod tests {
         async fn load(&self, _s: &SessionId) -> Result<Vec<Event>, StoreError> {
             Ok(vec![])
         }
-        async fn facts(&self, _p: &str) -> Result<Vec<Fact>, StoreError> {
+        async fn facts(&self, _s: &str, _p: &str) -> Result<Vec<Fact>, StoreError> {
+            Ok(vec![])
+        }
+        async fn fact_history(&self, _s: &str, _k: &str) -> Result<Vec<Fact>, StoreError> {
             Ok(vec![])
         }
         async fn put_fact(&self, _f: Fact) -> Result<(), StoreError> {
             Ok(())
+        }
+        async fn forget_fact(
+            &self,
+            _s: &str,
+            _k: &str,
+            _at: crate::event::Timestamp,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        async fn purge_facts(&self, _s: &str) -> Result<usize, StoreError> {
+            Ok(0)
+        }
+        async fn search_facts(
+            &self,
+            _s: &str,
+            _q: &str,
+            _k: usize,
+        ) -> Result<Vec<Fact>, StoreError> {
+            Ok(vec![])
+        }
+        async fn scopes(&self) -> Result<Vec<String>, StoreError> {
+            Ok(vec![])
         }
         async fn artifact(&self, _id: &ArtifactId) -> Result<Vec<u8>, StoreError> {
             Err(StoreError::NotFound)

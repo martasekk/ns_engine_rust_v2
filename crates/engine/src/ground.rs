@@ -287,6 +287,7 @@ mod tests {
                 uses: 0,
                 last_validated: nscore::Timestamp(1),
                 prov: nscore::Provenance::Constant,
+                ..Default::default()
             }],
             summary: Some(nscore::SessionSummary {
                 through_turn: 3,

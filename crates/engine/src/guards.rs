@@ -2,7 +2,7 @@ use nscore::{
     ClassifiedProposal, Guard, GuardCtx, Provenance, ResidualRule, SideEffect, Trust, Verdict,
 };
 
-fn contains_residual(p: &Provenance) -> bool {
+pub(crate) fn contains_residual(p: &Provenance) -> bool {
     match p {
         Provenance::Residual => true,
         Provenance::Transform { inputs, .. } => inputs.iter().any(contains_residual),

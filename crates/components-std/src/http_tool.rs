@@ -191,11 +191,40 @@ mod tests {
         ) -> Result<Vec<nscore::Event>, nscore::StoreError> {
             Ok(vec![])
         }
-        async fn facts(&self, _p: &str) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
+        async fn facts(&self, _s: &str, _p: &str) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
+            Ok(vec![])
+        }
+        async fn fact_history(
+            &self,
+            _s: &str,
+            _k: &str,
+        ) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
             Ok(vec![])
         }
         async fn put_fact(&self, _f: nscore::Fact) -> Result<(), nscore::StoreError> {
             Ok(())
+        }
+        async fn forget_fact(
+            &self,
+            _s: &str,
+            _k: &str,
+            _at: nscore::Timestamp,
+        ) -> Result<bool, nscore::StoreError> {
+            Ok(false)
+        }
+        async fn purge_facts(&self, _s: &str) -> Result<usize, nscore::StoreError> {
+            Ok(0)
+        }
+        async fn search_facts(
+            &self,
+            _s: &str,
+            _q: &str,
+            _k: usize,
+        ) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
+            Ok(vec![])
+        }
+        async fn scopes(&self) -> Result<Vec<String>, nscore::StoreError> {
+            Ok(vec![])
         }
         async fn artifact(&self, _id: &nscore::ArtifactId) -> Result<Vec<u8>, nscore::StoreError> {
             Err(nscore::StoreError::NotFound)

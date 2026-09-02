@@ -1,6 +1,9 @@
 use async_trait::async_trait;
-use nscore::{ArtifactId, Event, EventId, Fact, MemoryStore, SessionId, StoreError, Timestamp};
-use rusqlite::Connection;
+use nscore::{
+    ArtifactId, Event, EventId, Fact, FactState, MemoryStore, SessionId, StoreError, Timestamp,
+    Trust,
+};
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use tokio::sync::Mutex;
 
@@ -27,6 +30,46 @@ fn unhex32(s: &str) -> Result<[u8; 32], StoreError> {
     Ok(out)
 }
 
+fn trust_str(t: Trust) -> &'static str {
+    match t {
+        Trust::External => "External",
+        Trust::System => "System",
+        Trust::User => "User",
+    }
+}
+
+fn parse_trust(s: &str) -> Trust {
+    match s {
+        "External" => Trust::External,
+        "User" => Trust::User,
+        _ => Trust::System,
+    }
+}
+
+const FACT_COLUMNS: &str =
+    "scope, key, valid_from, valid_to, state, value_json, confidence, uses, \
+                            last_validated, prov_json, trust";
+
+fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
+    let value_json: String = r.get(5)?;
+    let prov_json: String = r.get(9)?;
+    let state: String = r.get(4)?;
+    let trust: String = r.get(10)?;
+    Ok(Fact {
+        scope: r.get(0)?,
+        key: r.get(1)?,
+        valid_from: Timestamp(r.get::<_, u64>(2)?),
+        valid_to: r.get::<_, Option<u64>>(3)?.map(Timestamp),
+        state: FactState::parse(&state).unwrap_or_default(),
+        value: serde_json::from_str(&value_json).unwrap_or(serde_json::Value::Null),
+        confidence: r.get::<_, f64>(6)? as f32,
+        uses: r.get(7)?,
+        last_validated: Timestamp(r.get::<_, u64>(8)?),
+        prov: serde_json::from_str(&prov_json).unwrap_or(nscore::Provenance::Residual),
+        trust: parse_trust(&trust),
+    })
+}
+
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(io_err)?;
@@ -43,23 +86,75 @@ impl SqliteStore {
                  kind_json  TEXT NOT NULL,
                  PRIMARY KEY (session_id, id)
              );
-             CREATE TABLE IF NOT EXISTS facts (
-                 key            TEXT PRIMARY KEY,
-                 value_json     TEXT NOT NULL,
-                 confidence     REAL NOT NULL,
-                 uses           INTEGER NOT NULL,
-                 last_validated INTEGER NOT NULL,
-                 prov_json      TEXT NOT NULL
-             );
              CREATE TABLE IF NOT EXISTS artifacts (
                  id      TEXT PRIMARY KEY,
                  content BLOB NOT NULL
              );",
         )
         .map_err(io_err)?;
+        Self::migrate_facts(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// M6 §6.1: facts are versioned by `(scope, key, valid_from)`. A pre-M6
+    /// `facts(key PRIMARY KEY, …)` table is carried over as one `current`
+    /// version per key in the `global` scope, `valid_from = last_validated`.
+    fn migrate_facts(conn: &Connection) -> Result<(), StoreError> {
+        let has_facts: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'facts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(io_err)?
+            > 0;
+        let versioned = if has_facts {
+            let mut stmt = conn.prepare("PRAGMA table_info(facts)").map_err(io_err)?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(io_err)?
+                .collect::<Result<_, _>>()
+                .map_err(io_err)?;
+            cols.iter().any(|c| c == "scope")
+        } else {
+            false
+        };
+        if has_facts && !versioned {
+            conn.execute_batch("ALTER TABLE facts RENAME TO facts_v1")
+                .map_err(io_err)?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS facts (
+                 scope          TEXT NOT NULL DEFAULT 'global',
+                 key            TEXT NOT NULL,
+                 valid_from     INTEGER NOT NULL,
+                 valid_to       INTEGER,
+                 state          TEXT NOT NULL DEFAULT 'current',
+                 value_json     TEXT NOT NULL,
+                 confidence     REAL NOT NULL,
+                 uses           INTEGER NOT NULL,
+                 last_validated INTEGER NOT NULL,
+                 prov_json      TEXT NOT NULL,
+                 trust          TEXT NOT NULL DEFAULT 'System',
+                 PRIMARY KEY (scope, key, valid_from)
+             );
+             CREATE INDEX IF NOT EXISTS facts_current ON facts(scope, state, key);",
+        )
+        .map_err(io_err)?;
+        if has_facts && !versioned {
+            conn.execute_batch(
+                "INSERT INTO facts (scope, key, valid_from, valid_to, state, value_json, confidence,
+                                    uses, last_validated, prov_json, trust)
+                 SELECT 'global', key, last_validated, NULL, 'current', value_json, confidence,
+                        uses, last_validated, prov_json, 'System'
+                 FROM facts_v1;
+                 DROP TABLE facts_v1;",
+            )
+            .map_err(io_err)?;
+        }
+        Ok(())
     }
 }
 
@@ -129,62 +224,135 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
-    async fn facts(&self, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
+    async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
-            .prepare(
-                "SELECT key, value_json, confidence, uses, last_validated, prov_json
-                 FROM facts WHERE key >= ?1 AND key < ?1 || x'7F' ORDER BY key",
-            )
+            .prepare(&format!(
+                "SELECT {FACT_COLUMNS} FROM facts
+                 WHERE scope = ?1 AND state = 'current' AND key >= ?2 AND key < ?2 || x'7F'
+                 ORDER BY key"
+            ))
             .map_err(io_err)?;
         let rows = stmt
-            .query_map([key_prefix], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2)?,
-                    r.get::<_, u32>(3)?,
-                    r.get::<_, u64>(4)?,
-                    r.get::<_, String>(5)?,
-                ))
-            })
+            .query_map(rusqlite::params![scope, key_prefix], row_to_fact)
             .map_err(io_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (key, value_json, confidence, uses, last_validated, prov_json) =
-                row.map_err(io_err)?;
-            out.push(Fact {
-                key,
-                value: serde_json::from_str(&value_json).map_err(io_err)?,
-                confidence: confidence as f32,
-                uses,
-                last_validated: Timestamp(last_validated),
-                prov: serde_json::from_str(&prov_json).map_err(io_err)?,
-            });
-        }
-        Ok(out)
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
+    }
+
+    async fn fact_history(&self, scope: &str, key: &str) -> Result<Vec<Fact>, StoreError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {FACT_COLUMNS} FROM facts WHERE scope = ?1 AND key = ?2
+                 ORDER BY valid_from DESC"
+            ))
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope, key], row_to_fact)
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
     }
 
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError> {
         let conn = self.conn.lock().await;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(io_err)?;
+        let value_json = serde_json::to_string(&fact.value).map_err(io_err)?;
+        let prov_json = serde_json::to_string(&fact.prov).map_err(io_err)?;
+        if exists.is_some() {
+            conn.execute(
+                "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
+                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11
+                 WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                rusqlite::params![
+                    fact.scope,
+                    fact.key,
+                    fact.valid_from.0,
+                    fact.valid_to.map(|t| t.0),
+                    fact.state.as_str(),
+                    value_json,
+                    fact.confidence as f64,
+                    fact.uses,
+                    fact.last_validated.0,
+                    prov_json,
+                    trust_str(fact.trust),
+                ],
+            )
+            .map_err(io_err)?;
+            return Ok(());
+        }
         conn.execute(
-            "INSERT INTO facts (key, value_json, confidence, uses, last_validated, prov_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(key) DO UPDATE SET
-                 value_json = excluded.value_json, confidence = excluded.confidence,
-                 uses = excluded.uses, last_validated = excluded.last_validated,
-                 prov_json = excluded.prov_json",
+            "UPDATE facts SET state = 'superseded', valid_to = ?3
+             WHERE scope = ?1 AND key = ?2 AND state = 'current'",
+            rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
+        )
+        .map_err(io_err)?;
+        conn.execute(
+            &format!(
+                "INSERT INTO facts ({FACT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            ),
             rusqlite::params![
+                fact.scope,
                 fact.key,
-                serde_json::to_string(&fact.value).map_err(io_err)?,
+                fact.valid_from.0,
+                fact.valid_to.map(|t| t.0),
+                fact.state.as_str(),
+                value_json,
                 fact.confidence as f64,
                 fact.uses,
                 fact.last_validated.0,
-                serde_json::to_string(&fact.prov).map_err(io_err)?,
+                prov_json,
+                trust_str(fact.trust),
             ],
         )
         .map_err(io_err)?;
         Ok(())
+    }
+
+    async fn forget_fact(&self, scope: &str, key: &str, at: Timestamp) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE facts SET state = 'forgotten', valid_to = ?3
+                 WHERE scope = ?1 AND key = ?2 AND state IN ('current', 'cold')",
+                rusqlite::params![scope, key, at.0],
+            )
+            .map_err(io_err)?;
+        Ok(n > 0)
+    }
+
+    async fn purge_facts(&self, scope: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM facts WHERE scope = ?1", [scope])
+            .map_err(io_err)
+    }
+
+    async fn search_facts(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        let current = self.facts(scope, "").await?;
+        Ok(nscore::lexical_rank(&current, query, k))
+    }
+
+    async fn scopes(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT scope FROM facts ORDER BY scope")
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
     }
 
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError> {
@@ -313,12 +481,131 @@ mod tests {
             uses: 0,
             last_validated: Timestamp(1),
             prov: Provenance::Constant,
+            valid_from: Timestamp(1),
+            ..Default::default()
         };
         store.put_fact(f.clone()).await.unwrap();
         f.value = serde_json::json!("en");
-        store.put_fact(f.clone()).await.unwrap(); // upsert same key
-        assert_eq!(store.facts("user.prefs").await.unwrap(), vec![f]);
-        assert_eq!(store.facts("orders").await.unwrap(), vec![]);
+        store.put_fact(f.clone()).await.unwrap(); // same valid_from: in place
+        assert_eq!(store.facts("global", "user.prefs").await.unwrap(), vec![f]);
+        assert_eq!(store.facts("global", "orders").await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn fact_versions_scopes_search_forget_and_purge() {
+        let (_d, store) = tmp_store();
+        nsengine_conformance(&store).await;
+    }
+
+    /// The shared conformance suite lives in ns-engine's store module; this
+    /// crate cannot depend on ns-engine, so the same assertions are inlined.
+    async fn nsengine_conformance(store: &dyn MemoryStore) {
+        let f = |key: &str, value: &str, at: u64| Fact {
+            key: key.into(),
+            value: serde_json::json!(value),
+            last_validated: Timestamp(at),
+            valid_from: Timestamp(at),
+            prov: Provenance::Constant,
+            ..Default::default()
+        };
+        store.put_fact(f("user.name", "Martin", 10)).await.unwrap();
+        let mut bumped = f("user.name", "Martin", 10);
+        bumped.uses = 3;
+        store.put_fact(bumped).await.unwrap();
+        let cur = store.facts("global", "user").await.unwrap();
+        assert_eq!((cur.len(), cur[0].uses), (1, 3));
+        store.put_fact(f("user.name", "Peter", 20)).await.unwrap();
+        let cur = store.facts("global", "user.name").await.unwrap();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].value, serde_json::json!("Peter"));
+        let hist = store.fact_history("global", "user.name").await.unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[1].state, FactState::Superseded);
+        assert_eq!(hist[1].valid_to, Some(Timestamp(20)));
+        let mut other = f("user.name", "Jana", 30);
+        other.scope = "chat42".into();
+        store.put_fact(other).await.unwrap();
+        assert_eq!(store.facts("global", "").await.unwrap().len(), 1);
+        assert_eq!(
+            store.scopes().await.unwrap(),
+            vec!["chat42".to_string(), "global".to_string()]
+        );
+        store.put_fact(f("user.city", "Brno", 40)).await.unwrap();
+        let hits = store.search_facts("global", "which city", 5).await.unwrap();
+        assert_eq!(hits[0].key, "user.city");
+        assert!(store
+            .forget_fact("global", "user.name", Timestamp(50))
+            .await
+            .unwrap());
+        assert!(store.facts("global", "user.name").await.unwrap().is_empty());
+        assert_eq!(
+            store.fact_history("global", "user.name").await.unwrap()[0].state,
+            FactState::Forgotten
+        );
+        assert!(!store
+            .forget_fact("global", "user.name", Timestamp(51))
+            .await
+            .unwrap());
+        store.put_fact(f("user.name", "Martin", 60)).await.unwrap();
+        assert_eq!(
+            store
+                .fact_history("global", "user.name")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(store.purge_facts("global").await.unwrap(), 4);
+        assert!(store.facts("global", "").await.unwrap().is_empty());
+        assert_eq!(store.facts("chat42", "").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_m6_facts_table_is_migrated_to_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE facts (
+                     key TEXT PRIMARY KEY, value_json TEXT NOT NULL, confidence REAL NOT NULL,
+                     uses INTEGER NOT NULL, last_validated INTEGER NOT NULL, prov_json TEXT NOT NULL);
+                 INSERT INTO facts VALUES ('user.name', '\"Peter\"', 1.0, 14, 1788370524628, '{\"type\":\"Residual\"}');
+                 INSERT INTO facts VALUES ('user.age', '\"17\"', 1.0, 14, 1788370533598, '{\"type\":\"Residual\"}');",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let facts = store.facts("global", "").await.unwrap();
+        assert_eq!(facts.len(), 2);
+        let name = facts.iter().find(|f| f.key == "user.name").unwrap();
+        assert_eq!(name.value, serde_json::json!("Peter"));
+        assert_eq!(name.uses, 14);
+        assert_eq!(name.valid_from, Timestamp(1788370524628));
+        assert_eq!(name.state, FactState::Current);
+        assert_eq!(name.trust, Trust::System);
+        // reopening is a no-op
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.facts("global", "").await.unwrap().len(), 2);
+        // and the new schema takes versions
+        store
+            .put_fact(Fact {
+                key: "user.name".into(),
+                value: serde_json::json!("Martin"),
+                valid_from: Timestamp(1788370524629),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .fact_history("global", "user.name")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

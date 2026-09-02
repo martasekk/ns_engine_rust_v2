@@ -899,7 +899,7 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
             "got: {reply}"
         );
     }
-    let stored = store.facts("user").await.unwrap();
+    let stored = store.facts("global", "user").await.unwrap();
     assert_eq!(stored.len(), 1);
     assert!(
         matches!(stored[0].prov, Provenance::UserInput { .. }),
@@ -931,6 +931,8 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
             uses: 3,
             last_validated: Timestamp(1),
             prov: Provenance::Residual,
+            valid_from: Timestamp(1),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -941,6 +943,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     };
     let sid = SessionId("facts5".into());
 
+    // A grounded restatement promotes an unverified fact to full confidence.
     let mut e = engine_with(vec![remember("Martin")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -948,16 +951,19 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     })
     .await
     .unwrap();
-    let f = store.facts("user.name").await.unwrap().remove(0);
+    let f = store.facts("global", "user.name").await.unwrap().remove(0);
     assert_eq!(f.uses, 4, "3 kept, then one recall bump in the reply path");
-    assert!((f.confidence - 0.6).abs() < 1e-6, "got {}", f.confidence);
+    assert!((f.confidence - 1.0).abs() < 1e-6, "got {}", f.confidence);
     assert_eq!(f.last_validated, Timestamp(42));
+    assert_eq!(f.valid_from, Timestamp(1), "same version, updated in place");
     assert!(
         matches!(f.prov, Provenance::UserInput { .. }),
         "a restatement re-grounds the value, got {:?}",
         f.prov
     );
+    assert_eq!(f.trust, Trust::User);
 
+    // A new value supersedes: the old version stays in history with valid_to.
     let mut e = engine_with(vec![remember("Peter")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -965,10 +971,231 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     })
     .await
     .unwrap();
-    let f = store.facts("user.name").await.unwrap().remove(0);
+    let f = store.facts("global", "user.name").await.unwrap().remove(0);
     assert_eq!(f.value, serde_json::json!("Peter"));
     assert_eq!(f.uses, 5);
     assert!((f.confidence - 1.0).abs() < 1e-6);
+    assert_eq!(f.valid_from, Timestamp(42));
+    let hist = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(hist.len(), 2);
+    assert_eq!(hist[1].state, FactState::Superseded);
+    assert_eq!(hist[1].valid_to, Some(Timestamp(42)));
+
+    // An ungrounded value is flagged under the default policy: half
+    // confidence, and a residual restatement only creeps up.
+    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "whatever".into(),
+    })
+    .await
+    .unwrap();
+    let f = store.facts("global", "user.name").await.unwrap().remove(0);
+    assert_eq!(f.value, serde_json::json!("Zed"));
+    assert!((f.confidence - 0.5).abs() < 1e-6, "got {}", f.confidence);
+    assert!(matches!(f.prov, Provenance::Residual));
+    assert_eq!(
+        f.valid_from,
+        Timestamp(43),
+        "coarse clock: still sorts after the previous version"
+    );
+    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "ok".into(),
+    })
+    .await
+    .unwrap();
+    let f = store.facts("global", "user.name").await.unwrap().remove(0);
+    assert!((f.confidence - 0.6).abs() < 1e-6, "got {}", f.confidence);
+    assert_eq!(
+        store
+            .fact_history("global", "user.name")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+        rationale: "".into(),
+        action: "remember_fact".into(),
+        args: serde_json::json!({"key": "memory_reset_requested", "value": "true"}),
+    }])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        remember_residual: nsengine::turn::RememberResidual::Never,
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let sid = SessionId("never".into());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "can you reset the memory".into(),
+    })
+    .await
+    .unwrap();
+    // Seen live: "true" was never said by the user and got stored anyway.
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::GuardDenied { guard, reason }, .. }
+            if guard == "residual_policy" && reason.contains("NeverResidual")
+    )));
+}
+
+#[tokio::test]
+async fn remember_fact_canonicalizes_key_spelling_variants() {
+    let store = Arc::new(InMemoryStore::new());
+    let remember = |key: &str| Proposal {
+        rationale: "".into(),
+        action: "remember_fact".into(),
+        args: serde_json::json!({"key": key, "value": "Brno"}),
+    };
+    let sid = SessionId("canon".into());
+    let mut e = engine_with(vec![remember("user.city")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "I live in Brno".into(),
+    })
+    .await
+    .unwrap();
+    let mut e = engine_with(vec![remember("User_City")], vec![], store.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "Brno, as I said".into(),
+    })
+    .await
+    .unwrap();
+    let facts = store.facts("global", "").await.unwrap();
+    assert_eq!(facts.len(), 1, "one key, not two spellings");
+    assert_eq!(facts[0].key, "user.city");
+    assert_eq!(facts[0].uses, 2, "restatement kept the count");
+}
+
+#[tokio::test]
+async fn forget_fact_soft_deletes_and_unknown_key_is_malformed() {
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .put_fact(Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            valid_from: Timestamp(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let forget = |key: &str| Proposal {
+        rationale: "".into(),
+        action: "forget_fact".into(),
+        args: serde_json::json!({"key": key}),
+    };
+    let sid = SessionId("forget".into());
+    let mut e = engine_with(
+        vec![forget("user.nope"), forget("user.name")],
+        vec![],
+        store.clone(),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "forget my name".into(),
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("forgot user.name"), "{reply}");
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+    let hist = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(hist[0].state, FactState::Forgotten);
+    assert_eq!(hist[0].valid_to, Some(Timestamp(42)));
+    let events = store.load(&sid).await.unwrap();
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Rejected { reason: RejectReason::Malformed { detail }, .. }
+            if detail.contains("no current fact named user.nope")
+    )));
+    assert_eq!(tool_calls(&events, "forget_fact"), 1);
+}
+
+#[tokio::test]
+async fn forget_all_is_staged_then_purges_on_confirmation() {
+    let store = Arc::new(InMemoryStore::new());
+    for (k, v) in [("user.name", "Martin"), ("user.age", "17")] {
+        store
+            .put_fact(Fact {
+                key: k.into(),
+                value: serde_json::json!(v),
+                valid_from: Timestamp(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let sid = SessionId("reset".into());
+    let forget_all = || Proposal {
+        rationale: "".into(),
+        action: "forget_all".into(),
+        args: serde_json::json!({}),
+    };
+    // Turn 1: staged, not executed (seen live: "reset the memory" stored a
+    // junk fact instead).
+    let mut e = engine_with(vec![forget_all()], vec![], store.clone());
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "can you reset the memory".into(),
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("irreversible"), "{reply}");
+    assert!(
+        reply.contains("This will forget every stored fact in scope global."),
+        "{reply}"
+    );
+    assert_eq!(store.facts("global", "").await.unwrap().len(), 2);
+    // Turn 2: the user confirms; the purge runs and history is gone too.
+    let mut e = engine_with(
+        vec![Proposal {
+            rationale: "".into(),
+            action: "confirm_pending".into(),
+            args: serde_json::json!({}),
+        }],
+        vec![],
+        store.clone(),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "yes".into(),
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("forgot 2 facts"), "{reply}");
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+    assert!(store
+        .fact_history("global", "user.name")
+        .await
+        .unwrap()
+        .is_empty());
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    let pos = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+    assert!(pos("PendingConfirmation") < pos("Confirmed"));
+    assert!(pos("Confirmed") < pos("ToolCalled"));
+    // The recording replays clean with the synthetic actions.
+    nsengine::replay::replay_session(sid, &events, vec![])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -998,7 +1225,7 @@ async fn remember_fact_without_value_is_malformed() {
             ..
         }
     )));
-    assert!(store.facts("").await.unwrap().is_empty());
+    assert!(store.facts("global", "").await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1022,7 +1249,7 @@ async fn remember_fact_trims_stray_punctuation_from_key() {
     })
     .await
     .unwrap();
-    let stored = store.facts("user.name").await.unwrap();
+    let stored = store.facts("global", "user.name").await.unwrap();
     assert_eq!(
         stored.len(),
         1,
@@ -1173,7 +1400,7 @@ async fn remember_fact_with_junk_key_is_malformed() {
         }
     )));
     assert!(
-        store.facts("").await.unwrap().is_empty(),
+        store.facts("global", "").await.unwrap().is_empty(),
         "junk key must not be stored"
     );
 }
