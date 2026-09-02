@@ -67,6 +67,19 @@ relevant_max = 5
 fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 remember_residual = "flag"    # "never": refuse remembered values the user never said
+# Rolling summary of the turns outside the window (M6 §5.1), written after
+# the reply is sent. Rebuilt from verbatim records every Nth time.
+summary_every_turns = 4       # 0 = off
+summary_rebuild_every = 3
+summary_max_chars = 800
+summary_input_max_chars = 6000
+
+# The summary model defaults to the emitter's model and provider; override
+# any field to swap the role, e.g. a local Ollama model:
+# [llm.summarizer]
+# model = "qwen2.5:3b"
+# base_url = "http://localhost:11434"
+# api_key_env = "OLLAMA_API_KEY"
 
 # External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
 # [[http_component]]

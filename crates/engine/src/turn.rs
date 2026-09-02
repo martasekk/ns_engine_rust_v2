@@ -36,6 +36,15 @@ pub struct EngineConfig {
     pub pinned_max: usize,
     /// M6 §6.5: facts lexically relevant to the current message.
     pub relevant_max: usize,
+    /// M6 §5.1: summarize once this many turns have fallen out of the
+    /// window since the last summary; 0 = no rolling summary.
+    pub summary_every_turns: usize,
+    /// Every Nth summary is rebuilt from all verbatim records with no
+    /// previous summary, bounding drift; 0 = never rebuild.
+    pub summary_rebuild_every: usize,
+    pub summary_max_chars: usize,
+    /// Verbatim input cap; the oldest records are dropped first.
+    pub summary_input_max_chars: usize,
 }
 
 impl Default for EngineConfig {
@@ -58,6 +67,10 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
+            summary_every_turns: 4,
+            summary_rebuild_every: 3,
+            summary_max_chars: 800,
+            summary_input_max_chars: 6000,
         }
     }
 }
@@ -189,7 +202,9 @@ pub const FORGET_FACT: &str = "forget_fact";
 fn forget_fact_spec() -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_FACT.into(),
-        description: "Forget one stored fact by its key (e.g. user.name).".into(),
+        description: "Delete one stored fact by its key (e.g. user.name). Only when the user \
+                      explicitly asks to forget or remove something stored."
+            .into(),
         args_schema: serde_json::json!({
             "type": "object",
             "properties": { "key": { "type": "string" } },
@@ -208,7 +223,8 @@ pub const FORGET_ALL: &str = "forget_all";
 fn forget_all_spec() -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_ALL.into(),
-        description: "Forget everything stored about the user (asks for confirmation first)."
+        description: "Erase everything stored about the user; asks for confirmation first. Only \
+                      when the user explicitly asks to reset or wipe the memory."
             .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Irreversible,
@@ -318,6 +334,89 @@ impl Engine {
             .any(|p| f.key.starts_with(p))
     }
 
+    /// M6 §5.1: fold the turns that have fallen out of the window into the
+    /// rolling summary, off the user's critical path (called after the
+    /// reply is sent). Returns whether a `Summarized` event was appended.
+    /// A summarizer failure appends nothing; the next boundary retries with
+    /// the larger range.
+    pub async fn maybe_summarize(&mut self, sid: &nscore::SessionId) -> Result<bool, EngineError> {
+        let every = self.cfg.summary_every_turns as u32;
+        if every == 0 {
+            return Ok(false);
+        }
+        let stored = self.parts.memory.load(sid).await?;
+        let n_loaded = stored.len();
+        let state = fold(&stored);
+        let through = state.turn.saturating_sub(self.cfg.window_turns as u32);
+        let last = state.summary.as_ref().map(|s| s.through_turn).unwrap_or(0);
+        if through < 1 || through.saturating_sub(last) < every {
+            return Ok(false);
+        }
+        // Drift control: every Nth summary is rebuilt from verbatim records
+        // alone, so summary-of-summary chains stay short (findings §2).
+        let rebuild = self.cfg.summary_rebuild_every > 0
+            && (state.summaries + 1).is_multiple_of(self.cfg.summary_rebuild_every as u32);
+        let from = if rebuild { 1 } else { last + 1 };
+        let mut records = state.records_in(from, through);
+        while records.len() > 1
+            && nscore::render_window(&records, records.len(), &self.cfg.caps)
+                .chars()
+                .count()
+                > self.cfg.summary_input_max_chars
+        {
+            records.remove(0);
+        }
+        let Some(first) = records.first() else {
+            return Ok(false);
+        };
+        let rebuilt_from = first.turn;
+        let scope = (self.cfg.scope_for)(sid);
+        let selected = self.select_facts(&scope, "").await;
+        let facts = self.fact_views(&scope, &selected).await;
+        let previous = if rebuild {
+            None
+        } else {
+            state.summary.as_ref()
+        };
+        let input = nscore::SummaryInput {
+            previous,
+            records: &records,
+            caps: &self.cfg.caps,
+            facts: &facts,
+        };
+        let draft = match self.parts.summarizer.summarize(input).await {
+            Ok(Some(d)) => d,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                eprintln!("summarizer: {e}");
+                return Ok(false);
+            }
+        };
+        // A summary built from external tool output stays external: the
+        // summarizer is a laundering channel otherwise (findings §5).
+        let trusts: Vec<nscore::Trust> = records.iter().map(|r| r.trust).collect();
+        let mut summary = nscore::SessionSummary {
+            through_turn: through,
+            topic: draft.topic,
+            established: draft.established,
+            open: draft.open,
+            trust: nscore::min_trust(&trusts),
+            rebuilt_from,
+        };
+        summary.clamp(self.cfg.summary_max_chars);
+        let mut log = EventLog::from_events(sid.clone(), stored);
+        log.append(
+            state.turn,
+            (self.clock)(),
+            EventKind::Summarized { summary },
+        );
+        self.parts
+            .memory
+            .append(sid, &log.events()[n_loaded..])
+            .await?;
+        Ok(true)
+    }
+
     /// Views of `facts` for the contexts; pinned keys carry the value they
     /// superseded (M6 §6.1: "what was my name before" from context alone).
     async fn fact_views(&self, scope: &str, facts: &[nscore::Fact]) -> Vec<nscore::FactView> {
@@ -364,6 +463,7 @@ impl Engine {
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
         let mut calls_this_turn: std::collections::HashSet<String> = Default::default();
         let mut never_residual_this_turn = false;
+        let mut forget_misses: u32 = 0;
         let mut emit_failures: u32 = 0;
         let mut last_emit_error: Option<String> = None;
         let mut settled: Option<ReplyPolicy> = None;
@@ -398,11 +498,23 @@ impl Engine {
                 if !denied_this_turn.contains(REMEMBER_FACT) {
                     actions.push(remember_fact_spec());
                 }
-                if !denied_this_turn.contains(FORGET_FACT) {
-                    actions.push(forget_fact_spec());
-                }
-                if !denied_this_turn.contains(FORGET_ALL) {
-                    actions.push(forget_all_spec());
+                // Forgetting is legal only while it can mean something: not
+                // after a fact was written this turn (seen live: "my name is
+                // now Peter" ended in forget_fact + a staged forget_all) and
+                // not after a forget already ran. Both are this turn's own
+                // events, so replay reproduces them; store state ("any facts
+                // at all?") must never decide legality.
+                let wrote_fact = calls_this_turn
+                    .iter()
+                    .any(|k| k.starts_with(&format!("{REMEMBER_FACT}\u{0}")));
+                let forgot = calls_this_turn.iter().any(|k| k.starts_with("forget_"));
+                if !wrote_fact && !forgot {
+                    if !denied_this_turn.contains(FORGET_FACT) {
+                        actions.push(forget_fact_spec());
+                    }
+                    if !denied_this_turn.contains(FORGET_ALL) {
+                        actions.push(forget_all_spec());
+                    }
                 }
                 if active_pending.is_some() {
                     actions.push(confirm_pending_spec());
@@ -920,6 +1032,12 @@ impl Engine {
                         },
                     );
                     rejections_this_turn.push(format!("forget_fact: {detail}"));
+                    // One miss may be a fixable key; a second one is a loop
+                    // (seen live: the same wrong key three times).
+                    forget_misses += 1;
+                    if forget_misses >= 2 {
+                        denied_this_turn.insert(FORGET_FACT.to_string());
+                    }
                     continue;
                 }
                 let spec = forget_fact_spec();
@@ -1340,6 +1458,10 @@ impl Engine {
                 .send(&session, &text)
                 .await
                 .map_err(|e| EngineError::Channel(e.to_string()))?;
+            // M6 §5.1: sleep-time work while the user types.
+            if let Err(e) = self.maybe_summarize(&session).await {
+                eprintln!("summary: {e}");
+            }
         }
     }
 }

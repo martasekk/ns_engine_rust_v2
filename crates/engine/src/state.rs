@@ -13,8 +13,10 @@ pub struct SessionState {
     /// One verbatim record per COMPLETED turn (M6 §4.1); the turn in
     /// progress is not a record until its `Replied` lands.
     pub records: Vec<TurnRecord>,
-    /// Latest rolling summary, if any (M6 §5.1; Phase 3 writes it).
+    /// Latest rolling summary, if any (M6 §5.1).
     pub summary: Option<SessionSummary>,
+    /// Number of `Summarized` events so far (rebuild cadence substrate).
+    pub summaries: u32,
     /// Last unconfirmed PendingConfirmation.
     pub pending_confirmation: Option<EventId>,
     /// Turn on which the pending confirmation was created (expiry substrate).
@@ -187,6 +189,10 @@ pub fn fold(events: &[Event]) -> SessionState {
             // A flagged first draft is audit material, not something the
             // models need to see again: the final Replied is the record.
             EventKind::ReplyFlagged { .. } => {}
+            EventKind::Summarized { summary } => {
+                s.summary = Some(summary.clone());
+                s.summaries += 1;
+            }
             EventKind::Replied { text } => {
                 s.history.push(("assistant".into(), text.clone()));
                 if let Some(mut r) = current.take() {
@@ -206,6 +212,15 @@ impl SessionState {
     pub fn window(&self, k: usize) -> Vec<TurnRecord> {
         let start = self.records.len().saturating_sub(k);
         self.records[start..].to_vec()
+    }
+
+    /// Completed turns with `from <= turn <= to`, oldest first.
+    pub fn records_in(&self, from: u32, to: u32) -> Vec<TurnRecord> {
+        self.records
+            .iter()
+            .filter(|r| r.turn >= from && r.turn <= to)
+            .cloned()
+            .collect()
     }
 }
 
@@ -580,6 +595,36 @@ mod tests {
             vec!["confirmed", "wipe -> ok: wiped", "reply failed: status 402"]
         );
         assert_eq!(s.turn, 5);
+    }
+
+    #[test]
+    fn fold_keeps_the_latest_summary_and_counts_them() {
+        let mut log = EventLog::new(SessionId("sum".into()));
+        let t = Timestamp(1);
+        let sum = |through: u32| SessionSummary {
+            through_turn: through,
+            topic: format!("through {through}"),
+            established: vec![],
+            open: vec![],
+            trust: Trust::User,
+            rebuilt_from: 1,
+        };
+        for turn in 1..=6 {
+            log.append(turn, t, EventKind::UserSaid { text: "x".into() });
+            log.append(turn, t, EventKind::Replied { text: "y".into() });
+            if turn == 4 {
+                log.append(turn, t, EventKind::Summarized { summary: sum(2) });
+            }
+            if turn == 6 {
+                log.append(turn, t, EventKind::Summarized { summary: sum(4) });
+            }
+        }
+        let s = fold(log.events());
+        assert_eq!(s.summary.as_ref().map(|x| x.through_turn), Some(4));
+        assert_eq!(s.summaries, 2);
+        assert_eq!(s.records.len(), 6, "summaries are not turn records");
+        let r = s.records_in(3, 4);
+        assert_eq!(r.iter().map(|r| r.turn).collect::<Vec<_>>(), vec![3, 4]);
     }
 
     #[test]

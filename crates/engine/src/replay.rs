@@ -40,7 +40,9 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::ReplyFailed { .. } | EventKind::ReplyFlagged { .. } => None,
+            EventKind::ReplyFailed { .. }
+            | EventKind::ReplyFlagged { .. }
+            | EventKind::Summarized { .. } => None,
             other => Some(normalize_kind(other)),
         })
         .collect()
@@ -48,7 +50,9 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
 
 fn normalize_kind(kind: &EventKind) -> String {
     match kind {
-        EventKind::ReplyFailed { .. } | EventKind::ReplyFlagged { .. } => {
+        EventKind::ReplyFailed { .. }
+        | EventKind::ReplyFlagged { .. }
+        | EventKind::Summarized { .. } => {
             unreachable!("filtered by normalize")
         }
         EventKind::UserSaid { text } => format!("UserSaid {text}"),

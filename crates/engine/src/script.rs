@@ -52,6 +52,40 @@ impl Replier for ScriptedReplier {
     }
 }
 
+/// Summarizer double: returns a fixed topic naming the range it was given
+/// and records every input it saw (previous present?, first and last turn).
+#[derive(Default)]
+pub struct ScriptedSummarizer {
+    /// Shared with the test that owns the engine.
+    pub calls: std::sync::Arc<Mutex<Vec<(bool, u32, u32)>>>,
+    /// When set, every call fails with this transport detail.
+    pub fail_with: Option<String>,
+}
+
+#[async_trait]
+impl nscore::Summarizer for ScriptedSummarizer {
+    async fn summarize(
+        &self,
+        input: nscore::SummaryInput<'_>,
+    ) -> Result<Option<nscore::SummaryDraft>, nscore::SummarizeError> {
+        if let Some(detail) = &self.fail_with {
+            return Err(nscore::SummarizeError::Transport(detail.clone()));
+        }
+        let first = input.records.first().map(|r| r.turn).unwrap_or(0);
+        let last = input.records.last().map(|r| r.turn).unwrap_or(0);
+        self.calls.lock().expect("scripted summarizer lock").push((
+            input.previous.is_some(),
+            first,
+            last,
+        ));
+        Ok(Some(nscore::SummaryDraft {
+            topic: format!("scripted summary of turns {first}-{last}"),
+            established: input.records.iter().map(|r| r.user.clone()).collect(),
+            open: vec![],
+        }))
+    }
+}
+
 /// Pure tool "echo": args {"text": string} -> summary = "echo: <text>".
 pub struct EchoTool {
     spec: ActionSpec,

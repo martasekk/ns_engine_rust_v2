@@ -113,6 +113,44 @@ pub trait Replier: Send + Sync {
     async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError>;
 }
 
+/// What the summarizer folds in (M6 §5.1): the previous summary for
+/// continuity (None on a full rebuild), the verbatim records of the new
+/// range, and the standing facts so they are not restated.
+pub struct SummaryInput<'a> {
+    pub previous: Option<&'a crate::memory::SessionSummary>,
+    pub records: &'a [crate::memory::TurnRecord],
+    pub caps: &'a crate::memory::Caps,
+    pub facts: &'a [crate::memory::FactView],
+}
+
+/// The model's part of a summary; the engine adds range, trust and turn.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SummaryDraft {
+    pub topic: String,
+    #[serde(default)]
+    pub established: Vec<String>,
+    #[serde(default)]
+    pub open: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SummarizeError {
+    #[error("malformed: {0}")]
+    Malformed(String),
+    #[error("transport: {0}")]
+    Transport(String),
+}
+
+#[async_trait]
+pub trait Summarizer: Send + Sync {
+    /// Ok(None) = no summary (the no-op implementation); Err = try again at
+    /// the next boundary with the larger range.
+    async fn summarize(
+        &self,
+        input: SummaryInput<'_>,
+    ) -> Result<Option<SummaryDraft>, SummarizeError>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
     #[error("closed")]

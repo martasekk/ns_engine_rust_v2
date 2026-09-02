@@ -195,6 +195,22 @@ async fn main() {
             .expect("open sqlite store"),
     ));
     b.set_channel(Box::new(nschannel_cli::CliChannel::new_stdio()));
+    // M6 §5.1: the rolling summary runs on its own role (model, provider,
+    // key), so it can be swapped without touching the emitter or replier.
+    if cfg.memory.summary_every_turns > 0 {
+        let (model, base_url, key_env) = cfg.llm.summarizer_role();
+        match std::env::var(&key_env).ok().filter(|k| !k.is_empty()) {
+            Some(role_key) => {
+                let c = nsllm::client::OpenRouterClient::new(transport.clone(), role_key);
+                let c = match base_url {
+                    Some(u) => c.with_base_url(u),
+                    None => c,
+                };
+                b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(c, model)));
+            }
+            None => eprintln!("{key_env} is not set — rolling summary disabled."),
+        }
+    }
     if cfg.evolution.enabled {
         // Driver B: the idle timer runs this pass during quiet periods.
         b.set_consolidator(Box::new(build_pass(
@@ -236,6 +252,10 @@ async fn main() {
         pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
         pinned_max: cfg.memory.pinned_max,
         relevant_max: cfg.memory.relevant_max,
+        summary_every_turns: cfg.memory.summary_every_turns,
+        summary_rebuild_every: cfg.memory.summary_rebuild_every,
+        summary_max_chars: cfg.memory.summary_max_chars,
+        summary_input_max_chars: cfg.memory.summary_input_max_chars,
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!("ns-harness M5 — type text, /quit to exit");

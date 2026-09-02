@@ -170,6 +170,9 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
             EventKind::Replied { text } => format!("Replied: {text}"),
             EventKind::ReplyFailed { detail } => format!("ReplyFailed: {detail}"),
             EventKind::ReplyFlagged { spans, .. } => format!("ReplyFlagged: {}", spans.join(", ")),
+            EventKind::Summarized { summary } => {
+                format!("Summarized: through turn {}", summary.through_turn)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")

@@ -53,6 +53,28 @@ pub struct MemorySection {
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
+    /// Rolling summary cadence (M6 §5.1); 0 disables the layer.
+    #[serde(default = "default_summary_every_turns")]
+    pub summary_every_turns: usize,
+    #[serde(default = "default_summary_rebuild_every")]
+    pub summary_rebuild_every: usize,
+    #[serde(default = "default_summary_max_chars")]
+    pub summary_max_chars: usize,
+    #[serde(default = "default_summary_input_max_chars")]
+    pub summary_input_max_chars: usize,
+}
+
+fn default_summary_every_turns() -> usize {
+    4
+}
+fn default_summary_rebuild_every() -> usize {
+    3
+}
+fn default_summary_max_chars() -> usize {
+    800
+}
+fn default_summary_input_max_chars() -> usize {
+    6000
 }
 
 fn default_remember_residual() -> String {
@@ -97,6 +119,10 @@ impl Default for MemorySection {
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
             fact_stale_days: default_fact_stale_days(),
+            summary_every_turns: default_summary_every_turns(),
+            summary_rebuild_every: default_summary_rebuild_every(),
+            summary_max_chars: default_summary_max_chars(),
+            summary_input_max_chars: default_summary_input_max_chars(),
         }
     }
 }
@@ -133,6 +159,11 @@ pub struct LlmConfig {
     pub emitter: ModelSection,
     #[serde(default)]
     pub replier: ReplierSection,
+    /// The rolling-summary model (M6 §5.1). Defaults to the emitter's model
+    /// and provider; each field can point elsewhere so the role can be
+    /// swapped without touching the others.
+    #[serde(default)]
+    pub summarizer: SummarizerSection,
 }
 
 fn default_api_key_env() -> String {
@@ -146,7 +177,41 @@ impl Default for LlmConfig {
             api_key_env: default_api_key_env(),
             emitter: ModelSection::default(),
             replier: ReplierSection::default(),
+            summarizer: SummarizerSection::default(),
         }
+    }
+}
+
+/// Per-role provider override: `[llm.summarizer] model = "…"`, optionally
+/// with its own `base_url` and `api_key_env`. Unset fields fall back to the
+/// emitter model and the global provider.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct SummarizerSection {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+impl LlmConfig {
+    /// (model, base_url, api_key_env) the summarizer actually uses.
+    pub fn summarizer_role(&self) -> (String, Option<String>, String) {
+        (
+            self.summarizer
+                .model
+                .clone()
+                .unwrap_or_else(|| self.emitter.model.clone()),
+            self.summarizer
+                .base_url
+                .clone()
+                .or_else(|| self.base_url.clone()),
+            self.summarizer
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| self.api_key_env.clone()),
+        )
     }
 }
 
@@ -379,6 +444,38 @@ mod tests {
     #[test]
     fn bad_toml_is_a_readable_error() {
         assert!(AppConfig::parse("[llm").is_err());
+    }
+
+    #[test]
+    fn summarizer_role_falls_back_to_emitter_and_global_provider() {
+        let cfg = AppConfig::parse(
+            "[llm]\nbase_url = \"https://api.mistral.ai\"\napi_key_env = \"MISTRAL_API_KEY\"\n[llm.emitter]\nmodel = \"mistral-small-latest\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.llm.summarizer_role(),
+            (
+                "mistral-small-latest".to_string(),
+                Some("https://api.mistral.ai".to_string()),
+                "MISTRAL_API_KEY".to_string()
+            )
+        );
+        let cfg = AppConfig::parse(
+            "[llm.summarizer]\nmodel = \"qwen2.5:3b\"\nbase_url = \"http://localhost:11434\"\napi_key_env = \"OLLAMA_API_KEY\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.llm.summarizer_role(),
+            (
+                "qwen2.5:3b".to_string(),
+                Some("http://localhost:11434".to_string()),
+                "OLLAMA_API_KEY".to_string()
+            )
+        );
+        assert_eq!(cfg.memory.summary_every_turns, 4);
+        assert_eq!(cfg.memory.summary_rebuild_every, 3);
+        let off = AppConfig::parse("[memory]\nsummary_every_turns = 0\n").unwrap();
+        assert_eq!(off.memory.summary_every_turns, 0);
     }
 
     #[test]

@@ -223,6 +223,27 @@ pub fn render_fact(f: &FactView) -> String {
     s
 }
 
+impl SessionSummary {
+    /// Deterministic size cap (M6 §5.1): drop `open` items from the end,
+    /// then `established` items, then cut the topic. The model's output
+    /// length is never trusted.
+    pub fn clamp(&mut self, max_chars: usize) {
+        while render_summary(self).chars().count() > max_chars {
+            if self.open.pop().is_some() {
+                continue;
+            }
+            if self.established.pop().is_some() {
+                continue;
+            }
+            let keep = self.topic.chars().count().saturating_sub(20);
+            if keep == 0 {
+                break;
+            }
+            self.topic = truncate_chars(&self.topic, keep);
+        }
+    }
+}
+
 /// One block: "Conversation so far (turns 1–8): …\nEstablished: …\nOpen: …".
 pub fn render_summary(s: &SessionSummary) -> String {
     let mut out = format!(
@@ -376,6 +397,35 @@ mod tests {
             render_fact(&v),
             "user.name: \"Peter\" (unverified) (stale) (was \"Martin\" until 17:35 UTC)"
         );
+    }
+
+    #[test]
+    fn summary_clamp_drops_lists_before_cutting_the_topic() {
+        let mut s = SessionSummary {
+            through_turn: 8,
+            topic: "The user is testing memory and asking about times.".into(),
+            established: vec!["a".repeat(40), "b".repeat(40)],
+            open: vec!["c".repeat(40), "d".repeat(40)],
+            trust: Trust::User,
+            rebuilt_from: 1,
+        };
+        s.clamp(200);
+        assert!(render_summary(&s).chars().count() <= 200);
+        assert_eq!(s.open.len(), 0, "open items go first");
+        assert_eq!(s.established.len(), 2, "established survives while it fits");
+        assert!(s.topic.starts_with("The user is testing"));
+        s.clamp(120);
+        assert!(s.established.is_empty(), "then established items");
+        assert!(
+            s.topic.starts_with("The user is testing"),
+            "topic untouched so far"
+        );
+        s.clamp(50);
+        assert!(
+            render_summary(&s).chars().count() <= 50,
+            "topic is cut last"
+        );
+        assert!(s.topic.ends_with('…'));
     }
 
     #[test]

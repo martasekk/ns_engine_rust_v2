@@ -98,10 +98,21 @@ mod tests {
         let tools = build_tools(&legal());
         let echo = &tools.as_array().unwrap()[0]["function"]["parameters"];
         assert_eq!(echo["properties"]["rationale"]["type"], "string");
-        assert_eq!(echo["properties"]["text"]["type"], "string", "original args kept");
-        let required: Vec<&str> =
-            echo["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(required, vec!["rationale", "text"], "rationale first (think-then-commit)");
+        assert_eq!(
+            echo["properties"]["text"]["type"], "string",
+            "original args kept"
+        );
+        let required: Vec<&str> = echo["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            required,
+            vec!["rationale", "text"],
+            "rationale first (think-then-commit)"
+        );
         assert_eq!(echo["additionalProperties"], false);
     }
 

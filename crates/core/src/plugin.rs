@@ -1,9 +1,26 @@
-use crate::traits::{Channel, Consolidator, Emitter, Guard, MemoryStore, Replier, Tool};
+use crate::traits::{
+    Channel, Consolidator, Emitter, Guard, MemoryStore, Replier, SummarizeError, Summarizer,
+    SummaryDraft, SummaryInput, Tool,
+};
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 pub trait HarnessPlugin {
     fn build(&self, app: &mut HarnessBuilder);
+}
+
+/// The default summarizer: never summarizes (M6 §5.1 layer off).
+pub struct NoopSummarizer;
+
+#[async_trait]
+impl Summarizer for NoopSummarizer {
+    async fn summarize(
+        &self,
+        _input: SummaryInput<'_>,
+    ) -> Result<Option<SummaryDraft>, SummarizeError> {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -13,6 +30,8 @@ pub struct HarnessBuilder {
     memory: Option<Arc<dyn MemoryStore>>,
     channel: Option<Box<dyn Channel>>,
     consolidator: Option<Box<dyn Consolidator>>,
+    /// Optional slot: `NoopSummarizer` when unset.
+    summarizer: Option<Box<dyn Summarizer>>,
     tools: Vec<Arc<dyn Tool>>,
     guards: Vec<Box<dyn Guard>>,
     dup: Vec<&'static str>,
@@ -35,6 +54,7 @@ pub struct HarnessParts {
     pub memory: Arc<dyn MemoryStore>,
     pub channel: Box<dyn Channel>,
     pub consolidator: Box<dyn Consolidator>,
+    pub summarizer: Box<dyn Summarizer>,
     pub tools: Vec<Arc<dyn Tool>>,
     pub guards: Vec<Box<dyn Guard>>,
 }
@@ -84,6 +104,13 @@ impl HarnessBuilder {
         self.consolidator = Some(c);
     }
 
+    pub fn set_summarizer(&mut self, s: Box<dyn Summarizer>) {
+        if self.summarizer.is_some() {
+            self.dup.push("summarizer");
+        }
+        self.summarizer = Some(s);
+    }
+
     pub fn add_tool(&mut self, t: Arc<dyn Tool>) {
         self.tools.push(t);
     }
@@ -93,7 +120,14 @@ impl HarnessBuilder {
     }
 
     pub fn build(self) -> Result<HarnessParts, BuildError> {
-        for slot in ["emitter", "replier", "memory", "channel", "consolidator"] {
+        for slot in [
+            "emitter",
+            "replier",
+            "memory",
+            "channel",
+            "consolidator",
+            "summarizer",
+        ] {
             if self.dup.contains(&slot) {
                 return Err(BuildError::DuplicateSlot(slot));
             }
@@ -118,6 +152,7 @@ impl HarnessBuilder {
             memory,
             channel,
             consolidator,
+            summarizer: self.summarizer.unwrap_or_else(|| Box::new(NoopSummarizer)),
             tools: self.tools,
             guards: self.guards,
         })

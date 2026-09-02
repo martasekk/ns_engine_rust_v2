@@ -34,7 +34,9 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -56,8 +58,9 @@ impl HttpTransport for ReqwestTransport {
         for (k, v) in headers {
             let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| TransportError::Network(format!("invalid header name {k}: {e}")))?;
-            let value = reqwest::header::HeaderValue::from_str(v)
-                .map_err(|e| TransportError::Network(format!("invalid header value for {k}: {e}")))?;
+            let value = reqwest::header::HeaderValue::from_str(v).map_err(|e| {
+                TransportError::Network(format!("invalid header value for {k}: {e}"))
+            })?;
             map.insert(name, value);
         }
         // `.json()` already sets content-type. `.headers()` replaces
@@ -65,10 +68,15 @@ impl HttpTransport for ReqwestTransport {
         // caller-supplied content-type can't produce a duplicate — strict
         // providers (Mistral) reject the body as a string on duplicates.
         let req = self.client.post(url).json(body).headers(map);
-        let resp = req.send().await.map_err(|e| TransportError::Network(e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| TransportError::Network(e.to_string()))?;
         let status = resp.status().as_u16();
-        let body: serde_json::Value =
-            resp.json().await.map_err(|e| TransportError::BadBody(e.to_string()))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| TransportError::BadBody(e.to_string()))?;
         Ok(HttpResponse { status, body })
     }
 }
@@ -81,12 +89,18 @@ pub struct MockTransport {
 
 impl MockTransport {
     pub fn new(responses: Vec<Result<HttpResponse, TransportError>>) -> Arc<Self> {
-        Arc::new(Self { queue: Mutex::new(responses.into()), requests: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            queue: Mutex::new(responses.into()),
+            requests: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn ok(bodies: Vec<serde_json::Value>) -> Arc<Self> {
         Self::new(
-            bodies.into_iter().map(|body| Ok(HttpResponse { status: 200, body })).collect(),
+            bodies
+                .into_iter()
+                .map(|body| Ok(HttpResponse { status: 200, body }))
+                .collect(),
         )
     }
 }
@@ -130,7 +144,11 @@ mod tests {
                 if let Some(head_end) = text.find("\r\n\r\n") {
                     let len = text
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
                         .unwrap_or(0);
                     if raw.len() >= head_end + 4 + len || n == 0 {
                         break;
@@ -159,13 +177,19 @@ mod tests {
             ("x-title".to_string(), "ns-harness".to_string()),
         ];
         let resp = ReqwestTransport::new()
-            .post(&format!("http://{addr}/v1/chat/completions"), &headers, &serde_json::json!({"a": 1}))
+            .post(
+                &format!("http://{addr}/v1/chat/completions"),
+                &headers,
+                &serde_json::json!({"a": 1}),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status, 200);
         let raw = rx.recv().unwrap();
-        let content_types =
-            raw.lines().filter(|l| l.to_ascii_lowercase().starts_with("content-type:")).count();
+        let content_types = raw
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .count();
         assert_eq!(content_types, 1, "raw request:\n{raw}");
         assert!(raw.to_ascii_lowercase().contains("x-title: ns-harness"));
     }
@@ -176,13 +200,22 @@ mod tests {
             serde_json::json!({"n": 1}),
             serde_json::json!({"n": 2}),
         ]);
-        let r1 = mock.post("http://x", &[], &serde_json::json!({"req": "a"})).await.unwrap();
+        let r1 = mock
+            .post("http://x", &[], &serde_json::json!({"req": "a"}))
+            .await
+            .unwrap();
         assert_eq!(r1.body["n"], 1);
-        let r2 = mock.post("http://x", &[], &serde_json::json!({"req": "b"})).await.unwrap();
+        let r2 = mock
+            .post("http://x", &[], &serde_json::json!({"req": "b"}))
+            .await
+            .unwrap();
         assert_eq!(r2.body["n"], 2);
         assert_eq!(mock.requests.lock().unwrap().len(), 2);
         assert_eq!(mock.requests.lock().unwrap()[0]["req"], "a");
         // exhausted queue is a network error, not a panic
-        assert!(mock.post("http://x", &[], &serde_json::json!({})).await.is_err());
+        assert!(mock
+            .post("http://x", &[], &serde_json::json!({}))
+            .await
+            .is_err());
     }
 }

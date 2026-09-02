@@ -61,6 +61,13 @@ pub enum EventKind {
         draft: String,
         spans: Vec<String>,
     },
+    /// Rolling summary of the turns outside the window (M6 §5.1), written
+    /// off the user's critical path. In the log because it is what the
+    /// models were shown; excluded from replay diffs (derived prose whose
+    /// cadence is configuration).
+    Summarized {
+        summary: crate::memory::SessionSummary,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
