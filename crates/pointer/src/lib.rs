@@ -14,6 +14,7 @@
 //! Wire contract, for whoever writes the agent: `docs/pointer-protocol.md`.
 
 pub mod agent;
+pub mod cli;
 pub mod client;
 pub mod geom;
 pub mod gesture;
