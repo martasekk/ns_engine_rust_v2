@@ -42,6 +42,7 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
         .filter_map(|e| match &e.kind {
             EventKind::ReplyFailed { .. }
             | EventKind::ReplyFlagged { .. }
+            | EventKind::ReplyEchoed { .. }
             | EventKind::Summarized { .. } => None,
             other => Some(normalize_kind(other)),
         })
@@ -52,6 +53,7 @@ fn normalize_kind(kind: &EventKind) -> String {
     match kind {
         EventKind::ReplyFailed { .. }
         | EventKind::ReplyFlagged { .. }
+        | EventKind::ReplyEchoed { .. }
         | EventKind::Summarized { .. } => {
             unreachable!("filtered by normalize")
         }
@@ -60,6 +62,7 @@ fn normalize_kind(kind: &EventKind) -> String {
         EventKind::Rejected { reason, .. } => {
             let variant = match reason {
                 nscore::RejectReason::Malformed { .. } => "Malformed",
+                nscore::RejectReason::ProviderUnavailable { .. } => "ProviderUnavailable",
                 nscore::RejectReason::IllegalAction { .. } => "IllegalAction",
                 nscore::RejectReason::GuardDenied { .. } => "GuardDenied",
             };

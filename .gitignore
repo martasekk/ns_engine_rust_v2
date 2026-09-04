@@ -4,3 +4,4 @@
 /*.sqlite-wal
 /config.toml
 /.claude/
+/wire.jsonl

@@ -68,9 +68,26 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RejectReason {
-    Malformed { detail: String },
-    IllegalAction { action: String },
-    GuardDenied { guard: String, reason: String },
+    /// The model produced something the engine could not use.
+    Malformed {
+        detail: String,
+    },
+    /// The model endpoint refused or failed. Not the model's fault and not a
+    /// proposal at all — kept distinct so it is never replayed back to the
+    /// emitter as "you did something malformed", and so an audit can tell a
+    /// bad session from a bad afternoon. In session `cli`, 96 of 130
+    /// rejections were this, recorded as `Malformed`.
+    ProviderUnavailable {
+        status: u16,
+        detail: String,
+    },
+    IllegalAction {
+        action: String,
+    },
+    GuardDenied {
+        guard: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

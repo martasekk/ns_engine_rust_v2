@@ -1,38 +1,42 @@
-# Copy to config.toml and adjust. The API key comes from the environment
-# variable named by [llm] api_key_env (default OPENROUTER_API_KEY), never
-# from this file.
+# Copy to config.toml and adjust. API keys never live in this file: a
+# provider names the environment variable that holds its key.
 #
-# Any provider that speaks POST {base_url}/v1/chat/completions with
-# OpenAI-style function tools works. Presets (uncomment one block):
+# ── Swapping the agent ────────────────────────────────────────────────────
+# Full guide: docs/providers.md — setup per provider, picking a model,
+# troubleshooting. `ns-app providers` lists every preset, shows which keys
+# are set, and prints what this config currently resolves to.
 #
-#   Mistral (free Experiment tier, ~1 req/s, 500K TPM). Requests are spaced
-#   1100 ms apart automatically for api.mistral.ai; set min_interval_ms to
-#   override (0 = no spacing).
-#     [llm]
-#     base_url = "https://api.mistral.ai"
-#     api_key_env = "MISTRAL_API_KEY"
-#     min_interval_ms = 1100
-#     [llm.emitter]
-#     model = "mistral-small-latest"
-#     [llm.replier]
-#     model = "mistral-small-latest"
+#   whole config   [llm] provider = "ollama"
+#   one run        NS_PROVIDER=ollama [NS_MODEL=qwen2.5:3b] ns-app
+#   one role       [llm.replier] model = "mistral:mistral-small-latest"
 #
-#   Ollama (local, unlimited; the key can be any non-empty string).
-#   Pick a non-thinking model: Ollama's OpenAI endpoint ignores `think`,
-#   so qwen3 burns the whole output budget on reasoning (minutes on CPU).
-#     [llm]
-#     base_url = "http://localhost:11434"
-#     api_key_env = "OLLAMA_API_KEY"
-#     [llm.emitter]
-#     model = "qwen2.5:3b"
-#     [llm.replier]
-#     model = "qwen2.5:3b"
+# A preset supplies base_url, api_key_env, a default model, the provider's
+# request spacing and whether Anthropic cache breakpoints survive the hop.
+# Any of those can be overridden field by field below. Presets ship for:
+# openrouter, mistral, ollama, lmstudio, llamacpp, openai, groq — anything
+# else works too, by spelling out base_url (the protocol is POST
+# {base_url}/v1/chat/completions with OpenAI-style function tools).
+#
+# In a `provider:model` string only a known provider name counts as a
+# prefix, so model ids that contain a colon (`qwen2.5:3b`) stay intact.
+[llm]
+provider = "openrouter"
 
-[llm.emitter]
-model = "openrouter/free"
+# Local, no key needed — pick a non-thinking model: Ollama's OpenAI
+# endpoint ignores `think`, so qwen3 spends its whole output budget on
+# reasoning (minutes on CPU).
+#   provider = "ollama"
 
-[llm.replier]
-model = "openrouter/free"
+# Free Experiment tier, ~1 req/s; requests are spaced 1100 ms apart
+# automatically. min_interval_ms = 0 turns the spacing off.
+#   provider = "mistral"
+
+# Per-role overrides. Unset fields fall back to [llm]; the summarizer falls
+# back to the emitter. Each role may sit on a different provider.
+# [llm.emitter]
+# model = "openrouter/free"
+# [llm.replier]
+# model = "openrouter/free"
 
 [engine]
 max_iterations = 5
@@ -69,6 +73,7 @@ pinned_max = 5
 relevant_max = 5
 fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
+max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said
 # Rolling summary of the turns outside the window (M6 §5.1), written after
 # the reply is sent. Rebuilt from verbatim records every Nth time.
@@ -78,12 +83,10 @@ summary_max_chars = 800
 summary_input_max_chars = 6000
 recall_top_k = 5              # hits per source for the recall action (FTS5 over the log)
 
-# The summary model defaults to the emitter's model and provider; override
-# any field to swap the role, e.g. a local Ollama model:
+# The summary model defaults to the emitter's model and provider. One line
+# moves just this role onto a local model:
 # [llm.summarizer]
-# model = "qwen2.5:3b"
-# base_url = "http://localhost:11434"
-# api_key_env = "OLLAMA_API_KEY"
+# model = "ollama:qwen2.5:3b"
 
 # External HTTP endpoints exposed as tools (Windmill/n8n escape hatch).
 # [[http_component]]

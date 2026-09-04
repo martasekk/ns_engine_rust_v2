@@ -68,10 +68,35 @@ pub struct EmitterContext {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmitError {
+    /// The model answered, and the answer was unusable.
     #[error("malformed: {0}")]
     Malformed(String),
+    /// The endpoint answered with an HTTP status. Structured, because the
+    /// recovery differs by class and a parsed-out-of-a-string status is a
+    /// recovery decision made on a formatting accident.
+    #[error("status {status}: {detail}")]
+    Provider { status: u16, detail: String },
+    /// The endpoint could not be reached at all.
     #[error("transport: {0}")]
     Transport(String),
+}
+
+impl EmitError {
+    /// Whether retrying the identical request could plausibly succeed.
+    /// 429 and 5xx are transient; 408 is a timeout. Every other 4xx is a
+    /// statement about the request or the account — a wrong model name, a
+    /// missing key, an empty balance — and repeating it only spends the
+    /// budget. Seen live: turns 154 and 155 of session `cli` each burned all
+    /// three emit retries against a 404 for a model that did not exist.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            EmitError::Provider { status, .. } => {
+                *status == 429 || *status == 408 || *status >= 500
+            }
+            // A malformed answer is worth re-asking: the model may do better.
+            EmitError::Malformed(_) | EmitError::Transport(_) => true,
+        }
+    }
 }
 
 #[async_trait]
@@ -100,6 +125,14 @@ pub struct ReplyContext {
     /// Claims the grounding interceptor found unsupported in a first draft
     /// (M6 §4.5); non-empty only on the single regeneration.
     pub do_not_state: Vec<String>,
+    /// Spans a first draft lifted verbatim out of its own prompt.
+    /// **Currently never populated:** the copy check was demoted from gate to
+    /// monitor after an ablation measured its true-positive rate at zero
+    /// (plan §8), so nothing regenerates on an echo. Kept as the seam for a
+    /// reference-aware copy check, which is what the entrainment literature
+    /// actually operationalizes — overlap against a gold answer, not overlap
+    /// in the abstract. Rendered by the replier when set.
+    pub do_not_repeat: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

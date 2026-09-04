@@ -32,7 +32,14 @@ fn engine_with(
     }
     Engine::with_clock(
         b.build().unwrap(),
-        EngineConfig::default(),
+        // `ScriptedReplier` answers with the turn trace verbatim — that is
+        // its whole job, so tests can assert on what the replier was shown.
+        // The copy bound would (correctly) flag every one of its replies, so
+        // it is off here and exercised on its own double instead.
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
         Box::new(|| Timestamp(42)),
     )
 }
@@ -191,6 +198,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Replied { .. } => "Replied",
         EventKind::ReplyFailed { .. } => "ReplyFailed",
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",
+        EventKind::ReplyEchoed { .. } => "ReplyEchoed",
         EventKind::Summarized { .. } => "Summarized",
     }
 }
@@ -251,6 +259,72 @@ async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
     )));
     // The recording replays clean: the interceptor is off under doubles and
     // ReplyFlagged is not a behavioral line.
+    nsengine::replay::replay_session(sid, &events, vec![])
+        .await
+        .unwrap();
+}
+
+/// The live failure, as a double: a draft that copies a line out of the turn
+/// trace instead of answering.
+struct ParrotingReplier(std::sync::atomic::AtomicU32);
+#[async_trait::async_trait]
+impl Replier for ParrotingReplier {
+    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Session `cli` t141, in shape: the tool line, handed back.
+        Ok("ToolReturned(ok: echo: from memory, user.name is Peter)".into())
+    }
+}
+
+/// Plan §8: the copy bound observes and does not act. It logs `ReplyEchoed`
+/// and the draft is sent unchanged — the ablation put its true-positive rate
+/// at zero, so it must not spend a reply call or override the model.
+#[tokio::test]
+async fn a_reply_copied_out_of_its_own_prompt_is_logged_but_not_regenerated() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("echo".into());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal(
+        "from memory, user.name is Peter",
+    )])));
+    b.set_replier(Box::new(ParrotingReplier(Default::default())));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "whats my name".into(),
+        })
+        .await
+        .unwrap();
+    // The draft stands: observed, not overridden.
+    assert_eq!(
+        reply,
+        "ToolReturned(ok: echo: from memory, user.name is Peter)"
+    );
+    let events = store.load(&sid).await.unwrap();
+    let echoed = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ReplyEchoed { draft, span, ratio } => {
+                Some((draft.clone(), span.clone(), *ratio))
+            }
+            _ => None,
+        })
+        .expect("the copied draft was logged");
+    assert_eq!(echoed.0, reply);
+    assert!(
+        echoed.1.contains("from memory user name is peter"),
+        "{echoed:?}"
+    );
+    assert!(echoed.2 > 0.6, "{echoed:?}");
     nsengine::replay::replay_session(sid, &events, vec![])
         .await
         .unwrap();
@@ -1344,7 +1418,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         "{reply}"
     );
     assert!(
-        reply.contains("fact user.previous_name = \\\"Tomas\\\""),
+        reply.contains("from memory, user.previous_name is Tomas"),
         "{reply}"
     );
     let events = store.load(&sid).await.unwrap();
@@ -1375,6 +1449,24 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         "turns inside the window are not returned: {}",
         returned.summary
     );
+
+    // Invariant (plan §3, phase 1): no tool result the models are shown
+    // carries engine syntax. A `k = v` line or a JSON envelope is the most
+    // copyable string we could hand a reply model, and turn 137 of the live
+    // `cli` session proved it — 16 replies of `fact user.previous_name =
+    // Tomas` grew from one recall result rendered that way.
+    for ev in &events {
+        if let EventKind::ToolReturned {
+            outcome: ToolOutcome::Ok { output },
+            ..
+        } = &ev.kind
+        {
+            let s = &output.summary;
+            assert!(!s.contains(" = "), "engine `k = v` syntax: {s}");
+            assert!(!s.starts_with('['), "JSON envelope: {s}");
+            assert!(!s.contains("\\\""), "escaped JSON quotes: {s}");
+        }
+    }
 
     // No matches is a legitimate, grounded answer (abstention).
     let mut e = engine_with(
@@ -1984,6 +2076,103 @@ async fn fallback_reply_explains_provider_error() {
     );
 }
 
+/// Emitter that always answers with one HTTP status, counting attempts.
+struct EmitProviderStatus(u16, Arc<std::sync::atomic::AtomicU32>);
+
+#[async_trait::async_trait]
+impl Emitter for EmitProviderStatus {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(EmitError::Provider {
+            status: self.0,
+            detail: "{\"error\":{\"message\":\"model 'x' not found\"}}".into(),
+        })
+    }
+}
+
+/// Plan §3, phase 5: recovery follows the failure class. A 404 names a model
+/// that does not exist and will not start existing; retrying it three times
+/// is what turns 154 and 155 of session `cli` each did.
+#[tokio::test]
+async fn a_terminal_provider_status_is_not_retried() {
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(EmitProviderStatus(404, calls.clone())));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let sid = SessionId("terminal".into());
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(), // max_emit_retries = 3
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "hi".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "asked once, not max_emit_retries times"
+    );
+    // And the message blames the endpoint, not the loop: breaking out after
+    // one attempt is not "ran out of steps".
+    assert!(reply.contains("404"), "the cause reaches the user: {reply}");
+    assert!(
+        !reply.contains("ran out of steps"),
+        "one terminal failure is not step exhaustion: {reply}"
+    );
+    assert!(
+        reply.contains("model provider answered HTTP 404"),
+        "{reply}"
+    );
+    // Recorded as an endpoint failure, not as a malformed proposal.
+    let events = store.load(&sid).await.unwrap();
+    let reasons: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::Rejected { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![nscore::RejectReason::ProviderUnavailable {
+            status: 404,
+            detail: "{\"error\":{\"message\":\"model 'x' not found\"}}".into(),
+        }]
+    );
+}
+
+/// A transient status still gets the full retry budget.
+#[tokio::test]
+async fn a_transient_provider_status_uses_the_retry_budget() {
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut e = engine_from(
+        Box::new(EmitProviderStatus(429, calls.clone())),
+        Box::new(ScriptedReplier),
+        EngineConfig::default(), // max_emit_retries = 3
+    );
+    e.run_turn(Incoming {
+        session: SessionId("transient".into()),
+        text: "hi".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
 #[tokio::test]
 async fn fallback_reply_explains_step_exhaustion() {
     let proposals = ["a", "b", "c", "d", "e"]
@@ -2424,4 +2613,109 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
         1,
         "turn two saw the swapped-in alias"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M6 §5.1: the rolling summary is sleep-time work — it must run *while* the
+// loop waits for the next message, not before the wait. On a local
+// summarizer it can take tens of seconds, which the user would otherwise
+// spend staring at no prompt.
+
+/// recv #3 announces that the loop got back to the channel, then blocks
+/// until the summary is done. The summarizer waits for that same
+/// announcement — so a loop that summarizes *before* recv deadlocks, and the
+/// test's timeout fails it. Nothing here can pass sequentially.
+struct HandshakeChannel {
+    received: usize,
+    at_channel: Arc<tokio::sync::Notify>,
+    summarized: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Channel for HandshakeChannel {
+    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        self.received += 1;
+        match self.received {
+            n @ (1 | 2) => Ok(Incoming {
+                session: SessionId("concurrent".into()),
+                text: format!("message {n}"),
+            }),
+            _ => {
+                self.at_channel.notify_one();
+                self.summarized.notified().await;
+                Err(ChannelError::Closed)
+            }
+        }
+    }
+    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+struct HandshakeSummarizer {
+    at_channel: Arc<tokio::sync::Notify>,
+    summarized: Arc<tokio::sync::Notify>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Summarizer for HandshakeSummarizer {
+    async fn summarize(
+        &self,
+        _input: SummaryInput<'_>,
+    ) -> Result<Option<SummaryDraft>, SummarizeError> {
+        // Only proceeds once the loop is already parked on recv.
+        self.at_channel.notified().await;
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.summarized.notify_one();
+        Ok(Some(SummaryDraft {
+            topic: "summarized while the user was typing".into(),
+            established: vec![],
+            open: vec![],
+        }))
+    }
+}
+
+#[tokio::test]
+async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
+    let store = Arc::new(InMemoryStore::new());
+    let at_channel = Arc::new(tokio::sync::Notify::new());
+    let summarized = Arc::new(tokio::sync::Notify::new());
+    let calls: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(HandshakeChannel {
+        received: 0,
+        at_channel: at_channel.clone(),
+        summarized: summarized.clone(),
+    }));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.set_summarizer(Box::new(HandshakeSummarizer {
+        at_channel,
+        summarized,
+        calls: calls.clone(),
+    }));
+    // window 1, every 1: a summary is due once turn 2 has completed.
+    let cfg = EngineConfig {
+        window_turns: 1,
+        summary_every_turns: 1,
+        ..EngineConfig::default()
+    };
+    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the summary must not block the wait for the next message")
+        .unwrap();
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let events = store.load(&SessionId("concurrent".into())).await.unwrap();
+    let summaries = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Summarized { .. }))
+        .count();
+    assert_eq!(summaries, 1, "the summary still lands in the log");
 }

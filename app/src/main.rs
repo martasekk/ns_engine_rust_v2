@@ -1,6 +1,6 @@
 mod config;
 
-use config::AppConfig;
+use config::{AppConfig, Role, RoleTarget};
 use nscore::{HarnessBuilder, SessionId, Tool};
 use nsengine::store::NoopConsolidator;
 use nsengine::turn::{Engine, EngineConfig};
@@ -30,33 +30,163 @@ fn parse_evolve_args(args: &[String]) -> Result<bool, String> {
     }
 }
 
-/// The provider key, if the configured env var is set and non-empty.
-fn api_key(cfg: &AppConfig) -> Option<String> {
-    std::env::var(&cfg.llm.api_key_env)
-        .ok()
-        .filter(|k| !k.is_empty())
-}
-
-/// One throttle per process: every role's client shares it, so the
-/// provider sees one paced stream (seen live: Mistral 429s on bursts).
-fn throttle(cfg: &AppConfig) -> Arc<nsllm::client::Throttle> {
-    static THROTTLE: std::sync::OnceLock<Arc<nsllm::client::Throttle>> = std::sync::OnceLock::new();
-    THROTTLE
-        .get_or_init(|| Arc::new(nsllm::client::Throttle::new(cfg.llm.min_interval_ms())))
+/// One throttle per endpoint: roles sharing a base URL share the pacing,
+/// so the provider sees one paced stream (seen live: Mistral 429s on
+/// bursts). Roles on different providers are paced independently.
+fn throttle_for(target: &RoleTarget) -> Arc<nsllm::client::Throttle> {
+    type Registry =
+        std::sync::Mutex<std::collections::HashMap<String, Arc<nsllm::client::Throttle>>>;
+    static THROTTLES: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let mut map = THROTTLES
+        .get_or_init(Registry::default)
+        .lock()
+        .expect("throttle registry");
+    map.entry(target.base_url_or_default().to_string())
+        .or_insert_with(|| Arc::new(nsllm::client::Throttle::new(target.min_interval_ms)))
         .clone()
 }
 
-fn make_client(
-    cfg: &AppConfig,
+/// The wire log, opened once when NS_TRACE names a path. A path that cannot
+/// be opened is fatal: a trace the user asked for and did not get would let
+/// them debug against a file that is silently never written.
+fn trace_sink() -> Option<Arc<nsllm::trace::Trace>> {
+    static SINK: std::sync::OnceLock<Option<Arc<nsllm::trace::Trace>>> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = env_override("NS_TRACE")?;
+        match nsllm::trace::Trace::open(&path) {
+            Ok(t) => {
+                eprintln!("tracing every provider request to {path}");
+                Some(Arc::new(t))
+            }
+            Err(e) => {
+                eprintln!("NS_TRACE={path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    })
+    .clone()
+}
+
+fn client_for(
+    target: &RoleTarget,
     transport: Arc<nsllm::transport::ReqwestTransport>,
     key: &str,
 ) -> nsllm::client::OpenRouterClient {
     let c = nsllm::client::OpenRouterClient::new(transport, key.to_string())
-        .with_throttle(throttle(cfg));
-    match &cfg.llm.base_url {
+        .with_throttle(throttle_for(target));
+    let c = match &target.base_url {
         Some(url) => c.with_base_url(url.clone()),
         None => c,
+    };
+    match trace_sink() {
+        Some(trace) => c.with_trace(trace, target.role.as_str()),
+        None => c,
     }
+}
+
+/// Resolve a role, or exit: an unknown provider or a missing model must not
+/// fall back silently to someone else's endpoint.
+fn role_or_exit(cfg: &AppConfig, role: Role) -> RoleTarget {
+    match cfg.llm.role(role) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn key_or_exit(target: &RoleTarget) -> String {
+    match target.key() {
+        Some(k) => k,
+        None => {
+            eprintln!(
+                "{} is not set — the {} role needs a provider API key.",
+                target.api_key_env,
+                target.role.as_str()
+            );
+            eprintln!(
+                "export {}=... , or switch to a local backend: NS_PROVIDER=ollama (ns-app providers).",
+                target.api_key_env
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A non-empty env var, trimmed.
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// `ns-app providers`: the presets, which keys are present, which one this
+/// config is on, and where the full guide lives.
+fn render_providers(cfg: &AppConfig) -> String {
+    let roles = cfg.llm.roles();
+    // A preset is "active" when a role actually resolves onto its endpoint.
+    let active: std::collections::HashSet<&str> = match &roles {
+        Ok(targets) => targets
+            .iter()
+            .filter_map(|t| nsllm::provider::for_base_url(t.base_url_or_default()))
+            .map(|p| p.name)
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+
+    let mut s = String::from(
+        "Providers — one word swaps the agent.\n\n\
+         \x20 in config.toml   [llm] provider = \"<name>\"\n\
+         \x20 for one run      NS_PROVIDER=<name> [NS_MODEL=<id>] cargo run -p ns-app\n\
+         \x20 for one role     [llm.replier] model = \"<name>:<model-id>\"\n\n",
+    );
+    let row = |mark: &str, name: &str, url: &str, env: &str, key: &str, model: &str| {
+        format!("  {mark:<2}{name:<12}{url:<32}{env:<21}{key:<9}{model}\n")
+    };
+    s.push_str(&row(
+        "",
+        "NAME",
+        "ENDPOINT",
+        "KEY (env var)",
+        "KEY?",
+        "DEFAULT MODEL",
+    ));
+    for p in nsllm::provider::PROVIDERS {
+        let key = if p.local {
+            "local"
+        } else if env_override(p.api_key_env).is_some() {
+            "set"
+        } else {
+            "MISSING"
+        };
+        s.push_str(&row(
+            if active.contains(p.name) { "→" } else { "" },
+            p.name,
+            p.base_url,
+            p.api_key_env,
+            key,
+            p.default_model.unwrap_or("(name one)"),
+        ));
+    }
+    s.push_str("\n  → = what this config uses.  local = key optional, any value works.\n\n");
+    match &roles {
+        Ok(targets) => {
+            s.push_str("Active roles:\n");
+            for t in targets {
+                s.push_str(&format!(
+                    "  {:<12}{} @ {}\n",
+                    t.role.as_str(),
+                    t.model,
+                    t.base_url_or_default()
+                ));
+            }
+        }
+        Err(e) => s.push_str(&format!("Active roles: config.toml: {e}\n")),
+    }
+    s.push_str("\nSetup, per-provider notes and troubleshooting: docs/providers.md\n");
+    s
 }
 
 /// Load learned.toml (fatal when unparsable: a bad rule set must not be
@@ -75,7 +205,7 @@ fn build_pass(
     cfg: &AppConfig,
     rules: RulesHandle,
     tools: &[Arc<dyn Tool>],
-    key: Option<&str>,
+    emitter: &RoleTarget,
     dry_run: bool,
 ) -> nsevolution::pass::EvolutionPass {
     let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
@@ -87,37 +217,34 @@ fn build_pass(
         cfg.evolution
             .pass_config(dry_run, cfg.memory.fact_stale_days),
     );
-    match key {
+    match emitter.key() {
         None => {
             eprintln!(
                 "{} is not set — notes lane skipped (symbolic lane needs no key).",
-                cfg.llm.api_key_env
+                emitter.api_key_env
             );
             pass
         }
         Some(key) => {
             let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
-            let model = cfg.llm.emitter.model.clone();
-            let factory_cfg = (cfg.llm.base_url.clone(), key.to_string(), model.clone());
+            let model = emitter.model.clone();
+            // The probe builds a fresh emitter per run, on the same target.
+            let factory_target = emitter.clone();
             let factory_transport = transport.clone();
-            let probe_throttle = throttle(cfg);
-            let emitter: nsevolution::notes::EmitterFactory = Arc::new(move || {
-                let (base_url, key, model) = factory_cfg.clone();
-                let c = nsllm::client::OpenRouterClient::new(factory_transport.clone(), key)
-                    .with_throttle(probe_throttle.clone());
-                let c = match base_url {
-                    Some(u) => c.with_base_url(u),
-                    None => c,
-                };
-                Box::new(nsllm::emitter::CloudEmitter::new(c, model)) as Box<dyn nscore::Emitter>
+            let factory_key = key.clone();
+            let factory_model = model.clone();
+            let emitter_factory: nsevolution::notes::EmitterFactory = Arc::new(move || {
+                let c = client_for(&factory_target, factory_transport.clone(), &factory_key);
+                Box::new(nsllm::emitter::CloudEmitter::new(c, factory_model.clone()))
+                    as Box<dyn nscore::Emitter>
             });
             let probe = nsevolution::notes::LiveProbe {
-                emitter,
+                emitter: emitter_factory,
                 known_specs: specs,
                 persona: cfg.persona.text.clone(),
             };
             let proposer = nsevolution::notes::ClientNoteProposer {
-                client: make_client(cfg, transport, key),
+                client: client_for(emitter, transport, &key),
                 model,
             };
             pass.with_notes(Box::new(probe), Box::new(proposer))
@@ -128,14 +255,25 @@ fn build_pass(
 #[tokio::main]
 async fn main() {
     let cfg_text = std::fs::read_to_string("config.toml").unwrap_or_default();
-    let cfg = match AppConfig::parse(&cfg_text) {
+    let mut cfg = match AppConfig::parse(&cfg_text) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config.toml: {e}");
             std::process::exit(1);
         }
     };
+    // A swap without editing config: NS_PROVIDER=ollama ns-app.
+    cfg.llm
+        .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
+    let cfg = cfg;
     let args: Vec<String> = std::env::args().collect();
+
+    // `ns-app providers`: which backends exist, which keys are present, and
+    // what this config resolves to. Needs no key and no network.
+    if args.get(1).map(String::as_str) == Some("providers") {
+        print!("{}", render_providers(&cfg));
+        return;
+    }
 
     // `ns-app dump <session_id>`: print the session log as JSONL and exit.
     // Needs no API key — the log is local.
@@ -153,6 +291,25 @@ async fn main() {
         return;
     }
 
+    // `ns-app echo <session_id>`: per-turn copy ratio for the session log.
+    // Needs no API key — the metric is lexical and the log is local.
+    if args.get(1).map(String::as_str) == Some("echo") {
+        let Some(session) = args.get(2) else {
+            eprintln!("usage: ns-app echo <session_id>");
+            std::process::exit(2);
+        };
+        let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
+            .expect("open sqlite store");
+        let events = nscore::MemoryStore::load(&store, &SessionId(session.clone()))
+            .await
+            .expect("load session");
+        print!(
+            "{}",
+            render_echo(&events, cfg.memory.window_turns, cfg.memory.caps())
+        );
+        return;
+    }
+
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane
     // needs no key; without one the notes lane is skipped with a warning.
     if args.get(1).map(String::as_str) == Some("evolve") {
@@ -165,8 +322,8 @@ async fn main() {
         };
         let rules = load_rules_or_exit(&cfg);
         let tools = build_tools(&cfg);
-        let key = api_key(&cfg);
-        let pass = build_pass(&cfg, rules, &tools, key.as_deref(), dry_run);
+        let emitter = role_or_exit(&cfg, Role::Emitter);
+        let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
         let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
             .expect("open sqlite store");
         match pass.run_report(&store).await {
@@ -179,12 +336,12 @@ async fn main() {
         return;
     }
 
-    let Some(key) = api_key(&cfg) else {
-        let key_env = &cfg.llm.api_key_env;
-        eprintln!("{key_env} is not set — the harness needs a provider API key.");
-        eprintln!("export {key_env}=... and run again (see [llm] api_key_env in config.toml).");
-        std::process::exit(1);
-    };
+    // Each role resolves on its own, so the emitter can sit on a local
+    // model while the replier stays in the cloud (or the other way round).
+    let emitter_target = role_or_exit(&cfg, Role::Emitter);
+    let replier_target = role_or_exit(&cfg, Role::Replier);
+    let emitter_key = key_or_exit(&emitter_target);
+    let replier_key = key_or_exit(&replier_target);
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
@@ -192,15 +349,15 @@ async fn main() {
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(nsllm::emitter::CloudEmitter::new(
-        make_client(&cfg, transport.clone(), &key),
-        cfg.llm.emitter.model.clone(),
+        client_for(&emitter_target, transport.clone(), &emitter_key),
+        emitter_target.model.clone(),
     )));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
-            make_client(&cfg, transport.clone(), &key),
-            cfg.llm.replier.model.clone(),
+            client_for(&replier_target, transport.clone(), &replier_key),
+            replier_target.model.clone(),
         )
-        .with_prompt_cache(cfg.llm.prompt_cache()),
+        .with_prompt_cache(replier_target.prompt_cache),
     ));
     b.set_memory(Arc::new(
         nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
@@ -210,18 +367,19 @@ async fn main() {
     // M6 §5.1: the rolling summary runs on its own role (model, provider,
     // key), so it can be swapped without touching the emitter or replier.
     if cfg.memory.summary_every_turns > 0 {
-        let (model, base_url, key_env) = cfg.llm.summarizer_role();
-        match std::env::var(&key_env).ok().filter(|k| !k.is_empty()) {
+        let target = role_or_exit(&cfg, Role::Summarizer);
+        match target.key() {
             Some(role_key) => {
-                let c = nsllm::client::OpenRouterClient::new(transport.clone(), role_key)
-                    .with_throttle(throttle(&cfg));
-                let c = match base_url {
-                    Some(u) => c.with_base_url(u),
-                    None => c,
-                };
-                b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(c, model)));
+                let c = client_for(&target, transport.clone(), &role_key);
+                b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(
+                    c,
+                    target.model.clone(),
+                )));
             }
-            None => eprintln!("{key_env} is not set — rolling summary disabled."),
+            None => eprintln!(
+                "{} is not set — rolling summary disabled.",
+                target.api_key_env
+            ),
         }
     }
     if cfg.evolution.enabled {
@@ -230,7 +388,7 @@ async fn main() {
             &cfg,
             rules.clone(),
             &tools,
-            Some(&key),
+            &emitter_target,
             false,
         )));
     } else {
@@ -259,6 +417,7 @@ async fn main() {
         caps: cfg.memory.caps(),
         facts_in_context: cfg.memory.facts_in_context,
         reply_grounding_check: cfg.memory.reply_grounding_check,
+        max_echo_ratio: cfg.memory.max_echo_ratio,
         // The CLI is single-user: every session shares the global scope.
         scope_for: Arc::new(|_| "global".to_string()),
         remember_residual,
@@ -272,10 +431,65 @@ async fn main() {
         recall_top_k: cfg.memory.recall_top_k,
     };
     let mut engine = Engine::new(parts, engine_cfg);
-    println!("ns-harness M5 — type text, /quit to exit");
+    println!(
+        "ns-harness — {}  |  {}",
+        emitter_target.describe(),
+        replier_target.describe()
+    );
+    println!("type text, /quit to exit  ·  `ns-app providers` lists the backends");
     if let Err(e) = engine.run().await {
         eprintln!("engine stopped: {e}");
     }
+}
+
+/// `echo_ratio` per replied turn, reconstructed from a stored log: the
+/// acceptance number for the reply-entrainment work (plan §3, phase 0).
+///
+/// The material is what the log preserves — the window as of that turn, the
+/// summary in force, and the turn's own trace. Standing facts are not in it:
+/// the log records what the engine decided, not which facts were selected,
+/// and the facts table holds only current values. So this **under**-reports
+/// against the runtime check, which sees the rendered facts too. It is a
+/// floor on the copying in a session, not a ceiling.
+fn render_echo(events: &[nscore::Event], window_turns: usize, caps: nscore::Caps) -> String {
+    let mut out = String::new();
+    let mut ratios: Vec<f32> = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        let nscore::EventKind::Replied { text } = &ev.kind else {
+            continue;
+        };
+        // Fold everything before this turn: records exist only for completed
+        // turns, so this is exactly the window the reply was shown.
+        let before: Vec<nscore::Event> = events[..i]
+            .iter()
+            .filter(|e| e.turn < ev.turn)
+            .cloned()
+            .collect();
+        let state = nsengine::state::fold(&before);
+        let window = state.window(window_turns);
+        let mut material = nsengine::turn::turn_trace(events, ev.turn);
+        if let Some(s) = &state.summary {
+            material.push('\n');
+            material.push_str(&nscore::render_summary(s));
+        }
+        material.push('\n');
+        material.push_str(&nscore::render_window(&window, window.len(), &caps));
+        let ratio = nsengine::echo::echo_ratio(text, &material);
+        ratios.push(ratio);
+        let head: String = text.replace('\n', " ").chars().take(70).collect();
+        out.push_str(&format!("t{:<5} {ratio:.2}  {head}\n", ev.turn));
+    }
+    let n = ratios.len();
+    let over = ratios.iter().filter(|r| **r >= 0.6).count();
+    let mean = if n == 0 {
+        0.0
+    } else {
+        ratios.iter().sum::<f32>() / n as f32
+    };
+    out.push_str(&format!(
+        "\n{n} replied turns · {over} at or over 0.60 · mean {mean:.3}\n"
+    ));
+    out
 }
 
 /// JSONL: one serialized event per line (spec §7 — eyeball any session).
@@ -309,6 +523,45 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first["kind"]["type"], "UserSaid");
+    }
+
+    #[test]
+    fn providers_listing_names_every_preset_and_the_active_roles() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"ollama\"").unwrap();
+        let out = render_providers(&cfg);
+        for p in nsllm::provider::PROVIDERS {
+            assert!(out.contains(p.name), "{} missing from:\n{out}", p.name);
+            assert!(out.contains(p.base_url), "{} url missing", p.name);
+        }
+        assert!(
+            out.contains("emitter     qwen2.5:3b @ http://localhost:11434"),
+            "{out}"
+        );
+        assert!(
+            out.contains("replier     qwen2.5:3b @ http://localhost:11434"),
+            "{out}"
+        );
+        assert!(
+            out.contains("OLLAMA_API_KEY       local"),
+            "local key is optional: {out}"
+        );
+        assert!(
+            out.contains("docs/providers.md"),
+            "points at the guide: {out}"
+        );
+        // The preset in use is marked; the others are not.
+        let ollama_row = out.lines().find(|l| l.contains("ollama ")).unwrap();
+        assert!(ollama_row.trim_start().starts_with('→'), "{ollama_row:?}");
+        let openai_row = out.lines().find(|l| l.contains("openai ")).unwrap();
+        assert!(!openai_row.contains('→'), "{openai_row:?}");
+    }
+
+    /// A bad provider name must surface in the listing, not panic it.
+    #[test]
+    fn providers_listing_reports_a_config_error_instead_of_roles() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"nope\"").unwrap();
+        let out = render_providers(&cfg);
+        assert!(out.contains("is unknown"), "{out}");
     }
 
     #[test]

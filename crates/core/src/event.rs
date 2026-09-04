@@ -61,6 +61,17 @@ pub enum EventKind {
         draft: String,
         spans: Vec<String>,
     },
+    /// The echo interceptor found that a first draft was `ratio` lifted out
+    /// of its own prompt — `span` is the longest copied run — and the reply
+    /// was generated once more with it named. The mirror of `ReplyFlagged`:
+    /// that one catches invention, this one catches copying, and only the
+    /// pair of them bounds a reply on both sides. Infrastructure: replay
+    /// ignores it.
+    ReplyEchoed {
+        draft: String,
+        span: String,
+        ratio: f32,
+    },
     /// Rolling summary of the turns outside the window (M6 §5.1), written
     /// off the user's critical path. In the log because it is what the
     /// models were shown; excluded from replay diffs (derived prose whose

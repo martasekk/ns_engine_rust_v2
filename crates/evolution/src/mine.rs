@@ -148,6 +148,9 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
             }
             EventKind::Rejected { reason, .. } => match reason {
                 RejectReason::Malformed { detail } => format!("Rejected: malformed — {detail}"),
+                RejectReason::ProviderUnavailable { status, detail } => {
+                    format!("Rejected: provider HTTP {status} — {detail}")
+                }
                 RejectReason::IllegalAction { action } => {
                     format!("Rejected: illegal action {action}")
                 }
@@ -171,6 +174,9 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
             EventKind::Replied { text } => format!("Replied: {text}"),
             EventKind::ReplyFailed { detail } => format!("ReplyFailed: {detail}"),
             EventKind::ReplyFlagged { spans, .. } => format!("ReplyFlagged: {}", spans.join(", ")),
+            EventKind::ReplyEchoed { span, ratio, .. } => {
+                format!("ReplyEchoed ({ratio:.2}): {span}")
+            }
             EventKind::Summarized { summary } => {
                 format!("Summarized: through turn {}", summary.through_turn)
             }
@@ -213,6 +219,9 @@ pub fn mine(session: &SessionId, events: &[Event], known_specs: &[ActionSpec]) -
                 proposal_of,
                 reason,
             } => match reason {
+                // A provider outage teaches the evolution pass nothing about
+                // the emitter's behaviour: no proposal was ever made.
+                RejectReason::ProviderUnavailable { .. } => {}
                 RejectReason::Malformed { .. } => {
                     if let Some(p) = proposals.get(&proposal_of.0) {
                         if let Some(spec) = specs.get(p.action.as_str()) {

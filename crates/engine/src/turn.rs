@@ -1,7 +1,8 @@
 use crate::state::fold;
 use nscore::{
-    ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming, LegalActionSet,
-    RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome, Verdict,
+    Channel, ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming,
+    LegalActionSet, RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome,
+    Verdict,
 };
 
 pub struct EngineConfig {
@@ -23,9 +24,16 @@ pub struct EngineConfig {
     /// M6 §6.5: standing facts shown to both models per turn.
     pub facts_in_context: usize,
     /// M6 §4.5: flag and regenerate (once) a reply that states numbers,
-    /// quotes or names absent from everything the model was shown. Off in
-    /// replay and probes, where recorded doubles stand in for the replier.
+    /// quotes or names absent from everything the model was shown — or that
+    /// copies its own prompt instead of answering. Off in replay and probes,
+    /// where recorded doubles stand in for the replier.
     pub reply_grounding_check: bool,
+    /// Reporting threshold, not a gate: a draft at or over this fraction of
+    /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
+    /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
+    /// plan §8 for the ablation that demoted it. Rides the
+    /// `reply_grounding_check` gate; above `1.0` nothing is logged.
+    pub max_echo_ratio: f32,
     /// M6 §6.6: the fact scope a session writes to and reads from. The CLI
     /// maps everything to `global`; a multi-user channel maps its chat id.
     pub scope_for: std::sync::Arc<dyn Fn(&nscore::SessionId) -> String + Send + Sync>,
@@ -64,6 +72,7 @@ impl Default for EngineConfig {
             caps: nscore::Caps::default(),
             facts_in_context: 10,
             reply_grounding_check: true,
+            max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
             pinned_prefixes: vec!["user.".into()],
@@ -490,6 +499,9 @@ impl Engine {
         let mut forget_misses: u32 = 0;
         let mut emit_failures: u32 = 0;
         let mut last_emit_error: Option<String> = None;
+        // Whether the emitter ever produced a proposal this turn; decides
+        // which fallback reason the user is given.
+        let mut proposed_this_turn = false;
         let mut settled: Option<ReplyPolicy> = None;
 
         for _ in 0..self.cfg.max_iterations {
@@ -554,8 +566,10 @@ impl Engine {
             // already done — otherwise it re-proposes completed actions until
             // max_iterations exhausts — and the standing facts, or it
             // re-remembers them every turn (seen live).
-            let trace_so_far: Vec<String> =
-                turn_trace(&log, turn).lines().map(str::to_string).collect();
+            let trace_so_far: Vec<String> = turn_trace(log.events(), turn)
+                .lines()
+                .map(str::to_string)
+                .collect();
             let selected = self.select_facts(&scope, &incoming.text).await;
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
@@ -576,20 +590,39 @@ impl Engine {
             let mut proposal = match self.parts.emitter.propose(ctx, &legal).await {
                 Ok(p) => p,
                 Err(e) => {
+                    // Four failure classes, three recoveries. A refused or
+                    // failed endpoint is not a malformed proposal, and a
+                    // terminal one (a model name that does not exist, an
+                    // empty balance) will not become one by asking again.
+                    let retryable = e.is_retryable();
+                    let reason = match &e {
+                        nscore::EmitError::Provider { status, detail } => {
+                            RejectReason::ProviderUnavailable {
+                                status: *status,
+                                detail: detail.clone(),
+                            }
+                        }
+                        other => RejectReason::Malformed {
+                            detail: other.to_string(),
+                        },
+                    };
                     log.append(
                         turn,
                         now(),
                         EventKind::Rejected {
                             proposal_of: nscore::EventId(0),
-                            reason: RejectReason::Malformed {
-                                detail: e.to_string(),
-                            },
+                            reason,
                         },
                     );
-                    rejections_this_turn.push(format!("emitter failure: {e}"));
+                    rejections_this_turn.push(match &e {
+                        nscore::EmitError::Provider { status, .. } => {
+                            format!("provider unavailable: HTTP {status}")
+                        }
+                        other => format!("emitter failure: {other}"),
+                    });
                     last_emit_error = Some(e.to_string());
                     emit_failures += 1;
-                    if emit_failures >= self.cfg.max_emit_retries {
+                    if !retryable || emit_failures >= self.cfg.max_emit_retries {
                         break;
                     }
                     continue;
@@ -597,6 +630,7 @@ impl Engine {
             };
 
             // d. record proposal
+            proposed_this_turn = true;
             let pid = log
                 .append(
                     turn,
@@ -1072,7 +1106,11 @@ impl Engine {
                     Ok(facts) => {
                         for f in facts {
                             trusts.push(f.trust);
-                            lines.push(format!("fact {} = {}", f.key, f.value));
+                            lines.push(format!(
+                                "from memory, {} is {}",
+                                f.key,
+                                value_text(&f.value)
+                            ));
                         }
                     }
                     Err(e) => failure = Some(e.to_string()),
@@ -1089,9 +1127,13 @@ impl Engine {
                             trust: nscore::Trust::System,
                         },
                     },
+                    // Joined, not JSON: brackets and escaped quotes are pure
+                    // copy-bait for the reply model and buy nothing, since
+                    // nothing parses this back (plan §3, phase 1). One line,
+                    // because `turn_trace` is line-per-event.
                     None => ToolOutcome::Ok {
                         output: nscore::ToolOutput {
-                            summary: serde_json::to_string(&lines).unwrap_or_default(),
+                            summary: lines.join("; "),
                             artifact: None,
                             trust: nscore::min_trust(&trusts),
                         },
@@ -1432,7 +1474,11 @@ impl Engine {
         // reply names the cause — the user shouldn't need the event log to
         // learn it was a rate limit rather than a refusal.
         let policy = settled.unwrap_or_else(|| {
-            let reason = if emit_failures >= self.cfg.max_emit_retries {
+            // The test is "did the emitter ever answer", not "was the retry
+            // budget spent". A terminal provider status breaks out after one
+            // attempt (phase 5), and calling that "ran out of steps after 5
+            // actions" would blame the loop for an endpoint that was down.
+            let reason = if emit_failures > 0 && !proposed_this_turn {
                 last_emit_error
                     .as_deref()
                     .map(explain_error)
@@ -1470,7 +1516,7 @@ impl Engine {
             },
             ReplyPolicy::Generate => {
                 let state = fold(log.events());
-                let trace = turn_trace(&log, turn);
+                let trace = turn_trace(log.events(), turn);
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
@@ -1485,23 +1531,56 @@ impl Engine {
                 // verbatim window and the summary — not a counter string.
                 let window = state.window(self.cfg.window_turns);
                 let guidance = rules.guidance_for_reply();
-                let make_ctx = |do_not_state: Vec<String>| ReplyContext {
-                    persona: self.cfg.persona.clone(),
-                    facts: facts.clone(),
-                    summary: state.summary.clone(),
-                    window: window.clone(),
-                    caps: self.cfg.caps,
-                    user_text: incoming.text.clone(),
-                    turn_trace: trace.clone(),
-                    guidance: guidance.clone(),
-                    do_not_state,
-                };
-                match self.parts.replier.reply(make_ctx(vec![])).await {
+                let make_ctx =
+                    |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
+                        persona: self.cfg.persona.clone(),
+                        facts: facts.clone(),
+                        summary: state.summary.clone(),
+                        window: window.clone(),
+                        caps: self.cfg.caps,
+                        user_text: incoming.text.clone(),
+                        turn_trace: trace.clone(),
+                        guidance: guidance.clone(),
+                        do_not_state,
+                        do_not_repeat,
+                    };
+                match self.parts.replier.reply(make_ctx(vec![], vec![])).await {
                     Ok(draft) if self.cfg.reply_grounding_check => {
-                        // M6 §4.5: claims nothing above supports are named
-                        // and the reply is generated once more; the second
-                        // draft stands whatever it says, and both are logged.
-                        let material = crate::ground::Material::from_context(&make_ctx(vec![]));
+                        // M6 §4.5. Two checks, one of which acts.
+                        //
+                        // `ungrounded` gates: a claim nothing above supports
+                        // is named and the reply regenerated once, and the
+                        // second draft stands whatever it says.
+                        //
+                        // `echoed` only observes. The 2026-09-04 ablation
+                        // (plan §7–§8) scored it over four control arms: 21
+                        // firings, zero true positives. `echo_ratio` is
+                        // reference-free, so it cannot tell a copied engine
+                        // artifact from the same short correct answer given
+                        // twice — the two have identical verbatim overlap,
+                        // and the historical parrots (0.80–1.00) and the
+                        // false positives (0.60–1.00) overlap completely, so
+                        // no threshold separates them either. Both loop
+                        // detectors this borrows from are monitors, at far
+                        // more conservative thresholds. So it is logged, and
+                        // nothing is regenerated on it: the observability is
+                        // what found all of this, and it is free.
+                        let ctx = make_ctx(vec![], vec![]);
+                        let echo_material = crate::ground::echo_material(&ctx);
+                        if let Some(span) =
+                            crate::echo::echoed(&draft, &echo_material, self.cfg.max_echo_ratio)
+                        {
+                            log.append(
+                                turn,
+                                now(),
+                                EventKind::ReplyEchoed {
+                                    draft: draft.clone(),
+                                    span,
+                                    ratio: crate::echo::echo_ratio(&draft, &echo_material),
+                                },
+                            );
+                        }
+                        let material = crate::ground::Material::from_context(&ctx);
                         let spans = crate::ground::ungrounded(&draft, &material);
                         if spans.is_empty() {
                             draft
@@ -1516,7 +1595,7 @@ impl Engine {
                             );
                             self.parts
                                 .replier
-                                .reply(make_ctx(spans))
+                                .reply(make_ctx(spans, vec![]))
                                 .await
                                 .unwrap_or(draft)
                         }
@@ -1550,23 +1629,59 @@ impl Engine {
         Ok(text)
     }
 
-    /// Outer loop: recv → run_turn → send, until the channel closes.
     /// Outer loop: recv → run_turn → send, until the channel closes. With
     /// `idle_after` set, a quiet period runs the consolidator once (driver B,
     /// spec M5 §5) — only when at least one turn ran since the last pass, and
     /// never interleaved with a turn (same task).
+    ///
+    /// The rolling summary (M6 §5.1) runs *concurrently with the wait for the
+    /// next message*, not before it: it is sleep-time work, and a local
+    /// summarizer can take tens of seconds — long enough to hold up the
+    /// prompt if it sits on the critical path.
     pub async fn run(&mut self) -> Result<(), EngineError> {
+        // The channel lives outside `self` for the loop's duration so the
+        // summary can borrow the engine while `recv` is still pending.
+        let mut channel = std::mem::replace(&mut self.parts.channel, Box::new(DetachedChannel));
+        let outcome = self.run_loop(&mut channel).await;
+        self.parts.channel = channel;
+        outcome
+    }
+
+    async fn run_loop(&mut self, channel: &mut Box<dyn Channel>) -> Result<(), EngineError> {
         let mut turns_since_pass: u32 = 0;
+        // The session whose turn just ended: it may owe a rolling summary.
+        let mut summary_due: Option<nscore::SessionId> = None;
         loop {
-            let received = match self.cfg.idle_after {
-                Some(d) => tokio::time::timeout(d, self.parts.channel.recv()).await,
-                None => Ok(self.parts.channel.recv().await),
+            let due = summary_due.take();
+            let next = match &due {
+                None => next_message(&mut **channel, self.cfg.idle_after).await?,
+                Some(sid) => {
+                    // `recv` is polled first (biased), so the prompt appears
+                    // before the summary starts; the summary then runs while
+                    // the user reads the reply and types. If the user gets
+                    // there first the summary is dropped mid-flight — it is
+                    // recomputed from the store at the next boundary, and its
+                    // input range is capped by summary_input_max_chars, so an
+                    // abandoned summary cannot make the next one unbounded.
+                    let mut pending =
+                        std::pin::pin!(next_message(&mut **channel, self.cfg.idle_after));
+                    tokio::select! {
+                        biased;
+                        next = &mut pending => next?,
+                        summarized = self.maybe_summarize(sid) => {
+                            if let Err(e) = summarized {
+                                eprintln!("summary: {e}");
+                            }
+                            pending.await?
+                        }
+                    }
+                }
             };
-            let incoming = match received {
-                Ok(Ok(i)) => i,
-                Ok(Err(ChannelError::Closed)) => return Ok(()),
-                Ok(Err(e)) => return Err(EngineError::Channel(e.to_string())),
-                Err(_elapsed) => {
+            let incoming = match next {
+                Next::Closed => return Ok(()),
+                Next::Idle => {
+                    // Silence is not a message: the summary is still owed.
+                    summary_due = due;
                     if turns_since_pass > 0 {
                         if let Err(e) = self.parts.consolidator.run(&*self.parts.memory).await {
                             eprintln!("evolution pass failed: {e}");
@@ -1575,20 +1690,72 @@ impl Engine {
                     }
                     continue;
                 }
+                Next::Message(i) => i,
             };
             let session = incoming.session.clone();
             let text = self.run_turn(incoming).await?;
             turns_since_pass += 1;
-            self.parts
-                .channel
+            channel
                 .send(&session, &text)
                 .await
                 .map_err(|e| EngineError::Channel(e.to_string()))?;
-            // M6 §5.1: sleep-time work while the user types.
-            if let Err(e) = self.maybe_summarize(&session).await {
-                eprintln!("summary: {e}");
-            }
+            summary_due = Some(session);
         }
+    }
+}
+
+/// What the wait for the next message produced.
+enum Next {
+    Message(Incoming),
+    /// `idle_after` elapsed with the channel quiet.
+    Idle,
+    Closed,
+}
+
+/// One wait on the channel, with the idle timeout folded in. A free function
+/// so it borrows only the channel, leaving the engine free for the summary.
+async fn next_message(
+    channel: &mut dyn Channel,
+    idle_after: Option<std::time::Duration>,
+) -> Result<Next, EngineError> {
+    let received = match idle_after {
+        Some(d) => tokio::time::timeout(d, channel.recv()).await,
+        None => Ok(channel.recv().await),
+    };
+    match received {
+        Ok(Ok(i)) => Ok(Next::Message(i)),
+        Ok(Err(ChannelError::Closed)) => Ok(Next::Closed),
+        Ok(Err(e)) => Err(EngineError::Channel(e.to_string())),
+        Err(_elapsed) => Ok(Next::Idle),
+    }
+}
+
+/// Stands in for the real channel while `run` holds it as a local. Never
+/// polled — `run` puts the real one back before returning.
+struct DetachedChannel;
+
+#[async_trait::async_trait]
+impl Channel for DetachedChannel {
+    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        Err(ChannelError::Closed)
+    }
+    async fn send(
+        &mut self,
+        _session: &nscore::SessionId,
+        _text: &str,
+    ) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+/// A fact value as prose: a JSON string without its quotes, anything else as
+/// it serializes. Model-visible text carries no engine syntax — no `k = v`,
+/// no JSON envelope — because whatever the reply model is shown it may
+/// reproduce verbatim (plan §3, phase 1).
+fn value_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -1609,14 +1776,23 @@ fn render_template(template: &str, vars: &serde_json::Value) -> String {
 }
 
 /// One human-readable line per this-turn event: outcomes AND refusal reasons.
-fn turn_trace(log: &EventLog, turn: u32) -> String {
-    log.events()
+/// Public because `ns-app echo` reconstructs, from a stored log, the material
+/// a reply was shown — and a second rendering of it would drift.
+pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
+    events
         .iter()
         .filter(|e| e.turn == turn)
         .filter_map(|e| match &e.kind {
             EventKind::Proposed { proposal } => Some(format!("Proposed({})", proposal.action)),
             EventKind::Rejected { reason, .. } => Some(match reason {
                 RejectReason::Malformed { detail } => format!("Rejected(malformed: {detail})"),
+                // Named as an endpoint problem, because this line is fed back
+                // to the emitter as context: telling it three times a turn
+                // that it produced bad output, while the endpoint was down,
+                // is teaching it the wrong lesson about its own behaviour.
+                RejectReason::ProviderUnavailable { status, detail } => {
+                    format!("(provider unavailable: HTTP {status}: {detail})")
+                }
                 RejectReason::IllegalAction { action } => {
                     format!("Rejected(illegal action: {action})")
                 }

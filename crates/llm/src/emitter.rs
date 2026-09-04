@@ -97,9 +97,7 @@ impl Emitter for CloudEmitter {
         });
         let body = self.client.chat(request).await.map_err(|e| match e {
             ApiError::Transport(d) => EmitError::Transport(d),
-            ApiError::Status { status, detail } => {
-                EmitError::Transport(format!("status {status}: {detail}"))
-            }
+            ApiError::Status { status, detail } => EmitError::Provider { status, detail },
         })?;
 
         let message = &body["choices"][0]["message"];
@@ -113,13 +111,29 @@ impl Emitter for CloudEmitter {
                 // text; treat that as respond_directly — the engine stays in
                 // control, and the replier narrates from the trace as usual.
                 let text = message["content"].as_str().unwrap_or_default().trim();
-                if text.is_empty() {
+                if !text.is_empty() {
+                    let mut rationale = format!("model answered in text: {text}");
+                    rationale.truncate(300);
+                    return Ok(Proposal {
+                        rationale,
+                        action: crate::schema::RESPOND_DIRECTLY.to_string(),
+                        args: serde_json::json!({}),
+                    });
+                }
+                // Neither a tool call nor text. Seen live with Ollama: the
+                // model insists on an action the engine has just made
+                // illegal (repeat gate), and the OpenAI shim drops the call
+                // because its name is not in `tools` — leaving an empty
+                // message. When this turn has already done something, that
+                // trace is the answer: narrate it instead of burning the
+                // retries and settling on the canned failure. With nothing
+                // done yet there is nothing to narrate, so it stays
+                // malformed and the engine retries.
+                if ctx.trace_so_far.is_empty() {
                     return Err(EmitError::Malformed("no tool_calls in response".into()));
                 }
-                let mut rationale = format!("model answered in text: {text}");
-                rationale.truncate(300);
                 return Ok(Proposal {
-                    rationale,
+                    rationale: "model returned nothing; answering from this turn's results".into(),
                     action: crate::schema::RESPOND_DIRECTLY.to_string(),
                     args: serde_json::json!({}),
                 });
@@ -290,17 +304,40 @@ mod tests {
         assert!(p.rationale.contains("The time is noon."));
     }
 
-    #[tokio::test]
-    async fn empty_response_is_malformed() {
-        let mock = MockTransport::ok(vec![serde_json::json!({
+    fn empty_message() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
             "id": "gen_1",
             "choices": [{
                 "finish_reason": "stop",
                 "message": {"role": "assistant", "content": null}
             }]
-        })]);
-        let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
+        })]
+    }
+
+    /// Nothing done yet, nothing said: unusable, so the engine retries.
+    #[tokio::test]
+    async fn empty_response_before_any_action_is_malformed() {
+        let mut ctx = ctx();
+        ctx.trace_so_far.clear();
+        let err = emitter(MockTransport::ok(empty_message()))
+            .propose(ctx, &legal())
+            .await
+            .unwrap_err();
         assert!(matches!(err, nscore::EmitError::Malformed(_)));
+    }
+
+    /// Seen live with Ollama: after the repeat gate makes the model's chosen
+    /// action illegal it keeps calling it, and the shim drops the call as
+    /// unknown, leaving an empty message. This turn's results are the
+    /// answer — narrate them rather than settling on the canned failure.
+    #[tokio::test]
+    async fn empty_response_after_an_action_narrates_the_trace() {
+        let p = emitter(MockTransport::ok(empty_message()))
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+        assert_eq!(p.action, "respond_directly");
+        assert!(p.args.as_object().is_some_and(|o| o.is_empty()));
     }
 
     #[tokio::test]
@@ -329,14 +366,41 @@ mod tests {
         assert!(matches!(err, nscore::EmitError::Transport(_)));
     }
 
+    /// An HTTP status keeps its status. The engine decides recovery by class,
+    /// and a status parsed back out of a formatted string is a recovery
+    /// decision resting on a formatting accident.
     #[tokio::test]
-    async fn api_4xx_maps_to_emit_transport_error() {
+    async fn api_status_maps_to_a_structured_provider_error() {
         let mock = MockTransport::new(vec![Ok(HttpResponse {
             status: 400,
             body: serde_json::json!({"error": {"message": "bad"}}),
         })]);
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
-        assert!(matches!(err, nscore::EmitError::Transport(_)));
+        let nscore::EmitError::Provider { status, detail } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*status, 400);
+        assert!(detail.contains("bad"), "{detail}");
+        assert!(!err.is_retryable(), "a 400 will not become a 200");
+    }
+
+    /// The classes that separate a bad afternoon from a bad request.
+    #[tokio::test]
+    async fn only_transient_provider_statuses_are_retryable() {
+        let p = |status| nscore::EmitError::Provider {
+            status,
+            detail: String::new(),
+        };
+        for status in [429, 408, 500, 503] {
+            assert!(p(status).is_retryable(), "{status} is transient");
+        }
+        // 404: the model name is wrong. 402: the account is empty. Session
+        // `cli` t154/t155 spent three emit retries each on a 404.
+        for status in [400, 401, 402, 403, 404] {
+            assert!(!p(status).is_retryable(), "{status} is terminal");
+        }
+        assert!(nscore::EmitError::Malformed("x".into()).is_retryable());
+        assert!(nscore::EmitError::Transport("x".into()).is_retryable());
     }
 
     #[tokio::test]

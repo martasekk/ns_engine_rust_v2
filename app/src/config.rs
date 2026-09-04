@@ -38,6 +38,12 @@ pub struct MemorySection {
     /// names absent from everything the model was shown (M6 §4.5).
     #[serde(default = "default_true")]
     pub reply_grounding_check: bool,
+    /// Reporting threshold for `ReplyEchoed`: a reply at or over this
+    /// fraction of one verbatim run out of its own prompt is logged and then
+    /// sent as-is. Measured, never acted on (plan §8). Rides the
+    /// `reply_grounding_check` gate; above 1.0 nothing is logged.
+    #[serde(default = "default_max_echo_ratio")]
+    pub max_echo_ratio: f32,
     /// "flag" stores an ungrounded remembered value at half confidence;
     /// "never" refuses it (M6 §6.3).
     #[serde(default = "default_remember_residual")]
@@ -121,6 +127,7 @@ impl Default for MemorySection {
             line_max_chars: default_line_max_chars(),
             facts_in_context: default_facts_in_context(),
             reply_grounding_check: true,
+            max_echo_ratio: default_max_echo_ratio(),
             remember_residual: default_remember_residual(),
             pinned_prefixes: default_pinned_prefixes(),
             pinned_max: default_pinned_max(),
@@ -155,70 +162,80 @@ impl MemorySection {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct LlmConfig {
-    #[serde(default)]
-    pub base_url: Option<String>,
-    /// Name of the environment variable holding the provider API key.
-    /// The key itself never lives in config.
-    #[serde(default = "default_api_key_env")]
-    pub api_key_env: String,
-    /// Minimum spacing between requests to the provider, shared by every
-    /// role. Unset: 1100 ms for api.mistral.ai (free tier is ~1 req/s), 0
-    /// elsewhere.
-    #[serde(default)]
-    pub min_interval_ms: Option<u64>,
-    #[serde(default)]
-    pub emitter: ModelSection,
-    #[serde(default)]
-    pub replier: ReplierSection,
-    /// The rolling-summary model (M6 §5.1). Defaults to the emitter's model
-    /// and provider; each field can point elsewhere so the role can be
-    /// swapped without touching the others.
-    #[serde(default)]
-    pub summarizer: SummarizerSection,
+/// The three model roles. Each resolves independently, so one can sit on a
+/// local model while another stays in the cloud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Emitter,
+    Replier,
+    Summarizer,
 }
 
-fn default_api_key_env() -> String {
-    "OPENROUTER_API_KEY".into()
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            base_url: None,
-            api_key_env: default_api_key_env(),
-            min_interval_ms: None,
-            emitter: ModelSection::default(),
-            replier: ReplierSection::default(),
-            summarizer: SummarizerSection::default(),
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Emitter => "emitter",
+            Role::Replier => "replier",
+            Role::Summarizer => "summarizer",
         }
     }
 }
 
-impl LlmConfig {
-    /// Explicit value, else a provider default (seen live: Mistral's free
-    /// tier 429s on back-to-back requests).
-    pub fn min_interval_ms(&self) -> u64 {
-        self.min_interval_ms.unwrap_or_else(|| {
-            if self
-                .base_url
-                .as_deref()
-                .is_some_and(|u| u.contains("mistral.ai"))
-            {
-                1100
-            } else {
-                0
-            }
-        })
+/// The provider the client falls back to when nothing names one.
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api";
+pub const DEFAULT_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Everything one role needs to reach a provider, after the preset, the
+/// `[llm]` defaults, the per-role overrides and the env overrides are
+/// folded together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleTarget {
+    pub role: Role,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key_env: String,
+    pub min_interval_ms: u64,
+    pub prompt_cache: bool,
+    /// Local server: any non-empty key works, so an unset key env is not a
+    /// startup error.
+    pub local: bool,
+}
+
+impl RoleTarget {
+    /// The URL the client will actually POST to.
+    pub fn base_url_or_default(&self) -> &str {
+        self.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL)
+    }
+
+    /// The key from the environment; a local server gets a placeholder.
+    pub fn key(&self) -> Option<String> {
+        match std::env::var(&self.api_key_env)
+            .ok()
+            .filter(|k| !k.is_empty())
+        {
+            Some(k) => Some(k),
+            None if self.local => Some("local".into()),
+            None => None,
+        }
+    }
+
+    /// One line for the startup banner: which model, where.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}: {} @ {}",
+            self.role.as_str(),
+            self.model,
+            self.base_url_or_default()
+        )
     }
 }
 
-/// Per-role provider override: `[llm.summarizer] model = "…"`, optionally
-/// with its own `base_url` and `api_key_env`. Unset fields fall back to the
-/// emitter model and the global provider.
-#[derive(Debug, serde::Deserialize, Default)]
-pub struct SummarizerSection {
+/// One model role in config. Every field is optional: unset falls back to
+/// `[llm]`, and for the summarizer to the emitter.
+#[derive(Debug, serde::Deserialize, Default, Clone)]
+pub struct RoleSection {
+    /// `"model-id"`, or `"provider:model-id"` to point this role at a
+    /// different provider than the rest.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -227,59 +244,198 @@ pub struct SummarizerSection {
     pub api_key_env: Option<String>,
 }
 
-impl LlmConfig {
-    /// (model, base_url, api_key_env) the summarizer actually uses.
-    pub fn summarizer_role(&self) -> (String, Option<String>, String) {
-        (
-            self.summarizer
-                .model
-                .clone()
-                .unwrap_or_else(|| self.emitter.model.clone()),
-            self.summarizer
-                .base_url
-                .clone()
-                .or_else(|| self.base_url.clone()),
-            self.summarizer
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| self.api_key_env.clone()),
-        )
-    }
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct LlmConfig {
+    /// Named preset — `ns-app providers` lists them. Supplies base_url,
+    /// api_key_env, a default model, the provider's rate limit and whether
+    /// prompt-cache breakpoints survive the hop. One word swaps the agent.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Spelled-out endpoint; overrides the preset's base_url.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Name of the environment variable holding the provider API key.
+    /// The key itself never lives in config.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Minimum spacing between requests to one provider, shared by every
+    /// role. Unset: the provider's own value (0 for most).
+    #[serde(default)]
+    pub min_interval_ms: Option<u64>,
+    /// Send Anthropic cache breakpoints. Unset: the provider's own value.
+    #[serde(default)]
+    pub prompt_cache: Option<bool>,
+    #[serde(default)]
+    pub emitter: RoleSection,
+    #[serde(default)]
+    pub replier: RoleSection,
+    /// The rolling-summary model (M6 §5.1). Falls back to the emitter's
+    /// model and provider; any field can point it elsewhere.
+    #[serde(default)]
+    pub summarizer: RoleSection,
+}
+
+fn unknown_provider(name: &str, where_: &str) -> String {
+    format!(
+        "{where_} provider {name:?} is unknown — known providers: {}",
+        nsllm::provider::names().join(", ")
+    )
+}
+
+fn is_loopback(url: &str) -> bool {
+    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"]
+        .iter()
+        .any(|h| url.contains(h))
 }
 
 impl LlmConfig {
-    /// Anthropic prompt-cache breakpoints are only forwarded by OpenRouter;
-    /// other OpenAI-compatible providers may reject the unknown field.
-    pub fn prompt_cache(&self) -> bool {
-        self.base_url
-            .as_deref()
-            .is_none_or(|u| u.contains("openrouter.ai"))
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ModelSection {
-    pub model: String,
-}
-
-impl Default for ModelSection {
-    fn default() -> Self {
-        Self {
-            model: "openrouter/free".into(),
+    fn section(&self, role: Role) -> &RoleSection {
+        match role {
+            Role::Emitter => &self.emitter,
+            Role::Replier => &self.replier,
+            Role::Summarizer => &self.summarizer,
         }
     }
-}
 
-#[derive(Debug, serde::Deserialize)]
-pub struct ReplierSection {
-    pub model: String,
-}
-
-impl Default for ReplierSection {
-    fn default() -> Self {
-        Self {
-            model: "openrouter/free".into(),
+    /// Env overrides, applied after parsing so `parse` stays pure:
+    /// `NS_PROVIDER` repoints every role, `NS_MODEL` sets every role's model.
+    ///
+    /// Switching backends drops the model ids and endpoints belonging to the
+    /// old one: `NS_PROVIDER=ollama` must not go on asking for
+    /// "google/gemini-3.8-flash". Naming the provider the config already
+    /// resolves to changes nothing, and an explicit `NS_MODEL` always wins.
+    pub fn apply_overrides(&mut self, provider: Option<String>, model: Option<String>) {
+        if let Some(name) = provider {
+            let target = nsllm::provider::find(&name);
+            let current = self
+                .role(Role::Emitter)
+                .ok()
+                .and_then(|t| nsllm::provider::for_base_url(t.base_url_or_default()));
+            // Only a preset with a default model can replace what it clears.
+            let switching = match (target, current) {
+                (Some(t), Some(c)) => t.name != c.name,
+                (Some(_), None) => true,
+                (None, _) => false,
+            } && target.is_some_and(|t| t.default_model.is_some());
+            self.provider = Some(name);
+            if switching {
+                self.base_url = None;
+                self.api_key_env = None;
+                for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+                    s.model = None;
+                    s.base_url = None;
+                    s.api_key_env = None;
+                }
+            }
         }
+        if let Some(m) = model {
+            for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+                s.model = Some(m.clone());
+            }
+        }
+    }
+
+    /// The `[llm] provider` preset, if one is named. Err on an unknown name:
+    /// silently falling back to OpenRouter would hide a typo behind a bill.
+    pub fn preset(&self) -> Result<Option<&'static nsllm::provider::Provider>, String> {
+        match self.provider.as_deref() {
+            None => Ok(None),
+            Some(name) => nsllm::provider::find(name)
+                .map(Some)
+                .ok_or_else(|| unknown_provider(name, "[llm]")),
+        }
+    }
+
+    /// Resolve one role. Precedence, most specific first: the role's own
+    /// fields, the provider named in its `provider:model` prefix, the
+    /// `[llm]` literals, the `[llm] provider` preset.
+    pub fn role(&self, role: Role) -> Result<RoleTarget, String> {
+        let global = self.preset()?;
+        let section = self.section(role);
+        // The summarizer inherits the emitter's spec — prefix included.
+        let spec = section.model.clone().or_else(|| {
+            (role == Role::Summarizer)
+                .then(|| self.emitter.model.clone())
+                .flatten()
+        });
+        let (prefix, model) = match spec.as_deref() {
+            Some(s) => {
+                let (p, m) = nsllm::provider::split_model(s);
+                (p, m.to_string())
+            }
+            None => (None, String::new()),
+        };
+
+        let base_url = section
+            .base_url
+            .clone()
+            .or_else(|| prefix.map(|p| p.base_url.to_string()))
+            .or_else(|| self.base_url.clone())
+            .or_else(|| global.map(|p| p.base_url.to_string()));
+        let api_key_env = section
+            .api_key_env
+            .clone()
+            .or_else(|| prefix.map(|p| p.api_key_env.to_string()))
+            .or_else(|| self.api_key_env.clone())
+            .or_else(|| global.map(|p| p.api_key_env.to_string()))
+            .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string());
+
+        // Rate limit, prompt cache and key-optionality follow the URL that
+        // is actually used, so a config that spells the endpoint out gets
+        // the same treatment as one that names the preset.
+        let url = base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+        let effective = nsllm::provider::for_base_url(url);
+        let min_interval_ms = self
+            .min_interval_ms
+            .or(effective.map(|p| p.min_interval_ms))
+            .unwrap_or(0);
+        let prompt_cache = self
+            .prompt_cache
+            .or(effective.map(|p| p.prompt_cache))
+            .unwrap_or(false);
+        let local = effective
+            .map(|p| p.local)
+            .unwrap_or_else(|| is_loopback(url));
+
+        let model = if model.is_empty() {
+            let named = prefix.or(global).or(effective);
+            named
+                .and_then(|p| p.default_model)
+                .map(str::to_string)
+                .ok_or_else(|| match named {
+                    Some(p) => format!(
+                        "[llm.{}] model is not set and provider {:?} has no default — \
+                         set model = \"…\"",
+                        role.as_str(),
+                        p.name
+                    ),
+                    None => format!(
+                        "[llm.{}] model is not set and base_url {url:?} matches no preset — \
+                         set model = \"…\", or name a preset: [llm] provider = \"…\"",
+                        role.as_str()
+                    ),
+                })?
+        } else {
+            model
+        };
+
+        Ok(RoleTarget {
+            role,
+            model,
+            base_url,
+            api_key_env,
+            min_interval_ms,
+            prompt_cache,
+            local,
+        })
+    }
+
+    /// Emitter, replier, summarizer — the order the banner prints them in.
+    pub fn roles(&self) -> Result<Vec<RoleTarget>, String> {
+        [Role::Emitter, Role::Replier, Role::Summarizer]
+            .into_iter()
+            .map(|r| self.role(r))
+            .collect()
     }
 }
 
@@ -337,6 +493,12 @@ pub struct EvolutionSection {
     pub max_notes: usize,
     #[serde(default = "default_replay_cap")]
     pub regression_replay_cap: usize,
+}
+
+/// 0.6: a reply more than half of which is one lifted run is a copy, not
+/// an answer. Below that, shared phrasing is ordinary language.
+fn default_max_echo_ratio() -> f32 {
+    0.6
 }
 
 fn default_true() -> bool {
@@ -435,7 +597,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.llm.base_url.as_deref(), Some("http://localhost:9999"));
-        assert_eq!(cfg.llm.emitter.model, "anthropic/claude-haiku-4.5");
+        let emitter = cfg.llm.role(Role::Emitter).unwrap();
+        assert_eq!(emitter.model, "anthropic/claude-haiku-4.5");
+        assert_eq!(emitter.base_url.as_deref(), Some("http://localhost:9999"));
         assert_eq!(cfg.engine.max_iterations, 4);
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
@@ -445,43 +609,223 @@ mod tests {
     #[test]
     fn api_key_env_defaults_to_openrouter_and_is_configurable() {
         let d = AppConfig::parse("").unwrap();
-        assert_eq!(d.llm.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(
+            d.llm.role(Role::Emitter).unwrap().api_key_env,
+            "OPENROUTER_API_KEY"
+        );
         let m = AppConfig::parse("[llm]\napi_key_env = \"MISTRAL_API_KEY\"").unwrap();
-        assert_eq!(m.llm.api_key_env, "MISTRAL_API_KEY");
+        assert_eq!(
+            m.llm.role(Role::Emitter).unwrap().api_key_env,
+            "MISTRAL_API_KEY"
+        );
+    }
+
+    /// A config that spells the endpoint out instead of naming the preset
+    /// still gets that provider's rate limit and prompt-cache behaviour.
+    #[test]
+    fn min_interval_and_prompt_cache_follow_the_resolved_base_url() {
+        let emitter = |toml: &str| {
+            AppConfig::parse(toml)
+                .unwrap()
+                .llm
+                .role(Role::Emitter)
+                .unwrap()
+        };
+        let d = emitter("");
+        assert_eq!(d.min_interval_ms, 0);
+        assert!(d.prompt_cache, "default base_url is OpenRouter");
+        let mistral = emitter("[llm]\nbase_url = \"https://api.mistral.ai\"");
+        assert_eq!(mistral.min_interval_ms, 1100);
+        assert!(!mistral.prompt_cache);
+        let explicit = emitter("[llm]\nbase_url = \"https://api.mistral.ai\"\nmin_interval_ms = 0");
+        assert_eq!(explicit.min_interval_ms, 0);
+        let ollama = emitter("[llm]\nbase_url = \"http://localhost:11434\"");
+        assert!(!ollama.prompt_cache);
+        assert!(ollama.local);
+        // An endpoint no preset knows: loopback still counts as local, and
+        // the model must be named because no preset can supply one.
+        let custom =
+            emitter("[llm]\nbase_url = \"http://127.0.0.1:9999\"\n[llm.emitter]\nmodel = \"x\"");
+        let err = AppConfig::parse("[llm]\nbase_url = \"http://127.0.0.1:9999\"")
+            .unwrap()
+            .llm
+            .role(Role::Emitter)
+            .unwrap_err();
+        assert!(err.contains("matches no preset"), "{err}");
+        assert!(custom.local);
+        assert!(!custom.prompt_cache);
+        assert_eq!(custom.min_interval_ms, 0);
     }
 
     #[test]
-    fn min_interval_defaults_per_provider_and_is_configurable() {
-        assert_eq!(AppConfig::parse("").unwrap().llm.min_interval_ms(), 0);
-        let mistral = AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"").unwrap();
-        assert_eq!(mistral.llm.min_interval_ms(), 1100);
-        let explicit =
-            AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"\nmin_interval_ms = 0")
-                .unwrap();
-        assert_eq!(explicit.llm.min_interval_ms(), 0);
+    fn a_named_preset_supplies_url_key_env_and_default_model() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"ollama\"").unwrap();
+        for t in cfg.llm.roles().unwrap() {
+            assert_eq!(t.model, "qwen2.5:3b", "{:?}", t.role);
+            assert_eq!(t.base_url.as_deref(), Some("http://localhost:11434"));
+            assert_eq!(t.api_key_env, "OLLAMA_API_KEY");
+            assert!(t.local);
+            assert!(!t.prompt_cache);
+        }
     }
 
     #[test]
-    fn prompt_cache_is_enabled_only_for_openrouter() {
-        let default = AppConfig::parse("").unwrap();
-        assert!(default.llm.prompt_cache(), "default base_url is OpenRouter");
-        let explicit = AppConfig::parse("[llm]\nbase_url = \"https://openrouter.ai/api\"").unwrap();
-        assert!(explicit.llm.prompt_cache());
-        let mistral = AppConfig::parse("[llm]\nbase_url = \"https://api.mistral.ai\"").unwrap();
-        assert!(!mistral.llm.prompt_cache());
-        let ollama = AppConfig::parse("[llm]\nbase_url = \"http://localhost:11434\"").unwrap();
-        assert!(!ollama.llm.prompt_cache());
+    fn preset_fields_can_be_overridden_one_at_a_time() {
+        let cfg = AppConfig::parse(
+            "[llm]\nprovider = \"ollama\"\nbase_url = \"http://gpu-box:11434\"\n[llm.emitter]\nmodel = \"gemma3:4b\"\n",
+        )
+        .unwrap();
+        let e = cfg.llm.role(Role::Emitter).unwrap();
+        assert_eq!(
+            e.model, "gemma3:4b",
+            "a colon in a model id is not a prefix"
+        );
+        assert_eq!(e.base_url.as_deref(), Some("http://gpu-box:11434"));
+        assert_eq!(
+            e.api_key_env, "OLLAMA_API_KEY",
+            "preset still supplies the key env"
+        );
+        // The replier keeps the preset's default model.
+        assert_eq!(cfg.llm.role(Role::Replier).unwrap().model, "qwen2.5:3b");
+    }
+
+    #[test]
+    fn a_role_prefix_points_one_role_at_another_provider() {
+        let cfg = AppConfig::parse(
+            "[llm]\nprovider = \"ollama\"\n[llm.replier]\nmodel = \"mistral:mistral-small-latest\"\n",
+        )
+        .unwrap();
+        let e = cfg.llm.role(Role::Emitter).unwrap();
+        assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434"));
+        let r = cfg.llm.role(Role::Replier).unwrap();
+        assert_eq!(r.model, "mistral-small-latest");
+        assert_eq!(r.base_url.as_deref(), Some("https://api.mistral.ai"));
+        assert_eq!(r.api_key_env, "MISTRAL_API_KEY");
+        assert_eq!(r.min_interval_ms, 1100);
+        assert!(!r.local);
+        // The summarizer inherits the emitter, not the replier.
+        assert_eq!(
+            cfg.llm.role(Role::Summarizer).unwrap().base_url.as_deref(),
+            Some("http://localhost:11434")
+        );
+    }
+
+    #[test]
+    fn a_bare_provider_name_as_the_model_means_its_default() {
+        let cfg = AppConfig::parse("[llm.emitter]\nmodel = \"ollama:\"").unwrap();
+        let e = cfg.llm.role(Role::Emitter).unwrap();
+        assert_eq!(e.model, "qwen2.5:3b");
+        assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434"));
+    }
+
+    #[test]
+    fn unknown_provider_is_a_readable_error_not_a_silent_fallback() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"ollamma\"").unwrap();
+        let err = cfg.llm.role(Role::Emitter).unwrap_err();
+        assert!(err.contains("ollamma"), "{err}");
+        assert!(err.contains("ollama"), "lists the known names: {err}");
+    }
+
+    #[test]
+    fn a_provider_without_a_default_model_demands_one() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"openai\"").unwrap();
+        let err = cfg.llm.role(Role::Emitter).unwrap_err();
+        assert!(err.contains("[llm.emitter]"), "{err}");
+        let ok = AppConfig::parse("[llm]\nprovider = \"openai\"\n[llm.emitter]\nmodel = \"some-model\"\n[llm.replier]\nmodel = \"some-model\"\n").unwrap();
+        assert_eq!(ok.llm.role(Role::Emitter).unwrap().model, "some-model");
+        assert_eq!(
+            ok.llm.role(Role::Summarizer).unwrap().model,
+            "some-model",
+            "summarizer inherits the emitter"
+        );
+    }
+
+    #[test]
+    fn env_overrides_repoint_every_role() {
+        let mut cfg = AppConfig::parse(
+            "[llm]\nprovider = \"mistral\"\n[llm.emitter]\nmodel = \"mistral-small-latest\"\n",
+        )
+        .unwrap();
+        cfg.llm
+            .apply_overrides(Some("ollama".into()), Some("qwen2.5:3b".into()));
+        for t in cfg.llm.roles().unwrap() {
+            assert_eq!(t.model, "qwen2.5:3b");
+            assert_eq!(t.base_url.as_deref(), Some("http://localhost:11434"));
+            assert_eq!(t.api_key_env, "OLLAMA_API_KEY");
+        }
+        // Switching backends drops the old backend's model ids: asking
+        // Ollama for "google/gemini-3.8-flash" is a 404, not a swap.
+        let mut cloud = AppConfig::parse(
+            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n[llm.replier]\nmodel = \"google/gemini-3.8-flash\"\n",
+        )
+        .unwrap();
+        cloud.llm.apply_overrides(Some("ollama".into()), None);
+        for t in cloud.llm.roles().unwrap() {
+            assert_eq!(t.model, "qwen2.5:3b", "{:?}", t.role);
+            assert_eq!(t.base_url.as_deref(), Some("http://localhost:11434"));
+        }
+        // Naming the provider it is already on changes nothing.
+        let mut same = AppConfig::parse(
+            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n",
+        )
+        .unwrap();
+        same.llm.apply_overrides(Some("openrouter".into()), None);
+        assert_eq!(
+            same.llm.role(Role::Emitter).unwrap().model,
+            "google/gemini-3.8-flash"
+        );
+        // An explicit NS_MODEL still wins over the preset default.
+        let mut both = AppConfig::parse("[llm]\nprovider = \"openrouter\"").unwrap();
+        both.llm
+            .apply_overrides(Some("ollama".into()), Some("gemma3:4b".into()));
+        assert_eq!(both.llm.role(Role::Emitter).unwrap().model, "gemma3:4b");
+    }
+
+    #[test]
+    fn a_local_target_needs_no_key_a_remote_one_does() {
+        let local = AppConfig::parse("[llm]\nprovider = \"ollama\"")
+            .unwrap()
+            .llm
+            .role(Role::Emitter)
+            .unwrap();
+        assert_eq!(local.key().as_deref(), Some("local"));
+        let remote = AppConfig::parse(
+            "[llm]\nprovider = \"mistral\"\napi_key_env = \"NS_TEST_KEY_ENV_THAT_IS_UNSET\"",
+        )
+        .unwrap()
+        .llm
+        .role(Role::Emitter)
+        .unwrap();
+        assert_eq!(remote.key(), None);
     }
 
     #[test]
     fn empty_config_gets_all_defaults() {
         let cfg = AppConfig::parse("").unwrap();
-        assert_eq!(cfg.llm.emitter.model, "openrouter/free");
-        assert_eq!(cfg.llm.replier.model, "openrouter/free");
+        assert_eq!(
+            cfg.llm.role(Role::Emitter).unwrap().model,
+            "openrouter/free"
+        );
+        assert_eq!(
+            cfg.llm.role(Role::Replier).unwrap().model,
+            "openrouter/free"
+        );
         assert_eq!(cfg.engine.max_iterations, 5);
         assert_eq!(cfg.engine.max_emit_retries, 3);
         assert_eq!(cfg.store.path, "ns.sqlite");
         assert!(cfg.http_components.is_empty());
+    }
+
+    /// The shipped example must parse and resolve — it is the first thing
+    /// anyone copies.
+    #[test]
+    fn config_example_parses_and_resolves_every_role() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../config.example.toml");
+        let text = std::fs::read_to_string(path).expect("config.example.toml");
+        let cfg = AppConfig::parse(&text).expect("example parses");
+        for t in cfg.llm.roles().expect("example resolves") {
+            assert!(!t.model.is_empty());
+        }
     }
 
     #[test]
@@ -495,26 +839,22 @@ mod tests {
             "[llm]\nbase_url = \"https://api.mistral.ai\"\napi_key_env = \"MISTRAL_API_KEY\"\n[llm.emitter]\nmodel = \"mistral-small-latest\"\n",
         )
         .unwrap();
-        assert_eq!(
-            cfg.llm.summarizer_role(),
-            (
-                "mistral-small-latest".to_string(),
-                Some("https://api.mistral.ai".to_string()),
-                "MISTRAL_API_KEY".to_string()
-            )
-        );
+        let s = cfg.llm.role(Role::Summarizer).unwrap();
+        assert_eq!(s.model, "mistral-small-latest");
+        assert_eq!(s.base_url.as_deref(), Some("https://api.mistral.ai"));
+        assert_eq!(s.api_key_env, "MISTRAL_API_KEY");
+
         let cfg = AppConfig::parse(
             "[llm.summarizer]\nmodel = \"qwen2.5:3b\"\nbase_url = \"http://localhost:11434\"\napi_key_env = \"OLLAMA_API_KEY\"\n",
         )
         .unwrap();
-        assert_eq!(
-            cfg.llm.summarizer_role(),
-            (
-                "qwen2.5:3b".to_string(),
-                Some("http://localhost:11434".to_string()),
-                "OLLAMA_API_KEY".to_string()
-            )
-        );
+        let s = cfg.llm.role(Role::Summarizer).unwrap();
+        assert_eq!(s.model, "qwen2.5:3b");
+        assert_eq!(s.base_url.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(s.api_key_env, "OLLAMA_API_KEY");
+        // …and the shorter spelling of the same swap.
+        let cfg = AppConfig::parse("[llm.summarizer]\nmodel = \"ollama:qwen2.5:3b\"\n").unwrap();
+        assert_eq!(cfg.llm.role(Role::Summarizer).unwrap(), s);
         assert_eq!(cfg.memory.summary_every_turns, 4);
         assert_eq!(cfg.memory.summary_rebuild_every, 3);
         let off = AppConfig::parse("[memory]\nsummary_every_turns = 0\n").unwrap();

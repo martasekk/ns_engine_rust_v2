@@ -45,6 +45,9 @@ pub struct OpenRouterClient {
     max_attempts: u32,
     backoff_base_ms: u64,
     throttle: Option<Arc<Throttle>>,
+    /// Opt-in wire log (NS_TRACE); `label` names the role in each entry.
+    trace: Option<Arc<crate::trace::Trace>>,
+    label: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +70,17 @@ impl OpenRouterClient {
             max_attempts: 4,
             backoff_base_ms: 1000,
             throttle: None,
+            trace: None,
+            label: String::new(),
         }
+    }
+
+    /// Log every request and response to the shared trace, tagged with the
+    /// role's name. Headers are never written — the API key is in one.
+    pub fn with_trace(mut self, trace: Arc<crate::trace::Trace>, label: &str) -> Self {
+        self.trace = Some(trace);
+        self.label = label.to_string();
+        self
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
@@ -109,7 +122,10 @@ impl OpenRouterClient {
             if let Some(t) = &self.throttle {
                 t.wait().await;
             }
-            match self.transport.post(&url, &headers, &request).await {
+            let started = std::time::Instant::now();
+            let outcome = self.transport.post(&url, &headers, &request).await;
+            self.trace_attempt(&url, attempt, started.elapsed(), &request, &outcome);
+            match outcome {
                 Ok(resp) if (200..300).contains(&resp.status) => return Ok(resp.body),
                 Ok(resp) if resp.status == 429 || resp.status >= 500 => {
                     last_err = ApiError::Status {
@@ -128,6 +144,37 @@ impl OpenRouterClient {
             }
         }
         Err(last_err)
+    }
+
+    /// One trace line per attempt: retries and the failures that caused them
+    /// stay visible, which is the point of the file.
+    fn trace_attempt(
+        &self,
+        url: &str,
+        attempt: u32,
+        took: std::time::Duration,
+        request: &serde_json::Value,
+        outcome: &Result<crate::transport::HttpResponse, TransportError>,
+    ) {
+        let Some(trace) = &self.trace else { return };
+        let mut entry = serde_json::json!({
+            "at_ms": crate::trace::now_ms(),
+            "at": nscore::time::format_utc(crate::trace::now_ms()),
+            "role": self.label,
+            "url": url,
+            "model": request.get("model").cloned().unwrap_or(serde_json::Value::Null),
+            "attempt": attempt + 1,
+            "ms": took.as_millis() as u64,
+            "request": request,
+        });
+        match outcome {
+            Ok(resp) => {
+                entry["status"] = serde_json::json!(resp.status);
+                entry["response"] = resp.body.clone();
+            }
+            Err(e) => entry["error"] = serde_json::json!(e.to_string()),
+        }
+        trace.record(&entry);
     }
 }
 
@@ -212,6 +259,62 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn trace_records_every_attempt_with_no_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire.jsonl");
+        let trace = Arc::new(crate::trace::Trace::open(&path).unwrap());
+        let mock = MockTransport::new(vec![
+            Ok(HttpResponse {
+                status: 429,
+                body: serde_json::json!({"error": "rate"}),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({"id": "msg", "usage": {"total_tokens": 12}}),
+            }),
+        ]);
+        client(mock)
+            .with_trace(trace, "emitter")
+            .chat(serde_json::json!({"model": "m", "messages": []}))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "the retry is visible too");
+        assert_eq!(lines[0]["status"], 429);
+        assert_eq!(lines[0]["attempt"], 1);
+        assert_eq!(lines[0]["role"], "emitter");
+        assert_eq!(lines[0]["model"], "m");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[1]["attempt"], 2);
+        assert_eq!(lines[1]["response"]["usage"]["total_tokens"], 12);
+        assert!(lines[1]["request"]["messages"].is_array());
+        // The key travels in a header; no headers are ever written.
+        assert!(!text.contains("test-key"), "the api key must not be traced");
+        assert!(!text.contains("authorization"));
+    }
+
+    #[tokio::test]
+    async fn trace_records_transport_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire.jsonl");
+        let trace = Arc::new(crate::trace::Trace::open(&path).unwrap());
+        let mock = MockTransport::new(vec![Err(TransportError::Network("down".into()))]);
+        let _ = client(mock)
+            .with_trace(trace, "replier")
+            .with_retry(1, 1)
+            .chat(serde_json::json!({"model": "m"}))
+            .await;
+        let entry: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert!(entry["error"].as_str().unwrap().contains("down"));
+        assert!(entry["status"].is_null());
     }
 
     #[tokio::test]

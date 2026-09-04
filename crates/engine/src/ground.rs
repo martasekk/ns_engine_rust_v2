@@ -8,6 +8,36 @@
 //! results by up to 24 points with a runtime interceptor of this shape.
 use nscore::ReplyContext;
 
+/// Every block `CloudReplier` renders *except* the user's own message, in the
+/// replier's own rendering — a superseded value shown as "(was …)" is
+/// legitimate material (seen live: "Your name was Martin." flagged against a
+/// bare `key: value`). One function so the two interceptors can never drift
+/// from each other or from the prompt.
+fn reference_parts(ctx: &ReplyContext) -> Vec<String> {
+    let mut parts: Vec<String> = vec![ctx.persona.clone(), ctx.turn_trace.clone()];
+    for f in &ctx.facts {
+        parts.push(nscore::render_fact(f));
+    }
+    if let Some(s) = &ctx.summary {
+        parts.push(nscore::render_summary(s));
+    }
+    parts.push(nscore::render_window(
+        &ctx.window,
+        ctx.window.len(),
+        &ctx.caps,
+    ));
+    parts.extend(ctx.guidance.iter().cloned());
+    parts
+}
+
+/// What a reply may draw on but must not reproduce, for `echo::echoed`. The
+/// user's own message is deliberately out: echoing the user back is a
+/// different failure with a different fix (plan §4), and counting it here
+/// would flag every reply that quotes the question it answers.
+pub fn echo_material(ctx: &ReplyContext) -> String {
+    reference_parts(ctx).join("\n")
+}
+
 /// Everything the reply model was shown, lowercased, for substring checks.
 pub struct Material {
     text: String,
@@ -25,26 +55,8 @@ impl Material {
 
     /// Exactly the blocks `CloudReplier` renders, plus the persona.
     pub fn from_context(ctx: &ReplyContext) -> Self {
-        let mut parts: Vec<String> = vec![
-            ctx.persona.clone(),
-            ctx.user_text.clone(),
-            ctx.turn_trace.clone(),
-        ];
-        // The same rendering the replier gets, markers included: a
-        // superseded value shown as "(was …)" is legitimate material (seen
-        // live: "Your name was Martin." flagged against a bare key: value).
-        for f in &ctx.facts {
-            parts.push(nscore::render_fact(f));
-        }
-        if let Some(s) = &ctx.summary {
-            parts.push(nscore::render_summary(s));
-        }
-        parts.push(nscore::render_window(
-            &ctx.window,
-            ctx.window.len(),
-            &ctx.caps,
-        ));
-        parts.extend(ctx.guidance.iter().cloned());
+        let mut parts = reference_parts(ctx);
+        parts.push(ctx.user_text.clone());
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         Self::from_parts(&refs)
     }
@@ -313,6 +325,7 @@ mod tests {
             turn_trace: "Proposed(respond_directly)".into(),
             guidance: vec!["Mention Praha when relevant.".into()],
             do_not_state: vec![],
+            do_not_repeat: vec![],
         };
         let m = Material::from_context(&ctx);
         let reply = "Hi Jana, Tomáš here. Brno gets 7 Widgetron units to Karlova 12; Praha too. Not 99 to Ostrava.";
@@ -338,6 +351,7 @@ mod tests {
             turn_trace: String::new(),
             guidance: vec![],
             do_not_state: vec![],
+            do_not_repeat: vec![],
         };
         let m = Material::from_context(&ctx);
         assert_eq!(
