@@ -2,7 +2,7 @@
 
 **For whoever writes the agent.** Every JSON sample below is printed by
 `cargo run -p ns-pointer --example protocol_samples`, so it is generated from
-the types rather than written beside them. Protocol version **1**.
+the types rather than written beside them. Protocol version **2**.
 
 Plan: `docs/superpowers/plans/2026-09-04-remote-pointer.md`.
 
@@ -11,7 +11,7 @@ Plan: `docs/superpowers/plans/2026-09-04-remote-pointer.md`.
 ## The contract in one paragraph
 
 Newline-delimited JSON over a stream socket: one object per line, requests and
-responses paired by `id`. **Four operations**, and six step kinds. Every coordinate the agent ever sees
+responses paired by `id`. **Six operations** (two of them optional), and six step kinds. Every coordinate the agent ever sees
 is an absolute physical pixel in virtual-desktop space, already clamped to a
 real screen. The agent performs no coordinate mapping, no clamping, no easing,
 no typing rhythm and no gesture composition — all of that happens in `ns-pointer` and is
@@ -111,6 +111,27 @@ noise; a stuck Ctrl makes the machine unusable until someone taps the physical
 key, and a dropped TCP connection is exactly when nobody is in a position to
 send the release.
 
+### `clipboard_read` / `clipboard_write` — optional, protocol 2
+
+```json
+{"id":5,"op":"clipboard_read"}
+{"id":6,"op":"clipboard_write","text":"a long pasted document"}
+```
+
+**You may skip both.** Answer `unsupported` and callers route around it —
+that is why they are separate operations rather than step kinds, and why a
+missing clipboard is not a broken agent.
+
+Worth implementing anyway, for two reasons that have nothing to do with
+convenience. `clipboard_write` then ctrl+v is how bulk text should move:
+`text` is per-character, so four thousand characters is eight thousand steps.
+And `clipboard_read`, after ctrl+a ctrl+c, is the only way in this protocol to
+get **data back off the machine without capturing its screen** — a text field
+or a document read as text, no image transport, no DPI registration.
+
+**Log the length, never the contents.** A clipboard holds passwords often
+enough that recording it would turn the audit trail into the leak.
+
 ---
 
 ## 2. What you send back
@@ -121,6 +142,7 @@ Exactly one response per request, same `id`.
 {"id":1,"ok":true,"result":{"kind":"ready","agent":"ns-pointerd 0.1.0","platform":"windows","protocol":1}}
 {"id":3,"ok":true,"result":{"kind":"position","x":1280,"y":720,"state":7}}
 {"id":4,"ok":true,"result":{"kind":"performed","steps":7,"state":7}}
+{"id":5,"ok":true,"result":{"kind":"clipboard","text":"a long pasted document"}}
 {"id":4,"ok":false,"error":{"kind":"blocked","detail":"target window is elevated (UIPI)"}}
 ```
 
@@ -155,7 +177,7 @@ and acting on it. It does **not** track screen *contents*; nothing here does.
 | `suspended` | the local override is active — the machine's owner has taken control back. Resolves on its own; distinct from `blocked` for that reason. |
 | `blocked` | the OS refused the injection. See §3. |
 | `out_of_bounds` | a `move` landed on no screen. The caller clamps, so this means the layout changed underneath it — compare `state`. |
-| `unsupported` | known operation, not available on this platform |
+| `unsupported` | known operation you have not implemented — the clipboard, typically. A legitimate permanent answer, not a failure |
 | `protocol` | unparseable, unknown op, or a version you do not implement |
 | `internal` | anything else, with `detail` |
 
@@ -223,6 +245,8 @@ loop over lines:
         hello    -> check token+protocol, reply ready
         screens  -> enumerate monitors, reply screens
         position -> reply position
+        clipboard_read  -> reply clipboard, or unsupported
+        clipboard_write -> set it, reply clipboard, or unsupported
         perform  -> for step in steps:
                         move(x, y) | button(b, down) | scroll(dx, dy)
                         key(k, down) | text(s)       | sleep(ms)

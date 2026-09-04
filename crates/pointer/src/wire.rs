@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change. The agent rejects what it does not know
 /// rather than guessing.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// One primitive the agent replays in order. `Perform` carries a list, so a
 /// whole gesture — an eased move, a click, a drag — is a single round trip
@@ -155,6 +155,16 @@ pub enum Op {
     Perform {
         steps: Vec<Step>,
     },
+    /// Read the target's clipboard. Protocol 2. The only way to get *data*
+    /// back off the machine without capturing its screen: select-all, copy,
+    /// read.
+    ClipboardRead,
+    /// Replace the target's clipboard. Protocol 2. The sane way to move bulk
+    /// text — `Step::Text` per character is right for a search box and wrong
+    /// for four thousand characters, which is eight thousand steps.
+    ClipboardWrite {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +194,9 @@ pub enum ResultBody {
     Performed {
         steps: u32,
         state: u64,
+    },
+    Clipboard {
+        text: String,
     },
 }
 

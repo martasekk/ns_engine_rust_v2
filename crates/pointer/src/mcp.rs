@@ -156,6 +156,24 @@ fn tools() -> Value {
             }, "required": ["text"]},
         },
         {
+            "name": "clipboard_read",
+            "title": "Read the clipboard",
+            "description": "Read the remote machine's clipboard as text. Combined with \
+                            ctrl+a then ctrl+c, this reads the contents of a text field or \
+                            document without capturing the screen. May answer unsupported.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "clipboard_write",
+            "title": "Set the clipboard",
+            "description": "Replace the remote machine's clipboard, then paste with \
+                            key_press ctrl+v. Prefer this to type_text for anything long: \
+                            typing is per-character. May answer unsupported.",
+            "inputSchema": {"type": "object", "properties": {
+                "text": {"type": "string"},
+            }, "required": ["text"]},
+        },
+        {
             "name": "key_press",
             "title": "Press a key or chord",
             "description": "Press one key, optionally with modifiers held: Enter, Tab, F5, \
@@ -334,6 +352,19 @@ impl<P: Pointer> McpServer<P> {
                     .await
                     .map(|s| json!({"state": s}))
             }
+            "clipboard_read" => session
+                .clipboard_read()
+                .await
+                .map(|text| json!({"text": text})),
+            "clipboard_write" => {
+                let Some(text) = args.get("text").and_then(Value::as_str) else {
+                    bad!("clipboard_write needs text")
+                };
+                session
+                    .clipboard_write(text)
+                    .await
+                    .map(|()| json!({"chars": text.chars().count()}))
+            }
             "type_text" => {
                 let Some(text) = args.get("text").and_then(Value::as_str) else {
                     bad!("type_text needs text")
@@ -391,6 +422,10 @@ impl<P: Pointer> McpServer<P> {
                         kind: ErrorKind::OutOfBounds,
                         ..
                     } => " The display layout changed; call screens_list again.",
+                    InputError::Agent {
+                        kind: ErrorKind::Unsupported,
+                        ..
+                    } => " This agent does not implement that; use another approach.",
                     _ => "",
                 };
                 tool_err(id, &format!("{e}.{hint}"))

@@ -122,6 +122,25 @@ where
             other => Err(unexpected(other)),
         }
     }
+
+    async fn clipboard_read(&self) -> Result<String, InputError> {
+        match self.call(Op::ClipboardRead).await? {
+            ResultBody::Clipboard { text } => Ok(text),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        match self
+            .call(Op::ClipboardWrite {
+                text: text.to_string(),
+            })
+            .await?
+        {
+            ResultBody::Clipboard { .. } => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 fn unexpected(body: ResultBody) -> InputError {

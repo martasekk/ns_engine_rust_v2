@@ -37,6 +37,8 @@ enum Act {
     Click,
     Scroll,
     Type,
+    ClipRead,
+    ClipWrite,
 }
 
 pub struct PointerTool {
@@ -56,6 +58,8 @@ pub async fn tools(pointer: Arc<dyn Pointer>) -> Result<Vec<Arc<dyn Tool>>, Stri
         Act::Click,
         Act::Scroll,
         Act::Type,
+        Act::ClipRead,
+        Act::ClipWrite,
     ]
     .into_iter()
     .map(|act| Arc::new(PointerTool::new(act, shared.clone())) as Arc<dyn Tool>)
@@ -138,6 +142,24 @@ impl PointerTool {
                         "key": {"type": "string"},
                         "modifiers": {"type": "array", "items": {"type": "string"}},
                     }
+                }),
+            ),
+            Act::ClipRead => (
+                "pointer_clipboard_read",
+                "Read the remote machine's clipboard. With ctrl+a then ctrl+c, this reads a \
+                 text field or document without a screenshot.",
+                SideEffect::Pure,
+                serde_json::json!({"type": "object", "properties": {}}),
+            ),
+            Act::ClipWrite => (
+                "pointer_clipboard_write",
+                "Replace the remote machine's clipboard, then paste it with pointer_type \
+                 key=v modifiers=[ctrl]. Prefer this to typing anything long.",
+                SideEffect::Reversible,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"]
                 }),
             ),
         };
@@ -350,6 +372,24 @@ impl Tool for PointerTool {
                     .await
                     .map_err(|e| failed("pointer", e))?;
                 ok(format!("scrolled {dx},{dy}"))
+            }
+            Act::ClipRead => {
+                let s = self.shared.lock().await;
+                let text = s.clipboard_read().await.map_err(|e| failed("pointer", e))?;
+                ok(text)
+            }
+            Act::ClipWrite => {
+                let Some(text) = args.get("text").and_then(serde_json::Value::as_str) else {
+                    return Err(failed("args", "needs text"));
+                };
+                let s = self.shared.lock().await;
+                s.clipboard_write(text)
+                    .await
+                    .map_err(|e| failed("pointer", e))?;
+                ok(format!(
+                    "put {} characters on the clipboard",
+                    text.chars().count()
+                ))
             }
             Act::Type => {
                 let s = self.shared.lock().await;
@@ -599,10 +639,46 @@ mod tests {
 
     /// All six actions drive one connection, so they cannot disagree about
     /// the layout they are resolving against.
+    /// Reading the clipboard is a read; replacing it is not irreversible in
+    /// the way a click is — nothing gets activated.
+    #[tokio::test]
+    async fn the_clipboard_actions_carry_the_right_effect_and_round_trip() {
+        let (t, _) = built().await;
+        assert_eq!(
+            find(&t, "pointer_clipboard_read").spec().side_effect,
+            SideEffect::Pure
+        );
+        assert_eq!(
+            find(&t, "pointer_clipboard_write").spec().side_effect,
+            SideEffect::Reversible
+        );
+        assert!(find(&t, "pointer_clipboard_write")
+            .stage(&serde_json::json!({"text": "x"}), &ctx())
+            .await
+            .is_none());
+
+        let out = find(&t, "pointer_clipboard_write")
+            .call(
+                &serde_json::json!({"text": "four thousand characters, notionally"}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.summary, "put 36 characters on the clipboard");
+        assert_eq!(
+            find(&t, "pointer_clipboard_read")
+                .call(&serde_json::json!({}), &ctx())
+                .await
+                .unwrap()
+                .summary,
+            "four thousand characters, notionally"
+        );
+    }
+
     #[tokio::test]
     async fn every_action_shares_one_session() {
         let (t, mock) = built().await;
-        assert_eq!(t.len(), 6);
+        assert_eq!(t.len(), 8);
         find(&t, "pointer_move")
             .call(&serde_json::json!({"x": 100, "y": 100}), &ctx())
             .await

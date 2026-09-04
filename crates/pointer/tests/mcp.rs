@@ -56,6 +56,14 @@ async fn talk(reqs: Vec<Value>) -> (Vec<Value>, Arc<MockPointer>) {
         async fn perform(&self, steps: &[Step]) -> Result<u64, InputError> {
             self.0.perform(steps).await
         }
+        // Defaulted methods need forwarding: a wrapper that omits them
+        // silently reports the capability unsupported.
+        async fn clipboard_read(&self) -> Result<String, InputError> {
+            self.0.clipboard_read().await
+        }
+        async fn clipboard_write(&self, t: &str) -> Result<(), InputError> {
+            self.0.clipboard_write(t).await
+        }
     }
     let session = Session::open(Shared(mock.clone())).await.unwrap();
     let server = McpServer::new(session);
@@ -116,6 +124,8 @@ async fn initialize_and_list_report_a_usable_surface() {
             "pointer_drag",
             "pointer_scroll",
             "type_text",
+            "clipboard_read",
+            "clipboard_write",
             "key_press",
         ]
     );
@@ -321,4 +331,67 @@ async fn a_malformed_line_does_not_kill_the_session() {
     cw.write_all(&b).await.unwrap();
     let ok: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(ok["id"], 9, "the session survives");
+}
+
+/// Bulk text goes via the clipboard, not eight thousand keystrokes — and the
+/// capability is optional, so "this agent has no clipboard" must reach the
+/// model as something it can route around.
+#[tokio::test]
+async fn the_clipboard_round_trips_through_mcp() {
+    let (r, _) = talk(vec![
+        call(
+            1,
+            "clipboard_write",
+            json!({"text": "a long pasted document"}),
+        ),
+        call(2, "clipboard_read", json!({})),
+        call(3, "clipboard_write", json!({})),
+    ])
+    .await;
+    assert_eq!(r[0]["result"]["structuredContent"]["chars"], 22);
+    assert_eq!(
+        r[1]["result"]["structuredContent"]["text"],
+        "a long pasted document"
+    );
+    assert_eq!(
+        r[2]["error"]["code"], -32602,
+        "missing text is a caller bug"
+    );
+}
+
+#[tokio::test]
+async fn an_unsupported_capability_reads_as_something_to_route_around() {
+    struct NoClipboard;
+    #[async_trait::async_trait]
+    impl nspointer::Pointer for NoClipboard {
+        async fn screens(&self) -> Result<Screens, InputError> {
+            Ok(layout())
+        }
+        async fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        async fn perform(&self, _: &[Step]) -> Result<u64, InputError> {
+            Ok(0)
+        }
+        // clipboard_read defaults to Unsupported
+    }
+    let server = McpServer::new(Session::open(NoClipboard).await.unwrap());
+    let (client, srv) = tokio::io::duplex(64 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    tokio::spawn(async move {
+        let _ = server.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let mut b = serde_json::to_vec(&call(1, "clipboard_read", json!({}))).unwrap();
+    b.push(b'\n');
+    cw.write_all(&b).await.unwrap();
+    let resp: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+
+    // Not a protocol error: the model can pick another route.
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Unsupported"), "{text}");
+    assert!(text.contains("use another approach"), "{text}");
 }

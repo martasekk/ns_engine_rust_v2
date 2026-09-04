@@ -43,6 +43,22 @@ pub trait Pointer: Send + Sync {
     /// Replay `steps` in order. Returns the screen-state token as of
     /// completion, so a caller can tell the layout moved under it.
     async fn perform(&self, steps: &[Step]) -> Result<u64, InputError>;
+
+    /// Optional (protocol 2). Defaults to `Unsupported` so a double or an
+    /// older agent needs no change.
+    async fn clipboard_read(&self) -> Result<String, InputError> {
+        Err(unsupported())
+    }
+    async fn clipboard_write(&self, _text: &str) -> Result<(), InputError> {
+        Err(unsupported())
+    }
+}
+
+fn unsupported() -> InputError {
+    InputError::Agent {
+        kind: ErrorKind::Unsupported,
+        detail: "clipboard is not available on this agent".into(),
+    }
 }
 
 /// So a `Session` can be built over an `Arc<dyn Pointer>` and shared by
@@ -58,6 +74,12 @@ impl<P: Pointer + ?Sized> Pointer for std::sync::Arc<P> {
     }
     async fn perform(&self, steps: &[Step]) -> Result<u64, InputError> {
         (**self).perform(steps).await
+    }
+    async fn clipboard_read(&self) -> Result<String, InputError> {
+        (**self).clipboard_read().await
+    }
+    async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        (**self).clipboard_write(text).await
     }
 }
 
@@ -256,6 +278,16 @@ impl<P: Pointer> Session<P> {
             &mut self.rng.lock().unwrap(),
         );
         self.pointer.perform(&steps).await
+    }
+
+    /// Read the target's clipboard.
+    pub async fn clipboard_read(&self) -> Result<String, InputError> {
+        self.pointer.clipboard_read().await
+    }
+
+    /// Replace the target's clipboard.
+    pub async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        self.pointer.clipboard_write(text).await
     }
 
     pub async fn scroll(&self, dx: i32, dy: i32) -> Result<u64, InputError> {

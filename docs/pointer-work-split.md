@@ -17,8 +17,25 @@ pub trait Platform: Send + Sync {
     fn key    (&self, k: &Key, down: bool)      -> Result<(), InputError>;
     fn text   (&self, s: &str)                  -> Result<(), InputError>;
     fn local_activity(&self) -> bool;
+
+    // Optional, protocol 2 — both default to `Unsupported`, so skipping them
+    // costs a capability rather than a compile error.
+    fn clipboard_read(&self)              -> Result<String, InputError>;
+    fn clipboard_write(&self, s: &str)    -> Result<(), InputError>;
 }
 ```
+
+**Still eight required methods.** The clipboard pair is defaulted, so an agent
+that ignores it builds and runs; callers get `unsupported` and route around.
+Worth doing when you get to it: `clipboard_read` after ctrl+a ctrl+c is the
+only way in this protocol to read data off the machine without capturing its
+screen, and `clipboard_write` + ctrl+v is how long text should move, since
+typing is per-character.
+
+One trap, which cost a test here: **if you wrap a `Platform` in another
+`Platform`, forward the defaulted methods explicitly.** A wrapper that omits
+them silently reports the capability as unsupported rather than failing to
+compile.
 
 Every value arrives needing no interpretation. A `Point` is an absolute
 physical pixel in virtual-desktop coordinates **that has already been checked
@@ -57,7 +74,7 @@ service lands in session 0 with no interactive desktop and drives nothing.
 | MCP stdio server, 8 tools, `ns-pointer-mcp` binary | `mcp.rs`, `bin/` | done |
 | `nscore::Tool` adapter | phase 4 | next |
 
-40 tests, all green without a display server.
+47 tests, all green without a display server.
 
 Once your `Platform` exists, the whole chain runs:
 

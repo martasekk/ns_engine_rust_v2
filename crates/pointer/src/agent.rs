@@ -287,6 +287,32 @@ impl<P: Platform> Agent<P> {
                 }
             }
             Op::Perform { steps } => self.perform(id, steps, held, bucket),
+            // Clipboard contents are not written to the audit log — only the
+            // length. A machine's clipboard holds passwords often enough that
+            // recording it would turn the audit trail into the leak.
+            Op::ClipboardRead => match self.platform.clipboard_read() {
+                Ok(text) => {
+                    self.audit.record(&serde_json::json!({
+                        "at": (self.clock)(), "event": "clipboard_read", "chars": text.chars().count(),
+                    }));
+                    Response::ok(id, ResultBody::Clipboard { text })
+                }
+                Err(e) => err_response(id, e),
+            },
+            Op::ClipboardWrite { text } => {
+                self.audit.record(&serde_json::json!({
+                    "at": (self.clock)(), "event": "clipboard_write", "chars": text.chars().count(),
+                }));
+                match self.platform.clipboard_write(&text) {
+                    Ok(()) => Response::ok(
+                        id,
+                        ResultBody::Clipboard {
+                            text: String::new(),
+                        },
+                    ),
+                    Err(e) => err_response(id, e),
+                }
+            }
         }
     }
 

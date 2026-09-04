@@ -56,6 +56,30 @@ pub trait Platform: Send + Sync {
     ///
     /// Returning `false` always is a valid, and dangerous, implementation.
     fn local_activity(&self) -> bool;
+
+    /// The target's clipboard, as text. **Optional**: the default answers
+    /// `Unsupported`, so an agent can ship without it and the capability
+    /// degrades to an error rather than a compile failure.
+    ///
+    /// Worth having because it is the only way to get *data* back off the
+    /// machine without capturing its screen — select-all, copy, read.
+    fn clipboard_read(&self) -> Result<String, InputError> {
+        Err(unsupported("clipboard_read"))
+    }
+
+    /// Replace the target's clipboard. **Optional**, as above. The sane way
+    /// to move bulk text: `Step::Text` is right for a search box and wrong
+    /// for four thousand characters, which is eight thousand steps.
+    fn clipboard_write(&self, _text: &str) -> Result<(), InputError> {
+        Err(unsupported("clipboard_write"))
+    }
+}
+
+fn unsupported(what: &str) -> InputError {
+    InputError::Agent {
+        kind: crate::wire::ErrorKind::Unsupported,
+        detail: format!("{what} is not implemented by this agent"),
+    }
 }
 
 /// A `Platform` that records and never touches anything, for exercising the
@@ -65,6 +89,7 @@ pub struct NullPlatform {
     pub screens: Option<Screens>,
     pub applied: std::sync::Mutex<Vec<String>>,
     pub local: std::sync::atomic::AtomicBool,
+    pub clipboard: std::sync::Mutex<String>,
     /// When set, every input call fails with it.
     pub refuse: Option<InputError>,
 }
@@ -131,5 +156,14 @@ impl Platform for NullPlatform {
 
     fn local_activity(&self) -> bool {
         self.local.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn clipboard_read(&self) -> Result<String, InputError> {
+        Ok(self.clipboard.lock().unwrap().clone())
+    }
+
+    fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        *self.clipboard.lock().unwrap() = text.to_string();
+        Ok(())
     }
 }

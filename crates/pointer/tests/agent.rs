@@ -95,6 +95,14 @@ async fn connect<P: Platform + 'static>(
         fn local_activity(&self) -> bool {
             self.0.local_activity()
         }
+        // Defaulted methods must be forwarded explicitly: a wrapper that
+        // omits them silently reports the capability as unsupported.
+        fn clipboard_read(&self) -> Result<String, InputError> {
+            self.0.clipboard_read()
+        }
+        fn clipboard_write(&self, t: &str) -> Result<(), InputError> {
+            self.0.clipboard_write(t)
+        }
     }
 
     let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
@@ -478,11 +486,102 @@ async fn an_unparseable_line_is_answered_not_fatal() {
     assert!(line.contains("\"kind\":\"protocol\""), "{line}");
     // and the connection is still usable
     w.write_all(
-        format!("{{\"id\":2,\"op\":\"hello\",\"token\":\"{TOKEN}\",\"protocol\":1}}\n").as_bytes(),
+        format!(
+            "{{\"id\":2,\"op\":\"hello\",\"token\":\"{TOKEN}\",\"protocol\":{}}}\n",
+            nspointer::PROTOCOL
+        )
+        .as_bytes(),
     )
     .await
     .unwrap();
     line.clear();
     r.read_line(&mut line).await.unwrap();
     assert!(line.contains("\"kind\":\"ready\""), "{line}");
+}
+
+/// Clipboard is optional: an agent that has not implemented it answers
+/// `Unsupported` rather than failing to build, and a caller can tell the
+/// difference between "not available" and "went wrong".
+#[tokio::test]
+async fn an_agent_without_a_clipboard_says_so() {
+    struct NoClipboard(Screens);
+    impl Platform for NoClipboard {
+        fn screens(&self) -> Result<Screens, InputError> {
+            Ok(self.0.clone())
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        fn move_to(&self, _: Point) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn button(&self, _: Button, _: bool) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn scroll(&self, _: i32, _: i32) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn key(&self, _: &Key, _: bool) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn text(&self, _: &str) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+        // clipboard_read / clipboard_write deliberately not implemented
+    }
+    let c = connect(
+        Arc::new(NoClipboard(layout())),
+        Limits::default(),
+        None,
+        fixed_clock(0),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+    let err = c.clipboard_read().await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Unsupported,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// The round trip, and the audit rule that goes with it.
+#[tokio::test]
+async fn the_clipboard_round_trips_without_its_contents_reaching_the_log() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let audit = Arc::new(Recorder::default());
+    let c = connect(
+        p.clone(),
+        Limits::default(),
+        Some(audit.clone()),
+        fixed_clock(0),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+
+    c.clipboard_write("hunter2 is not a good password")
+        .await
+        .unwrap();
+    assert_eq!(
+        c.clipboard_read().await.unwrap(),
+        "hunter2 is not a good password"
+    );
+
+    // A machine's clipboard holds secrets often enough that logging it would
+    // turn the audit trail into the leak. Length only.
+    let entries = audit.0.lock().unwrap().clone();
+    let text = serde_json::to_string(&entries).unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(text.contains("\"chars\":30"), "{text}");
+    assert!(audit.events().contains(&"clipboard_write".to_string()));
 }

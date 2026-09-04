@@ -15,6 +15,7 @@ pub struct MockPointer {
     /// When set, every `perform` fails with it — for exercising the
     /// `Suspended` and `Blocked` paths without a desktop to block on.
     pub fail: Option<InputError>,
+    pub clipboard: Mutex<String>,
 }
 
 impl MockPointer {
@@ -24,6 +25,7 @@ impl MockPointer {
             at: Mutex::new(at),
             performed: Mutex::new(Vec::new()),
             fail: None,
+            clipboard: Mutex::new(String::new()),
         }
     }
 
@@ -71,5 +73,14 @@ impl Pointer for MockPointer {
             *self.at.lock().unwrap() = Point::new(*x, *y);
         }
         Ok(self.screens.state)
+    }
+
+    async fn clipboard_read(&self) -> Result<String, InputError> {
+        Ok(self.clipboard.lock().unwrap().clone())
+    }
+
+    async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        *self.clipboard.lock().unwrap() = text.to_string();
+        Ok(())
     }
 }

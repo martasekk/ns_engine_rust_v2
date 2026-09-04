@@ -4,8 +4,9 @@
 any MCP client can drive it. Windows first, with the port to a second OS being
 one trait implementation rather than a second project.
 
-**Status, 2026-09-04:** phases 0, 1, 3 and 4 built and green — 287 tests
-across the workspace. Keyboard folded in (§6). The MCP survey changed
+**Status, 2026-09-04:** phases 0, 1, 3, 4 and 5 built and green — 292 tests
+across the workspace, on a machine with no display server. Remaining: the
+Windows `Platform` impl (yours), then UI Automation (§8). Keyboard folded in (§6). The MCP survey changed
 three decisions and one of those was later withdrawn (§8). Remaining: the
 Windows `Platform` impl (yours), then clipboard and UI Automation.
 
@@ -243,7 +244,7 @@ protocol bump.
 | 2 | Windows backend: `impl Pointer` over enigo — screen identity from device path/EDID, UIPI and secure-desktop detection, `KEYEVENTF_UNICODE` with surrogate pairs | **no** — your machine | |
 | 3 | `ns-pointer-mcp`: stdio JSON-RPC (MCP 2025-06-18), eight typed tools, absolute pixels by default with `screen` switching to fractions. Caller mistakes are JSON-RPC errors; machine refusals are `isError` tool results the model can read | **yes** | **done** — 9 tests, plus the binary |
 | 4 | `nscore::Tool` adapter — six actions in `components-std`, one shared session. `pointer_click` and `pointer_type` are `SideEffect::Irreversible`, so `SideEffectGate` stages them and `stage()` names the coordinates and text in the prompt | **yes** | **done** — 8 tests |
-| 5 | Clipboard read/write (§8) — the sane way to move bulk text; `Step::Text` per character is right for a search box and wrong for four thousand characters | partly | |
+| 5 | Clipboard read/write (§8), protocol 2. Optional on the agent — defaulted `Platform` methods, so it costs a capability rather than a compile error. Contents never reach the audit log, only the length | **yes** | **done** — 4 tests |
 | 6 | **UI Automation** (§8): `ui_tree`, `find_element`, `click_element`. Evaluate **before** screen capture — naming a control sidesteps DPI registration, image transport and stale screenshots at once | partly | |
 | 7 | Second platform (X11 or macOS) — one trait impl, the proof that §3 worked | partly | |
 
