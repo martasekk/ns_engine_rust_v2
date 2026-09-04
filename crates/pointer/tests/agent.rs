@@ -1,0 +1,488 @@
+//! End-to-end over an in-memory duplex: real client, real agent, real
+//! protocol, no socket and no desktop. Doubles as the conformance suite for
+//! an agent written in another language — every assertion here is a rule
+//! `docs/pointer-protocol.md` states.
+
+use nspointer::agent::{Agent, AgentConfig, Audit, Limits};
+use nspointer::client::RemotePointer;
+use nspointer::platform::{NullPlatform, Platform};
+use nspointer::wire::{ErrorKind, InputError, Key, Step};
+use nspointer::{Button, Loc, Point, Pointer, Rect, Screen, ScreenId, Screens, Session};
+use std::sync::Arc;
+use tokio::io::BufReader;
+
+const TOKEN: &str = "correct-horse-battery-staple";
+
+fn layout() -> Screens {
+    Screens {
+        screens: vec![Screen {
+            id: ScreenId::from("S1"),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            scale: 1.0,
+            primary: true,
+            label: "test".into(),
+        }],
+        state: 3,
+    }
+}
+
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<serde_json::Value>>);
+
+/// The orphan rule forbids `impl Audit for Arc<Recorder>`, and a handle is
+/// what an agent would hold anyway.
+struct AuditHandle(Arc<Recorder>);
+impl Audit for AuditHandle {
+    fn record(&self, entry: &serde_json::Value) {
+        self.0 .0.lock().unwrap().push(entry.clone());
+    }
+}
+impl Recorder {
+    fn events(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e["event"].as_str().unwrap_or("?").to_string())
+            .collect()
+    }
+}
+
+/// Spawns an agent on one end of a duplex and hands back a connected client.
+/// `clock` lets a test drive the rate limiter and the override without
+/// sleeping.
+async fn connect<P: Platform + 'static>(
+    platform: Arc<P>,
+    limits: Limits,
+    audit: Option<Arc<Recorder>>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    token: &str,
+) -> Result<
+    RemotePointer<
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    >,
+    InputError,
+> {
+    struct Shared<P>(Arc<P>);
+    impl<P: Platform> Platform for Shared<P> {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.0.screens()
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.0.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.0.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.0.button(b, d)
+        }
+        fn scroll(&self, x: i32, y: i32) -> Result<(), InputError> {
+            self.0.scroll(x, y)
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.0.key(k, d)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.0.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            self.0.local_activity()
+        }
+    }
+
+    let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
+    let (ar, aw) = tokio::io::split(agent_side);
+    let mut agent = Agent::new(
+        Shared(platform),
+        AgentConfig {
+            token: TOKEN.into(),
+            limits,
+        },
+    )
+    .with_clock(Box::new(move || clock()));
+    if let Some(a) = audit {
+        agent = agent.with_audit(Box::new(AuditHandle(a)));
+    }
+    tokio::spawn(async move {
+        let _ = agent.serve(ar, aw).await;
+    });
+    let (cr, cw) = tokio::io::split(client_side);
+    RemotePointer::connect(BufReader::new(cr), cw, token).await
+}
+
+fn fixed_clock(ms: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    Arc::new(move || ms)
+}
+
+#[tokio::test]
+async fn a_gesture_survives_the_round_trip_intact() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let c = connect(p.clone(), Limits::default(), None, fixed_clock(0), TOKEN)
+        .await
+        .unwrap();
+    let s = Session::open(c).await.unwrap();
+    s.click_at(&Loc::normalized("S1", 0.5, 0.5), Button::Left, 1)
+        .await
+        .unwrap();
+
+    let log = p.log();
+    assert!(log.iter().any(|l| l == "button Left true"));
+    assert!(log.iter().any(|l| l == "button Left false"));
+    // Landed exactly where the caller aimed: (1919·0.5, 1079·0.5) rounded.
+    assert_eq!(
+        log.iter().rev().find(|l| l.starts_with("move")).unwrap(),
+        "move 960,540"
+    );
+}
+
+#[tokio::test]
+async fn nothing_works_before_a_valid_hello() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    // Wrong token: the connection is refused at `connect`, so no later call
+    // has to remember to check.
+    let err = match connect(p.clone(), Limits::default(), None, fixed_clock(0), "guess").await {
+        Err(e) => e,
+        Ok(_) => panic!("a wrong token must not produce a connection"),
+    };
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Unauthorized,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        p.log().is_empty(),
+        "an unauthenticated caller moved nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_batch_is_refused_whole() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let limits = Limits {
+        max_steps: 10,
+        ..Limits::default()
+    };
+    let c = connect(p.clone(), limits, None, fixed_clock(0), TOKEN)
+        .await
+        .unwrap();
+    let steps: Vec<Step> = (0..11).map(|i| Step::Move { x: i, y: 0 }).collect();
+    let err = c.perform(&steps).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Protocol,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(p.log().is_empty(), "refused whole, not partway");
+}
+
+/// A limit the client applies to itself is not a limit, so this is enforced
+/// where a caller cannot reach it — and proven with a clock rather than a
+/// sleep.
+#[tokio::test]
+async fn the_rate_limit_is_enforced_and_refills() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let n = now.clone();
+    let limits = Limits {
+        performs_per_sec: 10.0,
+        burst: 2.0,
+        ..Limits::default()
+    };
+    let c = connect(
+        p.clone(),
+        limits,
+        None,
+        Arc::new(move || n.load(std::sync::atomic::Ordering::SeqCst)),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+
+    let one = [Step::Scroll { dx: 0, dy: 1 }];
+    assert!(c.perform(&one).await.is_ok());
+    assert!(c.perform(&one).await.is_ok());
+    let err = c.perform(&one).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Internal,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    // 200ms at 10/s refills two tokens.
+    now.store(200, std::sync::atomic::Ordering::SeqCst);
+    assert!(c.perform(&one).await.is_ok(), "the bucket refills");
+}
+
+/// The person at the keyboard outranks the socket.
+#[tokio::test]
+async fn local_activity_suspends_remote_input_until_it_lapses() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let n = now.clone();
+    let limits = Limits {
+        suspend_ms: 3_000,
+        ..Limits::default()
+    };
+    let c = connect(
+        p.clone(),
+        limits,
+        None,
+        Arc::new(move || n.load(std::sync::atomic::Ordering::SeqCst)),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+
+    let one = [Step::Scroll { dx: 0, dy: 1 }];
+    assert!(c.perform(&one).await.is_ok());
+
+    // A human touches the machine.
+    p.local.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = c.perform(&one).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Suspended,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    // Still suspended a second later, and distinct from a rate limit so the
+    // caller can tell "wait" from "back off".
+    now.store(2_000, std::sync::atomic::Ordering::SeqCst);
+    let err = c.perform(&one).await.unwrap_err();
+    assert!(matches!(
+        err,
+        InputError::Agent {
+            kind: ErrorKind::Suspended,
+            ..
+        }
+    ));
+    // ...and released once it lapses.
+    now.store(4_500, std::sync::atomic::Ordering::SeqCst);
+    assert!(c.perform(&one).await.is_ok());
+}
+
+/// A stuck Ctrl is not a failed operation, it is an unusable machine. The
+/// client cannot fix this — the failure is precisely when it has no second
+/// half of the batch to send.
+#[tokio::test]
+async fn a_failed_batch_releases_what_it_had_pressed() {
+    struct FailsOnText(Screens, std::sync::Mutex<Vec<String>>);
+    impl Platform for FailsOnText {
+        fn screens(&self) -> Result<Screens, InputError> {
+            Ok(self.0.clone())
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        fn move_to(&self, _: Point) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.1.lock().unwrap().push(format!("button {b:?} {d}"));
+            Ok(())
+        }
+        fn scroll(&self, _: i32, _: i32) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.1.lock().unwrap().push(format!("key {k:?} {d}"));
+            Ok(())
+        }
+        fn text(&self, _: &str) -> Result<(), InputError> {
+            Err(InputError::Agent {
+                kind: ErrorKind::Blocked,
+                detail: "elevated".into(),
+            })
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+    }
+    let p = Arc::new(FailsOnText(layout(), Default::default()));
+    let c = connect(p.clone(), Limits::default(), None, fixed_clock(0), TOKEN)
+        .await
+        .unwrap();
+
+    let err = c
+        .perform(&[
+            Step::Key {
+                key: Key::Ctrl,
+                down: true,
+            },
+            Step::Button {
+                button: Button::Left,
+                down: true,
+            },
+            Step::Text { text: "x".into() }, // refused here
+            Step::Key {
+                key: Key::Ctrl,
+                down: false,
+            },
+        ])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Blocked,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+
+    let log = p.1.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        vec![
+            "key Ctrl true",
+            "button Left true",
+            // the agent cleaned up after the batch it could not finish
+            "key Ctrl false",
+            "button Left false",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn held_keys_are_released_when_the_connection_drops() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let audit = Arc::new(Recorder::default());
+    {
+        let c = connect(
+            p.clone(),
+            Limits::default(),
+            Some(audit.clone()),
+            fixed_clock(0),
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        c.perform(&[Step::Key {
+            key: Key::Ctrl,
+            down: true,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(p.log(), vec!["key Ctrl true"]);
+        // client dropped here: the socket closes with Ctrl still down
+    }
+    // Give the agent task its turn to notice the close.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+        if p.log().len() > 1 {
+            break;
+        }
+    }
+    assert_eq!(p.log(), vec!["key Ctrl true", "key Ctrl false"]);
+    assert!(audit.events().contains(&"release_held".to_string()));
+}
+
+#[tokio::test]
+async fn the_audit_records_what_was_injected_not_what_was_asked() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let audit = Arc::new(Recorder::default());
+    let c = connect(
+        p.clone(),
+        Limits::default(),
+        Some(audit.clone()),
+        fixed_clock(7),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+    c.perform(&[Step::Scroll { dx: 0, dy: 1 }]).await.unwrap();
+    let entries = audit.0.lock().unwrap().clone();
+    let performed = entries.iter().find(|e| e["event"] == "performed").unwrap();
+    assert_eq!(performed["steps"], 1);
+    assert_eq!(performed["at"], 7);
+}
+
+#[tokio::test]
+async fn a_bad_protocol_version_is_refused_rather_than_guessed() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let (client_side, agent_side) = tokio::io::duplex(4096);
+    let (ar, aw) = tokio::io::split(agent_side);
+    let agent = Agent::new(
+        NullPlatform::new(layout()),
+        AgentConfig {
+            token: TOKEN.into(),
+            limits: Limits::default(),
+        },
+    );
+    tokio::spawn(async move {
+        let _ = agent.serve(ar, aw).await;
+    });
+    let (cr, cw) = tokio::io::split(client_side);
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut w = cw;
+    w.write_all(
+        format!("{{\"id\":1,\"op\":\"hello\",\"token\":\"{TOKEN}\",\"protocol\":99}}\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(cr).read_line(&mut line).await.unwrap();
+    assert!(line.contains("\"kind\":\"protocol\""), "{line}");
+    let _ = p;
+}
+
+#[tokio::test]
+async fn an_unparseable_line_is_answered_not_fatal() {
+    let (client_side, agent_side) = tokio::io::duplex(4096);
+    let (ar, aw) = tokio::io::split(agent_side);
+    let agent = Agent::new(
+        NullPlatform::new(layout()),
+        AgentConfig {
+            token: TOKEN.into(),
+            limits: Limits::default(),
+        },
+    );
+    tokio::spawn(async move {
+        let _ = agent.serve(ar, aw).await;
+    });
+    let (cr, cw) = tokio::io::split(client_side);
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut w = cw;
+    let mut r = BufReader::new(cr);
+    w.write_all(b"{not json\n").await.unwrap();
+    let mut line = String::new();
+    r.read_line(&mut line).await.unwrap();
+    assert!(line.contains("\"kind\":\"protocol\""), "{line}");
+    // and the connection is still usable
+    w.write_all(
+        format!("{{\"id\":2,\"op\":\"hello\",\"token\":\"{TOKEN}\",\"protocol\":1}}\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    line.clear();
+    r.read_line(&mut line).await.unwrap();
+    assert!(line.contains("\"kind\":\"ready\""), "{line}");
+}
