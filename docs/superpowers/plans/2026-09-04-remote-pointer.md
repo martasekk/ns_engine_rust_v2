@@ -4,8 +4,8 @@
 any MCP client can drive it. Windows first, with the port to a second OS being
 one trait implementation rather than a second project.
 
-**Status, 2026-09-04:** phases 0, 1, 3, 4, 5 and 6 built and green — 300
-tests across the workspace, on a machine with no display server. Everything
+**Status, 2026-09-04:** every phase that does not need a desktop is built —
+317 tests across the workspace, on a machine with no display server. Everything
 that can be built without a desktop is built; what remains is the Windows
 `Platform` impl. Keyboard folded in (§6). The MCP survey changed
 three decisions and one of those was later withdrawn (§8). Remaining: the
@@ -443,3 +443,48 @@ here has been measured against a real accessibility tree, because this machine
 has no desktop to read one from. The first real `ui_tree` from Windows is the
 measurement, and the compression ratio is reported in every `ui_read`
 (`raw_controls` against `controls`) so it can be seen rather than assumed.
+
+---
+
+## 14. The MCP confirmation gate
+
+§12 recorded an asymmetry and left it open: the harness path stages
+`pointer_click` and `pointer_type` through `SideEffectGate`, naming the
+coordinates before anything happens, and an MCP client gets none of that. The
+specification asks *clients* to keep a human in the loop and cannot enforce
+it; the survey found no server that does.
+
+Neither extreme is right. A well-behaved client already prompts, so gating
+every call doubles the prompts it shows for no gain. Gating none of them
+trusts a property nothing checks — and an auto-approving client is exactly the
+case where the gate matters.
+
+**`Confirm::FirstAction` is the default.** The first irreversible action of a
+session must carry `"confirm": true`; confirming arms the session for the
+rest. One explicit moment per session, one extra round trip, and it holds even
+when the client approves everything automatically. `Confirm::EveryAction` and
+`Confirm::Off` exist for callers who want the other ends.
+
+The refusal names the action, for the same reason `stage()` does:
+
+```
+This would click (800, 400) on a real desktop, which cannot be undone.
+Call again with "confirm": true if the person you are working for wants that.
+Confirming once arms this session for the rest of its input.
+```
+
+Moves, reads and scrolls are not gated: nothing is activated by looking, or by
+a cursor arriving somewhere.
+
+---
+
+## 15. Shipping to the other machine
+
+`ns-pointer` has no path dependencies and no workspace ties, so the crate
+directory plus a Cargo.toml with pinned versions is a complete, buildable
+unit. `scratchpad/bundle/ns-pointer-bundle.tar.gz` is that, plus a drop-in
+`main.rs` for the agent and the three documents.
+
+Verified by extracting it into an empty directory and running `cargo test
+--offline`: 69 tests, same as in the workspace. A bundle that has not been
+built from its own tarball is a hopeful tarball.

@@ -1,7 +1,7 @@
 //! The MCP surface, driven the way a client drives it: JSON-RPC lines in,
 //! JSON-RPC lines out, over an in-memory pipe.
 
-use nspointer::mcp::{parse_key, McpServer, MCP_PROTOCOL};
+use nspointer::mcp::{parse_key, Confirm, McpServer, MCP_PROTOCOL};
 use nspointer::mock::MockPointer;
 use nspointer::wire::{ErrorKind, InputError, Key, Step};
 use nspointer::{Point, Rect, Screen, ScreenId, Screens, Session};
@@ -66,7 +66,8 @@ async fn talk(reqs: Vec<Value>) -> (Vec<Value>, Arc<MockPointer>) {
         }
     }
     let session = Session::open(Shared(mock.clone())).await.unwrap();
-    let server = McpServer::new(session);
+    // Existing behaviour tests run ungated; the gate has its own below.
+    let server = McpServer::new(session).with_confirm(Confirm::Off);
 
     let (client, srv) = tokio::io::duplex(256 * 1024);
     let (sr, sw) = tokio::io::split(srv);
@@ -264,7 +265,8 @@ async fn a_refusal_from_the_machine_is_a_readable_tool_result() {
         }
     }
     let session = Session::open(Suspended).await.unwrap();
-    let server = McpServer::new(session);
+    // Existing behaviour tests run ungated; the gate has its own below.
+    let server = McpServer::new(session).with_confirm(Confirm::Off);
     let (client, srv) = tokio::io::duplex(64 * 1024);
     let (sr, sw) = tokio::io::split(srv);
     tokio::spawn(async move {
@@ -481,4 +483,137 @@ async fn ui_find_turns_a_name_into_a_click_target() {
         .unwrap()
         .contains("button \"Save\" (300,200)"));
     assert!(!sc["text"].as_str().unwrap().contains("Hidden"));
+}
+
+/// The asymmetry this closes: the harness path stages irreversible actions
+/// through `SideEffectGate` and an MCP client gets nothing. A well-behaved
+/// client prompts anyway, so gating every call doubles its prompts; gating
+/// none trusts a property nothing checks. One explicit moment per session.
+#[tokio::test]
+async fn the_first_irreversible_action_must_say_it_means_it() {
+    let mock = Arc::new(MockPointer::new(layout(), Point::new(0, 0)));
+    let server = McpServer::new(Session::open(mock.clone()).await.unwrap());
+    let (client, srv) = tokio::io::duplex(256 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    tokio::spawn(async move {
+        let _ = server.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let ask = |v: Value| {
+        let mut b = serde_json::to_vec(&v).unwrap();
+        b.push(b'\n');
+        b
+    };
+    let next = |line: String| -> Value { serde_json::from_str(&line).unwrap() };
+
+    // Reads and moves pass straight through: nothing is activated by looking,
+    // or by a cursor arriving somewhere.
+    cw.write_all(&ask(call(1, "pointer_move", json!({"x": 10, "y": 10}))))
+        .await
+        .unwrap();
+    let r = next(lines.next_line().await.unwrap().unwrap());
+    assert_eq!(r["result"]["isError"], false, "a move is not gated");
+
+    // The first click is refused, and the refusal names what it would do.
+    let before = mock.steps().len();
+    cw.write_all(&ask(call(2, "pointer_click", json!({"x": 800, "y": 400}))))
+        .await
+        .unwrap();
+    let r = next(lines.next_line().await.unwrap().unwrap());
+    assert_eq!(r["result"]["isError"], true);
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("click (800, 400)"),
+        "names the action: {text}"
+    );
+    assert!(text.contains("cannot be undone"), "{text}");
+    assert_eq!(
+        mock.steps().len(),
+        before,
+        "and not one step reached the desktop"
+    );
+
+    // Saying so lets it through...
+    cw.write_all(&ask(call(
+        3,
+        "pointer_click",
+        json!({"x": 800, "y": 400, "confirm": true}),
+    )))
+    .await
+    .unwrap();
+    let r = next(lines.next_line().await.unwrap().unwrap());
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert!(mock.steps().len() > before, "the confirmed click landed");
+
+    // ...and arms the session, so the rest is not a prompt per click.
+    cw.write_all(&ask(call(4, "type_text", json!({"text": "already armed"}))))
+        .await
+        .unwrap();
+    let r = next(lines.next_line().await.unwrap().unwrap());
+    assert_eq!(r["result"]["isError"], false, "{r}");
+}
+
+#[tokio::test]
+async fn every_action_mode_never_arms_and_off_never_asks() {
+    for (mode, first_ok, second_ok) in [
+        (Confirm::EveryAction, false, false),
+        (Confirm::Off, true, true),
+    ] {
+        let mock = Arc::new(MockPointer::new(layout(), Point::new(0, 0)));
+        let server = McpServer::new(Session::open(mock).await.unwrap()).with_confirm(mode);
+        let (client, srv) = tokio::io::duplex(256 * 1024);
+        let (sr, sw) = tokio::io::split(srv);
+        tokio::spawn(async move {
+            let _ = server.serve(sr, sw).await;
+        });
+        let (cr, mut cw) = tokio::io::split(client);
+        let mut lines = BufReader::new(cr).lines();
+
+        let go = |id: u64| {
+            let mut b =
+                serde_json::to_vec(&call(id, "key_press", json!({"key": "enter"}))).unwrap();
+            b.push(b'\n');
+            b
+        };
+        // First, with an explicit yes, then a second without one.
+        let mut confirmed = serde_json::to_vec(&call(
+            1,
+            "key_press",
+            json!({"key": "enter", "confirm": true}),
+        ))
+        .unwrap();
+        confirmed.push(b'\n');
+        cw.write_all(&confirmed).await.unwrap();
+        let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(r["result"]["isError"], false, "{mode:?} confirmed: {r}");
+        let _ = first_ok;
+
+        cw.write_all(&go(2)).await.unwrap();
+        let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            r["result"]["isError"], !second_ok,
+            "{mode:?} does not arm across calls: {r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_confirm_argument_is_advertised_on_the_tools_that_need_it() {
+    let (r, _) = talk(vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+    ])
+    .await;
+    let tools = r[0]["result"]["tools"].as_array().unwrap();
+    let has_confirm = |name: &str| {
+        tools.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]["properties"]
+            .get("confirm")
+            .is_some()
+    };
+    for t in ["pointer_click", "pointer_drag", "type_text", "key_press"] {
+        assert!(has_confirm(t), "{t} should advertise confirm");
+    }
+    for t in ["pointer_move", "ui_read", "screens_list", "pointer_scroll"] {
+        assert!(!has_confirm(t), "{t} should not");
+    }
 }

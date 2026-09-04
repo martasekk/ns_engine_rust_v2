@@ -90,6 +90,9 @@ fn tools() -> Value {
          0.0-1.0 within that screen instead of absolute pixels."});
     let button = json!({"type": "string", "enum": ["left", "right", "middle"],
                         "description": "Default left."});
+    let confirm = json!({"type": "boolean", "description":
+        "Say true to confirm that the person you are working for wants input \
+         put on a real desktop. Required once per session by default."});
     json!([
         {
             "name": "screens_list",
@@ -124,6 +127,7 @@ fn tools() -> Value {
                 "x": xy("Target")["x"], "y": xy("Target")["y"], "screen": screen,
                 "button": button,
                 "count": {"type": "integer", "description": "1 for a click, 2 to double-click."},
+                "confirm": confirm.clone(),
             }},
         },
         {
@@ -133,7 +137,7 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {
                 "from_x": {"type": "number"}, "from_y": {"type": "number"},
                 "to_x": {"type": "number"}, "to_y": {"type": "number"},
-                "screen": screen, "button": button,
+                "screen": screen, "button": button, "confirm": confirm.clone(),
             }, "required": ["from_x", "from_y", "to_x", "to_y"]},
         },
         {
@@ -152,7 +156,7 @@ fn tools() -> Value {
                             including characters like @ that depend on keyboard layout. \
                             It cannot press Enter or produce a shortcut — use key_press.",
             "inputSchema": {"type": "object", "properties": {
-                "text": {"type": "string"},
+                "text": {"type": "string"}, "confirm": confirm.clone(),
             }, "required": ["text"]},
         },
         {
@@ -209,20 +213,111 @@ fn tools() -> Value {
                      home end pageup pagedown f1-f24, or a single character."},
                 "modifiers": {"type": "array", "items": {"type": "string"}, "description":
                     "Held while the key is tapped, released in reverse: ctrl alt shift meta."},
+                "confirm": confirm.clone(),
             }, "required": ["key"]},
         },
     ])
 }
 
+/// When an MCP caller must say it means it before input reaches the desktop.
+///
+/// The harness path stages `pointer_click` and `pointer_type` through
+/// `SideEffectGate` and names the coordinates before anything happens
+/// (plan §12). An MCP client gets none of that: the specification asks
+/// *clients* to keep a human in the loop and cannot enforce it, and the
+/// survey found no server that does.
+///
+/// A well-behaved client already prompts, so gating every call would double
+/// the prompts it shows. Gating none of them trusts a property nothing
+/// checks. `FirstAction` is the default because it costs exactly one extra
+/// round trip per session and guarantees one explicit human moment even when
+/// the client auto-approves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Confirm {
+    Off,
+    /// The first irreversible action of a session must carry `confirm: true`.
+    FirstAction,
+    /// Every one must.
+    EveryAction,
+}
+
 pub struct McpServer<P: Pointer> {
     session: Mutex<Session<P>>,
+    confirm: Confirm,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+/// Tools that put input on the desktop. A read is not one of them, and
+/// neither is a move: nothing is activated by a cursor arriving somewhere.
+fn irreversible(tool: &str) -> bool {
+    matches!(
+        tool,
+        "pointer_click" | "pointer_drag" | "type_text" | "key_press"
+    )
 }
 
 impl<P: Pointer> McpServer<P> {
     pub fn new(session: Session<P>) -> Self {
         Self {
             session: Mutex::new(session),
+            confirm: Confirm::FirstAction,
+            armed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn with_confirm(mut self, confirm: Confirm) -> Self {
+        self.confirm = confirm;
+        self
+    }
+
+    /// Whether this call may proceed, or the sentence explaining what it
+    /// would do and how to say yes. Named specifically, because "confirm
+    /// 'pointer_click'" is not a question anyone can answer.
+    fn gate(&self, name: &str, args: &Value) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if self.confirm == Confirm::Off || !irreversible(name) {
+            return None;
+        }
+        let said_yes = args
+            .get("confirm")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if said_yes {
+            self.armed.store(true, Ordering::SeqCst);
+            return None;
+        }
+        if self.confirm == Confirm::FirstAction && self.armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let what = match name {
+            "pointer_click" => match (args.get("x"), args.get("y")) {
+                (Some(x), Some(y)) => format!("click ({x}, {y})"),
+                _ => "click where the pointer is".into(),
+            },
+            "pointer_drag" => format!(
+                "drag ({}, {}) to ({}, {})",
+                args["from_x"], args["from_y"], args["to_x"], args["to_y"]
+            ),
+            "type_text" => format!(
+                "type {:?}",
+                args.get("text").and_then(Value::as_str).unwrap_or("")
+            ),
+            "key_press" => format!(
+                "press {}",
+                args.get("key").and_then(Value::as_str).unwrap_or("?")
+            ),
+            _ => name.to_string(),
+        };
+        let scope = if self.confirm == Confirm::FirstAction {
+            " Confirming once arms this session for the rest of its input."
+        } else {
+            ""
+        };
+        Some(format!(
+            "This would {what} on a real desktop, which cannot be undone. \
+             Call again with \"confirm\": true if the person you are working for \
+             wants that.{scope}"
+        ))
     }
 
     pub async fn serve<R, W>(&self, read: R, write: W) -> std::io::Result<()>
@@ -307,6 +402,10 @@ impl<P: Pointer> McpServer<P> {
             Some(s) => Loc::normalized(s.as_str(), x, y),
             None => Loc::absolute(x.round() as i32, y.round() as i32),
         };
+
+        if let Some(ask) = self.gate(name, &args) {
+            return tool_err(id, &ask);
+        }
 
         let session = self.session.lock().await;
         let outcome: Result<Value, InputError> = match name {
