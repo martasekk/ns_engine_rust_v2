@@ -295,12 +295,27 @@ impl<P: Platform> Agent<P> {
                 return Response::err(id, ErrorKind::Unauthorized, "bad token");
             }
             *authed = true;
+            // A dead override is the one failure a caller cannot detect for
+            // itself: the agent simply never says `suspended`. So it is said
+            // out loud, on every connection and in the log, rather than left
+            // to be inferred from an absence.
+            let hook_ok = self.platform.local_hook_ok();
+            if !hook_ok {
+                self.audit.record(&serde_json::json!({
+                    "at": (self.clock)(), "event": "no_local_override",
+                }));
+                eprintln!(
+                    "ns-pointerd: WARNING — the local override is not installed. \
+                     Remote input cannot be interrupted from the keyboard."
+                );
+            }
             return Response::ok(
                 id,
                 ResultBody::Ready {
                     agent: concat!("ns-pointerd ", env!("CARGO_PKG_VERSION")).into(),
                     platform: std::env::consts::OS.into(),
                     protocol: PROTOCOL,
+                    local_override: hook_ok,
                 },
             );
         }

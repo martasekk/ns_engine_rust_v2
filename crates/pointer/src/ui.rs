@@ -24,8 +24,12 @@
 //!    around the caller's query.
 //! 2. **Semantic structuring** — reading order, with a `[BLOCK]` separator
 //!    wherever the vertical gap exceeds an adaptive threshold.
-//! 3. **Modal detection** — role and keyword scoring, plus the temporal
-//!    difference against a previous tree when one is supplied.
+//! 3. **Modal detection** — role scoring and the temporal difference against
+//!    a previous tree, both language-independent, with an English keyword
+//!    list as one weak extra signal. Controls are attached to a detected
+//!    modal by *proximity and interactivity*, never by vocabulary: a Czech
+//!    dialog's `Zrušit` must join its dialog exactly as an English `Cancel`
+//!    does.
 //!
 //! Deliberately **not** copied: their per-application region maps (Chrome
 //! `BROWSER_TABS`/`ADDRESS_BAR`, VS Code `ACTIVITY_BAR`, Calc `FORMULA_BAR`).
@@ -267,7 +271,21 @@ pub fn compress(raw: Vec<UiNode>, opts: &Options) -> UiView {
         let anchors: Vec<Point> = modals.iter().map(|m| m.center).collect();
         let mut joined = Vec::new();
         nodes.retain(|n| {
-            if modal_score(n) > 0.0 && anchors.iter().any(|a| near(*a, n.center)) {
+            // Any *interactive* control near a detected modal, not only one
+            // carrying an English decision keyword.
+            //
+            // The keyword version was silently locale-bound. The verification
+            // machine reports its taskbar as "Hlavní panel"; a Czech dialog's
+            // `Zrušit` and `Potvrdit` score nothing against a list of `cancel`
+            // and `confirm`, so the dialog was announced and the two buttons
+            // that dismiss it were left in the background list — the half a
+            // caller actually needs. Role and proximity carry no vocabulary,
+            // so this works in every language, and the keyword list is
+            // demoted to what it always should have been: one weak extra
+            // signal for a banner that has no dialog-ish role at all.
+            let part_of_modal = (is_interactive(&n.role) || modal_score(n) > 0.0)
+                && anchors.iter().any(|a| near(*a, n.center));
+            if part_of_modal {
                 joined.push(n.clone());
                 false
             } else {

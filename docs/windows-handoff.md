@@ -78,21 +78,29 @@ machine's owner has. But "run the watcher and wave the mouse" passes once and
 then rots, because the same zero appears whether the hook works or was never
 installed.
 
-Two changes make the silent case impossible, and the second is a `Platform`
-signature change, so it is cheaper to agree now than after the impl hardens
-around `-> bool`:
+**Done on this side, non-breaking.** `Platform` gains one optional method:
 
-1. **Hook installation failure is a startup error**, or a loud repeated logged
-   warning. A `Platform` that cannot see the user must not silently pretend the
-   user is absent.
-2. **Report last-seen rather than a bare bool.** `local_activity() -> bool`
-   cannot distinguish "nothing happened" from "nothing is watching".
-   Something like `local_state() -> LocalState { last_event_ms: Option<u64>,
-   hook_ok: bool }` can, and the agent can then answer `suspended` *or* say it
-   does not know. `hook_ok: false` is then in the audit log forever after.
+```rust
+fn local_hook_ok(&self) -> bool { false }   // note the default
+```
 
-Then the manual wave-the-mouse check is a one-time acceptance rather than the
-whole guarantee.
+Your existing impl compiles untouched and reports `false`, which is the safe
+reading: an agent that has not said it installed a hook is assumed not to have
+one. **Return `true` only where the raw-input registration or the low-level
+hook actually succeeded**, and `false` again if it later goes away.
+
+The agent then puts it in `Ready`, logs `no_local_override`, and `ns-pointer`
+prints a warning on every command:
+
+```
+warning: this agent reports no local override — moving the physical mouse
+will not interrupt anything sent from here.
+```
+
+That is the whole change, and it turns the wave-the-mouse check from the whole
+guarantee into a one-time acceptance: after it, a dead hook is visible in the
+audit log and on every connection rather than indistinguishable from a quiet
+user.
 
 ## 4. `ui_tree` — the highest-value optional method
 
@@ -117,10 +125,21 @@ English only — `accept`, `cancel`, `confirm`, `ok`. On a Czech desktop, modal
 detection is simply off: a `Zrušit` / `Potvrdit` dialog scores nothing and
 stays in the background list.
 
-I lean toward **dropping the keyword signal entirely** rather than maintaining
-a list per locale — role scoring and the temporal difference are already
-implemented and need no vocabulary. Worth deciding with a real Czech dialog in
-front of us rather than in the abstract.
+**Fixed on this side, and better than the option I proposed.** I had suggested
+dropping the keyword signal; the real bug was narrower and the fix is
+strictly better.
+
+A dialog was already found by *role*, which carries no vocabulary — that part
+worked in Czech all along. What failed was the second pass that attaches a
+dialog's own buttons to it: it looked for English decision keywords, so
+`Zrušit` and `Potvrdit` stayed in the background list while the dialog they
+belong to was announced. That is the half a caller actually needs.
+
+It now attaches any **interactive** control near a detected modal. Role and
+proximity carry no vocabulary, so it works in every language, and the keyword
+list is demoted to one weak extra signal for a banner with no dialog-ish role
+at all. There is a Czech test and an English one, asserting identical
+behaviour.
 
 ## 6. Still unexercised, and cheap once item 1 is up
 

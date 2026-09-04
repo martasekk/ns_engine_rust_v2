@@ -11,6 +11,16 @@ use tokio::sync::Mutex;
 pub struct RemotePointer<R, W> {
     io: Mutex<(R, W)>,
     next_id: std::sync::atomic::AtomicU64,
+    /// From the agent's `Ready`. `false` means it has no brake.
+    local_override: std::sync::atomic::AtomicBool,
+}
+
+impl<R, W> RemotePointer<R, W> {
+    /// Whether the machine's owner can interrupt what this connection does.
+    pub fn local_override(&self) -> bool {
+        self.local_override
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl<R, W> RemotePointer<R, W>
@@ -24,6 +34,7 @@ where
         let p = Self {
             io: Mutex::new((read, write)),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            local_override: std::sync::atomic::AtomicBool::new(false),
         };
         match p
             .call(Op::Hello {
@@ -32,7 +43,15 @@ where
             })
             .await?
         {
-            ResultBody::Ready { protocol, .. } if protocol == PROTOCOL => Ok(p),
+            ResultBody::Ready {
+                protocol,
+                local_override,
+                ..
+            } if protocol == PROTOCOL => {
+                p.local_override
+                    .store(local_override, std::sync::atomic::Ordering::SeqCst);
+                Ok(p)
+            }
             ResultBody::Ready { protocol, .. } => Err(InputError::Transport(format!(
                 "agent speaks protocol {protocol}, this client speaks {PROTOCOL}"
             ))),

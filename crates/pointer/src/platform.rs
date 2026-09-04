@@ -54,8 +54,25 @@ pub trait Platform: Send + Sync {
     /// come from us. Drives the local override, which is the only reason the
     /// person at the keyboard can take their machine back.
     ///
-    /// Returning `false` always is a valid, and dangerous, implementation.
+    /// Returning `false` always is a valid, and dangerous, implementation —
+    /// which is what `local_hook_ok` exists to make visible.
     fn local_activity(&self) -> bool;
+
+    /// Whether the thing that watches for the user is actually installed and
+    /// running.
+    ///
+    /// `local_activity() -> bool` cannot distinguish *nothing happened* from
+    /// *nothing is watching*, and those are the same answer forever if the
+    /// hook silently failed to register. This separates them.
+    ///
+    /// **Defaults to `false`, and that is deliberate.** An agent that has not
+    /// said it installed a hook is assumed not to have one, and says so
+    /// loudly rather than presenting a dead brake as a working one. Return
+    /// `true` only where the raw-input registration or low-level hook
+    /// actually succeeded — and return `false` again if it later goes away.
+    fn local_hook_ok(&self) -> bool {
+        false
+    }
 
     /// The target's clipboard, as text. **Optional**: the default answers
     /// `Unsupported`, so an agent can ship without it and the capability
@@ -93,6 +110,52 @@ fn unsupported(what: &str) -> InputError {
     }
 }
 
+/// So a `Platform` can be shared without a hand-written wrapper.
+///
+/// This exists because writing that wrapper went wrong three times in a row,
+/// always the same way: it forwards the required methods, inherits the
+/// *defaults* for the optional ones, and the capability silently reports as
+/// unsupported instead of failing to compile. A blanket forward removes the
+/// chance to get it wrong.
+impl<P: Platform + ?Sized> Platform for std::sync::Arc<P> {
+    fn screens(&self) -> Result<Screens, InputError> {
+        (**self).screens()
+    }
+    fn position(&self) -> Result<Point, InputError> {
+        (**self).position()
+    }
+    fn move_to(&self, p: Point) -> Result<(), InputError> {
+        (**self).move_to(p)
+    }
+    fn button(&self, b: Button, down: bool) -> Result<(), InputError> {
+        (**self).button(b, down)
+    }
+    fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+        (**self).scroll(dx, dy)
+    }
+    fn key(&self, k: &Key, down: bool) -> Result<(), InputError> {
+        (**self).key(k, down)
+    }
+    fn text(&self, s: &str) -> Result<(), InputError> {
+        (**self).text(s)
+    }
+    fn local_activity(&self) -> bool {
+        (**self).local_activity()
+    }
+    fn local_hook_ok(&self) -> bool {
+        (**self).local_hook_ok()
+    }
+    fn clipboard_read(&self) -> Result<String, InputError> {
+        (**self).clipboard_read()
+    }
+    fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
+        (**self).clipboard_write(text)
+    }
+    fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        (**self).ui_tree()
+    }
+}
+
 /// A `Platform` that records and never touches anything, for exercising the
 /// agent's guards without a desktop.
 #[derive(Default)]
@@ -101,16 +164,19 @@ pub struct NullPlatform {
     pub applied: std::sync::Mutex<Vec<String>>,
     pub local: std::sync::atomic::AtomicBool,
     pub clipboard: std::sync::Mutex<String>,
+    pub hook_ok: std::sync::atomic::AtomicBool,
     /// When set, every input call fails with it.
     pub refuse: Option<InputError>,
 }
 
 impl NullPlatform {
     pub fn new(screens: Screens) -> Self {
-        Self {
+        let p = Self {
             screens: Some(screens),
             ..Default::default()
-        }
+        };
+        p.hook_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+        p
     }
 
     pub fn refusing(screens: Screens, e: InputError) -> Self {
@@ -167,6 +233,10 @@ impl Platform for NullPlatform {
 
     fn local_activity(&self) -> bool {
         self.local.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn local_hook_ok(&self) -> bool {
+        self.hook_ok.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn clipboard_read(&self) -> Result<String, InputError> {

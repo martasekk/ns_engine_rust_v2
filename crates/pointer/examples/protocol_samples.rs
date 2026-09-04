@@ -63,6 +63,7 @@ fn main() {
                 agent: "ns-pointerd 0.1.0".into(),
                 platform: "windows".into(),
                 protocol: PROTOCOL,
+                local_override: true,
             },
         ),
     );

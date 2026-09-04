@@ -47,6 +47,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if !pointer.local_override() {
+        eprintln!(
+            "warning: this agent reports no local override — moving the physical \
+             mouse will not interrupt anything sent from here."
+        );
+    }
     let session = match Session::open(pointer).await {
         Ok(s) => s,
         Err(e) => {

@@ -203,3 +203,53 @@ async fn a_query_never_removes_a_control() {
     let names = |v: &UiView| -> Vec<String> { v.nodes.iter().map(|n| n.role.clone()).collect() };
     assert_eq!(names(&with), names(&without));
 }
+
+/// The gap the Windows verification exposed by accident: that machine reports
+/// its taskbar as "Hlavní panel", and the modal keyword list is English.
+///
+/// A dialog is found by *role*, which carries no vocabulary. Its buttons must
+/// join it the same way — by being interactive and near it — or the dialog is
+/// announced while the two controls that dismiss it stay in the background
+/// list, which is the half a caller needs.
+#[tokio::test]
+async fn a_dialog_in_any_language_brings_its_buttons_with_it() {
+    let czech = vec![
+        n("Button", "Uložit", 100, 44),
+        n("Dialog", "Neuložené změny", 500, 400),
+        n("Button", "Zrušit", 460, 460),
+        n("Button", "Potvrdit", 560, 460),
+        // Far away: a toolbar button, not part of the dialog.
+        n("Button", "Nápověda", 1400, 950),
+    ];
+    let v = compress(czech, &Options::default());
+    let modal: Vec<&str> = v.modals.iter().map(|x| x.name.as_str()).collect();
+
+    assert!(modal.contains(&"Neuložené změny"), "{modal:?}");
+    assert!(
+        modal.contains(&"Zrušit"),
+        "no English keyword anywhere: {modal:?}"
+    );
+    assert!(modal.contains(&"Potvrdit"), "{modal:?}");
+    assert!(
+        !modal.contains(&"Nápověda"),
+        "900px away is not part of the dialog: {modal:?}"
+    );
+    assert!(
+        v.nodes.iter().any(|x| x.name == "Uložit"),
+        "toolbar survives"
+    );
+
+    // The same shape in English behaves identically — the fix did not trade
+    // one locale for another.
+    let english = vec![
+        n("Dialog", "Unsaved changes", 500, 400),
+        n("Button", "Discard", 460, 460),
+        n("Button", "Keep", 560, 460),
+    ];
+    let v = compress(english, &Options::default());
+    let modal: Vec<&str> = v.modals.iter().map(|x| x.name.as_str()).collect();
+    assert!(
+        modal.contains(&"Discard") && modal.contains(&"Keep"),
+        "{modal:?}"
+    );
+}

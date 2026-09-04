@@ -69,46 +69,10 @@ async fn connect<P: Platform + 'static>(
     >,
     InputError,
 > {
-    struct Shared<P>(Arc<P>);
-    impl<P: Platform> Platform for Shared<P> {
-        fn screens(&self) -> Result<Screens, InputError> {
-            self.0.screens()
-        }
-        fn position(&self) -> Result<Point, InputError> {
-            self.0.position()
-        }
-        fn move_to(&self, p: Point) -> Result<(), InputError> {
-            self.0.move_to(p)
-        }
-        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
-            self.0.button(b, d)
-        }
-        fn scroll(&self, x: i32, y: i32) -> Result<(), InputError> {
-            self.0.scroll(x, y)
-        }
-        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
-            self.0.key(k, d)
-        }
-        fn text(&self, s: &str) -> Result<(), InputError> {
-            self.0.text(s)
-        }
-        fn local_activity(&self) -> bool {
-            self.0.local_activity()
-        }
-        // Defaulted methods must be forwarded explicitly: a wrapper that
-        // omits them silently reports the capability as unsupported.
-        fn clipboard_read(&self) -> Result<String, InputError> {
-            self.0.clipboard_read()
-        }
-        fn clipboard_write(&self, t: &str) -> Result<(), InputError> {
-            self.0.clipboard_write(t)
-        }
-    }
-
     let (client_side, agent_side) = tokio::io::duplex(64 * 1024);
     let (ar, aw) = tokio::io::split(agent_side);
     let mut agent = Agent::new(
-        Shared(platform),
+        platform,
         AgentConfig {
             token: TOKEN.into(),
             limits,
@@ -603,35 +567,8 @@ async fn listening(
     limits: Limits,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> String {
-    struct Shared(Arc<NullPlatform>);
-    impl Platform for Shared {
-        fn screens(&self) -> Result<Screens, InputError> {
-            self.0.screens()
-        }
-        fn position(&self) -> Result<Point, InputError> {
-            self.0.position()
-        }
-        fn move_to(&self, p: Point) -> Result<(), InputError> {
-            self.0.move_to(p)
-        }
-        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
-            self.0.button(b, d)
-        }
-        fn scroll(&self, x: i32, y: i32) -> Result<(), InputError> {
-            self.0.scroll(x, y)
-        }
-        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
-            self.0.key(k, d)
-        }
-        fn text(&self, s: &str) -> Result<(), InputError> {
-            self.0.text(s)
-        }
-        fn local_activity(&self) -> bool {
-            self.0.local_activity()
-        }
-    }
     let c = cfg(limits);
-    let agent = Agent::new(Shared(platform), c).with_clock(Box::new(move || clock()));
+    let agent = Agent::new(platform, c).with_clock(Box::new(move || clock()));
     let listener = bind(
         &AgentConfig {
             token: TOKEN.into(),
@@ -806,4 +743,65 @@ async fn connections_past_the_cap_are_told_why_before_the_hangup() {
     let mut line = String::new();
     BufReader::new(r).read_line(&mut line).await.unwrap();
     assert!(line.contains("too many connections"), "{line}");
+}
+
+/// A dead override is the one failure a caller cannot infer for itself — the
+/// agent simply never says `suspended`. So it is reported, and the default is
+/// the pessimistic one: an agent that has not said it installed a hook is
+/// assumed not to have one.
+#[tokio::test]
+async fn an_agent_with_no_local_override_says_so_rather_than_looking_healthy() {
+    struct NoHook(Screens);
+    impl Platform for NoHook {
+        fn screens(&self) -> Result<Screens, InputError> {
+            Ok(self.0.clone())
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        fn move_to(&self, _: Point) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn button(&self, _: Button, _: bool) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn scroll(&self, _: i32, _: i32) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn key(&self, _: &Key, _: bool) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn text(&self, _: &str) -> Result<(), InputError> {
+            Ok(())
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+        // local_hook_ok deliberately not implemented: the default is `false`.
+    }
+    let audit = Arc::new(Recorder::default());
+    let (client, srv) = tokio::io::duplex(64 * 1024);
+    let (ar, aw) = tokio::io::split(srv);
+    let agent = Agent::new(NoHook(layout()), cfg(Limits::default()))
+        .with_audit(Box::new(AuditHandle(audit.clone())));
+    tokio::spawn(async move {
+        let _ = agent.serve(ar, aw).await;
+    });
+    let (cr, cw) = tokio::io::split(client);
+    let p = RemotePointer::connect(BufReader::new(cr), cw, TOKEN)
+        .await
+        .unwrap();
+
+    assert!(
+        !p.local_override(),
+        "the brake is dead and the client knows"
+    );
+    assert!(audit.events().contains(&"no_local_override".to_string()));
+
+    // And an agent that installed one reports the opposite, over the same path.
+    let plat = Arc::new(NullPlatform::new(layout()));
+    let c = connect(plat, Limits::default(), None, fixed_clock(0), TOKEN)
+        .await
+        .unwrap();
+    assert!(c.local_override());
 }

@@ -183,6 +183,12 @@ pub enum ResultBody {
         agent: String,
         platform: String,
         protocol: u32,
+        /// Whether the machine's owner can interrupt remote input. `false`
+        /// means the agent has no brake, and a caller should say so rather
+        /// than proceed quietly. Absent on protocol-1 agents, where it reads
+        /// as `false` — the safe assumption.
+        #[serde(default)]
+        local_override: bool,
     },
     Screens {
         screens: Vec<Screen>,

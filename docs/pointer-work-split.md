@@ -17,6 +17,7 @@ pub trait Platform: Send + Sync {
     fn key    (&self, k: &Key, down: bool)      -> Result<(), InputError>;
     fn text   (&self, s: &str)                  -> Result<(), InputError>;
     fn local_activity(&self) -> bool;
+    fn local_hook_ok(&self) -> bool;      // defaults to FALSE — see below
 
     // Optional, protocol 2 — both default to `Unsupported`, so skipping them
     // costs a capability rather than a compile error.
@@ -39,10 +40,32 @@ Worth doing when you get to it, in this order:
 3. **`clipboard_write`** + ctrl+v is how long text should move, since typing
    is per-character.
 
-One trap, which cost a test here: **if you wrap a `Platform` in another
-`Platform`, forward the defaulted methods explicitly.** A wrapper that omits
-them silently reports the capability as unsupported rather than failing to
-compile.
+### `local_hook_ok` defaults to `false`, and that is the point
+
+`local_activity() -> bool` cannot tell *nothing happened* from *nothing is
+watching*, and those are the same answer forever if the hook silently failed
+to register. `local_hook_ok` separates them, and its default is the
+pessimistic one: an agent that has not said it installed a hook is assumed not
+to have one.
+
+Return `true` only where the registration actually succeeded, and `false`
+again if it goes away. The agent then reports it in `Ready`, logs
+`no_local_override`, and `ns-pointer` warns on every command — instead of a
+dead brake looking exactly like a quiet user.
+
+That turns the wave-the-mouse check from the whole guarantee into a one-time
+acceptance.
+
+### One trap, and one that is now handled for you
+
+**If you wrap a `Platform` in another `Platform`, forward the defaulted
+methods explicitly.** A wrapper that omits them silently reports the
+capability unsupported rather than failing to compile — this went wrong three
+times here before it was worth fixing structurally.
+
+`Arc<P>` now forwards everything, so `Arc<WindowsPlatform>` is safe to share
+without writing a wrapper at all. Any other wrapper is still yours to get
+right.
 
 Every value arrives needing no interpretation. A `Point` is an absolute
 physical pixel in virtual-desktop coordinates **that has already been checked
