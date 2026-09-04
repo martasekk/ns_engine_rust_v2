@@ -180,7 +180,10 @@ impl<P: Platform> Agent<P> {
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
-                Ok(req) => self.dispatch(req, &mut authed, &mut held, &mut bucket),
+                Ok(req) => {
+                    self.dispatch(req, &mut authed, &mut held, &mut bucket)
+                        .await
+                }
                 // No id to answer against: say so and move on rather than
                 // guessing which request this was.
                 Err(e) => Response::err(0, ErrorKind::Protocol, e.to_string()),
@@ -221,7 +224,7 @@ impl<P: Platform> Agent<P> {
         }
     }
 
-    fn dispatch(
+    async fn dispatch(
         &self,
         req: Request,
         authed: &mut bool,
@@ -286,10 +289,20 @@ impl<P: Platform> Agent<P> {
                     Err(e) => err_response(id, e),
                 }
             }
-            Op::Perform { steps } => self.perform(id, steps, held, bucket),
+            Op::Perform { steps } => self.perform(id, steps, held, bucket).await,
             // Clipboard contents are not written to the audit log — only the
             // length. A machine's clipboard holds passwords often enough that
             // recording it would turn the audit trail into the leak.
+            Op::UiTree => match self.platform.ui_tree() {
+                Ok(nodes) => {
+                    self.audit.record(&serde_json::json!({
+                        "at": (self.clock)(), "event": "ui_tree", "nodes": nodes.len(),
+                    }));
+                    let state = self.platform.screens().map(|s| s.state).unwrap_or(0);
+                    Response::ok(id, ResultBody::Ui { nodes, state })
+                }
+                Err(e) => err_response(id, e),
+            },
             Op::ClipboardRead => match self.platform.clipboard_read() {
                 Ok(text) => {
                     self.audit.record(&serde_json::json!({
@@ -316,7 +329,13 @@ impl<P: Platform> Agent<P> {
         }
     }
 
-    fn perform(&self, id: u64, steps: Vec<Step>, held: &mut Held, bucket: &mut Bucket) -> Response {
+    async fn perform(
+        &self,
+        id: u64,
+        steps: Vec<Step>,
+        held: &mut Held,
+        bucket: &mut Bucket,
+    ) -> Response {
         let now = (self.clock)();
 
         // The person at the keyboard outranks the socket. Checked before the
@@ -351,7 +370,7 @@ impl<P: Platform> Agent<P> {
 
         let n = steps.len() as u32;
         for step in &steps {
-            if let Err(e) = self.apply(step, held) {
+            if let Err(e) = self.apply(step, held).await {
                 self.audit.record(&serde_json::json!({
                     "at": now, "event": "refused", "step": step, "error": e.to_string(),
                 }));
@@ -369,7 +388,7 @@ impl<P: Platform> Agent<P> {
     }
 
     /// The step interpreter — the part that genuinely is a `match` in a loop.
-    fn apply(&self, step: &Step, held: &mut Held) -> Result<(), InputError> {
+    async fn apply(&self, step: &Step, held: &mut Held) -> Result<(), InputError> {
         match step {
             Step::Move { x, y } => self.platform.move_to(crate::geom::Point::new(*x, *y)),
             Step::Button { button, down } => {
@@ -384,8 +403,13 @@ impl<P: Platform> Agent<P> {
                 Ok(())
             }
             Step::Text { text } => self.platform.text(text),
+            // `tokio::time::sleep`, not `std::thread::sleep`. A 300ms eased
+            // move is ~37 sleeps, and blocking the executor for the duration
+            // of every gesture stalls every other connection and task the
+            // runtime is carrying. Caught auditing this file, not by a test —
+            // a single-connection agent never notices.
             Step::Sleep { ms } => {
-                std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+                tokio::time::sleep(std::time::Duration::from_millis(*ms as u64)).await;
                 Ok(())
             }
         }

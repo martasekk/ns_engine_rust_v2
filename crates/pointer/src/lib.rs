@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod mock;
 pub mod motion;
 pub mod platform;
+pub mod ui;
 pub mod wire;
 
 pub use geom::{Loc, Point, Rect, Screen, ScreenId, Screens};
@@ -52,6 +53,10 @@ pub trait Pointer: Send + Sync {
     async fn clipboard_write(&self, _text: &str) -> Result<(), InputError> {
         Err(unsupported())
     }
+    /// Optional (protocol 2). The raw tree; `ui::compress` does the rest.
+    async fn ui_tree(&self) -> Result<Vec<ui::UiNode>, InputError> {
+        Err(unsupported())
+    }
 }
 
 fn unsupported() -> InputError {
@@ -80,6 +85,9 @@ impl<P: Pointer + ?Sized> Pointer for std::sync::Arc<P> {
     }
     async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
         (**self).clipboard_write(text).await
+    }
+    async fn ui_tree(&self) -> Result<Vec<ui::UiNode>, InputError> {
+        (**self).ui_tree().await
     }
 }
 
@@ -127,6 +135,8 @@ pub struct Session<P: Pointer> {
     /// mutex because gestures are `&self` — the alternative is threading
     /// `&mut` through every call for the sake of a path generator.
     rng: std::sync::Mutex<Rng>,
+    /// The previous raw tree, for temporal-difference modal detection.
+    last_ui: std::sync::Mutex<Option<Vec<ui::UiNode>>>,
 }
 
 impl<P: Pointer> Session<P> {
@@ -139,6 +149,7 @@ impl<P: Pointer> Session<P> {
             timing: Timing::default(),
             motion: Motion::default(),
             rng: std::sync::Mutex::new(Rng::seed(0x5EED)),
+            last_ui: std::sync::Mutex::new(None),
         })
     }
 
@@ -278,6 +289,24 @@ impl<P: Pointer> Session<P> {
             &mut self.rng.lock().unwrap(),
         );
         self.pointer.perform(&steps).await
+    }
+
+    /// The target's controls, compressed for a prompt. Keeps the previous
+    /// tree so the next call can tell what just appeared — the temporal half
+    /// of modal detection.
+    pub async fn ui_read(&self, query: Option<&str>) -> Result<ui::UiView, InputError> {
+        let raw = self.pointer.ui_tree().await?;
+        let previous = self.last_ui.lock().unwrap().clone();
+        let view = ui::compress(
+            raw.clone(),
+            &ui::Options {
+                query: query.map(str::to_string),
+                previous,
+                max_nodes: 0,
+            },
+        );
+        *self.last_ui.lock().unwrap() = Some(raw);
+        Ok(view)
     }
 
     /// Read the target's clipboard.

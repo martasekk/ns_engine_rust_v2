@@ -124,6 +124,8 @@ async fn initialize_and_list_report_a_usable_surface() {
             "pointer_drag",
             "pointer_scroll",
             "type_text",
+            "ui_read",
+            "ui_find",
             "clipboard_read",
             "clipboard_write",
             "key_press",
@@ -394,4 +396,89 @@ async fn an_unsupported_capability_reads_as_something_to_route_around() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Unsupported"), "{text}");
     assert!(text.contains("use another approach"), "{text}");
+}
+
+/// The route to a click that does not involve guessing pixels: name a
+/// control, get a point, click it. No screenshot anywhere in the loop.
+#[tokio::test]
+async fn ui_find_turns_a_name_into_a_click_target() {
+    use nspointer::ui::UiNode;
+    struct WithUi(std::sync::Mutex<Vec<Step>>);
+    #[async_trait::async_trait]
+    impl nspointer::Pointer for WithUi {
+        async fn screens(&self) -> Result<Screens, InputError> {
+            Ok(layout())
+        }
+        async fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        async fn perform(&self, s: &[Step]) -> Result<u64, InputError> {
+            self.0.lock().unwrap().extend_from_slice(s);
+            Ok(11)
+        }
+        async fn ui_tree(&self) -> Result<Vec<UiNode>, InputError> {
+            Ok(vec![
+                UiNode {
+                    role: "Group".into(),
+                    name: "Toolbar".into(),
+                    center: Point::new(100, 40),
+                    h: 24,
+                    visible: true,
+                    enabled: true,
+                },
+                UiNode {
+                    role: "Button".into(),
+                    name: "Save".into(),
+                    center: Point::new(300, 200),
+                    h: 24,
+                    visible: true,
+                    enabled: true,
+                },
+                UiNode {
+                    role: "Button".into(),
+                    name: "Hidden".into(),
+                    center: Point::new(9, 9),
+                    h: 24,
+                    visible: false,
+                    enabled: true,
+                },
+            ])
+        }
+    }
+    let server = McpServer::new(Session::open(WithUi(Default::default())).await.unwrap());
+    let (client, srv) = tokio::io::duplex(64 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    tokio::spawn(async move {
+        let _ = server.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let send = |v: Value| {
+        let mut b = serde_json::to_vec(&v).unwrap();
+        b.push(b'\n');
+        b
+    };
+
+    cw.write_all(&send(call(1, "ui_find", json!({"name": "Save"}))))
+        .await
+        .unwrap();
+    let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let m = &r["result"]["structuredContent"]["matches"][0];
+    assert_eq!(m["name"], "Save");
+    assert_eq!(m["x"], 300);
+    assert_eq!(m["y"], 200);
+
+    cw.write_all(&send(call(2, "ui_read", json!({}))))
+        .await
+        .unwrap();
+    let r: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let sc = &r["result"]["structuredContent"];
+    // Compression is reported rather than asserted: 3 raw, the hidden one gone.
+    assert_eq!(sc["raw_controls"], 3);
+    assert_eq!(sc["controls"], 2);
+    assert!(sc["text"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Save\" (300,200)"));
+    assert!(!sc["text"].as_str().unwrap().contains("Hidden"));
 }

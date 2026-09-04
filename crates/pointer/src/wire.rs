@@ -165,6 +165,8 @@ pub enum Op {
     ClipboardWrite {
         text: String,
     },
+    /// The target's controls, uncompressed. Protocol 2, optional.
+    UiTree,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +199,10 @@ pub enum ResultBody {
     },
     Clipboard {
         text: String,
+    },
+    Ui {
+        nodes: Vec<crate::ui::UiNode>,
+        state: u64,
     },
 }
 

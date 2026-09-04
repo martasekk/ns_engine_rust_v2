@@ -4,9 +4,10 @@
 any MCP client can drive it. Windows first, with the port to a second OS being
 one trait implementation rather than a second project.
 
-**Status, 2026-09-04:** phases 0, 1, 3, 4 and 5 built and green — 292 tests
-across the workspace, on a machine with no display server. Remaining: the
-Windows `Platform` impl (yours), then UI Automation (§8). Keyboard folded in (§6). The MCP survey changed
+**Status, 2026-09-04:** phases 0, 1, 3, 4, 5 and 6 built and green — 300
+tests across the workspace, on a machine with no display server. Everything
+that can be built without a desktop is built; what remains is the Windows
+`Platform` impl. Keyboard folded in (§6). The MCP survey changed
 three decisions and one of those was later withdrawn (§8). Remaining: the
 Windows `Platform` impl (yours), then clipboard and UI Automation.
 
@@ -245,7 +246,7 @@ protocol bump.
 | 3 | `ns-pointer-mcp`: stdio JSON-RPC (MCP 2025-06-18), eight typed tools, absolute pixels by default with `screen` switching to fractions. Caller mistakes are JSON-RPC errors; machine refusals are `isError` tool results the model can read | **yes** | **done** — 9 tests, plus the binary |
 | 4 | `nscore::Tool` adapter — six actions in `components-std`, one shared session. `pointer_click` and `pointer_type` are `SideEffect::Irreversible`, so `SideEffectGate` stages them and `stage()` names the coordinates and text in the prompt | **yes** | **done** — 8 tests |
 | 5 | Clipboard read/write (§8), protocol 2. Optional on the agent — defaulted `Platform` methods, so it costs a capability rather than a compile error. Contents never reach the audit log, only the length | **yes** | **done** — 4 tests |
-| 6 | **UI Automation** (§8): `ui_tree`, `find_element`, `click_element`. Evaluate **before** screen capture — naming a control sidesteps DPI registration, image transport and stale screenshots at once | partly | |
+| 6 | **UI Automation** (§8, §13): `ui_tree` on the agent (optional), the A11y-Compressor pipeline and `ui_read`/`ui_find` on this side | **yes** | **done** — 8 tests |
 | 7 | Second platform (X11 or macOS) — one trait impl, the proof that §3 worked | partly | |
 
 Phases 0, 1, 3 and 4 are the bulk of the code and all land on a box with no
@@ -377,3 +378,68 @@ quotes, which would have put `screen "S1"` in a prompt read by a person; and
 primary`) rather than JSON, because the entrainment plan's phase-1 invariant —
 no engine syntax in model-visible text — applies to every tool, not only to
 `recall`.
+
+---
+
+## 13. Phase 6 — UI automation, and what the research changed
+
+### The audit that came first
+
+Reading the implementation before extending it found one real defect:
+`agent.rs` executed `Step::Sleep` with **`std::thread::sleep` inside the async
+serve loop**. A 300ms eased move is ~37 sleeps, so every gesture blocked a
+tokio worker thread for its full duration, stalling every other connection and
+task the runtime carried. A single-connection agent never notices, which is
+why no test caught it. Now `tokio::time::sleep`, with `apply`/`perform`/
+`dispatch` made async to carry it.
+
+### What the research said
+
+| Source | Finding | Effect here |
+| --- | --- | --- |
+| **A11y-Compressor** — arXiv 2605.00551, ACL 2026 SRW — **[read]** | Compressing a linearized accessibility tree cut input to **22% of baseline while raising OSWorld success 5.1 points** (0.207 vs 0.156). Three phases: modal detection, redundancy reduction, semantic structuring | **Adopted, and it is the whole design of `ui.rs`.** A raw tree is not merely expensive, it is *worse at the task* |
+| The same paper's **ablation** | Alone: redundancy reduction 0.156 (exactly baseline), modal detection 0.134, semantic structuring 0.134 — both *below* baseline. Only the combination gains | **Decisive.** It rules out shipping the cheap phase alone, which is what a "just prune the tree" instinct would have built |
+| Its **per-application region maps** (Chrome `ADDRESS_BAR`, VS Code `ACTIVITY_BAR`, Calc `FORMULA_BAR`) | Coordinate thresholds fitted to the OSWorld application set | **Rejected.** A table of magic numbers per application is not a mechanism. The adaptive gap threshold is the part of phase 3 that generalizes, and is what is implemented |
+| **WindowsWorld** (ACL 2026), **Windows Agent Arena** | Evaluate under Screenshot, Screenshot + a11y tree, and Set-of-Mark. "MLLMs typically lack specialized pretraining for GUI understanding, and therefore benefit significantly from the semantic and structural information provided by the accessibility tree" | **Validates the ordering.** The a11y tree is a first-class modality, not a fallback for when capture is unavailable |
+| **MCP design guidance 2026** (AWS `DESIGN_GUIDELINES`, cdata, Workato) | Curated intention-level capabilities over maximal tool count; "use tool count as a signal"; one bounded context per server; determinism over cleverness; MCP costs 10–32× the tokens of a CLI for the same work | **Validates the surface and constrains the addition.** Ten tools against zavora's 64. It is also why `ui_read` returns a *compressed* view: an uncompressed tree would be the exact token-bloat failure the guidance names |
+
+### What was built
+
+`ui.rs`, all three phases, in the forms that generalize:
+
+1. **Redundancy reduction** — drop invisible, disabled and unnamed
+   non-actionable nodes; deduplicate within 20px preferring the interactive
+   role over its container; bounding boxes to centres; attributes to role and
+   name; text to 100 characters, or a 50-character window around the caller's
+   query.
+2. **Semantic structuring** — reading order, `[BLOCK]` wherever the vertical
+   gap exceeds three median row heights (floored at 40px).
+3. **Modal detection** — role scoring (+2.0 dialog, −0.5 decorative) plus
+   temporal difference against the previous tree, which `Session` keeps.
+
+`ui_find` is the payoff: a name goes in, a clickable point comes out, and
+there is no screenshot anywhere in the loop.
+
+### Two corrections the tests forced
+
+**A decision keyword is corroborating evidence, not sufficient evidence.** The
+first version scored keywords at +1.0 against a 1.0 threshold, so an `OK` and
+a `Cancel` sitting in a toolbar were announced as a modal and two real
+controls disappeared behind a MODAL banner. Keywords now score 0.6, and a
+second pass attaches keyword-bearing controls to a *detected* modal by
+proximity — a flat node list has no parent links, so distance stands in for
+containment.
+
+**A query must never filter.** `ui_read`'s `query` steers text windows only.
+A caller's bad guess about what it is looking for must not be able to hide the
+control it actually needed, and there is a test that says so.
+
+### Honest limits
+
+The paper's numbers are quoted as motivation and **do not transfer to this
+implementation**: the region maps are deliberately absent, and their ablation
+is precisely the evidence that a partial pipeline may not deliver. Nothing
+here has been measured against a real accessibility tree, because this machine
+has no desktop to read one from. The first real `ui_tree` from Windows is the
+measurement, and the compression ratio is reported in every `ui_read`
+(`raw_controls` against `controls`) so it can be seen rather than assumed.

@@ -73,6 +73,17 @@ pub trait Platform: Send + Sync {
     fn clipboard_write(&self, _text: &str) -> Result<(), InputError> {
         Err(unsupported("clipboard_write"))
     }
+
+    /// The target's controls, flattened. **Optional**, defaulted to
+    /// `Unsupported`. On Windows this is UI Automation.
+    ///
+    /// Return everything you can see and do **no** filtering: the caller
+    /// compresses (`ui::compress`), and a filter here would be a second,
+    /// untested, per-platform copy of that judgement. Bounds come back as a
+    /// centre point plus a height, both in absolute virtual-desktop pixels.
+    fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        Err(unsupported("ui_tree"))
+    }
 }
 
 fn unsupported(what: &str) -> InputError {

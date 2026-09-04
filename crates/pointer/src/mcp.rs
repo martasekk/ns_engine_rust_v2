@@ -156,6 +156,30 @@ fn tools() -> Value {
             }, "required": ["text"]},
         },
         {
+            "name": "ui_read",
+            "title": "Read the UI",
+            "description": "The remote machine's controls as text — role, name and a \
+                            clickable point each, compressed. Prefer this to guessing \
+                            coordinates: naming a control is exact, and it needs no \
+                            screenshot. Anything blocking the screen is listed first under \
+                            MODAL. Pass `query` to keep text windows around what you are \
+                            looking for; it never removes controls. May answer unsupported.",
+            "inputSchema": {"type": "object", "properties": {
+                "query": {"type": "string", "description":
+                    "What you are looking for. Steers text truncation only."},
+            }},
+        },
+        {
+            "name": "ui_find",
+            "title": "Find a control",
+            "description": "Controls whose name or role matches, best first, each with the \
+                            point to click. The intended route to a click: ui_find \"Save\", \
+                            then pointer_click at the point it returns.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string"},
+            }, "required": ["name"]},
+        },
+        {
             "name": "clipboard_read",
             "title": "Read the clipboard",
             "description": "Read the remote machine's clipboard as text. Combined with \
@@ -351,6 +375,30 @@ impl<P: Pointer> McpServer<P> {
                     .scroll(dx, dy as i32)
                     .await
                     .map(|s| json!({"state": s}))
+            }
+            "ui_read" => {
+                let q = args.get("query").and_then(Value::as_str);
+                session.ui_read(q).await.map(|v| {
+                    json!({
+                        "text": v.render(),
+                        "controls": v.nodes.len(),
+                        "modals": v.modals.len(),
+                        "raw_controls": v.raw_count,
+                    })
+                })
+            }
+            "ui_find" => {
+                let Some(name) = args.get("name").and_then(Value::as_str) else {
+                    bad!("ui_find needs name")
+                };
+                session.ui_read(Some(name)).await.map(|v| {
+                    json!({
+                        "matches": v.find(name).iter().take(10).map(|n| json!({
+                            "role": n.role, "name": n.name,
+                            "x": n.center.x, "y": n.center.y,
+                        })).collect::<Vec<_>>()
+                    })
+                })
             }
             "clipboard_read" => session
                 .clipboard_read()

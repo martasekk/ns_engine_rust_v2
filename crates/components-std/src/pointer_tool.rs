@@ -39,6 +39,8 @@ enum Act {
     Type,
     ClipRead,
     ClipWrite,
+    UiRead,
+    UiFind,
 }
 
 pub struct PointerTool {
@@ -60,6 +62,8 @@ pub async fn tools(pointer: Arc<dyn Pointer>) -> Result<Vec<Arc<dyn Tool>>, Stri
         Act::Type,
         Act::ClipRead,
         Act::ClipWrite,
+        Act::UiRead,
+        Act::UiFind,
     ]
     .into_iter()
     .map(|act| Arc::new(PointerTool::new(act, shared.clone())) as Arc<dyn Tool>)
@@ -160,6 +164,28 @@ impl PointerTool {
                     "type": "object",
                     "properties": {"text": {"type": "string"}},
                     "required": ["text"]
+                }),
+            ),
+            Act::UiRead => (
+                "pointer_ui_read",
+                "The remote machine's controls as text — role, name and a clickable point \
+                 each. Prefer this to guessing coordinates. Anything blocking the screen is \
+                 listed first under MODAL.",
+                SideEffect::Pure,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}}
+                }),
+            ),
+            Act::UiFind => (
+                "pointer_ui_find",
+                "Find a control by name and get the point to click. The route to a click \
+                 that does not involve guessing pixels.",
+                SideEffect::Pure,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
                 }),
             ),
         };
@@ -372,6 +398,37 @@ impl Tool for PointerTool {
                     .await
                     .map_err(|e| failed("pointer", e))?;
                 ok(format!("scrolled {dx},{dy}"))
+            }
+            Act::UiRead => {
+                let q = args.get("query").and_then(serde_json::Value::as_str);
+                let s = self.shared.lock().await;
+                let v = s.ui_read(q).await.map_err(|e| failed("pointer", e))?;
+                ok(v.render().trim_end().replace('\n', " | "))
+            }
+            Act::UiFind => {
+                let Some(name) = args.get("name").and_then(serde_json::Value::as_str) else {
+                    return Err(failed("args", "needs name"));
+                };
+                let s = self.shared.lock().await;
+                let v = s
+                    .ui_read(Some(name))
+                    .await
+                    .map_err(|e| failed("pointer", e))?;
+                let hits = v.find(name);
+                if hits.is_empty() {
+                    return ok(format!("no control matching {name}"));
+                }
+                ok(hits
+                    .iter()
+                    .take(5)
+                    .map(|n| {
+                        format!(
+                            "{} \"{}\" at ({}, {})",
+                            n.role, n.name, n.center.x, n.center.y
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "))
             }
             Act::ClipRead => {
                 let s = self.shared.lock().await;
@@ -678,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn every_action_shares_one_session() {
         let (t, mock) = built().await;
-        assert_eq!(t.len(), 8);
+        assert_eq!(t.len(), 10);
         find(&t, "pointer_move")
             .call(&serde_json::json!({"x": 100, "y": 100}), &ctx())
             .await

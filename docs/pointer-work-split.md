@@ -22,15 +22,22 @@ pub trait Platform: Send + Sync {
     // costs a capability rather than a compile error.
     fn clipboard_read(&self)              -> Result<String, InputError>;
     fn clipboard_write(&self, s: &str)    -> Result<(), InputError>;
+    fn ui_tree(&self)                     -> Result<Vec<UiNode>, InputError>;
 }
 ```
 
 **Still eight required methods.** The clipboard pair is defaulted, so an agent
 that ignores it builds and runs; callers get `unsupported` and route around.
-Worth doing when you get to it: `clipboard_read` after ctrl+a ctrl+c is the
-only way in this protocol to read data off the machine without capturing its
-screen, and `clipboard_write` + ctrl+v is how long text should move, since
-typing is per-character.
+Worth doing when you get to it, in this order:
+
+1. **`ui_tree`** — UI Automation, and the highest-value thing you can add.
+   Return everything, filtered by nothing: the caller compresses. It turns
+   "click at (812, 344)" into "click the control named Save", which removes
+   the entire coordinate-registration problem rather than solving it.
+2. **`clipboard_read`** after ctrl+a ctrl+c is the only other way to read
+   data off the machine without capturing its screen.
+3. **`clipboard_write`** + ctrl+v is how long text should move, since typing
+   is per-character.
 
 One trap, which cost a test here: **if you wrap a `Platform` in another
 `Platform`, forward the defaulted methods explicitly.** A wrapper that omits
@@ -74,7 +81,9 @@ service lands in session 0 with no interactive desktop and drives nothing.
 | MCP stdio server, 8 tools, `ns-pointer-mcp` binary | `mcp.rs`, `bin/` | done |
 | `nscore::Tool` adapter | phase 4 | next |
 
-47 tests, all green without a display server.
+| UI-tree compression (A11y-Compressor pipeline) | `ui.rs` | done |
+
+55 tests, all green without a display server.
 
 Once your `Platform` exists, the whole chain runs:
 

@@ -11,7 +11,7 @@ Plan: `docs/superpowers/plans/2026-09-04-remote-pointer.md`.
 ## The contract in one paragraph
 
 Newline-delimited JSON over a stream socket: one object per line, requests and
-responses paired by `id`. **Six operations** (two of them optional), and six step kinds. Every coordinate the agent ever sees
+responses paired by `id`. **Seven operations** (three of them optional), and six step kinds. Every coordinate the agent ever sees
 is an absolute physical pixel in virtual-desktop space, already clamped to a
 real screen. The agent performs no coordinate mapping, no clamping, no easing,
 no typing rhythm and no gesture composition — all of that happens in `ns-pointer` and is
@@ -132,6 +132,32 @@ or a document read as text, no image transport, no DPI registration.
 **Log the length, never the contents.** A clipboard holds passwords often
 enough that recording it would turn the audit trail into the leak.
 
+### `ui_tree` — optional, protocol 2
+
+```json
+{"id":7,"op":"ui_tree"}
+```
+
+Every control you can see, flattened, with **no filtering of any kind**. The
+caller compresses (`ui::compress`); a filter here would be a second,
+untested, per-platform copy of that judgement. On Windows this is UI
+Automation.
+
+```json
+{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true}
+```
+
+`center` is absolute virtual-desktop pixels, so a caller can click it
+directly. `h` is used only to derive the layout-block threshold. Include
+invisible and disabled nodes and say so in the flags — the caller drops them,
+and it can tell "greyed out" from "absent", which matters when a model is
+wondering why a button did nothing.
+
+This is the most valuable of the three optional operations. Naming a control
+sidesteps DPI registration, image transport, resolution differences and stale
+screenshots at once, and it is what the strongest comparable MCP server has
+that this one otherwise would not.
+
 ---
 
 ## 2. What you send back
@@ -143,6 +169,7 @@ Exactly one response per request, same `id`.
 {"id":3,"ok":true,"result":{"kind":"position","x":1280,"y":720,"state":7}}
 {"id":4,"ok":true,"result":{"kind":"performed","steps":7,"state":7}}
 {"id":5,"ok":true,"result":{"kind":"clipboard","text":"a long pasted document"}}
+{"id":7,"ok":true,"result":{"kind":"ui","state":7,"nodes":[{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true}]}}
 {"id":4,"ok":false,"error":{"kind":"blocked","detail":"target window is elevated (UIPI)"}}
 ```
 
@@ -245,6 +272,7 @@ loop over lines:
         hello    -> check token+protocol, reply ready
         screens  -> enumerate monitors, reply screens
         position -> reply position
+        ui_tree         -> reply ui, or unsupported
         clipboard_read  -> reply clipboard, or unsupported
         clipboard_write -> set it, reply clipboard, or unsupported
         perform  -> for step in steps:

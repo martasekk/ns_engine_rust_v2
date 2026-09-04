@@ -123,6 +123,13 @@ where
         }
     }
 
+    async fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        match self.call(Op::UiTree).await? {
+            ResultBody::Ui { nodes, .. } => Ok(nodes),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn clipboard_read(&self) -> Result<String, InputError> {
         match self.call(Op::ClipboardRead).await? {
             ResultBody::Clipboard { text } => Ok(text),
