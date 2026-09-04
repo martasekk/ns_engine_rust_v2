@@ -83,7 +83,9 @@ service lands in session 0 with no interactive desktop and drives nothing.
 
 | UI-tree compression (A11y-Compressor pipeline) | `ui.rs` | done |
 
-55 tests, all green without a display server.
+| TCP accept loop (`serve_tcp`) | `agent.rs` | done |
+
+60 tests, all green without a display server.
 
 Once your `Platform` exists, the whole chain runs:
 
@@ -96,16 +98,29 @@ MCP client ──stdio──> ns-pointer-mcp ──TCP+token──> your agent �
 ## The two ways to use this, and the overlap each avoids
 
 **If you write the agent in Rust** — implement `Platform`, hand it to
-`Agent::new`, done. The guards, framing, auth and interpreter are already
-there and already tested. This is ~200 lines of Win32 and nothing else.
+`Agent::new`, and serve. The guards, framing, auth, the accept loop and the
+interpreter are already written and tested. This is ~200 lines of Win32 and
+nothing else.
 
 ```rust
+use nspointer::agent::{serve_tcp, Agent, AgentConfig, Limits, Listen};
+
 let agent = Agent::new(WindowsPlatform::new()?, AgentConfig {
     token: std::env::var("NS_POINTER_TOKEN")?,
     limits: Limits::default(),
 });
-agent.serve(read, write).await?;
+serve_tcp(agent, &Listen::loopback(7373)).await?;
 ```
+
+`serve_tcp` binds, accepts, and gives each connection its own task. It refuses
+to start on an empty token, and refuses a non-loopback address unless
+`allow_remote` says you meant it — both failure modes are silent and permanent
+otherwise. The local override, the rate ceiling and the connection cap are
+**machine-wide**, not per socket: they protect one desktop, and a limit a
+caller can reset by reconnecting is not a limit.
+
+You do not need a step runner. Everything a canned `click` or `move` demo did
+is a `perform` over this socket, driven by whatever holds the other end.
 
 **If you write it in another language** — implement the whole protocol from
 `docs/pointer-protocol.md`, and treat `crates/pointer/tests/agent.rs` as the

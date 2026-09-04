@@ -585,3 +585,225 @@ async fn the_clipboard_round_trips_without_its_contents_reaching_the_log() {
     assert!(text.contains("\"chars\":30"), "{text}");
     assert!(audit.events().contains(&"clipboard_write".to_string()));
 }
+
+// ---- the accept loop (plan 2026-09-04-pointer-integration, phase A1) ----
+
+use nspointer::agent::{bind, serve_listener, Listen};
+
+fn cfg(limits: Limits) -> AgentConfig {
+    AgentConfig {
+        token: TOKEN.into(),
+        limits,
+    }
+}
+
+/// Starts a real listener on an ephemeral port and returns its address.
+async fn listening(
+    platform: Arc<NullPlatform>,
+    limits: Limits,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> String {
+    struct Shared(Arc<NullPlatform>);
+    impl Platform for Shared {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.0.screens()
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.0.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.0.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.0.button(b, d)
+        }
+        fn scroll(&self, x: i32, y: i32) -> Result<(), InputError> {
+            self.0.scroll(x, y)
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.0.key(k, d)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.0.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            self.0.local_activity()
+        }
+    }
+    let c = cfg(limits);
+    let agent = Agent::new(Shared(platform), c).with_clock(Box::new(move || clock()));
+    let listener = bind(
+        &AgentConfig {
+            token: TOKEN.into(),
+            limits: Limits::default(),
+        },
+        &Listen::loopback(0),
+    )
+    .await
+    .unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let _ = serve_listener(Arc::new(agent), listener).await;
+    });
+    addr
+}
+
+async fn dial(
+    addr: &str,
+    token: &str,
+) -> Result<
+    RemotePointer<
+        BufReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+        tokio::io::WriteHalf<tokio::net::TcpStream>,
+    >,
+    InputError,
+> {
+    let s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (r, w) = tokio::io::split(s);
+    RemotePointer::connect(BufReader::new(r), w, token).await
+}
+
+/// The whole chain over a real socket, which is what `ns-pointerd` will do.
+#[tokio::test]
+async fn a_real_socket_carries_the_protocol() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let addr = listening(p.clone(), Limits::default(), fixed_clock(0)).await;
+
+    let c = dial(&addr, TOKEN).await.unwrap();
+    let s = Session::open(c).await.unwrap();
+    s.click_at(&Loc::normalized("S1", 0.5, 0.5), Button::Left, 1)
+        .await
+        .unwrap();
+    assert!(p.log().iter().any(|l| l == "button Left true"));
+    assert_eq!(
+        p.log()
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("move"))
+            .unwrap(),
+        "move 960,540"
+    );
+
+    // A wrong token gets nowhere, over a socket as over a pipe.
+    assert!(dial(&addr, "guess").await.is_err());
+}
+
+/// The bug the accept loop surfaced. A rate limit held per socket is defeated
+/// by opening a second socket — so it is machine-wide, and this proves it.
+#[tokio::test]
+async fn the_rate_limit_is_machine_wide_not_per_connection() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let n = now.clone();
+    let addr = listening(
+        p.clone(),
+        Limits {
+            performs_per_sec: 1.0,
+            burst: 2.0,
+            ..Limits::default()
+        },
+        Arc::new(move || n.load(std::sync::atomic::Ordering::SeqCst)),
+    )
+    .await;
+
+    let one = [Step::Scroll { dx: 0, dy: 1 }];
+    let a = dial(&addr, TOKEN).await.unwrap();
+    assert!(a.perform(&one).await.is_ok());
+    assert!(a.perform(&one).await.is_ok());
+    assert!(a.perform(&one).await.is_err(), "budget of 2 is spent");
+
+    // A second connection does not get a fresh budget.
+    let b = dial(&addr, TOKEN).await.unwrap();
+    let err = b.perform(&one).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Internal,
+                ..
+            }
+        ),
+        "reconnecting must not multiply the rate: {err:?}"
+    );
+}
+
+/// The override protects a desktop, not a socket: one connection tripping it
+/// must stop the others too.
+#[tokio::test]
+async fn the_local_override_is_machine_wide() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let addr = listening(p.clone(), Limits::default(), fixed_clock(1_000)).await;
+    let a = dial(&addr, TOKEN).await.unwrap();
+    let b = dial(&addr, TOKEN).await.unwrap();
+    let one = [Step::Scroll { dx: 0, dy: 1 }];
+    assert!(a.perform(&one).await.is_ok());
+
+    p.local.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(a.perform(&one).await.is_err(), "the connection that saw it");
+    let err = b.perform(&one).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InputError::Agent {
+                kind: ErrorKind::Suspended,
+                ..
+            }
+        ),
+        "and every other one: {err:?}"
+    );
+}
+
+/// Both refusals are hard errors, because both failure modes are silent and
+/// permanent: no token accepts anyone who finds the port, and a stray bind
+/// address is an input-injection service on the network.
+#[tokio::test]
+async fn binding_refuses_the_two_configurations_that_would_be_mistakes() {
+    let no_token = AgentConfig {
+        token: String::new(),
+        limits: Limits::default(),
+    };
+    let e = bind(&no_token, &Listen::loopback(0)).await.unwrap_err();
+    assert!(e.to_string().contains("empty token"), "{e}");
+
+    let exposed = Listen {
+        addr: "0.0.0.0:0".into(),
+        allow_remote: false,
+    };
+    let e = bind(&cfg(Limits::default()), &exposed).await.unwrap_err();
+    assert!(e.to_string().contains("allow_remote"), "{e}");
+
+    // Meaning it is allowed; the point is that it cannot happen by typo.
+    assert!(bind(
+        &cfg(Limits::default()),
+        &Listen {
+            addr: "0.0.0.0:0".into(),
+            allow_remote: true
+        }
+    )
+    .await
+    .is_ok());
+}
+
+#[tokio::test]
+async fn connections_past_the_cap_are_told_why_before_the_hangup() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let addr = listening(
+        p,
+        Limits {
+            max_connections: 1,
+            ..Limits::default()
+        },
+        fixed_clock(0),
+    )
+    .await;
+    let _first = dial(&addr, TOKEN).await.unwrap();
+
+    // The second is refused with a reason rather than a silent close: a
+    // caller cannot otherwise tell a full agent from a dead one.
+    let s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let (r, _w) = tokio::io::split(s);
+    use tokio::io::AsyncBufReadExt as _;
+    let mut line = String::new();
+    BufReader::new(r).read_line(&mut line).await.unwrap();
+    assert!(line.contains("too many connections"), "{line}");
+}
