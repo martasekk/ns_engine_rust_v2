@@ -95,3 +95,12 @@ recall_top_k = 5              # hits per source for the recall action (FTS5 over
 # url = "https://example.com/api/stock"
 # side_effect = "Pure"
 # args_schema = { type = "object", properties = { product = { type = "string" } }, required = ["product"] }
+
+# A desktop to drive: the ns-pointer agent (ns-pointerd) on that machine.
+# Registers pointer_screens, pointer_click, pointer_type, pointer_ui_read and
+# the rest as harness actions; clicks and typing are staged behind the same
+# confirmation flow as every other irreversible action. The token comes from
+# the named env var, never from this file. NS_POINTER_ADDR overrides addr.
+# [pointer]
+# addr = "192.168.1.40:7373"      # the agent must be started with allow_remote for a non-loopback bind
+# token_env = "NS_POINTER_TOKEN"  # default

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
 
-fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
+async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> =
         vec![Arc::new(nscomponents_std::time_tool::GetTimeTool::new())];
     let tool_transport = Arc::new(nscomponents_std::transport::ReqwestToolTransport::new());
@@ -18,7 +18,65 @@ fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
             tool_transport.clone(),
         )));
     }
+    if let Some(target) = cfg.pointer_target(env_override("NS_POINTER_ADDR")) {
+        // A configured desktop with no token is a config error, like a role
+        // with no key: exit rather than run without the thing that was asked
+        // for. An unreachable one is a warning: the machine being off must
+        // not take the chat down with it, but it must be said.
+        let Some(token) = target.token() else {
+            eprintln!(
+                "{} is not set — [pointer] addr = {:?} needs the agent's token.",
+                target.token_env, target.addr
+            );
+            std::process::exit(1);
+        };
+        match connect_pointer(&target.addr, &token).await {
+            Ok(more) => tools.extend(more),
+            Err(e) => eprintln!("pointer: {e}\npointer: the desktop actions are not registered."),
+        }
+    }
     tools
+}
+
+/// Dial the ns-pointer agent and turn the connection into harness actions.
+///
+/// The same hop `ns-pointer-mcp` makes, minus the MCP layer: the engine's
+/// own gates do what that layer's `confirm` argument approximates. What the
+/// agent said in `ready` is printed here, since the engine has no
+/// `initialize` to carry it, and a session that starts not armed or with no
+/// local brake is something the person at this end should know before the
+/// emitter's first click.
+async fn connect_pointer(addr: &str, token: &str) -> Result<Vec<Arc<dyn Tool>>, String> {
+    use nspointer::client::RemotePointer;
+    let dial = tokio::net::TcpStream::connect(addr);
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), dial)
+        .await
+        .map_err(|_| format!("no answer from the agent at {addr} within 5s"))?
+        .map_err(|e| format!("cannot reach the agent at {addr}: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let (r, w) = stream.into_split();
+    let pointer = RemotePointer::connect(tokio::io::BufReader::new(r), w, token)
+        .await
+        .map_err(|e| format!("agent at {addr} refused the connection: {e}"))?;
+    if !pointer.local_override() {
+        eprintln!(
+            "pointer: warning — the agent at {addr} has no local override; nobody at that \
+             machine can interrupt input sent from here by touching the mouse."
+        );
+    }
+    if pointer.armed() == Some(false) {
+        eprintln!(
+            "pointer: note — the agent at {addr} is not armed; the first click, key or text \
+             will be refused with needs_confirmation until someone presses the arming chord \
+             on the machine."
+        );
+    }
+    let shared: Arc<dyn nspointer::Pointer> = Arc::new(pointer);
+    let tools = nscomponents_std::pointer_tool::tools(shared)
+        .await
+        .map_err(|e| format!("could not read the screen layout from {addr}: {e}"))?;
+    eprintln!("pointer: {} desktop actions on {addr}", tools.len());
+    Ok(tools)
 }
 
 /// `ns-app evolve [--dry-run]` → Ok(dry_run)
@@ -321,7 +379,7 @@ async fn main() {
             }
         };
         let rules = load_rules_or_exit(&cfg);
-        let tools = build_tools(&cfg);
+        let tools = build_tools(&cfg).await;
         let emitter = role_or_exit(&cfg, Role::Emitter);
         let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
         let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
@@ -345,7 +403,7 @@ async fn main() {
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
-    let tools = build_tools(&cfg);
+    let tools = build_tools(&cfg).await;
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(nsllm::emitter::CloudEmitter::new(
@@ -569,5 +627,54 @@ mod tests {
         assert_eq!(parse_evolve_args(&[]), Ok(false));
         assert_eq!(parse_evolve_args(&["--dry-run".to_string()]), Ok(true));
         assert!(parse_evolve_args(&["--wat".to_string()]).is_err());
+    }
+
+    /// The whole client hop, against an agent that records and touches
+    /// nothing: the ten desktop actions arrive, and a bad token is refused
+    /// with the agent's reason rather than a hang.
+    #[tokio::test]
+    async fn a_configured_pointer_agent_becomes_ten_harness_actions() {
+        use nspointer::agent::{bind, serve_listener, Agent, AgentConfig, Limits, Listen};
+        use nspointer::platform::NullPlatform;
+        use nspointer::{Rect, Screen, ScreenId, Screens};
+        let platform = NullPlatform {
+            screens: Some(Screens {
+                screens: vec![Screen {
+                    id: ScreenId::from("S1"),
+                    bounds: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 1920,
+                        h: 1080,
+                    },
+                    scale: 1.0,
+                    primary: true,
+                    label: "main".into(),
+                }],
+                state: 1,
+            }),
+            ..Default::default()
+        };
+        let cfg = AgentConfig {
+            token: "t0k".into(),
+            limits: Limits::default(),
+        };
+        let listener = bind(&cfg, &Listen::loopback(0)).await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let agent = Arc::new(Agent::new(platform, cfg));
+        tokio::spawn(async move {
+            let _ = serve_listener(agent, listener).await;
+        });
+
+        let tools = connect_pointer(&addr, "t0k").await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
+        assert_eq!(names.len(), 10, "{names:?}");
+        assert!(names.contains(&"pointer_click") && names.contains(&"pointer_ui_read"));
+
+        let err = match connect_pointer(&addr, "wrong").await {
+            Err(e) => e,
+            Ok(_) => panic!("a wrong token must be refused"),
+        };
+        assert!(err.contains("refused"), "{err}");
     }
 }

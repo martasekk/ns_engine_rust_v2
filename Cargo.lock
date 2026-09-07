@@ -604,6 +604,7 @@ dependencies = [
  "ns-evolution",
  "ns-llm",
  "ns-memory-sqlite",
+ "ns-pointer",
  "serde",
  "serde_json",
  "tempfile",

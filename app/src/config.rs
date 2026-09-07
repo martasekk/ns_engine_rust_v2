@@ -17,6 +17,36 @@ pub struct AppConfig {
     pub evolution: EvolutionSection,
     #[serde(default)]
     pub memory: MemorySection,
+    /// [pointer] — a desktop to drive, through the ns-pointer agent on it.
+    /// Absent means no pointer actions are registered.
+    #[serde(default)]
+    pub pointer: Option<PointerSection>,
+}
+
+/// [pointer] — where the ns-pointer agent listens and which env var holds
+/// its token. The token never goes in the file, for the same reason the
+/// provider keys do not.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct PointerSection {
+    /// `host:port` of the agent, reachable from this process. The agent
+    /// binds loopback unless told `allow_remote`, so a remote address means
+    /// it was started to accept one.
+    pub addr: String,
+    #[serde(default = "default_pointer_token_env")]
+    pub token_env: String,
+}
+
+fn default_pointer_token_env() -> String {
+    "NS_POINTER_TOKEN".into()
+}
+
+impl PointerSection {
+    pub fn token(&self) -> Option<String> {
+        std::env::var(&self.token_env)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
 }
 
 /// [memory] — working memory sizes (M6 spec §4, §10).
@@ -564,6 +594,25 @@ impl AppConfig {
     pub fn parse(toml_text: &str) -> Result<AppConfig, String> {
         toml::from_str(toml_text).map_err(|e| e.to_string())
     }
+
+    /// The agent to drive, if any. `NS_POINTER_ADDR` — the same variable
+    /// `ns-pointer-mcp` and the CLI read — repoints a configured section or
+    /// stands in for a missing one, so one export tries a different machine
+    /// without editing the file.
+    pub fn pointer_target(&self, env_addr: Option<String>) -> Option<PointerSection> {
+        match (&self.pointer, env_addr) {
+            (Some(p), Some(addr)) => Some(PointerSection {
+                addr,
+                token_env: p.token_env.clone(),
+            }),
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(addr)) => Some(PointerSection {
+                addr,
+                token_env: default_pointer_token_env(),
+            }),
+            (None, None) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -915,5 +964,34 @@ mod tests {
         assert!(cfg.evolution.pass_config(true, 90).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
+    }
+
+    /// Absent is "no desktop"; present needs an address, and the token is an
+    /// env var name, never the token.
+    #[test]
+    fn pointer_section_is_optional_and_env_addr_repoints_it() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!(cfg.pointer.is_none());
+        assert!(cfg.pointer_target(None).is_none());
+        // One export tries a machine without a config edit.
+        let t = cfg.pointer_target(Some("10.0.0.5:7373".into())).unwrap();
+        assert_eq!(t.addr, "10.0.0.5:7373");
+        assert_eq!(t.token_env, "NS_POINTER_TOKEN");
+
+        let cfg =
+            AppConfig::parse("[pointer]\naddr = \"192.168.1.40:7373\"\ntoken_env = \"DESK_TOKEN\"")
+                .unwrap();
+        let t = cfg.pointer_target(None).unwrap();
+        assert_eq!(t.addr, "192.168.1.40:7373");
+        assert_eq!(t.token_env, "DESK_TOKEN");
+        // The env address wins, the configured token env stays.
+        let t = cfg.pointer_target(Some("127.0.0.1:7373".into())).unwrap();
+        assert_eq!(t.addr, "127.0.0.1:7373");
+        assert_eq!(t.token_env, "DESK_TOKEN");
+
+        assert!(
+            AppConfig::parse("[pointer]\ntoken_env = \"X\"").is_err(),
+            "a section without an address is a mistake, not a default"
+        );
     }
 }

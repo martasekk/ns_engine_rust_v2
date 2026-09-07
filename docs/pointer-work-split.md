@@ -24,8 +24,25 @@ pub trait Platform: Send + Sync {
     fn clipboard_read(&self)              -> Result<String, InputError>;
     fn clipboard_write(&self, s: &str)    -> Result<(), InputError>;
     fn ui_tree(&self)                     -> Result<Vec<UiNode>, InputError>;
+
+    // Defaulted to the slow or the silent answer; override for speed or honesty.
+    fn state(&self) -> u64;                       // default: screens().state
+    fn ui_tree_visible(&self) -> Result<Vec<UiNode>, InputError>;  // default: ui_tree()
+    fn armed(&self) -> Option<bool>;              // default: None — "no gate"
 }
 ```
+
+The last three exist because of what the Windows side measured. `state` is
+stamped on every `performed`, `position` and `ui` reply, and the default gets
+it through a full monitor enumeration after every click; a fingerprint of the
+monitor rectangles is tens of microseconds. `ui_tree_visible` is the one
+filter you may apply, because the caller asked: 73% of a real tree is
+off-screen and dropped on arrival. `armed` lets the client hear at `hello`
+that the first click will be refused, instead of finding out from the refusal.
+
+Three of the methods are slow and synchronous — `ui_tree` and the clipboard
+pair — and the agent runs them on a blocking thread. Implement them as plain
+blocking calls; do not spin up your own threads or runtimes for them.
 
 **Still eight required methods.** The clipboard pair is defaulted, so an agent
 that ignores it builds and runs; callers get `unsupported` and route around.
@@ -56,6 +73,22 @@ dead brake looking exactly like a quiet user.
 That turns the wave-the-mouse check from the whole guarantee into a one-time
 acceptance.
 
+**"It installed" is a fact about the past.** Windows silently unhooks a thread
+whose callback overruns `LowLevelHooksTimeout`, long after
+`SetWindowsHookExW` returned success, so a `local_hook_ok` that reports the
+registration result reports something that stopped being true. Report
+*delivery* instead: count callbacks — including our own injected events, which
+are the only events we can cause on demand — and treat a counter that has not
+moved after an injection plus a grace period as a dead hook.
+
+The ordering is the whole trick, and getting it backwards is silent.
+**Sample the counter before `SendInput`, never after.** Sampled after, it
+already contains the events it is waiting for, can never grow again, and so
+reports a healthy hook as dead the moment anything is injected. Unit tests
+pass either way — this was found on a live connection, by `ns-pointer`
+warning `this agent reports no local override` against a hook that was fine.
+Worth a regression test, because the next person will not be that lucky.
+
 ### One trap, and one that is now handled for you
 
 **If you wrap a `Platform` in another `Platform`, forward the defaulted
@@ -80,14 +113,32 @@ The four that carry real work:
 | `move_to` | `SendInput` with `MOUSEEVENTF_ABSOLUTE \| MOUSEEVENTF_VIRTUALDESK`, normalized 0–65535 across the **virtual desktop**, not the primary monitor, from a per-monitor-DPI-aware thread. |
 | `text` | `KEYEVENTF_UNICODE`, `wVk = 0`, `wScan` = the UTF-16 code unit. A non-BMP character is **two** inputs, one per surrogate. |
 | `local_activity` | Has a human touched this machine since the last call? Physical mouse movement over a threshold, or a keystroke that was not ours. Returning `false` always compiles, works, and removes the only means by which the person at the keyboard can take their machine back. |
+| `ui_tree` | Everything, filtered by nothing, invisible and disabled **flagged rather than dropped**. Roles from a control-type id map, never `CurrentLocalizedControlType` — that returns `Tlačítko` on a Czech desktop, and a role nobody can match on is worse than no role. Ask UIA for a cached request: measured 250× here, 11ms against 2.8s over ~2700 nodes. Fill `focused`, `focusable`, `depth` and `window` — all four come out of the same cached fetch — and the compressor gets containment and a focus marker for free. |
+| `ui_tree_visible` | `ui_tree` with a provider-side `IsOffscreen == false` condition. Must return every node `ui_tree` would flag `visible: true`; a stricter filter is the second copy of the caller's judgement the seam forbids. |
+| `state` | A per-call fingerprint of the monitor rectangles, so it cannot go stale. Skip only the identity queries. Must agree with `screens().state`. |
+| `key(_, false)` | May be refused (secure desktop, elevated foreground). Return the error; the agent keeps the key on a machine-wide stuck list and retries before the next `perform`. Do not swallow it and do not retry inside `Platform`. |
 
 Plus: return `Blocked` when the OS refuses. On Windows `SendInput` **returns
 success under UIPI and does nothing**, so a backend that trusts the return
 value reports clicks that never happened. Detect the foreground window's
 integrity level and the secure desktop (UAC prompt, lock screen, Ctrl+Alt+Del).
 
+Plus: answer `NeedsConfirmation` until a person at the machine has armed the
+session — the lower half of the split described at the end of this document,
+and the only half a caller cannot go around. Gate what commits (button and key
+presses, `text`); never gate a release, or a refusal mid-chord leaves Ctrl
+down. Watch for the arming chord somewhere the socket cannot reach it: a
+low-level keyboard hook already ignores injected input, so nothing sent over
+the wire can arm the machine.
+
 And outside the code: run in the **user's session**, not as a service — a
 service lands in session 0 with no interactive desktop and drives nothing.
+
+One more thing UIA will lie to you about: a minimized window is parked at
+roughly (-32000, -32000) by Windows convention and still reports as on
+screen. Flag those `visible: false`. Left alone they reach the caller as a
+click target on no monitor, which either clicks nothing or comes back
+`out_of_bounds` for a control you just advertised.
 
 ---
 
@@ -99,22 +150,32 @@ service lands in session 0 with no interactive desktop and drives nothing.
 | Gestures: click, drag, chord, typing rhythm, modifier recovery | `gesture.rs` | done |
 | Path shapes: eased / Bézier / Gaussian / Perlin, seeded | `motion.rs` | done |
 | Wire types and framing | `wire.rs` | done |
-| **Agent guards**: auth, step cap, rate limit, local override, held-key release, audit | `agent.rs` | done |
+| **Agent guards**: auth, step cap, rate limit, local override, held-key release, refused-release retry, audit | `agent.rs` | done |
+| Blocking platform calls off the runtime (`spawn_blocking` for `ui_tree`, clipboard) | `agent.rs` | done |
 | Client (`RemotePointer`), `Session` | `client.rs`, `lib.rs` | done |
-| MCP stdio server, 8 tools, `ns-pointer-mcp` binary | `mcp.rs`, `bin/` | done |
-| `nscore::Tool` adapter | phase 4 | next |
+| MCP stdio server, 12 tools, `ns-pointer-mcp` binary; `armed` and `local_override` reported to the model at `initialize` and in `screens_list` | `mcp.rs`, `bin/` | done |
+| `nscore::Tool` adapter | `components-std/pointer_tool.rs` | done |
+| **Confirmation gate, upper half**: `Confirm`, the `confirm` argument, the sentence a model reads | `mcp.rs` | done — but advisory, see below |
 
 | UI-tree compression (A11y-Compressor pipeline) | `ui.rs` | done |
 
 | TCP accept loop (`serve_tcp`) | `agent.rs` | done |
 
-60 tests, all green without a display server.
+81 tests, all green without a display server.
 
 Once your `Platform` exists, the whole chain runs:
 
 ```
 MCP client ──stdio──> ns-pointer-mcp ──TCP+token──> your agent ──> Platform
+ns-app [pointer] ────────────────────> TCP+token ──> your agent ──> Platform
 ```
+
+The second line is the engine's own emitter driving the desktop: a
+`[pointer] addr = "host:port"` section in `config.toml` (token from
+`NS_POINTER_TOKEN`) dials the agent at startup and registers the ten
+`pointer_*` actions. Clicks and typing are staged behind the harness's
+confirmation flow with the coordinates named, so nothing there needs the MCP
+layer's `confirm` argument.
 
 ---
 
@@ -154,7 +215,8 @@ that cannot live on my side:
 - authenticate; there is no unauthenticated mode
 - cap steps per `perform`, and rate-limit performs
 - suspend on local activity, and answer `suspended`
-- **release every held key and button on disconnect and on suspend**
+- **release every held key and button on disconnect and on suspend**, and
+  keep and retry the ones the OS refused
 - report OS refusals as `blocked` rather than trusting a return value
 - log what was actually injected
 
@@ -164,8 +226,33 @@ about coordinates.
 
 ---
 
+## The one correction to the split above
+
+"Whether allowed" was listed on my side, and for one case that was wrong.
+
+`Confirm::FirstAction` lives in the MCP layer, so it gates a model driving
+through MCP and nothing else: `ns-pointer click 900 500` on a raw socket ran
+three times with no prompt while it was in place. That is the §4 argument of
+the protocol doc turned on its author — anything that can open this socket can
+speak this protocol, so a guard above the socket is a guard a caller can
+decline to use.
+
+So the confirmation gate is **two gates, and they are not redundant**:
+
+| | where | knows | can be bypassed |
+| --- | --- | --- | --- |
+| upper | `mcp.rs`, mine | what the model *intends* — "this would type your password into a chat window" | yes, by not using MCP |
+| lower | `Platform`, yours | only what reached the OS | no |
+
+Keep both. The upper one writes the sentence a person can actually judge; the
+lower one is the one that enforces. The lower one answers
+`needs_confirmation`, which exists in `wire.rs` for this purpose and is
+documented in §4.7 of the protocol.
+
+---
+
 ## The seam, in one line
 
 **You answer "what is on this machine and how do I poke it."** Everything
-about *where*, *when*, *how fast*, *whether allowed*, and *what happens when
-it goes wrong* is already on my side.
+about *where*, *when* and *how fast* is on my side; *whether allowed* is
+shared, and the half that enforces is yours.
