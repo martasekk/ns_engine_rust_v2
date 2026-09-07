@@ -580,10 +580,10 @@ impl Engine {
             // already done — otherwise it re-proposes completed actions until
             // max_iterations exhausts — and the standing facts, or it
             // re-remembers them every turn (seen live).
-            let trace_so_far: Vec<String> = turn_trace(log.events(), turn)
-                .lines()
-                .map(str::to_string)
-                .collect();
+            // Clipped: this is the line that is re-sent on every iteration,
+            // so an uncapped tool result is paid for again at every step
+            // after it.
+            let trace_so_far: Vec<String> = trace_for_prompt(log.events(), turn);
             let selected = self.select_facts(&scope, &incoming.text).await;
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
@@ -1530,7 +1530,12 @@ impl Engine {
             },
             ReplyPolicy::Generate => {
                 let state = fold(log.events());
-                let trace = turn_trace(log.events(), turn);
+                // Clipped for the same reason, though this one is built once
+                // per turn rather than once per iteration. `turn_trace` itself
+                // stays uncapped: `render_echo` measures the reply against the
+                // full material, and capping there would change what that
+                // number means.
+                let trace = trace_for_prompt(log.events(), turn).join("\n");
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
@@ -1826,6 +1831,44 @@ pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
         .join("\n")
 }
 
+/// Longest a single trace line may be when it goes into a prompt.
+///
+/// The trace is re-sent to the emitter on *every* iteration of the turn, so a
+/// large tool result is not paid for once but once per remaining step. On a
+/// desktop task that is the dominant cost: `pointer_ui_read` renders the
+/// visible control tree to one line — around 800 nodes on a browser page —
+/// and fifteen iterations after it, the same text has been sent fifteen more
+/// times.
+///
+/// 1200 characters keeps what a model actually needs from a result: whether it
+/// worked, and the first screenful of what came back. What is dropped is
+/// counted rather than silently cut, so a model that needs the rest knows to
+/// narrow its query — `pointer_ui_find` over `pointer_ui_read` — instead of
+/// concluding the screen is empty.
+const TRACE_LINE_MAX_CHARS: usize = 1200;
+
+/// Clip one trace line, on a character boundary, saying what was dropped.
+///
+/// Char boundaries rather than bytes: these lines carry window titles and
+/// control names, which on this machine are Czech, and slicing a UTF-8
+/// sequence in half would panic.
+fn clip_trace_line(line: &str, max: usize) -> String {
+    let total = line.chars().count();
+    if total <= max {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max).collect();
+    format!("{head}… [{} more characters]", total - max)
+}
+
+/// The trace as the models should see it: every line clipped.
+fn trace_for_prompt(events: &[nscore::Event], turn: u32) -> Vec<String> {
+    turn_trace(events, turn)
+        .lines()
+        .map(|l| clip_trace_line(l, TRACE_LINE_MAX_CHARS))
+        .collect()
+}
+
 /// The guards every engine runs, before the harness's own.
 ///
 /// `SideEffectGate` is left out rather than neutered when confirmation is off,
@@ -1872,6 +1915,48 @@ mod tests {
             names(true).len(),
             "only the one guard differs"
         );
+    }
+
+    /// A result that fits is passed through untouched: most of them do, and a
+    /// trace full of "[0 more characters]" would be noise.
+    #[test]
+    fn a_short_trace_line_is_left_alone() {
+        let line = "ToolReturned(ok: moved to (960, 540))";
+        assert_eq!(clip_trace_line(line, TRACE_LINE_MAX_CHARS), line);
+        assert_eq!(clip_trace_line("exactly ten", 11), "exactly ten");
+    }
+
+    /// The case the cap exists for: a `pointer_ui_read` rendered to one line.
+    /// The head survives, and what was dropped is counted rather than silently
+    /// cut, so a model can tell the difference between an empty screen and a
+    /// result it should have narrowed.
+    #[test]
+    fn a_long_trace_line_keeps_its_head_and_says_what_was_dropped() {
+        let line = format!("ToolReturned(ok: {})", "node ".repeat(500));
+        let clipped = clip_trace_line(&line, 100);
+        assert!(
+            clipped.starts_with("ToolReturned(ok: node node"),
+            "{clipped}"
+        );
+        assert!(
+            clipped.contains("more characters]"),
+            "the drop must be visible: {clipped}"
+        );
+        // 100 kept, plus the note.
+        assert_eq!(clipped.chars().take(100).count(), 100);
+        assert!(clipped.chars().count() < line.chars().count());
+    }
+
+    /// Window titles and control names on this machine are Czech, and the
+    /// clipboard round-trip test types an emoji. Slicing a UTF-8 sequence in
+    /// half would panic, so the cap counts characters.
+    #[test]
+    fn clipping_never_splits_a_character() {
+        let line = "Průzkumník souborů 🐎 Zrušit Tlačítko Systémové hodiny";
+        for max in 1..line.chars().count() {
+            let clipped = clip_trace_line(line, max);
+            assert!(clipped.chars().count() >= max, "max {max}: {clipped}");
+        }
     }
 
     #[test]
