@@ -34,6 +34,16 @@ pub struct PointerSection {
     pub addr: String,
     #[serde(default = "default_pointer_token_env")]
     pub token_env: String,
+    /// Whether to read the agent's compose box, so the person at that machine
+    /// can talk back mid-task. On by default: the service answers from memory
+    /// on loopback, and an agent that does not offer it costs one refused
+    /// connection and a warning.
+    #[serde(default = "default_true")]
+    pub messages: bool,
+    /// `host:port` of the messages service. Unset means the agent's default,
+    /// which is the pointer port plus one.
+    #[serde(default)]
+    pub messages_addr: Option<String>,
 }
 
 fn default_pointer_token_env() -> String {
@@ -46,6 +56,25 @@ impl PointerSection {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+    }
+
+    /// Where the messages service is, or `None` when it is switched off or
+    /// the pointer address is too odd to derive one from.
+    ///
+    /// The agent puts the two services one port apart, so deriving costs the
+    /// owner nothing in the normal case and `messages_addr` is there for when
+    /// it is not the normal case.
+    pub fn messages_target(&self) -> Option<String> {
+        if !self.messages {
+            return None;
+        }
+        if let Some(explicit) = &self.messages_addr {
+            return Some(explicit.clone());
+        }
+        // Rightmost colon: an IPv6 literal has its own.
+        let (host, port) = self.addr.rsplit_once(':')?;
+        let port: u16 = port.parse().ok()?;
+        Some(format!("{host}:{}", port.checked_add(1)?))
     }
 }
 
@@ -604,11 +633,18 @@ impl AppConfig {
             (Some(p), Some(addr)) => Some(PointerSection {
                 addr,
                 token_env: p.token_env.clone(),
+                messages: p.messages,
+                // Deliberately not carried over: the override names a port on
+                // the machine that was configured, and the env var has just
+                // pointed everything at a different one.
+                messages_addr: None,
             }),
             (Some(p), None) => Some(p.clone()),
             (None, Some(addr)) => Some(PointerSection {
                 addr,
                 token_env: default_pointer_token_env(),
+                messages: true,
+                messages_addr: None,
             }),
             (None, None) => None,
         }
@@ -993,5 +1029,59 @@ mod tests {
             AppConfig::parse("[pointer]\ntoken_env = \"X\"").is_err(),
             "a section without an address is a mistake, not a default"
         );
+    }
+
+    /// The agent puts its two services one port apart, so a config that names
+    /// only the pointer still finds the compose box.
+    #[test]
+    fn the_messages_service_is_derived_from_the_pointer_port() {
+        let cfg = AppConfig::parse("[pointer]\naddr = \"127.0.0.1:7373\"").unwrap();
+        let t = cfg.pointer_target(None).unwrap();
+        assert_eq!(t.messages_target().as_deref(), Some("127.0.0.1:7374"));
+    }
+
+    #[test]
+    fn an_explicit_messages_address_wins() {
+        let cfg = AppConfig::parse(
+            "[pointer]\naddr = \"10.0.0.5:7373\"\nmessages_addr = \"10.0.0.5:9999\"",
+        )
+        .unwrap();
+        let t = cfg.pointer_target(None).unwrap();
+        assert_eq!(t.messages_target().as_deref(), Some("10.0.0.5:9999"));
+    }
+
+    #[test]
+    fn the_compose_box_can_be_switched_off() {
+        let cfg =
+            AppConfig::parse("[pointer]\naddr = \"127.0.0.1:7373\"\nmessages = false").unwrap();
+        assert_eq!(cfg.pointer_target(None).unwrap().messages_target(), None);
+    }
+
+    /// `NS_POINTER_ADDR` repoints everything at another machine, so an override
+    /// naming a port on the machine that was configured must not survive it.
+    #[test]
+    fn an_env_override_drops_a_stale_messages_address() {
+        let cfg = AppConfig::parse(
+            "[pointer]\naddr = \"10.0.0.5:7373\"\nmessages_addr = \"10.0.0.5:9999\"",
+        )
+        .unwrap();
+        let t = cfg.pointer_target(Some("192.168.1.40:7373".into())).unwrap();
+        assert_eq!(t.messages_target().as_deref(), Some("192.168.1.40:7374"));
+    }
+
+    /// An IPv6 literal has colons of its own; the port is the rightmost one.
+    #[test]
+    fn an_ipv6_address_keeps_its_own_colons() {
+        let cfg = AppConfig::parse("[pointer]\naddr = \"[::1]:7373\"").unwrap();
+        let t = cfg.pointer_target(None).unwrap();
+        assert_eq!(t.messages_target().as_deref(), Some("[::1]:7374"));
+    }
+
+    /// An address with no port cannot have one derived, and guessing would
+    /// dial something arbitrary.
+    #[test]
+    fn an_underivable_address_yields_no_messages_service() {
+        let cfg = AppConfig::parse("[pointer]\naddr = \"desktop.local\"").unwrap();
+        assert_eq!(cfg.pointer_target(None).unwrap().messages_target(), None);
     }
 }

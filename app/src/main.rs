@@ -38,6 +38,33 @@ async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
     tools
 }
 
+/// Dial the agent's messages service, so the person at that machine can talk
+/// back mid-task.
+///
+/// `None` on every failure, and each one says why: the compose box is an
+/// addition to the conversation and must never be the reason there is no
+/// conversation. An agent built before the service existed simply refuses the
+/// connection, and that is worth one line, not an exit.
+async fn desktop_messages(cfg: &AppConfig) -> Option<nspointer::messages::Messages> {
+    let target = cfg.pointer_target(env_override("NS_POINTER_ADDR"))?;
+    let addr = target.messages_target()?;
+    let token = target.token()?;
+    match nspointer::messages::Messages::connect(&addr, &token).await {
+        Ok(m) => {
+            println!(
+                "desktop: reading the compose box on {addr} — press ctrl+shift+T on that \
+                 machine to type a line into this conversation."
+            );
+            Some(m)
+        }
+        Err(e) => {
+            eprintln!("desktop: no messages service on {addr} ({e});");
+            eprintln!("desktop: the compose box will not reach this session.");
+            None
+        }
+    }
+}
+
 /// Dial the ns-pointer agent and turn the connection into harness actions.
 ///
 /// The same hop `ns-pointer-mcp` makes, minus the MCP layer: the engine's
@@ -421,7 +448,16 @@ async fn main() {
         nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
             .expect("open sqlite store"),
     ));
-    b.set_channel(Box::new(nschannel_cli::CliChannel::new_stdio()));
+    // stdin, plus the desktop's compose box when there is one to read. The
+    // agent has offered that channel since 2026-09-05 and nothing collected
+    // it; a line typed into the badge went into the outbox and stopped there.
+    let cli = nschannel_cli::CliChannel::new_stdio();
+    match desktop_messages(&cfg).await {
+        Some(client) => b.set_channel(Box::new(
+            nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
+        )),
+        None => b.set_channel(Box::new(cli)),
+    };
     // M6 §5.1: the rolling summary runs on its own role (model, provider,
     // key), so it can be swapped without touching the emitter or replier.
     if cfg.memory.summary_every_turns > 0 {

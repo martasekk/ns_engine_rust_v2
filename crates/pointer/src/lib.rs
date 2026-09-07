@@ -20,6 +20,7 @@ pub mod client;
 pub mod geom;
 pub mod gesture;
 pub mod mcp;
+pub mod messages;
 pub mod mock;
 pub mod motion;
 pub mod platform;
