@@ -502,6 +502,21 @@ impl LlmConfig {
 pub struct EngineSection {
     pub max_iterations: u32,
     pub max_emit_retries: u32,
+    /// Whether an irreversible action is staged and confirmed before it runs.
+    ///
+    /// True for a session someone is sitting in front of. False for one meant
+    /// to run unattended: there is nobody to answer the prompt, so the gate
+    /// stops being a safeguard and becomes a stall. Turning it off means every
+    /// irreversible action the model proposes happens — clicks and typing on a
+    /// real desktop included, where there is no undo for "sent the email".
+    /// The brakes that remain are the machine's own: the local override, the
+    /// arming chord, and the badge's pie menu.
+    #[serde(default = "default_confirm_irreversible")]
+    pub confirm_irreversible: bool,
+}
+
+fn default_confirm_irreversible() -> bool {
+    true
 }
 
 impl Default for EngineSection {
@@ -509,6 +524,7 @@ impl Default for EngineSection {
         Self {
             max_iterations: 5,
             max_emit_retries: 3,
+            confirm_irreversible: default_confirm_irreversible(),
         }
     }
 }

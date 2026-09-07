@@ -503,6 +503,7 @@ async fn main() {
     let engine_cfg = EngineConfig {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
+        confirm_irreversible: cfg.engine.confirm_irreversible,
         persona: cfg.persona.text.clone(),
         templates: cfg.templates.clone(),
         learned: rules,
@@ -530,6 +531,17 @@ async fn main() {
         emitter_target.describe(),
         replier_target.describe()
     );
+    if !cfg.engine.confirm_irreversible {
+        // Said out loud because it is the one thing a glance at the process
+        // cannot tell you, and because the gate it names is the one that would
+        // otherwise have asked before anything irreversible happened.
+        eprintln!(
+            "ns-harness: AUTONOMOUS — irreversible actions run without asking. \
+             Clicks and typing on the desktop happen unattended; the brakes left \
+             are on the machine itself (touch its mouse or keyboard to suspend \
+             input for 5s, or use the badge's pie menu)."
+        );
+    }
     println!("type text, /quit to exit  ·  `ns-app providers` lists the backends");
     if let Err(e) = engine.run().await {
         eprintln!("engine stopped: {e}");

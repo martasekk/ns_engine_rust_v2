@@ -14,10 +14,16 @@
 //! exactly its job, and the client was the thing behaving badly.
 //!
 //! The fix is to *believe the number the agent already sends back*. It says
-//! how many milliseconds remain; wait that long, then try once more. Once,
-//! not in a loop: if the person still has their hand on the mouse after the
-//! window has elapsed, that is an answer rather than a reason to keep asking,
-//! and the refusal goes back up to whoever asked with the reason intact.
+//! how many milliseconds remain; wait that long, then try again. The waiting
+//! is the whole point — attempts spaced by the full window cannot livelock the
+//! way an immediate retry does, because the window is only re-armed by input
+//! that arrives during it.
+//!
+//! The budget is finite (`MAX_WAITS`). An unattended session should survive
+//! the owner typing for a minute without abandoning its task, and should still
+//! stop eventually rather than wait on a machine somebody is plainly using:
+//! after the budget, "the machine is in use" is the answer, and the refusal
+//! goes back up with its reason intact.
 //!
 //! Only `perform` is wrapped, because only `perform` is suspended — the
 //! reads (`screens`, `position`, `ui_tree`, the clipboard pair) do not consult
@@ -29,12 +35,12 @@ use crate::ui::UiNode;
 use crate::wire::{ErrorKind, InputError, Step};
 use crate::{Point, Pointer, Screens};
 
-/// Longest we will ever wait for the override to lapse.
+/// Longest we will ever wait for one lapse of the override.
 ///
-/// The agent's default window is 3s, so this is generous. It exists because
-/// the remaining time is parsed out of a human-readable string: a malformed or
-/// hostile detail must not be able to park a model for a minute.
-const MAX_WAIT: Duration = Duration::from_millis(5_000);
+/// `ns-pointerd` sets its window to 5s, so this clears it with room to spare.
+/// It exists because the remaining time is parsed out of a human-readable
+/// string: a malformed or hostile detail must not be able to park a model.
+const LONGEST_WAIT: Duration = Duration::from_millis(6_000);
 
 /// Parse the `Nms remaining` the agent puts in a suspension detail.
 ///
@@ -54,7 +60,7 @@ fn remaining_ms(detail: &str) -> Option<u64> {
     digits.chars().rev().collect::<String>().parse().ok()
 }
 
-/// How long to wait before the single retry, or `None` to not retry at all.
+/// How long to wait before the next attempt, or `None` to not retry at all.
 fn wait_for(e: &InputError) -> Option<Duration> {
     match e {
         InputError::Agent {
@@ -64,20 +70,46 @@ fn wait_for(e: &InputError) -> Option<Duration> {
             let ms = remaining_ms(detail)?;
             // The window is closed *for* ms; waiting exactly that long can
             // land on the boundary, so add a little.
-            Some(Duration::from_millis(ms + 50).min(MAX_WAIT))
+            Some(Duration::from_millis(ms + 50).min(LONGEST_WAIT))
         }
         _ => None,
     }
 }
 
-/// A `Pointer` that waits out a local override once before giving up.
+/// How many times to wait the window out before reporting the refusal.
+///
+/// One retry is enough for a person who brushed the mouse once. It is not
+/// enough for an unattended session, where the owner may type for a minute
+/// and every keystroke re-arms the window: giving up after one wait would end
+/// the task because somebody answered an email. Twelve waits of ~5s is about
+/// a minute of continuous typing, after which "the machine is in use" really
+/// is the answer.
+///
+/// This cannot spin: each attempt is preceded by a wait of the full remaining
+/// window, so the attempts are spaced by the window itself. That spacing is
+/// the entire difference between this and the immediate retry that produced
+/// 43 refusals in a row.
+pub const MAX_WAITS: usize = 12;
+
+/// A `Pointer` that waits out a local override before giving up.
 pub struct WaitOutOverride<P> {
     inner: P,
+    max_waits: usize,
 }
 
 impl<P> WaitOutOverride<P> {
     pub fn new(inner: P) -> Self {
-        WaitOutOverride { inner }
+        WaitOutOverride {
+            inner,
+            max_waits: MAX_WAITS,
+        }
+    }
+
+    /// How many times to wait the window out. Zero passes the first refusal
+    /// straight up.
+    pub fn with_max_waits(mut self, max_waits: usize) -> Self {
+        self.max_waits = max_waits;
+        self
     }
 }
 
@@ -92,17 +124,23 @@ impl<P: Pointer> Pointer for WaitOutOverride<P> {
     }
 
     async fn perform(&self, steps: &[Step]) -> Result<u64, InputError> {
-        let first = match self.inner.perform(steps).await {
-            Ok(v) => return Ok(v),
-            Err(e) => e,
-        };
-        let Some(wait) = wait_for(&first) else {
-            return Err(first);
-        };
-        tokio::time::sleep(wait).await;
-        // Once. A second refusal means the person is still there, and that is
-        // the answer to report rather than a reason to ask again.
-        self.inner.perform(steps).await
+        let mut waited = 0usize;
+        loop {
+            let refusal = match self.inner.perform(steps).await {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            // Anything but a suspension, or a budget spent: the caller gets
+            // the refusal with its reason intact.
+            let Some(wait) = wait_for(&refusal) else {
+                return Err(refusal);
+            };
+            if waited >= self.max_waits {
+                return Err(refusal);
+            }
+            waited += 1;
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn clipboard_read(&self) -> Result<String, InputError> {
@@ -185,7 +223,7 @@ mod tests {
     /// The cap is the whole reason the parse is allowed to be loose.
     #[test]
     fn the_wait_is_capped() {
-        assert_eq!(wait_for(&suspended(600_000)), Some(MAX_WAIT));
+        assert_eq!(wait_for(&suspended(600_000)), Some(LONGEST_WAIT));
     }
 
     #[test]
@@ -214,11 +252,21 @@ mod tests {
         assert_eq!(p.inner.calls.load(Ordering::SeqCst), 2);
     }
 
-    /// The loop this module exists to prevent. A person who still has their
-    /// hand on the mouse gets one retry, not forty-three.
+    /// The budget is what lets an unattended run survive someone typing for a
+    /// while: eleven refusals in a row is not the end of the task.
     #[tokio::test]
-    async fn a_person_who_is_still_there_is_reported_not_retried_again() {
-        let p = WaitOutOverride::new(flaky(usize::MAX));
+    async fn a_run_of_refusals_inside_the_budget_still_gets_through() {
+        let p = WaitOutOverride::new(flaky(11));
+        assert_eq!(p.perform(&[]).await.expect("gets through"), 7);
+        assert_eq!(p.inner.calls.load(Ordering::SeqCst), 12);
+    }
+
+    /// The loop this module exists to prevent. A person who still has their
+    /// hand on the mouse is eventually told so, and the attempts are bounded
+    /// rather than forty-three in a row.
+    #[tokio::test]
+    async fn a_person_who_is_still_there_is_reported_once_the_budget_is_spent() {
+        let p = WaitOutOverride::new(flaky(usize::MAX)).with_max_waits(3);
         let e = p.perform(&[]).await.expect_err("still suspended");
         assert!(
             matches!(
@@ -232,9 +280,18 @@ mod tests {
         );
         assert_eq!(
             p.inner.calls.load(Ordering::SeqCst),
-            2,
-            "one attempt and one retry, and no more"
+            4,
+            "the first attempt plus one per wait in the budget, and no more"
         );
+    }
+
+    /// Zero budget is the old behaviour, and the escape hatch for a caller
+    /// that would rather hear about the refusal immediately.
+    #[tokio::test]
+    async fn a_zero_budget_passes_the_first_refusal_straight_up() {
+        let p = WaitOutOverride::new(flaky(usize::MAX)).with_max_waits(0);
+        assert!(p.perform(&[]).await.is_err());
+        assert_eq!(p.inner.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

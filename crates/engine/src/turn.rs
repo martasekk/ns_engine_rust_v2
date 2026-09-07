@@ -55,6 +55,22 @@ pub struct EngineConfig {
     pub summary_input_max_chars: usize,
     /// M6 §7: hits per source the `recall` action returns.
     pub recall_top_k: usize,
+    /// Whether an irreversible action must be confirmed before it runs.
+    ///
+    /// True is the default and the right answer for a harness a person is
+    /// sitting in front of: `SideEffectGate` stages the proposal and asks,
+    /// naming what will actually happen.
+    ///
+    /// False removes that gate entirely, for a session meant to run
+    /// unattended for long stretches — there is nobody at the keyboard to
+    /// answer, and a staged proposal would simply stall until there is. It is
+    /// a real loosening and worth being deliberate about: every irreversible
+    /// action the model proposes then happens, including clicks and typing on
+    /// a real desktop, where there is no undo for "sent the email". What
+    /// remains is not this gate but the machine's own brakes — the local
+    /// override that suspends injection the moment a person touches the mouse,
+    /// the arming chord, and the badge's pie menu.
+    pub confirm_irreversible: bool,
 }
 
 impl Default for EngineConfig {
@@ -83,6 +99,8 @@ impl Default for EngineConfig {
             summary_max_chars: 800,
             summary_input_max_chars: 6000,
             recall_top_k: 5,
+            // The safe default: ask before anything irreversible.
+            confirm_irreversible: true,
         }
     }
 }
@@ -296,16 +314,12 @@ impl Engine {
         cfg: EngineConfig,
         clock: Box<dyn Fn() -> Timestamp + Send + Sync>,
     ) -> Self {
+        let guards = builtin_guards(cfg.confirm_irreversible);
         Self {
             parts,
             cfg,
             clock,
-            builtin_guards: vec![
-                Box::new(crate::guards::ResidualPolicy),
-                Box::new(crate::guards::TaintPolicy),
-                Box::new(crate::guards::DedupeGate),
-                Box::new(crate::guards::SideEffectGate),
-            ],
+            builtin_guards: guards,
         }
     }
 
@@ -1812,9 +1826,53 @@ pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
         .join("\n")
 }
 
+/// The guards every engine runs, before the harness's own.
+///
+/// `SideEffectGate` is left out rather than neutered when confirmation is off,
+/// so a trace shows no side-effect gate at all instead of one that silently
+/// allows everything. An unattended session has nobody to answer the prompt,
+/// and a staged proposal there is not a safeguard, it is a stall.
+fn builtin_guards(confirm_irreversible: bool) -> Vec<Box<dyn nscore::Guard>> {
+    let mut guards: Vec<Box<dyn nscore::Guard>> = vec![
+        Box::new(crate::guards::ResidualPolicy),
+        Box::new(crate::guards::TaintPolicy),
+        Box::new(crate::guards::DedupeGate),
+    ];
+    if confirm_irreversible {
+        guards.push(Box::new(crate::guards::SideEffectGate));
+    }
+    guards
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default must stay the safe one: a config that says nothing about
+    /// confirmation gets the gate.
+    #[test]
+    fn irreversible_actions_are_confirmed_unless_asked_otherwise() {
+        assert!(EngineConfig::default().confirm_irreversible);
+    }
+
+    /// Switching it off removes the gate rather than leaving one that always
+    /// allows, so a trace shows honestly that nothing was gating.
+    #[test]
+    fn the_side_effect_gate_is_absent_when_confirmation_is_off() {
+        fn names(confirm: bool) -> Vec<String> {
+            builtin_guards(confirm)
+                .iter()
+                .map(|g| g.name().to_string())
+                .collect()
+        }
+        assert!(names(true).contains(&"side_effect_gate".to_string()));
+        assert!(!names(false).contains(&"side_effect_gate".to_string()));
+        assert_eq!(
+            names(false).len() + 1,
+            names(true).len(),
+            "only the one guard differs"
+        );
+    }
 
     #[test]
     fn render_substitutes_known_placeholders_only() {
