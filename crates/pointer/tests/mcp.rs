@@ -418,7 +418,7 @@ async fn ui_find_turns_a_name_into_a_click_target() {
             self.0.lock().unwrap().extend_from_slice(s);
             Ok(11)
         }
-        async fn ui_tree(&self) -> Result<Vec<UiNode>, InputError> {
+        async fn ui_tree(&self, _visible_only: bool) -> Result<Vec<UiNode>, InputError> {
             Ok(vec![
                 UiNode {
                     role: "Group".into(),
@@ -427,6 +427,7 @@ async fn ui_find_turns_a_name_into_a_click_target() {
                     h: 24,
                     visible: true,
                     enabled: true,
+                    ..Default::default()
                 },
                 UiNode {
                     role: "Button".into(),
@@ -435,6 +436,7 @@ async fn ui_find_turns_a_name_into_a_click_target() {
                     h: 24,
                     visible: true,
                     enabled: true,
+                    ..Default::default()
                 },
                 UiNode {
                     role: "Button".into(),
@@ -443,6 +445,7 @@ async fn ui_find_turns_a_name_into_a_click_target() {
                     h: 24,
                     visible: false,
                     enabled: true,
+                    ..Default::default()
                 },
             ])
         }
@@ -616,4 +619,311 @@ async fn the_confirm_argument_is_advertised_on_the_tools_that_need_it() {
     for t in ["pointer_move", "ui_read", "screens_list", "pointer_scroll"] {
         assert!(!has_confirm(t), "{t} should not");
     }
+}
+
+/// The refusal a human can lift from where they are sitting.
+///
+/// `needs_confirmation` exists because the other two refusals mislead here.
+/// `blocked` says the OS refused and will keep refusing, and a model told that
+/// reasonably stops trying something one keypress would allow; `suspended`
+/// lapses on its own, so the answer is to wait. This one lapses only when a
+/// person acts, so the detail — which chord, on which machine — has to survive
+/// all the way to the reader, and the model has to be told not to spin.
+#[tokio::test]
+async fn a_refusal_awaiting_a_human_says_what_would_arm_it() {
+    struct NotArmed;
+    #[async_trait::async_trait]
+    impl nspointer::Pointer for NotArmed {
+        async fn screens(&self) -> Result<Screens, InputError> {
+            Ok(layout())
+        }
+        async fn position(&self) -> Result<Point, InputError> {
+            Ok(Point::new(0, 0))
+        }
+        async fn perform(&self, _: &[Step]) -> Result<u64, InputError> {
+            Err(InputError::Agent {
+                kind: ErrorKind::NeedsConfirmation,
+                detail: "not armed. This would press the Left mouse button on a real \
+                         desktop, which cannot be undone. Press ctrl+alt+p on the machine \
+                         itself to arm this session."
+                    .into(),
+            })
+        }
+    }
+    let session = Session::open(NotArmed).await.unwrap();
+    let server = McpServer::new(session).with_confirm(Confirm::Off);
+    let (client, srv) = tokio::io::duplex(64 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    tokio::spawn(async move {
+        let _ = server.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let mut b = serde_json::to_vec(&call(1, "pointer_click", json!({"x": 10, "y": 10}))).unwrap();
+    b.push(b'\n');
+    cw.write_all(&b).await.unwrap();
+    let resp: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+    // The instruction the agent gave has to reach the reader intact. A model
+    // that is told "not armed" but not *how* to arm it can only guess.
+    assert!(
+        text.contains("ctrl+alt+p"),
+        "the chord that would arm it must survive: {text}"
+    );
+    assert!(text.contains("NeedsConfirmation"), "{text}");
+    assert!(
+        text.contains("Do not retry in a loop"),
+        "retrying cannot change the answer, so the model must be told: {text}"
+    );
+    // And it must not read as either of the refusals it is not.
+    assert!(
+        !text.contains("OS refused") && !text.contains("taken control back"),
+        "must not be dressed as blocked or suspended: {text}"
+    );
+}
+
+/// Drives any server over a duplex; one response per request that has an id.
+async fn drive<P: nspointer::Pointer + 'static>(
+    server: McpServer<P>,
+    reqs: Vec<Value>,
+) -> Vec<Value> {
+    let (client, srv) = tokio::io::duplex(256 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    tokio::spawn(async move {
+        let _ = server.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let mut out = Vec::new();
+    for r in reqs {
+        let has_id = r.get("id").is_some();
+        let mut b = serde_json::to_vec(&r).unwrap();
+        b.push(b'\n');
+        cw.write_all(&b).await.unwrap();
+        cw.flush().await.unwrap();
+        if has_id {
+            let line = lines.next_line().await.unwrap().unwrap();
+            out.push(serde_json::from_str(&line).unwrap());
+        }
+    }
+    out
+}
+
+/// A gated agent: refuses commits until `armed` is set, like ns-pointerd.
+struct Gated(Arc<std::sync::atomic::AtomicBool>);
+#[async_trait::async_trait]
+impl nspointer::Pointer for Gated {
+    async fn screens(&self) -> Result<Screens, InputError> {
+        Ok(layout())
+    }
+    async fn position(&self) -> Result<Point, InputError> {
+        Ok(Point::new(0, 0))
+    }
+    async fn perform(&self, steps: &[Step]) -> Result<u64, InputError> {
+        let commits = steps.iter().any(|s| {
+            matches!(
+                s,
+                Step::Button { down: true, .. } | Step::Key { down: true, .. } | Step::Text { .. }
+            )
+        });
+        if commits && !self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(InputError::Agent {
+                kind: ErrorKind::NeedsConfirmation,
+                detail: "not armed. Press ctrl+alt+p on the machine itself to arm this session."
+                    .into(),
+            });
+        }
+        Ok(11)
+    }
+}
+
+fn init() -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+}
+
+/// The promise made in the 2026-09-05 reply: once the agent fills `armed`,
+/// the model hears it where it reads — `initialize`'s instructions and the
+/// tool every description says to call first — rather than from the first
+/// refusal. And it stays true: an accepted commit means a person armed it.
+#[tokio::test]
+async fn the_agents_arming_state_reaches_the_model_and_tracks_what_performs_say() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let session = Session::open(Gated(flag.clone())).await.unwrap();
+    let server = McpServer::new(session)
+        .with_confirm(Confirm::Off)
+        .with_agent(true, Some(false));
+    let (client, srv) = tokio::io::duplex(256 * 1024);
+    let (sr, sw) = tokio::io::split(srv);
+    let server = Arc::new(server);
+    let s2 = server.clone();
+    tokio::spawn(async move {
+        let _ = s2.serve(sr, sw).await;
+    });
+    let (cr, mut cw) = tokio::io::split(client);
+    let mut lines = BufReader::new(cr).lines();
+    let ask = |r: Value| {
+        let mut b = serde_json::to_vec(&r).unwrap();
+        b.push(b'\n');
+        b
+    };
+    async fn one(
+        cw: &mut (impl AsyncWriteExt + Unpin),
+        lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        b: Vec<u8>,
+    ) -> Value {
+        cw.write_all(&b).await.unwrap();
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    }
+
+    // Before anything: initialize says so, in words a model acts on.
+    let r = one(&mut cw, &mut lines, ask(init())).await;
+    let text = r["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("NOT ARMED"), "{text}");
+    assert!(text.contains("needs_confirmation"), "{text}");
+    assert!(text.contains("Tell the user before you start"), "{text}");
+    assert!(
+        !text.contains("NO LOCAL OVERRIDE"),
+        "override exists here: {text}"
+    );
+
+    // And screens_list carries it structurally, with a note a model reads.
+    let r = one(&mut cw, &mut lines, ask(call(2, "screens_list", json!({})))).await;
+    assert_eq!(r["result"]["structuredContent"]["armed"], false, "{r}");
+    assert_eq!(r["result"]["structuredContent"]["local_override"], true);
+    assert!(r["result"]["structuredContent"]["note"]
+        .as_str()
+        .unwrap()
+        .contains("Not armed"));
+
+    // A commit is refused, the refusal names the chord, and the state holds.
+    let r = one(
+        &mut cw,
+        &mut lines,
+        ask(call(3, "pointer_click", json!({"x": 10, "y": 10}))),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("ctrl+alt+p"));
+    assert_eq!(server.agent_armed(), Some(false));
+
+    // A person presses the chord. The next accepted commit is the evidence.
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = one(
+        &mut cw,
+        &mut lines,
+        ask(call(4, "pointer_click", json!({"x": 10, "y": 10}))),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(server.agent_armed(), Some(true));
+    let r = one(&mut cw, &mut lines, ask(call(5, "screens_list", json!({})))).await;
+    assert_eq!(r["result"]["structuredContent"]["armed"], true);
+    assert!(
+        r["result"]["structuredContent"].get("note").is_none(),
+        "no note once armed: {r}"
+    );
+
+    // Disarmed again (idle expiry, the manual brake): the refusal flips it back.
+    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    let r = one(
+        &mut cw,
+        &mut lines,
+        ask(call(6, "type_text", json!({"text": "x"}))),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], true);
+    assert_eq!(server.agent_armed(), Some(false));
+
+    // A move was never gated, so it says nothing about arming either way.
+    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = one(
+        &mut cw,
+        &mut lines,
+        ask(call(7, "pointer_move", json!({"x": 10, "y": 10}))),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false);
+    assert_eq!(
+        server.agent_armed(),
+        Some(false),
+        "a move is not evidence of arming"
+    );
+}
+
+/// An agent with no gate says nothing, and nothing must be invented for it:
+/// an accepted click there is not "a person armed it".
+#[tokio::test]
+async fn a_gateless_agent_claims_nothing_about_arming() {
+    let session = Session::open(MockPointer::new(layout(), Point::new(0, 0)))
+        .await
+        .unwrap();
+    let server = McpServer::new(session)
+        .with_confirm(Confirm::Off)
+        .with_agent(true, None);
+    let r = drive(
+        server,
+        vec![
+            init(),
+            call(2, "pointer_click", json!({"x": 10, "y": 10})),
+            call(3, "screens_list", json!({})),
+        ],
+    )
+    .await;
+    let text = r[0]["result"]["instructions"].as_str().unwrap();
+    assert!(!text.contains("ARMED") && !text.contains("armed"), "{text}");
+    assert_eq!(r[1]["result"]["isError"], false);
+    assert!(
+        r[2]["result"]["structuredContent"].get("armed").is_none(),
+        "{}",
+        r[2]
+    );
+    assert_eq!(r[2]["result"]["structuredContent"]["local_override"], true);
+}
+
+/// The other thing `ready` says that a model should hear before acting.
+#[tokio::test]
+async fn a_missing_local_override_is_said_up_front_and_in_the_gate() {
+    let session = Session::open(MockPointer::new(layout(), Point::new(0, 0)))
+        .await
+        .unwrap();
+    let server = McpServer::new(session).with_agent(false, Some(false));
+    let r = drive(
+        server,
+        vec![init(), call(2, "pointer_click", json!({"x": 10, "y": 10}))],
+    )
+    .await;
+    let text = r[0]["result"]["instructions"].as_str().unwrap();
+    assert!(text.contains("NO LOCAL OVERRIDE"), "{text}");
+    // This server's own gate mentions the machine's gate too, so the model
+    // does not learn about the second one from a second refusal.
+    let gate = r[1]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(gate.contains("\"confirm\": true"), "{gate}");
+    assert!(
+        gate.contains("machine itself is also not yet armed"),
+        "{gate}"
+    );
+    // A server built over a double with nothing declared claims nothing.
+    let session = Session::open(MockPointer::new(layout(), Point::new(0, 0)))
+        .await
+        .unwrap();
+    let r = drive(
+        McpServer::new(session),
+        vec![init(), call(2, "screens_list", json!({}))],
+    )
+    .await;
+    let text = r[0]["result"]["instructions"].as_str().unwrap();
+    assert!(
+        !text.contains("OVERRIDE") && !text.contains("ARMED"),
+        "{text}"
+    );
+    assert!(r[1]["result"]["structuredContent"]
+        .get("local_override")
+        .is_none());
 }

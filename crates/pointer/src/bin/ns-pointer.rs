@@ -53,6 +53,12 @@ async fn main() {
              mouse will not interrupt anything sent from here."
         );
     }
+    if pointer.armed() == Some(false) {
+        eprintln!(
+            "note: this agent is not armed — the first input will be refused with \
+             needs_confirmation until someone presses the arming chord on the machine."
+        );
+    }
     let session = match Session::open(pointer).await {
         Ok(s) => s,
         Err(e) => {

@@ -33,6 +33,19 @@ client-side too, and reaches you as nothing but a longer list of points.
 Answer anything else on an unauthenticated connection with `unauthorized`.
 Reject a `protocol` you do not implement with `protocol`; do not guess.
 
+The `ready` reply may carry `armed` (protocol 2, optional). If you gate the
+first commit on a person pressing a chord (§4.7), say here whether they have:
+`"armed": false` lets the caller ask them *before* the first `perform` comes
+back `needs_confirmation` instead of after. Leave it out if you have no gate;
+an absent field is "not saying", and the caller treats it as neither answer.
+
+What the client does with it: `ns-pointer-mcp` puts it in the `initialize`
+result's `instructions` and in the `screens_list` reply — the two places a
+model reads before it acts — and keeps it current from what `perform` answers
+(an accepted commit means armed, `needs_confirmation` means not). The CLI
+prints a note at connect. So a disarm on idle or on the manual brake needs no
+message of its own: the next refusal is how the client learns.
+
 ### `screens` — the layout
 
 ```json
@@ -68,7 +81,7 @@ whole implementation is a loop over a match:
 | `button` | `button` (`left`\|`right`\|`middle`), `down` (bool) | Press or release **where the pointer already is**. Never moves. |
 | `scroll` | `dx`, `dy` (i32) | Notches, not pixels. Positive `dy` scrolls down, positive `dx` right. |
 | `key` | `key` (object), `down` (bool) | Press or release one key, **where the pointer already is**. See below. |
-| `text` | `text` (string) | Type the literal characters. On Windows: `SendInput` with `KEYEVENTF_UNICODE`, `wVk = 0`, `wScan` = the UTF-16 code unit. Non-BMP characters (emoji) are two inputs, one per surrogate. |
+| `text` | `text` (string) | Type the literal characters. On Windows: `SendInput` with `KEYEVENTF_UNICODE`, `wVk = 0`, `wScan` = the UTF-16 code unit. Non-BMP characters (emoji) are two inputs, one per surrogate. Newlines are the one exception — see below. |
 | `sleep` | `ms` (u32) | Wait. Typically 8ms between path points, 40ms inside a click, ~70ms between characters. |
 
 A single click arrives as one `perform` of ~40 steps: it is one round trip,
@@ -94,6 +107,22 @@ answers, and neither mechanism can do the other's job:
 {"step":"text","text":"user@example.com"}
 ```
 
+#### Newlines in `text` are the Enter key
+
+The single sanctioned deviation from "type the literal characters": send `\n`
+as the Enter key, drop `\r`, and treat `\r\n` as one press.
+
+This is not tidiness. U+000A injected as a Unicode code unit does nothing at
+all in most Windows text controls, so the literal reading makes the character
+silently vanish — and a caller writing `"line one\nline two"` has plainly asked
+for a new line, not for a no-op. Every other character in the string is still
+injected literally; this rule is limited to the two that encode "next line",
+and it is the reason a caller never has to decompose a multi-line string into
+`text`/`key`/`text` themselves.
+
+The cost, stated plainly: a literal U+000A can no longer be typed through
+`text`. Nothing has wanted to.
+
 `{"k":"char","c":"c"}` means *whichever key produces `c` on the target's
 current layout* — `VkKeyScanW` on Windows. It is for the `c` in Ctrl+C, not for
 typing prose.
@@ -110,6 +139,14 @@ a connection drops, and when the local override engages.** A stuck letter is
 noise; a stuck Ctrl makes the machine unusable until someone taps the physical
 key, and a dropped TCP connection is exactly when nobody is in a position to
 send the release.
+
+A release the OS refuses — a UAC prompt came up, the foreground window is
+elevated — is a key that is **still down** after you believed you released
+it. Do not discard the refusal. Keep the key on a list, record it, and try
+the release again before the next `perform`, on whichever connection sends
+it; the one that pressed the key has usually just gone. The reference agent
+does this machine-wide. A batch that then goes ahead with a modifier still
+stuck will most likely be refused too, and that refusal is the useful error.
 
 ### `clipboard_read` / `clipboard_write` — optional, protocol 2
 
@@ -136,15 +173,26 @@ enough that recording it would turn the audit trail into the leak.
 
 ```json
 {"id":7,"op":"ui_tree"}
+{"id":7,"op":"ui_tree","visible_only":true}
 ```
 
-Every control you can see, flattened, with **no filtering of any kind**. The
-caller compresses (`ui::compress`); a filter here would be a second,
-untested, per-platform copy of that judgement. On Windows this is UI
-Automation.
+Every control you can see, flattened, with **no filtering of any kind** —
+with one exception, and only when asked for it. The caller compresses
+(`ui::compress`); a filter here would be a second, untested, per-platform
+copy of that judgement. On Windows this is UI Automation.
+
+The exception is `visible_only`. Measured on a real desktop, 73% of the tree
+comes back `visible: false` and the caller drops every one of those nodes
+first thing — roughly 300 KB of JSON per read, over loopback, to keep about
+800 nodes. When the request says `visible_only: true`, leave out what you
+would have reported as `visible: false`, and nothing else; on Windows a
+provider-side `IsOffscreen == false` condition halves the walk. Absent or
+`false` still means everything. An agent that ignores the field is merely
+slower, never wrong. A stricter filter than "what I would have flagged
+invisible" is the copy of the caller's judgement this rule exists to prevent.
 
 ```json
-{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true}
+{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true,"focused":false,"focusable":true,"depth":3,"window":0}
 ```
 
 `center` is absolute virtual-desktop pixels, so a caller can click it
@@ -152,6 +200,36 @@ directly. `h` is used only to derive the layout-block threshold. Include
 invisible and disabled nodes and say so in the flags — the caller drops them,
 and it can tell "greyed out" from "absent", which matters when a model is
 wondering why a button did nothing.
+
+Four more fields, all optional and all defaulting to "not known" (`false` /
+`0`), so an agent that sends none of them is read exactly as before. On
+Windows all four come out of the same cached fetch at no measurable cost:
+
+| field | what it is | what the caller does with it |
+| --- | --- | --- |
+| `focused` | the control that will receive typed text; at most one per tree | rendered as `[FOCUS]`, so a model knows where `type` lands without a screenshot |
+| `focusable` | can take keyboard focus (`IsKeyboardFocusable`) | the platform's own word on "interactive", in any language; catches a `Custom` control or a `Pane` that is really a canvas, which no role list can name |
+| `depth` | depth below its top-level window; 0 for the window itself | with `window`, containment — a dialog's controls are in its window, below it |
+| `window` | index of the top-level window in walk order; 0 is the foreground window | windows are read whole, foreground first, and a window boundary is a `[BLOCK]` |
+
+Modal attachment uses containment where these are present and a 300 px
+radius where they are not, so a wide dialog's far button joins its dialog
+and a toolbar button in the window behind does not.
+
+**`center` is required, not optional**, so an element whose bounding rectangle
+has no extent cannot be reported and is the one thing you may drop. Measured
+on a real desktop this is 4.3% (233 of 5450), nearly all zero-extent wrappers
+in browser content. `Option<Point>` was considered and declined: every consumer
+of the field is spatial, so an absent centre skips all of them and the node is
+unusable anyway. If you would rather not lose them, give a zero-extent element
+its nearest ancestor's rectangle — that is where a person would click for it,
+and it needs no protocol change.
+
+Two flags that are *not* the same thing, and the second is easy to get wrong:
+a minimized window is parked near (-32000, -32000) by Windows convention and
+UI Automation still reports it as on screen. Report those as `visible: false`.
+Left alone they surface as a click target on no monitor, and the caller either
+clicks nothing or gets `out_of_bounds` for a control you just told it about.
 
 This is the most valuable of the three optional operations. Naming a control
 sidesteps DPI registration, image transport, resolution differences and stale
@@ -165,12 +243,13 @@ that this one otherwise would not.
 Exactly one response per request, same `id`.
 
 ```json
-{"id":1,"ok":true,"result":{"kind":"ready","agent":"ns-pointerd 0.1.0","platform":"windows","protocol":1}}
+{"id":1,"ok":true,"result":{"kind":"ready","agent":"ns-pointerd 0.1.0","platform":"windows","protocol":2,"local_override":true,"armed":false}}
 {"id":3,"ok":true,"result":{"kind":"position","x":1280,"y":720,"state":7}}
 {"id":4,"ok":true,"result":{"kind":"performed","steps":7,"state":7}}
 {"id":5,"ok":true,"result":{"kind":"clipboard","text":"a long pasted document"}}
-{"id":7,"ok":true,"result":{"kind":"ui","state":7,"nodes":[{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true}]}}
+{"id":7,"ok":true,"result":{"kind":"ui","nodes":[{"role":"Button","name":"Save","center":{"x":300,"y":200},"h":24,"visible":true,"enabled":true,"focused":false,"focusable":true,"depth":3,"window":0}],"state":7}}
 {"id":4,"ok":false,"error":{"kind":"blocked","detail":"target window is elevated (UIPI)"}}
+{"id":6,"ok":false,"error":{"kind":"needs_confirmation","detail":"not armed. This would press the Left mouse button on a real desktop, which cannot be undone. Press ctrl+alt+p on the machine itself to arm this session."}}
 ```
 
 ```json
@@ -196,6 +275,11 @@ resolution, arrangement, a monitor connected or removed. Returned on every
 response. It lets a caller notice the layout moved between reading `screens`
 and acting on it. It does **not** track screen *contents*; nothing here does.
 
+Because it rides on every reply, produce it cheaply: a fingerprint of the
+monitor rectangles is enough to notice a change, and the identity queries
+(device paths, DPI) belong in `screens` alone. The reference agent's
+`Platform::state()` exists for exactly this.
+
 ### Errors
 
 | `kind` | when |
@@ -206,7 +290,17 @@ and acting on it. It does **not** track screen *contents*; nothing here does.
 | `out_of_bounds` | a `move` landed on no screen. The caller clamps, so this means the layout changed underneath it — compare `state`. |
 | `unsupported` | known operation you have not implemented — the clipboard, typically. A legitimate permanent answer, not a failure |
 | `protocol` | unparseable, unknown op, or a version you do not implement |
+| `needs_confirmation` | a person at the machine has not approved this yet. Lapses when a human does a specific thing, so `detail` must say **which** thing — which chord, on which machine. See §4.7. |
 | `internal` | anything else, with `detail` |
+
+The three refusals are deliberately not one refusal, because a caller's next
+move differs for each. `blocked` is the OS saying no and it will keep saying
+no until the machine changes — stop. `suspended` is the owner having taken
+control back and it lapses by itself — wait, then retry. `needs_confirmation`
+lapses only when a person acts, so retrying changes nothing: relay the
+`detail` and stop. Collapsing the last into `blocked` is the expensive
+mistake, because a caller told `blocked` gives up on something one keypress
+would have allowed.
 
 ---
 
@@ -259,7 +353,33 @@ below has to be enforced where a caller cannot reach it.
    injected. A log written by the client records intent; only yours records
    effect.
 
-Items 1–6 are why "the agent is a `match` in a loop" is true of the step
+7. **Gate what cannot be undone**, and gate it *here*. A client can be asked
+   to confirm before it clicks, and `ns-pointer`'s MCP layer does exactly that
+   — but that gate is advisory by the same argument as the rest of this
+   section: anything that can open this socket can skip it. `ns-pointer click`
+   on a raw socket executed three times running with no prompt while the MCP
+   gate was in place, which is the whole point restated. Answer
+   `needs_confirmation` until a person at the machine has armed the session.
+
+   The two gates are not redundant and neither replaces the other. The upper
+   one knows what the model *intends* and can say "this would type your
+   password into a chat window"; the lower one only knows what reached the OS,
+   but it is the one that cannot be bypassed. Keep both; enforce at the bottom.
+
+   What to gate is a narrower list than it looks. Button presses, key presses
+   and `text` — the things that commit. Not `move`, not `scroll`, and no read:
+   nothing is activated by looking or by a cursor arriving somewhere, and
+   gating moves fires the prompt on the path rather than on the click it leads
+   to. **Never gate a release.** Letting go is not the thing you withhold, and
+   a refusal halfway through a chord that leaves Ctrl down has created the
+   stuck modifier item 4 exists to prevent.
+
+   Arming must be observed by something the socket cannot drive — on Windows,
+   a low-level keyboard hook, which ignores injected input for free. Acknowledge
+   it without taking focus (`MessageBeep`, not a dialog): moving focus changes
+   which window is under the pointer, which is the thing being confirmed.
+
+Items 1–7 are why "the agent is a `match` in a loop" is true of the step
 interpreter and false of the agent.
 
 ## 5. A minimal agent, in shape
@@ -269,19 +389,21 @@ loop over lines:
     req = parse(line)                       -> on failure: protocol
     if not authed and req.op != hello       -> unauthorized
     match req.op:
-        hello    -> check token+protocol, reply ready
+        hello    -> check token+protocol, reply ready (+ armed, if gated)
         screens  -> enumerate monitors, reply screens
         position -> reply position
-        ui_tree         -> reply ui, or unsupported
+        ui_tree         -> reply ui (visible only if asked), or unsupported
         clipboard_read  -> reply clipboard, or unsupported
         clipboard_write -> set it, reply clipboard, or unsupported
-        perform  -> for step in steps:
+        perform  -> if not armed and steps commit -> needs_confirmation
+                    retry any release the OS refused earlier
+                    for step in steps:
                         move(x, y) | button(b, down) | scroll(dx, dy)
                         key(k, down) | text(s)       | sleep(ms)
                         on OS refusal -> blocked, stop
                     reply performed
 on disconnect / on suspend:
-    release every key and button still held
+    release every key and button still held; keep what the OS refuses
 ```
 
 That is the whole agent. The interesting parts are the monitor enumeration in

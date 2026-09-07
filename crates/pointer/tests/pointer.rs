@@ -654,3 +654,41 @@ async fn a_key_press_is_a_press_and_a_release() {
         ]
     );
 }
+
+/// Every protocol-2 addition since the first drop is an optional field with a
+/// default, so a message from before the addition still parses to the same
+/// meaning it had. This is the whole reason the version is still 2.
+#[test]
+fn older_messages_still_parse_with_the_old_meaning() {
+    use nspointer::wire::{Op, Request, Response, ResultBody};
+    // A client that predates `visible_only` asks for everything.
+    let r: Request = serde_json::from_str(r#"{"id":7,"op":"ui_tree"}"#).unwrap();
+    assert_eq!(
+        r.op,
+        Op::UiTree {
+            visible_only: false
+        }
+    );
+    // An agent that predates `armed` has not said; one that predates
+    // `local_override` has no brake.
+    let r: Response = serde_json::from_str(
+        r#"{"id":1,"ok":true,"result":{"kind":"ready","agent":"x","platform":"windows","protocol":2}}"#,
+    )
+    .unwrap();
+    match r.result.unwrap() {
+        ResultBody::Ready {
+            armed,
+            local_override,
+            ..
+        } => {
+            assert_eq!(armed, None);
+            assert!(!local_override);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A node from an agent that sends none of the structural fields.
+    let n: nspointer::ui::UiNode =
+        serde_json::from_str(r#"{"role":"Button","name":"Save","center":{"x":1,"y":2}}"#).unwrap();
+    assert!(n.visible && n.enabled && !n.focused && !n.focusable);
+    assert_eq!((n.depth, n.window), (0, 0));
+}

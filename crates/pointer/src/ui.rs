@@ -25,11 +25,11 @@
 //! 2. **Semantic structuring** — reading order, with a `[BLOCK]` separator
 //!    wherever the vertical gap exceeds an adaptive threshold.
 //! 3. **Modal detection** — role scoring and the temporal difference against
-//!    a previous tree, both language-independent, with an English keyword
-//!    list as one weak extra signal. Controls are attached to a detected
-//!    modal by *proximity and interactivity*, never by vocabulary: a Czech
-//!    dialog's `Zrušit` must join its dialog exactly as an English `Cancel`
-//!    does.
+//!    a previous tree. No vocabulary anywhere: not in the scoring, and not in
+//!    the attachment, which goes by *proximity and interactivity*. A Czech
+//!    dialog's `Zrušit` joins its dialog exactly as an English `Cancel` does,
+//!    and the paper's English keyword list is deliberately not implemented —
+//!    see `modal_score`.
 //!
 //! Deliberately **not** copied: their per-application region maps (Chrome
 //! `BROWSER_TABS`/`ADDRESS_BAR`, VS Code `ACTIVITY_BAR`, Calc `FORMULA_BAR`).
@@ -53,6 +53,34 @@ pub struct UiNode {
     /// Accessible name — the label a person would call it by.
     pub name: String,
     /// Centre in absolute virtual-desktop pixels, ready for `pointer_click`.
+    ///
+    /// Not `Option<Point>`, and that is a decision rather than an oversight.
+    /// The Windows end measured what it costs: of 5450 elements, 233 (4.3%)
+    /// have a bounding rectangle with no extent and so no centre to report —
+    /// concentrated in browser content, where zero-extent wrappers are common
+    /// (154 in Firefox, 71 in one Talk window).
+    ///
+    /// Making this optional would not recover them. Every consumer of this
+    /// field is spatial — deduplication within 20px, reading-order sort,
+    /// the adaptive block gap, modal proximity, `find`'s click target, and
+    /// the rendered line itself. A node with no position takes the "skip"
+    /// branch at all six, so the type would grow an `Option` and the node
+    /// would still not be usable; the module's contract is that a name goes
+    /// in and a clickable point comes out, and something with no point cannot
+    /// take part in it.
+    ///
+    /// Note this is the opposite call from `visible`, and the difference is
+    /// the reason. Offscreen nodes are *flagged rather than dropped* because a
+    /// caller can still act on one — scroll it into view, or understand why a
+    /// click missed. There is no comparable move for a node that has no
+    /// location at all.
+    ///
+    /// What would change this: evidence that those 233 are not wrappers but
+    /// *named controls* whose own children are unnamed, in which case the name
+    /// is real information being lost. The cheaper fix even then is on the
+    /// agent side and needs no type change — a zero-extent element can inherit
+    /// its nearest ancestor's rectangle, which is where a person would click
+    /// for it anyway.
     pub center: Point,
     /// Height, kept only to compute the adaptive block gap. Not rendered.
     #[serde(default)]
@@ -62,10 +90,48 @@ pub struct UiNode {
     pub visible: bool,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The control that will receive typed text. At most one per tree.
+    /// Rendered as `[FOCUS]`, so a caller knows where `type` lands without a
+    /// screenshot.
+    #[serde(default)]
+    pub focused: bool,
+    /// Can take keyboard focus — the platform's own word on "interactive",
+    /// in any language, including custom controls whose role is `Custom` or
+    /// `Pane`. Read alongside the role list, never instead of it: an older
+    /// agent sends nothing here and the default reads as it did before.
+    #[serde(default)]
+    pub focusable: bool,
+    /// Depth below the top-level window; 0 for the window itself.
+    #[serde(default)]
+    pub depth: u16,
+    /// Index of the top-level window in walk order; 0 is the foreground
+    /// window. With `depth` this is the containment a flat list otherwise
+    /// lacks: a dialog's controls are in its window, below it.
+    #[serde(default)]
+    pub window: u16,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// What an agent that sends none of the optional fields is taken to mean:
+/// visible, enabled, nothing known about focus or structure.
+impl Default for UiNode {
+    fn default() -> Self {
+        Self {
+            role: String::new(),
+            name: String::new(),
+            center: Point::new(0, 0),
+            h: 0,
+            visible: true,
+            enabled: true,
+            focused: false,
+            focusable: false,
+            depth: 0,
+            window: 0,
+        }
+    }
 }
 
 /// Roles a caller can act on. Deduplication keeps these over containers: two
@@ -92,38 +158,55 @@ const INTERACTIVE: &[&str] = &[
 /// Roles that make a node a modal candidate.
 const MODAL_ROLES: &[&str] = &["dialog", "alertdialog", "alert", "modal", "popup"];
 
-/// Words that appear on the thing demanding an answer.
-const MODAL_WORDS: &[&str] = &[
-    "cookie", "accept", "agree", "cancel", "consent", "allow", "deny", "confirm", "dismiss",
-    "continue", "ok",
-];
-
 fn is_interactive(role: &str) -> bool {
     let r = role.to_ascii_lowercase();
     INTERACTIVE.iter().any(|i| r.contains(i))
 }
 
-/// How much a node looks like part of a modal. `A11y-Compressor` scores
-/// +2.0 for an interactive dialog tag, -0.5 for decorative ones, and adds a
-/// name-based score for decision keywords; the threshold is 1.0.
+/// Whether a caller can act on this node. Two signals, either suffices: the
+/// role list, which is what an older agent gives us to go on, and the
+/// platform's own `focusable`, which catches what the list cannot name — a
+/// `Custom` control, a `Pane` that is really a canvas — and does so in every
+/// locale, since it is a bit and not a word.
+fn actionable(n: &UiNode) -> bool {
+    n.focusable || is_interactive(&n.role)
+}
+
+/// Whether this tree carries containment at all. An older agent sends every
+/// node at depth 0 in window 0, and that is indistinguishable from one
+/// window with nothing under it — so structure is trusted only where some
+/// node says it is somewhere.
+fn structured(nodes: &[UiNode]) -> bool {
+    nodes.iter().any(|n| n.depth > 0 || n.window > 0)
+}
+
+/// How much a node looks like part of a modal. `A11y-Compressor` scores +2.0
+/// for an interactive dialog tag and -0.5 for decorative ones, and adds a
+/// name-based score for English decision keywords; the threshold is 1.0. The
+/// keyword term is **not** implemented, and its absence is the considered
+/// half of this function.
+///
+/// A word list scores `Cancel` and reads `Zrušit` as nothing, so the same
+/// dialog is a modal in English and background noise in Czech. That is worse
+/// than a signal that never fires: detection quality becomes a property of
+/// the target machine's locale, and the failure is silent on exactly the
+/// desktops nobody tests on. `role` is an id-mapped enum and proximity is
+/// arithmetic — both mean the same thing in every language, and between them
+/// they already carry the two cases the keywords were reaching for. A dialog
+/// scores on its role, and its buttons join it by sitting next to it.
+///
+/// What is genuinely lost: a consent banner marked up as a plain `group`,
+/// which has no dialog-ish role to score on. In English that used to be
+/// rescued by "cookie"/"accept" when it also just appeared. It is now caught
+/// only by the temporal signal, or not at all — the same way it was already
+/// never caught in Czech.
 fn modal_score(n: &UiNode) -> f32 {
     let role = n.role.to_ascii_lowercase();
-    let name = n.name.to_ascii_lowercase();
     let mut score = 0.0;
     if MODAL_ROLES.iter().any(|m| role.contains(m)) {
         score += 2.0;
     } else if role.contains("group") || role.contains("pane") || role.contains("image") {
         score -= 0.5;
-    }
-    // Deliberately below the threshold on its own. A keyword is *corroborating*
-    // evidence, not sufficient evidence: an OK and a Cancel sitting in a
-    // toolbar are not a dialog, and scoring them as one hid two real controls
-    // behind a MODAL banner in the first version of this file.
-    if MODAL_WORDS.iter().any(|w| {
-        name.split_whitespace()
-            .any(|t| t.trim_matches(|c: char| !c.is_alphanumeric()) == *w)
-    }) {
-        score += 0.6;
     }
     score
 }
@@ -163,6 +246,14 @@ fn shorten(text: &str, query: Option<&str>) -> String {
     format!("{head}…")
 }
 
+fn line(n: &UiNode) -> String {
+    let focus = if n.focused { " [FOCUS]" } else { "" };
+    format!(
+        "{} \"{}\" ({},{}){focus}",
+        n.role, n.name, n.center.x, n.center.y
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// What the caller is looking for. Steers text windows; never filters, so
@@ -195,9 +286,7 @@ pub struct UiView {
 /// compression.
 fn reduce(mut nodes: Vec<UiNode>, query: Option<&str>) -> Vec<UiNode> {
     // Noise: invisible, disabled, or unnamed and not actionable.
-    nodes.retain(|n| {
-        n.visible && n.enabled && (!n.name.trim().is_empty() || is_interactive(&n.role))
-    });
+    nodes.retain(|n| n.visible && n.enabled && (!n.name.trim().is_empty() || actionable(n)));
     for n in nodes.iter_mut() {
         n.name = shorten(n.name.trim(), query);
         n.role = n.role.to_ascii_lowercase();
@@ -212,7 +301,7 @@ fn reduce(mut nodes: Vec<UiNode>, query: Option<&str>) -> Vec<UiNode> {
             .find(|k| (k.center.x - n.center.x).abs() < 20 && (k.center.y - n.center.y).abs() < 20);
         match near {
             Some(k) => {
-                let better = match (is_interactive(&n.role), is_interactive(&k.role)) {
+                let better = match (actionable(&n), actionable(k)) {
                     (true, false) => true,
                     (false, true) => false,
                     _ => n.name.len() < k.name.len() && !n.name.is_empty(),
@@ -263,29 +352,41 @@ pub fn compress(raw: Vec<UiNode>, opts: &Options) -> UiView {
             true
         }
     });
-    // Second pass: a decision keyword next to a modal is that modal's own
-    // button. Without it the dialog is announced and the controls that
-    // dismiss it are left in the background list, which is the half a caller
-    // actually needs.
+    // Second pass: the controls that belong to a detected modal are that
+    // modal's own buttons. Without it the dialog is announced and the
+    // controls that dismiss it are left in the background list, which is the
+    // half a caller actually needs.
     if !modals.is_empty() {
-        let anchors: Vec<Point> = modals.iter().map(|m| m.center).collect();
+        let has_structure = structured(&nodes) || structured(&modals);
+        let anchors: Vec<&UiNode> = modals.iter().collect();
         let mut joined = Vec::new();
         nodes.retain(|n| {
-            // Any *interactive* control near a detected modal, not only one
-            // carrying an English decision keyword.
+            // Any *actionable* control that belongs to a detected modal, not
+            // only one carrying an English decision keyword.
             //
             // The keyword version was silently locale-bound. The verification
             // machine reports its taskbar as "Hlavní panel"; a Czech dialog's
             // `Zrušit` and `Potvrdit` score nothing against a list of `cancel`
             // and `confirm`, so the dialog was announced and the two buttons
             // that dismiss it were left in the background list — the half a
-            // caller actually needs. Role and proximity carry no vocabulary,
-            // so this works in every language, and the keyword list is
-            // demoted to what it always should have been: one weak extra
-            // signal for a banner that has no dialog-ish role at all.
-            let part_of_modal = (is_interactive(&n.role) || modal_score(n) > 0.0)
-                && anchors.iter().any(|a| near(*a, n.center));
-            if part_of_modal {
+            // caller actually needs. Role, focus and position carry no
+            // vocabulary, so this works in every language.
+            //
+            // "Belongs to" is containment where the agent reports it — same
+            // window, deeper than the dialog node — and a 300px radius where
+            // it does not. A dialog that is its own top-level window owns
+            // everything in it; one nested inside a window is told apart from
+            // the rest of that window's deep tree by proximity as well, since
+            // depth alone is not a parent link.
+            let belongs = anchors.iter().any(|a| {
+                if has_structure {
+                    let inside = n.window == a.window && n.depth > a.depth;
+                    inside && (a.depth == 0 || near(a.center, n.center))
+                } else {
+                    near(a.center, n.center)
+                }
+            });
+            if (actionable(n) || modal_score(n) > 0.0) && belongs {
                 joined.push(n.clone());
                 false
             } else {
@@ -299,7 +400,13 @@ pub fn compress(raw: Vec<UiNode>, opts: &Options) -> UiView {
     // threshold is the median height, floored at 40px and tripled — a gap
     // three rows tall is a change of region in any layout, without a table of
     // per-application coordinates.
-    nodes.sort_by_key(|n| (n.center.y, n.center.x));
+    //
+    // Window first, where the agent says which is which: the foreground
+    // window is read whole before anything behind it, instead of two
+    // windows' rows interleaving by y. A window boundary is a block boundary
+    // regardless of the gap. An older agent puts everything in window 0 and
+    // gets the plain y-then-x order it always had.
+    nodes.sort_by_key(|n| (n.window, n.center.y, n.center.x));
     let mut heights: Vec<u32> = nodes.iter().map(|n| n.h).filter(|h| *h > 0).collect();
     heights.sort_unstable();
     let median = heights.get(heights.len() / 2).copied().unwrap_or(0);
@@ -307,7 +414,7 @@ pub fn compress(raw: Vec<UiNode>, opts: &Options) -> UiView {
     let blocks: Vec<usize> = nodes
         .windows(2)
         .enumerate()
-        .filter(|(_, w)| w[1].center.y - w[0].center.y > gap)
+        .filter(|(_, w)| w[1].window != w[0].window || w[1].center.y - w[0].center.y > gap)
         .map(|(i, _)| i)
         .collect();
 
@@ -324,28 +431,36 @@ pub fn compress(raw: Vec<UiNode>, opts: &Options) -> UiView {
 
 impl UiView {
     /// One line per control, `[BLOCK]` between regions. Modals first and
-    /// labelled, because a caller that misses one clicks through it.
+    /// labelled, because a caller that misses one clicks through it. The
+    /// control with keyboard focus is marked `[FOCUS]`: it is where `type`
+    /// will land, and the one fact about the screen a caller most often
+    /// guesses wrong.
     pub fn render(&self) -> String {
         let mut out = String::new();
         if !self.modals.is_empty() {
             out.push_str("MODAL (handle this before anything behind it):\n");
             for m in &self.modals {
-                out.push_str(&format!(
-                    "  {} \"{}\" ({},{})\n",
-                    m.role, m.name, m.center.x, m.center.y
-                ));
+                out.push_str(&format!("  {}\n", line(m)));
             }
         }
         for (i, n) in self.nodes.iter().enumerate() {
-            out.push_str(&format!(
-                "{} \"{}\" ({},{})\n",
-                n.role, n.name, n.center.x, n.center.y
-            ));
+            out.push_str(&line(n));
+            out.push('\n');
             if self.blocks.contains(&i) {
                 out.push_str("[BLOCK]\n");
             }
         }
         out
+    }
+
+    /// The control that will receive typed text, if the agent reports focus
+    /// and something has it. `None` from an older agent means "not known",
+    /// not "nothing focused".
+    pub fn focused(&self) -> Option<&UiNode> {
+        self.modals
+            .iter()
+            .chain(self.nodes.iter())
+            .find(|n| n.focused)
     }
 
     /// Controls matching `query`, best first: an exact name, then a prefix,

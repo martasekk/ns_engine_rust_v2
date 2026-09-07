@@ -55,7 +55,11 @@ pub trait Pointer: Send + Sync {
         Err(unsupported())
     }
     /// Optional (protocol 2). The raw tree; `ui::compress` does the rest.
-    async fn ui_tree(&self) -> Result<Vec<ui::UiNode>, InputError> {
+    ///
+    /// `visible_only` asks the agent to leave out what is off screen. It is
+    /// the one filter the agent may apply, because the caller asked for it,
+    /// and `false` still means everything.
+    async fn ui_tree(&self, _visible_only: bool) -> Result<Vec<ui::UiNode>, InputError> {
         Err(unsupported())
     }
 }
@@ -63,7 +67,7 @@ pub trait Pointer: Send + Sync {
 fn unsupported() -> InputError {
     InputError::Agent {
         kind: ErrorKind::Unsupported,
-        detail: "clipboard is not available on this agent".into(),
+        detail: "not available on this agent".into(),
     }
 }
 
@@ -87,8 +91,8 @@ impl<P: Pointer + ?Sized> Pointer for std::sync::Arc<P> {
     async fn clipboard_write(&self, text: &str) -> Result<(), InputError> {
         (**self).clipboard_write(text).await
     }
-    async fn ui_tree(&self) -> Result<Vec<ui::UiNode>, InputError> {
-        (**self).ui_tree().await
+    async fn ui_tree(&self, visible_only: bool) -> Result<Vec<ui::UiNode>, InputError> {
+        (**self).ui_tree(visible_only).await
     }
 }
 
@@ -296,7 +300,12 @@ impl<P: Pointer> Session<P> {
     /// tree so the next call can tell what just appeared — the temporal half
     /// of modal detection.
     pub async fn ui_read(&self, query: Option<&str>) -> Result<ui::UiView, InputError> {
-        let raw = self.pointer.ui_tree().await?;
+        // Visible only. `compress` drops off-screen nodes first thing, and on
+        // a real desktop they were 73% of the tree — ~300 KB per read, over
+        // loopback, to keep ~800 nodes. Asking the agent to leave them out
+        // costs nothing in the result and halves its walk. Anyone who wants
+        // the whole tree holds the `Pointer` and can ask it for `false`.
+        let raw = self.pointer.ui_tree(true).await?;
         let previous = self.last_ui.lock().unwrap().clone();
         let view = ui::compress(
             raw.clone(),

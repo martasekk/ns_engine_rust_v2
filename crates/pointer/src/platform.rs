@@ -6,9 +6,17 @@
 //! held-key recovery, the audit log — is written once, above this line, and
 //! is already tested.
 //!
-//! Eight methods, all synchronous, all taking values that need no
+//! Eight required methods, all synchronous, all taking values that need no
 //! interpretation: a `Point` is an absolute physical pixel in virtual-desktop
-//! coordinates, and it has already been checked against a real screen.
+//! coordinates, and it has already been checked against a real screen. The
+//! rest have defaults, and every default is the slow or the pessimistic
+//! answer rather than a wrong one — override them for speed (`state`,
+//! `ui_tree_visible`) or for honesty (`local_hook_ok`, `armed`).
+//!
+//! Synchronous is a promise about the signature, not about the cost: the
+//! agent runs `ui_tree` and the clipboard calls on a blocking thread, so a
+//! two-second UI Automation walk or a clipboard held by another process does
+//! not stall the connections it is not serving.
 //!
 //! Implementing this for Windows is the whole of the Windows work.
 
@@ -25,6 +33,20 @@ pub trait Platform: Send + Sync {
     ///
     /// `Screens::state` increments on any display-configuration change.
     fn screens(&self) -> Result<Screens, InputError>;
+
+    /// The display-configuration counter alone, without the enumeration.
+    ///
+    /// The agent stamps `state` on every `performed`, `position` and `ui`
+    /// reply, and the default gets it the only way it can: a full
+    /// `screens()`. On Windows that is `EnumDisplayMonitors`,
+    /// `QueryDisplayConfig`, two `DisplayConfigGetDeviceInfo` per path and
+    /// `GetDpiForMonitor` per monitor, after every click, to read one number.
+    /// Override it with something that cannot go stale — a per-call
+    /// fingerprint of the monitor rectangles is tens of microseconds — and
+    /// skip only the identity queries. Must agree with `screens().state`.
+    fn state(&self) -> u64 {
+        self.screens().map(|s| s.state).unwrap_or(0)
+    }
 
     fn position(&self) -> Result<Point, InputError>;
 
@@ -101,6 +123,32 @@ pub trait Platform: Send + Sync {
     fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
         Err(unsupported("ui_tree"))
     }
+
+    /// `ui_tree` without the nodes that are off screen — the one filter the
+    /// platform may apply, and only because the caller asked for it
+    /// (`Op::UiTree { visible_only: true }`). On a real desktop 73% of the
+    /// tree came back `visible: false` and the compressor dropped every one
+    /// of them first thing; a provider-side `IsOffscreen == false` condition
+    /// halves the walk and returns exactly the 27% that survive.
+    ///
+    /// The default forwards to `ui_tree`, so an agent that has not
+    /// implemented it is merely slower, never wrong: the compressor drops
+    /// the same nodes either way. An override must return every node that
+    /// `ui_tree` would report as `visible: true` — a stricter filter is the
+    /// second copy of the compressor's judgement this seam exists to avoid.
+    fn ui_tree_visible(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        self.ui_tree()
+    }
+
+    /// Whether a person at the machine has armed input for this process,
+    /// where such a gate exists. `None` — the default — means "no gate, or
+    /// not saying", and is reported to the client as exactly that. Return
+    /// `Some` only from an agent that will answer the first `perform` with
+    /// `needs_confirmation` until the chord is pressed: then the client can
+    /// ask the person before that refusal rather than after it.
+    fn armed(&self) -> Option<bool> {
+        None
+    }
 }
 
 fn unsupported(what: &str) -> InputError {
@@ -120,6 +168,9 @@ fn unsupported(what: &str) -> InputError {
 impl<P: Platform + ?Sized> Platform for std::sync::Arc<P> {
     fn screens(&self) -> Result<Screens, InputError> {
         (**self).screens()
+    }
+    fn state(&self) -> u64 {
+        (**self).state()
     }
     fn position(&self) -> Result<Point, InputError> {
         (**self).position()
@@ -153,6 +204,12 @@ impl<P: Platform + ?Sized> Platform for std::sync::Arc<P> {
     }
     fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
         (**self).ui_tree()
+    }
+    fn ui_tree_visible(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        (**self).ui_tree_visible()
+    }
+    fn armed(&self) -> Option<bool> {
+        (**self).armed()
     }
 }
 

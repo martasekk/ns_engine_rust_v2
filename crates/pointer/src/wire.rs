@@ -166,7 +166,17 @@ pub enum Op {
         text: String,
     },
     /// The target's controls, uncompressed. Protocol 2, optional.
-    UiTree,
+    ///
+    /// `visible_only` asks the agent to leave out what is off screen. It is
+    /// the one filter the agent may apply, and only because the caller asked:
+    /// the compressor drops invisible nodes first thing, and on a real desktop
+    /// they were 73% of the tree — ~300 KB per read to keep ~800 nodes.
+    /// Defaults to `false`, so `{"op":"ui_tree"}` from an older client still
+    /// parses and still means "everything".
+    UiTree {
+        #[serde(default)]
+        visible_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,6 +199,15 @@ pub enum ResultBody {
         /// as `false` — the safe assumption.
         #[serde(default)]
         local_override: bool,
+        /// Whether a person at the machine has armed this session, where the
+        /// agent has an arming gate at all. `None` means the agent did not
+        /// say — an older agent, or one with no gate — and a caller should
+        /// not read that as either answer. `Some(false)` is worth acting on
+        /// at `hello` time: the first `perform` is going to come back
+        /// `needs_confirmation`, and asking the person *before* that refusal
+        /// is better than reporting it after.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        armed: Option<bool>,
     },
     Screens {
         screens: Vec<Screen>,
@@ -234,6 +253,19 @@ pub enum ErrorKind {
     Unsupported,
     /// Unparseable, unknown op, or wrong protocol version.
     Protocol,
+    /// A person at the target machine has not approved this yet.
+    ///
+    /// Distinct from both of its neighbours, and the distinction is the point.
+    /// `Blocked` is the OS refusing, and it will keep refusing until something
+    /// about the machine changes. `Suspended` is the owner having taken
+    /// control back, and it lapses on its own. This one lapses when a human
+    /// does a specific thing, and the `detail` is expected to say which thing
+    /// — which chord, on which machine. A caller told `Blocked` would
+    /// reasonably give up on something one keypress would allow.
+    ///
+    /// It is not retryable in a loop: retrying changes nothing until the
+    /// person acts, so the caller's move is to relay the `detail` and wait.
+    NeedsConfirmation,
     Internal,
 }
 

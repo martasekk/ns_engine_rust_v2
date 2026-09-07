@@ -567,8 +567,20 @@ async fn listening(
     limits: Limits,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> String {
+    listening_with(platform, limits, clock, None).await
+}
+
+async fn listening_with<P: Platform + 'static>(
+    platform: Arc<P>,
+    limits: Limits,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    audit: Option<Arc<Recorder>>,
+) -> String {
     let c = cfg(limits);
-    let agent = Agent::new(platform, c).with_clock(Box::new(move || clock()));
+    let mut agent = Agent::new(platform, c).with_clock(Box::new(move || clock()));
+    if let Some(a) = audit {
+        agent = agent.with_audit(Box::new(AuditHandle(a)));
+    }
     let listener = bind(
         &AgentConfig {
             token: TOKEN.into(),
@@ -804,4 +816,297 @@ async fn an_agent_with_no_local_override_says_so_rather_than_looking_healthy() {
         .await
         .unwrap();
     assert!(c.local_override());
+}
+
+/// `state` rides on every `performed`, `position` and `ui` reply, and the
+/// default way to get it is a full display enumeration. A platform that can
+/// answer cheaper overrides `state()`, and that override — not `screens()` —
+/// is what the replies carry.
+#[tokio::test]
+async fn the_state_stamp_comes_from_state_not_from_a_full_enumeration() {
+    struct Counted {
+        inner: NullPlatform,
+        enumerations: std::sync::atomic::AtomicUsize,
+    }
+    impl Platform for Counted {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.enumerations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.screens()
+        }
+        fn state(&self) -> u64 {
+            42
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.inner.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.inner.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.inner.button(b, d)
+        }
+        fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+            self.inner.scroll(dx, dy)
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.inner.key(k, d)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.inner.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            self.inner.local_activity()
+        }
+        fn local_hook_ok(&self) -> bool {
+            true
+        }
+        fn ui_tree(&self) -> Result<Vec<nspointer::ui::UiNode>, InputError> {
+            Ok(Vec::new())
+        }
+    }
+    let p = Arc::new(Counted {
+        inner: NullPlatform::new(layout()),
+        enumerations: Default::default(),
+    });
+    let c = connect(p.clone(), Limits::default(), None, fixed_clock(0), TOKEN)
+        .await
+        .unwrap();
+    // `screens().state` is 3 in `layout()`; the override says 42.
+    let before = p.enumerations.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(c.perform(&[Step::Move { x: 1, y: 1 }]).await.unwrap(), 42);
+    c.position().await.unwrap();
+    c.ui_tree(true).await.unwrap();
+    let after = p.enumerations.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after, before,
+        "three replies stamped with state, zero display enumerations"
+    );
+    // And `screens` itself still enumerates, and still reports its own number.
+    assert_eq!(c.screens().await.unwrap().state, 3);
+}
+
+/// `ui_tree` is a one-to-two second synchronous walk on the target. It runs
+/// on a blocking thread, so a second connection's `perform` goes through
+/// while the first is still waiting — provably, on a `current_thread`
+/// runtime, where a blocking call on a worker would stall everything.
+#[tokio::test]
+async fn a_slow_ui_tree_does_not_stall_another_connection() {
+    struct Slow(NullPlatform);
+    impl Platform for Slow {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.0.screens()
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.0.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.0.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.0.button(b, d)
+        }
+        fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+            self.0.scroll(dx, dy)
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.0.key(k, d)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.0.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+        fn local_hook_ok(&self) -> bool {
+            true
+        }
+        fn ui_tree(&self) -> Result<Vec<nspointer::ui::UiNode>, InputError> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(Vec::new())
+        }
+    }
+    let addr = listening_with(
+        Arc::new(Slow(NullPlatform::new(layout()))),
+        Limits::default(),
+        fixed_clock(0),
+        None,
+    )
+    .await;
+    let a = dial(&addr, TOKEN).await.unwrap();
+    let b = dial(&addr, TOKEN).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let walk = tokio::spawn(async move { a.ui_tree(false).await });
+    // Give the walk time to be dispatched before racing it.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    b.perform(&[Step::Move { x: 5, y: 5 }]).await.unwrap();
+    let perform_took = started.elapsed();
+    walk.await.unwrap().unwrap();
+    assert!(
+        perform_took < std::time::Duration::from_millis(300),
+        "perform waited {perform_took:?} behind a 400ms ui_tree"
+    );
+}
+
+/// A key-up the OS refuses is a key that is still down after the agent
+/// believed it released it. It is recorded, kept, and tried again before the
+/// next `perform` — on any connection, because the one that pressed it has
+/// usually just gone.
+#[tokio::test]
+async fn a_refused_release_is_recorded_and_retried_on_the_next_perform() {
+    struct StickyUp {
+        inner: NullPlatform,
+        refuse_ups: std::sync::atomic::AtomicBool,
+    }
+    impl Platform for StickyUp {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.inner.screens()
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.inner.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.inner.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.inner.button(b, d)
+        }
+        fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+            self.inner.scroll(dx, dy)
+        }
+        fn key(&self, k: &Key, down: bool) -> Result<(), InputError> {
+            if !down && self.refuse_ups.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(InputError::Agent {
+                    kind: ErrorKind::Blocked,
+                    detail: "secure desktop".into(),
+                });
+            }
+            self.inner.key(k, down)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.inner.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+        fn local_hook_ok(&self) -> bool {
+            true
+        }
+    }
+    let p = Arc::new(StickyUp {
+        inner: NullPlatform::new(layout()),
+        refuse_ups: std::sync::atomic::AtomicBool::new(true),
+    });
+    let audit = Arc::new(Recorder::default());
+    let addr = listening_with(
+        p.clone(),
+        Limits::default(),
+        fixed_clock(0),
+        Some(audit.clone()),
+    )
+    .await;
+
+    // Connection one presses Ctrl and goes away while the OS refuses key-ups.
+    {
+        let c = dial(&addr, TOKEN).await.unwrap();
+        c.perform(&[Step::Key {
+            key: Key::Ctrl,
+            down: true,
+        }])
+        .await
+        .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !audit.events().contains(&"release_refused".to_string()) {
+        assert!(std::time::Instant::now() < deadline, "{:?}", audit.events());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !p.inner.log().iter().any(|l| l == "key Ctrl false"),
+        "the refusal was real: no release reached the platform"
+    );
+    let refused = audit.0.lock().unwrap().clone();
+    let refused = refused
+        .iter()
+        .find(|e| e["event"] == "release_refused")
+        .unwrap()
+        .clone();
+    assert_eq!(refused["keys"].as_array().unwrap().len(), 1, "{refused}");
+
+    // The OS relents. Connection two performs something unrelated, and the
+    // stuck Ctrl is released before its batch.
+    p.refuse_ups
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let c = dial(&addr, TOKEN).await.unwrap();
+    c.perform(&[Step::Move { x: 9, y: 9 }]).await.unwrap();
+    let log = p.inner.log();
+    let up = log
+        .iter()
+        .position(|l| l == "key Ctrl false")
+        .expect("retried");
+    let mv = log.iter().position(|l| l == "move 9,9").unwrap();
+    assert!(up < mv, "release before the batch, not after: {log:?}");
+    let events = audit.events();
+    assert!(
+        events.contains(&"release_retried".to_string()),
+        "{events:?}"
+    );
+}
+
+/// What the agent said about arming at `hello` is what the client holds.
+/// An agent with no gate says nothing, and nothing is what the client knows.
+#[tokio::test]
+async fn armed_reaches_the_client_and_silence_is_not_an_answer() {
+    struct Gated(NullPlatform);
+    impl Platform for Gated {
+        fn screens(&self) -> Result<Screens, InputError> {
+            self.0.screens()
+        }
+        fn position(&self) -> Result<Point, InputError> {
+            self.0.position()
+        }
+        fn move_to(&self, p: Point) -> Result<(), InputError> {
+            self.0.move_to(p)
+        }
+        fn button(&self, b: Button, d: bool) -> Result<(), InputError> {
+            self.0.button(b, d)
+        }
+        fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+            self.0.scroll(dx, dy)
+        }
+        fn key(&self, k: &Key, d: bool) -> Result<(), InputError> {
+            self.0.key(k, d)
+        }
+        fn text(&self, s: &str) -> Result<(), InputError> {
+            self.0.text(s)
+        }
+        fn local_activity(&self) -> bool {
+            false
+        }
+        fn armed(&self) -> Option<bool> {
+            Some(false)
+        }
+    }
+    let c = connect(
+        Arc::new(Gated(NullPlatform::new(layout()))),
+        Limits::default(),
+        None,
+        fixed_clock(0),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.armed(), Some(false));
+
+    let c = connect(
+        Arc::new(NullPlatform::new(layout())),
+        Limits::default(),
+        None,
+        fixed_clock(0),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.armed(), None, "no gate is not the same as not armed");
 }

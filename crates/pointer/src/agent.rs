@@ -17,7 +17,7 @@ use crate::platform::Platform;
 use crate::wire::{
     Button, ErrorKind, InputError, Key, Op, Request, Response, ResultBody, Step, PROTOCOL,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// An append-only record of what was actually injected. Mirrors the shape of
@@ -150,10 +150,23 @@ impl Held {
     fn is_empty(&self) -> bool {
         self.keys.is_empty() && self.buttons.is_empty()
     }
+
+    fn absorb(&mut self, other: Held) {
+        for k in other.keys {
+            self.key(&k, true);
+        }
+        for b in other.buttons {
+            self.button(b, true);
+        }
+    }
 }
 
 pub struct Agent<P: Platform> {
-    platform: P,
+    /// Shared rather than owned so a blocking call can be moved onto a
+    /// blocking thread with the platform it needs: `ui_tree` is a one-to-two
+    /// second walk and the clipboard retries for up to 200ms when another
+    /// process holds it, and neither belongs on a runtime worker.
+    platform: Arc<P>,
     cfg: AgentConfig,
     audit: Box<dyn Audit>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -162,9 +175,13 @@ pub struct Agent<P: Platform> {
     suspended_until: Mutex<u64>,
     bucket: Mutex<Bucket>,
     live: std::sync::atomic::AtomicU32,
+    /// Keys and buttons the OS refused to release. Machine-wide, like the
+    /// override: the connection that pressed them may be gone by the time a
+    /// release can succeed, and a stuck Ctrl is stuck for whoever comes next.
+    stuck: Mutex<Held>,
 }
 
-impl<P: Platform> Agent<P> {
+impl<P: Platform + 'static> Agent<P> {
     pub fn new(platform: P, cfg: AgentConfig) -> Self {
         let limits_burst = cfg.limits.burst;
         let now = std::time::SystemTime::now()
@@ -172,7 +189,7 @@ impl<P: Platform> Agent<P> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Self {
-            platform,
+            platform: Arc::new(platform),
             cfg,
             audit: Box::new(NoAudit),
             clock: Box::new(|| {
@@ -192,6 +209,7 @@ impl<P: Platform> Agent<P> {
                 last_ms: now,
             }),
             live: std::sync::atomic::AtomicU32::new(0),
+            stuck: Mutex::new(Held::default()),
         }
     }
 
@@ -256,6 +274,13 @@ impl<P: Platform> Agent<P> {
     /// Release everything still held, innermost first. Best effort by
     /// definition: this runs when something has already gone wrong, and a
     /// failure here must not mask it.
+    ///
+    /// Best effort is not the same as forgotten. A key-up the OS refuses —
+    /// a UAC prompt came up, the foreground window is elevated — is a key
+    /// that is still down after this returns, and `let _ =` was the agent
+    /// believing otherwise. Refusals are recorded and kept in `stuck`, and
+    /// the next `perform` on any connection tries them again before it does
+    /// anything else.
     fn release(&self, held: &mut Held, why: &str) {
         if held.is_empty() {
             return;
@@ -267,12 +292,57 @@ impl<P: Platform> Agent<P> {
             "keys": held.keys.len(),
             "buttons": held.buttons.len(),
         }));
+        let refused = self.release_each(held);
+        if !refused.is_empty() {
+            self.audit.record(&serde_json::json!({
+                "at": (self.clock)(),
+                "event": "release_refused",
+                "why": why,
+                "keys": refused.keys,
+                "buttons": refused.buttons,
+            }));
+            self.stuck.lock().unwrap().absorb(refused);
+        }
+    }
+
+    /// Try to release each of `held`, innermost first. What comes back is
+    /// what the OS would not let go of; `held` is empty afterwards either
+    /// way, because the caller's record of what *it* pressed is no longer
+    /// the truth about the keyboard.
+    fn release_each(&self, held: &mut Held) -> Held {
+        let mut refused = Held::default();
         for k in held.keys.drain(..).rev() {
-            let _ = self.platform.key(&k, false);
+            if self.platform.key(&k, false).is_err() {
+                refused.keys.push(k);
+            }
         }
         for b in held.buttons.drain(..).rev() {
-            let _ = self.platform.button(b, false);
+            if self.platform.button(b, false).is_err() {
+                refused.buttons.push(b);
+            }
         }
+        refused
+    }
+
+    /// Retry the releases the OS refused earlier, before this batch adds to
+    /// them. A still-stuck modifier is reported rather than hidden; the batch
+    /// goes ahead regardless, because whatever refused the key-up will refuse
+    /// the batch too, and that refusal is the more useful error.
+    fn retry_stuck(&self) {
+        let mut stuck = self.stuck.lock().unwrap();
+        if stuck.is_empty() {
+            return;
+        }
+        let before = (stuck.keys.len(), stuck.buttons.len());
+        let still = self.release_each(&mut stuck);
+        let after = (still.keys.len(), still.buttons.len());
+        self.audit.record(&serde_json::json!({
+            "at": (self.clock)(),
+            "event": "release_retried",
+            "released": (before.0 - after.0) + (before.1 - after.1),
+            "still_stuck": after.0 + after.1,
+        }));
+        *stuck = still;
     }
 
     async fn dispatch(&self, req: Request, authed: &mut bool, held: &mut Held) -> Response {
@@ -316,6 +386,7 @@ impl<P: Platform> Agent<P> {
                     platform: std::env::consts::OS.into(),
                     protocol: PROTOCOL,
                     local_override: hook_ok,
+                    armed: self.platform.armed(),
                 },
             );
         }
@@ -336,7 +407,7 @@ impl<P: Platform> Agent<P> {
                 Err(e) => err_response(id, e),
             },
             Op::Position => {
-                let state = self.platform.screens().map(|s| s.state).unwrap_or(0);
+                let state = self.platform.state();
                 match self.platform.position() {
                     Ok(p) => Response::ok(
                         id,
@@ -350,20 +421,35 @@ impl<P: Platform> Agent<P> {
                 }
             }
             Op::Perform { steps } => self.perform(id, steps, held).await,
+            // The three slow, synchronous platform calls run on a blocking
+            // thread. Not `block_in_place`: that panics on a `current_thread`
+            // runtime, which is what `#[tokio::test]` hands out.
+            Op::UiTree { visible_only } => {
+                let r = self
+                    .blocking(move |p| {
+                        if visible_only {
+                            p.ui_tree_visible()
+                        } else {
+                            p.ui_tree()
+                        }
+                    })
+                    .await;
+                match r {
+                    Ok(nodes) => {
+                        self.audit.record(&serde_json::json!({
+                            "at": (self.clock)(), "event": "ui_tree", "nodes": nodes.len(),
+                            "visible_only": visible_only,
+                        }));
+                        let state = self.platform.state();
+                        Response::ok(id, ResultBody::Ui { nodes, state })
+                    }
+                    Err(e) => err_response(id, e),
+                }
+            }
             // Clipboard contents are not written to the audit log — only the
             // length. A machine's clipboard holds passwords often enough that
             // recording it would turn the audit trail into the leak.
-            Op::UiTree => match self.platform.ui_tree() {
-                Ok(nodes) => {
-                    self.audit.record(&serde_json::json!({
-                        "at": (self.clock)(), "event": "ui_tree", "nodes": nodes.len(),
-                    }));
-                    let state = self.platform.screens().map(|s| s.state).unwrap_or(0);
-                    Response::ok(id, ResultBody::Ui { nodes, state })
-                }
-                Err(e) => err_response(id, e),
-            },
-            Op::ClipboardRead => match self.platform.clipboard_read() {
+            Op::ClipboardRead => match self.blocking(|p| p.clipboard_read()).await {
                 Ok(text) => {
                     self.audit.record(&serde_json::json!({
                         "at": (self.clock)(), "event": "clipboard_read", "chars": text.chars().count(),
@@ -376,7 +462,7 @@ impl<P: Platform> Agent<P> {
                 self.audit.record(&serde_json::json!({
                     "at": (self.clock)(), "event": "clipboard_write", "chars": text.chars().count(),
                 }));
-                match self.platform.clipboard_write(&text) {
+                match self.blocking(move |p| p.clipboard_write(&text)).await {
                     Ok(()) => Response::ok(
                         id,
                         ResultBody::Clipboard {
@@ -386,6 +472,24 @@ impl<P: Platform> Agent<P> {
                     Err(e) => err_response(id, e),
                 }
             }
+        }
+    }
+
+    /// Run a synchronous platform call where it cannot stall the runtime. A
+    /// panic inside the platform surfaces as `Internal` rather than taking
+    /// the connection — the socket is the one place a caller can be told.
+    async fn blocking<T, F>(&self, f: F) -> Result<T, InputError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&P) -> Result<T, InputError> + Send + 'static,
+    {
+        let p = self.platform.clone();
+        match tokio::task::spawn_blocking(move || f(&p)).await {
+            Ok(r) => r,
+            Err(e) => Err(InputError::Agent {
+                kind: ErrorKind::Internal,
+                detail: format!("platform call did not complete: {e}"),
+            }),
         }
     }
 
@@ -422,6 +526,10 @@ impl<P: Platform> Agent<P> {
             return Response::err(id, ErrorKind::Internal, "rate limit");
         }
 
+        // Whatever an earlier release could not let go of comes first, or
+        // this batch's clicks land as Ctrl+clicks.
+        self.retry_stuck();
+
         let n = steps.len() as u32;
         for step in &steps {
             if let Err(e) = self.apply(step, held).await {
@@ -437,7 +545,7 @@ impl<P: Platform> Agent<P> {
         self.audit.record(&serde_json::json!({
             "at": now, "event": "performed", "steps": n,
         }));
-        let state = self.platform.screens().map(|s| s.state).unwrap_or(0);
+        let state = self.platform.state();
         Response::ok(id, ResultBody::Performed { steps: n, state })
     }
 

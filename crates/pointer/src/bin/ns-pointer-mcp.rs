@@ -44,6 +44,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Read off the connection before the session takes it. Both go to the
+    // model through `initialize` and `screens_list`; the warnings below are
+    // for whoever is reading this process's stderr.
+    let local_override = pointer.local_override();
+    let armed = pointer.armed();
+    if !local_override {
+        eprintln!(
+            "warning: the agent at {addr} has no local override — nobody at that \
+             machine can interrupt input sent from here by touching the mouse."
+        );
+    }
+    if armed == Some(false) {
+        eprintln!(
+            "note: the agent at {addr} is not armed — the first click, key or text \
+             will be refused with needs_confirmation until someone presses the \
+             arming chord on the machine."
+        );
+    }
     let session = match Session::open(pointer).await {
         Ok(s) => s,
         Err(e) => {
@@ -56,7 +74,7 @@ async fn main() {
         session.screens().screens.len()
     );
 
-    let server = McpServer::new(session);
+    let server = McpServer::new(session).with_agent(local_override, armed);
     if let Err(e) = server.serve(tokio::io::stdin(), tokio::io::stdout()).await {
         eprintln!("mcp: {e}");
         std::process::exit(1);

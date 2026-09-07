@@ -1,0 +1,90 @@
+# The bundle's manifest: what `ns-pointer` looks like as a standalone crate,
+# outside this workspace, on the machine it is going to drive.
+#
+# It exists as a file rather than as a heredoc inside the packaging script for
+# one reason: the pins below have been re-resolved away twice by a stray
+# `cargo add`, and a version you can see in a diff is harder to lose than one
+# generated on the fly.
+#
+# --- Why the pins ---------------------------------------------------------
+#
+# The target that matters is `x86_64-pc-windows-gnu`, and unpinned this crate
+# does not reach our code at all:
+#
+#     error: error calling dlltool 'dlltool.exe': program not found
+#
+# The chain is tokio 1.53 -> windows-sys 0.61 -> `raw-dylib` link attributes.
+# rustc implements `raw-dylib` on a GNU target by shelling out to `dlltool`,
+# which needs an assembler the bundled MinGW does not ship. The 0.52 line of
+# windows-sys links against prebuilt import libraries instead and needs no
+# such tool, so holding tokio on the 1.43 line holds windows-sys there too.
+#
+# `mio` is pinned for the same reason and must move with tokio: it is a
+# transitive dependency that pulls its own windows-sys, and letting it float
+# reintroduces the 0.61 line through the back door with tokio still pinned.
+#
+# These are `=` pins, not floors. A caret would let the resolver walk straight
+# back to the version that fails, and it would fail on the target machine
+# rather than here — the one place the breakage is expensive to see.
+#
+# --- What the pins measurably do ------------------------------------------
+#
+#   cargo tree --target x86_64-pc-windows-gnu -i windows-sys
+#
+# pinned      windows-sys 0.52.0  <- mio 1.0.3, tokio 1.43.1, socket2 0.5.10
+# unpinned    windows-sys 0.61.2  <- mio 1.2.3, tokio 1.53.1, socket2 0.6.5
+#
+# Note `socket2` moves too, and is not pinned here: it is reached only through
+# tokio, so tokio's pin already holds it. mio is listed explicitly because
+# this crate does not depend on it directly either — the entry exists purely
+# to keep the resolver from advancing it on its own.
+#
+# --- Reading the lockfile without being misled ----------------------------
+#
+# `Cargo.lock` contains windows-sys 0.61.2 *even when the pins are working*,
+# which looks exactly like the pin having failed. It has not. That copy is
+# reached by
+#
+#   windows-sys 0.61.2 <- errno <- signal-hook-registry
+#
+# which is tokio's **unix** signal handling: present in the lockfile, absent
+# from the windows-gnu build graph. Grepping the lockfile is therefore not a
+# check. Use the `cargo tree --target` command above, which resolves for one
+# target and answers the question actually being asked.
+#
+# The alternative, if you would rather not carry pins: build the Windows side
+# with the MSVC toolchain, which has no `dlltool` in the path at all. Then
+# these can be relaxed to "1". Do not relax them for a GNU build.
+#
+# Building this bundle on Linux cannot catch a regression here; only building
+# it on the target can. Treat a green `cargo test` here as evidence about the
+# protocol logic and about nothing else.
+
+[package]
+name = "ns-pointer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nspointer"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+
+# Pinned. See the note above before changing either line.
+tokio = { version = "=1.43.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+    "net",
+] }
+mio = "=1.0.3"
+
+[dev-dependencies]
+tokio = { version = "=1.43.1", features = ["full"] }

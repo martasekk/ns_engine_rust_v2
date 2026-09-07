@@ -56,6 +56,13 @@ fn main() {
         },
     );
     line(
+        "REQ ui_tree",
+        &Request {
+            id: 7,
+            op: Op::UiTree { visible_only: true },
+        },
+    );
+    line(
         "RES ready",
         &Response::ok(
             1,
@@ -64,6 +71,7 @@ fn main() {
                 platform: "windows".into(),
                 protocol: PROTOCOL,
                 local_override: true,
+                armed: Some(false),
             },
         ),
     );
@@ -116,6 +124,27 @@ fn main() {
     line(
         "RES performed",
         &Response::ok(4, ResultBody::Performed { steps: 7, state: 7 }),
+    );
+    line(
+        "RES ui",
+        &Response::ok(
+            7,
+            ResultBody::Ui {
+                nodes: vec![nspointer::ui::UiNode {
+                    role: "Button".into(),
+                    name: "Save".into(),
+                    center: Point::new(300, 200),
+                    h: 24,
+                    visible: true,
+                    enabled: true,
+                    focused: false,
+                    focusable: true,
+                    depth: 3,
+                    window: 0,
+                }],
+                state: 7,
+            },
+        ),
     );
     line(
         "RES error",

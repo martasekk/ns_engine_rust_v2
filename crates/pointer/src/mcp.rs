@@ -244,7 +244,17 @@ pub enum Confirm {
 pub struct McpServer<P: Pointer> {
     session: Mutex<Session<P>>,
     confirm: Confirm,
+    /// This server's own gate: whether the caller has said yes once.
     armed: std::sync::atomic::AtomicBool,
+    /// The agent's gate, as it last reported it (protocol §4.7). Seeded from
+    /// `ready` at connect, then kept current from what performs come back
+    /// with: an accepted commit means a person armed it, `needs_confirmation`
+    /// means they have not. `None` is an agent with no gate, or an older one,
+    /// and is never read as either answer.
+    agent_armed: std::sync::Mutex<Option<bool>>,
+    /// Whether the agent said a person at the machine can interrupt it.
+    /// `None` until the binary tells us; a test double has no `ready`.
+    local_override: Option<bool>,
 }
 
 /// Tools that put input on the desktop. A read is not one of them, and
@@ -262,12 +272,84 @@ impl<P: Pointer> McpServer<P> {
             session: Mutex::new(session),
             confirm: Confirm::FirstAction,
             armed: std::sync::atomic::AtomicBool::new(false),
+            agent_armed: std::sync::Mutex::new(None),
+            local_override: None,
         }
     }
 
     pub fn with_confirm(mut self, confirm: Confirm) -> Self {
         self.confirm = confirm;
         self
+    }
+
+    /// What the agent said in `ready`. The binary reads both off
+    /// `RemotePointer` before the session takes it; a caller building over a
+    /// double can leave them unset and nothing is claimed either way.
+    pub fn with_agent(self, local_override: bool, armed: Option<bool>) -> Self {
+        *self.agent_armed.lock().unwrap() = armed;
+        Self {
+            local_override: Some(local_override),
+            ..self
+        }
+    }
+
+    /// The agent's arming state as this server currently understands it.
+    pub fn agent_armed(&self) -> Option<bool> {
+        *self.agent_armed.lock().unwrap()
+    }
+
+    /// Learn from what a commit came back with. Only an agent that has
+    /// declared a gate is tracked: an accepted click on a gateless agent says
+    /// nothing about arming, and `Some(true)` there would be an invention.
+    fn observe(&self, name: &str, outcome: &Result<Value, InputError>) {
+        if !irreversible(name) {
+            return;
+        }
+        let mut agent = self.agent_armed.lock().unwrap();
+        match outcome {
+            Err(InputError::Agent {
+                kind: ErrorKind::NeedsConfirmation,
+                ..
+            }) => *agent = Some(false),
+            Ok(_) if agent.is_some() => *agent = Some(true),
+            _ => {}
+        }
+    }
+
+    /// The `instructions` a client hands its model at `initialize` — the one
+    /// place the spec gives a server to say how it should be used, and the
+    /// place `armed` belongs: a model told at connect that the first click
+    /// will be refused until a person presses a chord can ask for that up
+    /// front, instead of discovering it from the refusal.
+    fn instructions(&self) -> String {
+        let mut s = String::from(
+            "Drives the pointer and keyboard of a real desktop on another machine. \
+             Call screens_list first. To click something, prefer ui_find (or ui_read) \
+             to name the control, then pointer_click at the point it returns; guess \
+             coordinates only from a screenshot mapped with the scale screens_list \
+             gives. type_text types characters; key_press presses Enter, Tab and \
+             shortcuts; for long text, clipboard_write then key_press ctrl+v. A \
+             refusal from the machine arrives as a tool result, not a protocol error: \
+             read it, because it says what to do next.",
+        );
+        match self.agent_armed() {
+            Some(false) => s.push_str(
+                " The agent reports this session is NOT ARMED: a person at that machine \
+                 must press its arming chord before the first click, key or text is \
+                 accepted, and until then those come back needs_confirmation naming the \
+                 chord. Tell the user before you start, and do not retry in a loop.",
+            ),
+            Some(true) => s.push_str(" A person at that machine has armed this session for input."),
+            None => {}
+        }
+        if self.local_override == Some(false) {
+            s.push_str(
+                " There is NO LOCAL OVERRIDE on that machine: its user cannot interrupt \
+                 this session by touching the mouse or keyboard. Act conservatively and \
+                 stop at the first sign that something unexpected has focus.",
+            );
+        }
+        s
     }
 
     /// Whether this call may proceed, or the sentence explaining what it
@@ -313,10 +395,18 @@ impl<P: Pointer> McpServer<P> {
         } else {
             ""
         };
+        // Two gates, two people. Saying so here saves the model a round trip
+        // it would otherwise spend learning it from the agent's refusal.
+        let machine = if self.agent_armed() == Some(false) {
+            " The machine itself is also not yet armed: a person there must \
+             press its arming chord as well."
+        } else {
+            ""
+        };
         Some(format!(
             "This would {what} on a real desktop, which cannot be undone. \
              Call again with \"confirm\": true if the person you are working for \
-             wants that.{scope}"
+             wants that.{scope}{machine}"
         ))
     }
 
@@ -362,6 +452,7 @@ impl<P: Pointer> McpServer<P> {
                         "name": "ns-pointer",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
+                    "instructions": self.instructions(),
                 }
             }),
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
@@ -415,13 +506,31 @@ impl<P: Pointer> McpServer<P> {
                 match s.refresh().await {
                     Ok(()) => {
                         let sc = s.screens();
-                        Ok(json!({
+                        let mut v = json!({
                             "screens": sc.screens.iter().map(|x| json!({
                                 "id": x.id.0, "bounds": x.bounds, "scale": x.scale,
                                 "primary": x.primary, "label": x.label,
                             })).collect::<Vec<_>>(),
                             "state": sc.state,
-                        }))
+                        });
+                        // The tool every description says to call first is
+                        // the other place a model will read this. Present
+                        // only when the agent has a gate, so absence is not
+                        // mistaken for "armed".
+                        if let Some(armed) = self.agent_armed() {
+                            v["armed"] = json!(armed);
+                            if !armed {
+                                v["note"] = json!(
+                                    "Not armed: a person at the machine must press the \
+                                     arming chord before the first click, key or text \
+                                     is accepted."
+                                );
+                            }
+                        }
+                        if let Some(lo) = self.local_override {
+                            v["local_override"] = json!(lo);
+                        }
+                        Ok(v)
                     }
                     Err(e) => Err(e),
                 }
@@ -548,6 +657,7 @@ impl<P: Pointer> McpServer<P> {
             }
             other => return rpc_error(id, -32602, &format!("unknown tool: {other}")),
         };
+        self.observe(name, &outcome);
 
         match outcome {
             Ok(v) => tool_ok(id, v),
@@ -573,6 +683,19 @@ impl<P: Pointer> McpServer<P> {
                         kind: ErrorKind::Unsupported,
                         ..
                     } => " This agent does not implement that; use another approach.",
+                    // The one refusal a human can lift from where they are
+                    // sitting, so it is the one worth spending a sentence on.
+                    // The agent's own detail names the chord and the machine;
+                    // repeating the call cannot change the answer, and a model
+                    // that loops here just burns the session in silence.
+                    InputError::Agent {
+                        kind: ErrorKind::NeedsConfirmation,
+                        ..
+                    } => {
+                        " A person at that machine has to approve this first. \
+                          Do not retry in a loop: tell the user what you are about \
+                          to do and what the error says will arm it."
+                    }
                     _ => "",
                 };
                 tool_err(id, &format!("{e}.{hint}"))

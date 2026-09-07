@@ -13,6 +13,9 @@ pub struct RemotePointer<R, W> {
     next_id: std::sync::atomic::AtomicU64,
     /// From the agent's `Ready`. `false` means it has no brake.
     local_override: std::sync::atomic::AtomicBool,
+    /// From the agent's `Ready`. `None` means the agent has no arming gate,
+    /// or did not say.
+    armed: std::sync::Mutex<Option<bool>>,
 }
 
 impl<R, W> RemotePointer<R, W> {
@@ -20,6 +23,14 @@ impl<R, W> RemotePointer<R, W> {
     pub fn local_override(&self) -> bool {
         self.local_override
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a person at the machine has armed this session, as of
+    /// `hello`. `Some(false)` means the first `perform` will come back
+    /// `needs_confirmation`, so a caller can ask them now rather than then.
+    /// `None` is not knowledge either way.
+    pub fn armed(&self) -> Option<bool> {
+        *self.armed.lock().unwrap()
     }
 }
 
@@ -35,6 +46,7 @@ where
             io: Mutex::new((read, write)),
             next_id: std::sync::atomic::AtomicU64::new(1),
             local_override: std::sync::atomic::AtomicBool::new(false),
+            armed: std::sync::Mutex::new(None),
         };
         match p
             .call(Op::Hello {
@@ -46,10 +58,12 @@ where
             ResultBody::Ready {
                 protocol,
                 local_override,
+                armed,
                 ..
             } if protocol == PROTOCOL => {
                 p.local_override
                     .store(local_override, std::sync::atomic::Ordering::SeqCst);
+                *p.armed.lock().unwrap() = armed;
                 Ok(p)
             }
             ResultBody::Ready { protocol, .. } => Err(InputError::Transport(format!(
@@ -142,8 +156,8 @@ where
         }
     }
 
-    async fn ui_tree(&self) -> Result<Vec<crate::ui::UiNode>, InputError> {
-        match self.call(Op::UiTree).await? {
+    async fn ui_tree(&self, visible_only: bool) -> Result<Vec<crate::ui::UiNode>, InputError> {
+        match self.call(Op::UiTree { visible_only }).await? {
             ResultBody::Ui { nodes, .. } => Ok(nodes),
             other => Err(unexpected(other)),
         }
