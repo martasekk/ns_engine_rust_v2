@@ -259,6 +259,78 @@ async fn local_activity_suspends_remote_input_until_it_lapses() {
     assert!(c.perform(&one).await.is_ok());
 }
 
+/// A refusal that returns above the platform is invisible unless the agent
+/// records it: the platform is never called, so the machine-side log has
+/// nothing to write. A real session refused 43 `perform`s in a row for the
+/// local override and left the Windows injection log not merely empty but
+/// never created, while the agent looked idle.
+#[tokio::test]
+async fn the_refusals_that_never_reach_the_platform_are_still_audited() {
+    let p = Arc::new(NullPlatform::new(layout()));
+    let audit = Arc::new(Recorder::default());
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let n = now.clone();
+    let limits = Limits {
+        suspend_ms: 3_000,
+        max_steps: 2,
+        ..Limits::default()
+    };
+    let c = connect(
+        p.clone(),
+        limits,
+        Some(audit.clone()),
+        Arc::new(move || n.load(std::sync::atomic::Ordering::SeqCst)),
+        TOKEN,
+    )
+    .await
+    .unwrap();
+
+    let one = [Step::Scroll { dx: 0, dy: 1 }];
+
+    // The local override.
+    p.local.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(c.perform(&one).await.is_err());
+    p.local.store(false, std::sync::atomic::Ordering::SeqCst);
+    now.store(9_000, std::sync::atomic::Ordering::SeqCst);
+
+    // The step cap.
+    let too_many = [
+        Step::Scroll { dx: 0, dy: 1 },
+        Step::Scroll { dx: 0, dy: 1 },
+        Step::Scroll { dx: 0, dy: 1 },
+    ];
+    assert!(c.perform(&too_many).await.is_err());
+
+    let whys: Vec<String> = audit
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "refused")
+        .map(|e| e["why"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert!(
+        whys.contains(&"suspended".to_string()),
+        "the local override left no trace: {whys:?}"
+    );
+    assert!(
+        whys.contains(&"step cap".to_string()),
+        "the step cap left no trace: {whys:?}"
+    );
+
+    // The reason travels with it, so the log says how long was left rather
+    // than only that something was refused.
+    let detail = audit
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e["why"] == "suspended")
+        .and_then(|e| e["error"].as_str().map(str::to_string))
+        .expect("the suspension is recorded with its reason");
+    assert!(detail.contains("ms remaining"), "{detail}");
+}
+
 /// A stuck Ctrl is not a failed operation, it is an unusable machine. The
 /// client cannot fix this — the failure is precisely when it has no second
 /// half of the batch to send.

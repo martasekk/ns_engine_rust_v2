@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 use nscore::{ActionSpec, SideEffect, StagedEffect, Tool, ToolCtx, ToolError, ToolOutput, Trust};
+use nspointer::backoff::WaitOutOverride;
 use nspointer::mcp::parse_key;
 use nspointer::{Button, Loc, Pointer, Session};
 use std::sync::Arc;
@@ -51,6 +52,11 @@ pub struct PointerTool {
 
 /// Every action over one connection. Register the lot with `HarnessBuilder`.
 pub async fn tools(pointer: Arc<dyn Pointer>) -> Result<Vec<Arc<dyn Tool>>, String> {
+    // Wrapped here rather than at each call site: the local override is
+    // re-armed by every attempt, so a model that retries a suspended
+    // `perform` can never get through and simply loops. `WaitOutOverride`
+    // waits the time the agent itself reports and tries exactly once more.
+    let pointer: Arc<dyn Pointer> = Arc::new(WaitOutOverride::new(pointer));
     let session = Session::open(pointer).await.map_err(|e| e.to_string())?;
     let shared: Shared = Arc::new(Mutex::new(session));
     Ok([

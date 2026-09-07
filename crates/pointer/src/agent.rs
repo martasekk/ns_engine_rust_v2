@@ -502,27 +502,39 @@ impl<P: Platform + 'static> Agent<P> {
             *self.suspended_until.lock().unwrap() = now + self.cfg.limits.suspend_ms;
             self.release(held, "local_activity");
         }
+        // These three refusals return above the platform, so unless they are
+        // recorded here nothing downstream can see them at all: the agent's
+        // own log stays empty while a client is being turned away. That is not
+        // hypothetical either -- a run that refused 43 `perform`s in a row for
+        // the local override left the Windows side's injection log not merely
+        // empty but never created, and the agent looked idle.
         let until = *self.suspended_until.lock().unwrap();
         if now < until {
-            return Response::err(
-                id,
-                ErrorKind::Suspended,
-                format!("local override, {}ms remaining", until - now),
-            );
+            let detail = format!("local override, {}ms remaining", until - now);
+            self.audit.record(&serde_json::json!({
+                "at": now, "event": "refused", "why": "suspended",
+                "steps": steps.len(), "error": detail,
+            }));
+            return Response::err(id, ErrorKind::Suspended, detail);
         }
 
         if steps.len() > self.cfg.limits.max_steps {
-            return Response::err(
-                id,
-                ErrorKind::Protocol,
-                format!(
-                    "{} steps exceeds the cap of {}",
-                    steps.len(),
-                    self.cfg.limits.max_steps
-                ),
+            let detail = format!(
+                "{} steps exceeds the cap of {}",
+                steps.len(),
+                self.cfg.limits.max_steps
             );
+            self.audit.record(&serde_json::json!({
+                "at": now, "event": "refused", "why": "step cap",
+                "steps": steps.len(), "error": detail,
+            }));
+            return Response::err(id, ErrorKind::Protocol, detail);
         }
         if !self.bucket.lock().unwrap().take(now, &self.cfg.limits) {
+            self.audit.record(&serde_json::json!({
+                "at": now, "event": "refused", "why": "rate limit",
+                "steps": steps.len(),
+            }));
             return Response::err(id, ErrorKind::Internal, "rate limit");
         }
 
