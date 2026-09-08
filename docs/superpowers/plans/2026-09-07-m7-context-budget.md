@@ -494,3 +494,28 @@ after Phase 5).
 - 2026-09-07: plan written against `main` @ a478d46 and branch `messages-client` @ eef270c.
   Baseline numbers in §2 from `ns-run/ns.sqlite` session `cli` via `ns-app dump`. Nothing
   built yet; T0.0 (merge) is the first step.
+- 2026-09-08: Phase 0 and Phase 1 built on branch `m7-context-budget`, which is based on
+  `messages-client` rather than merging it — T0.0's purpose was to have that code underneath,
+  and basing achieves it without touching anyone's branches.
+
+  | Task | State | Commit |
+  |---|---|---|
+  | T0.0 base on `messages-client` | done | branch point |
+  | T0.4 persist side effects mid-turn | done | `096636c` |
+  | T0.1 `ModelCall` + `UsageSink` + manifest | done | `93bf508` |
+  | T2.4 tools-array measurement (`Usage::tools_tokens`) | done, pulled forward | `93bf508` |
+  | T2.5 `_rationale` ordering fix | done | `93bf508` |
+  | T1.1 clip with a handle · T1.2 `inspect_result` | done | `37c6e37` |
+  | T1.3 fold this turn's older steps | done | `ca3c7d8` |
+  | T0.2 `ns-app budget` | in progress | — |
+  | T0.3 baseline row | blocked on T0.2 | — |
+
+  Two things learned while building, both recorded above: the rationale field was not
+  actually first in the emitted schema (§T2.5), and the fold's verbatim budget has to count
+  *outcomes* rather than lines — counting lines let proposal/rejection churn fill the window
+  and folded away the turn's only result, after which the reply narrated something its own
+  prompt no longer contained.
+
+  Deferred to the config pass that follows T0.2, to avoid two writers in `app/`:
+  `[memory] tool_result_max_chars` and `trace_verbatim_lines` exist as `EngineConfig` fields
+  with the plan's defaults (1200, 5) but are not yet readable from `config.toml`.
