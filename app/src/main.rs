@@ -1,5 +1,6 @@
 mod budget;
 mod config;
+mod eval;
 
 use config::{AppConfig, Role, RoleTarget};
 use nscore::{HarnessBuilder, SessionId, Tool};
@@ -420,6 +421,22 @@ async fn main() {
             )
         );
         return;
+    }
+
+    // `ns-app eval [<ledger-path>]`: the six memory abilities against a fixed
+    // model (M7 T5.2). Needs no API key and no network — every model in the
+    // set is a scripted double, which is the point: a number that moves
+    // between two runs moved because the harness changed. Exits non-zero when
+    // an ability failed, so a release script can gate on it.
+    if args.get(1).map(String::as_str) == Some("eval") {
+        let ledger = match eval::parse_args(&args[2..]) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(eval::run(&ledger).await);
     }
 
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane

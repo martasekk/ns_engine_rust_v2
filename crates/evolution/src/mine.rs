@@ -31,6 +31,45 @@ pub enum SignatureKind {
     Corrected {
         text: String,
     },
+    /// The budget dropped something (or, under `report` mode, said it would)
+    /// and the turn or the next one then went wrong (M7 T5.3).
+    ///
+    /// The correlation is the signature; the drop alone is not. Self-GC
+    /// reports 85% of its prunes leaving the continuation unaffected, and
+    /// M7's T2.2 makes that share — the no-impact rate — the condition for
+    /// switching `budget_mode` to `enforce`. A drop nothing followed is
+    /// evidence *for* enforcing, so mining it as a failure would invert the
+    /// number the phase exists to measure.
+    BudgetDropped {
+        /// `window`, `facts` or `summary` — [`nscore::Dropped::block`].
+        block: String,
+        /// The turn number or fact key that went.
+        detail: String,
+    },
+    /// A tool result was clipped and the model then spent an iteration on
+    /// `inspect_result` to get the rest (M7 T5.3).
+    ///
+    /// Named by the action whose result was clipped, because that is the
+    /// shape of the fix: `tool_result_max_chars` is one number for every
+    /// tool, and the recorded desktop session says it should not be — a
+    /// `pointer_ui_read` runs 14,425 characters against a median result of
+    /// 24. An inspection that follows a clip is the cap saying, in the only
+    /// currency the free tier meters, that it was too low for that action.
+    ResultClippedThenInspected {
+        action: String,
+    },
+    /// The router put the turn in a tier that hid a tool the model then
+    /// asked for, and `run_turn` widened the tier mid-turn (M7 T5.3).
+    ///
+    /// The escalation already bounds the damage to one iteration, so this is
+    /// not a failure the user saw — it is a request spent on a wrong guess
+    /// about the message, on a fifty-a-day tier. The fix is a cue in
+    /// `[router] recall_cues` or the tool-family list, and the user text of
+    /// the turn is where it comes from.
+    Misrouted {
+        from: nscore::Tier,
+        to: nscore::Tier,
+    },
 }
 
 impl SignatureKind {
@@ -39,6 +78,16 @@ impl SignatureKind {
             SignatureKind::MalformedArg { .. } | SignatureKind::IllegalNearTool { .. } => {
                 "symbolic"
             }
+            // The three M7 signatures are notes, and the reason is the
+            // symbolic lane's own type rather than a judgement about them.
+            // `Patch` is `NormalizeArg | AliasAction`, and `verify_patch`
+            // proves a candidate by replaying recorded sessions against a
+            // patched `LearnedRules`. A per-action `tool_result_max_chars`
+            // and a router cue are neither: they are `EngineConfig` read at
+            // startup, outside the object the gate can patch and outside the
+            // one replay varies. Plan §9 wants both in the symbolic lane
+            // eventually; that needs `Patch` to grow the variants first, and
+            // having the signatures counted is what makes it worth doing.
             _ => "note",
         }
     }
@@ -50,6 +99,9 @@ impl SignatureKind {
             SignatureKind::RepeatedGuardDenial { .. } => "RepeatedGuardDenial",
             SignatureKind::ToolErrArgs { .. } => "ToolErrArgs",
             SignatureKind::Corrected { .. } => "Corrected",
+            SignatureKind::BudgetDropped { .. } => "BudgetDropped",
+            SignatureKind::ResultClippedThenInspected { .. } => "ResultClippedThenInspected",
+            SignatureKind::Misrouted { .. } => "Misrouted",
         }
     }
 }
@@ -136,6 +188,80 @@ pub fn is_fallback(policy: &ReplyPolicy) -> bool {
     }
 }
 
+/// The user's message reduced to its words: lowercased, every run of
+/// non-alphanumerics collapsed to one space.
+///
+/// Unicode-aware rather than [`nscore::squash`], which keeps ASCII
+/// alphanumerics only. The re-asks on this machine are Czech, and squashing
+/// turns "napiš" into "napi" and "nápis" into "npis" — a normalizer that
+/// deletes the diacritics reports two different questions as one, which is
+/// exactly the false positive a re-ask signature must not have.
+fn normalized_user_text(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Turns that ended badly: a fallback reply, a reply that failed, a
+/// correction, or a message the user had already sent in an earlier turn.
+///
+/// The re-ask is the one worth explaining. When the harness answers around a
+/// question the user asked, the user asks it again — recorded turns 85 and
+/// 104 of the 2026-09-02 session are both that — and the second asking is
+/// the only signal in the log that the first answer was no good. Nothing
+/// else marks it: the turn settled, the reply was sent, no guard fired.
+fn troubled_turns(events: &[Event]) -> HashSet<u32> {
+    let mut asked: HashMap<String, u32> = HashMap::new();
+    let mut out = HashSet::new();
+    for e in events {
+        match &e.kind {
+            EventKind::UserSaid { text } => match asked.entry(normalized_user_text(text)) {
+                std::collections::hash_map::Entry::Occupied(first) => {
+                    if *first.get() != e.turn {
+                        out.insert(e.turn);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(e.turn);
+                }
+            },
+            EventKind::Settled { policy } if is_fallback(policy) => {
+                out.insert(e.turn);
+            }
+            // A reply the model could not produce is a fallback the user saw
+            // (F7), the same reading `FallbackReply` already takes.
+            EventKind::ReplyFailed { .. } => {
+                out.insert(e.turn);
+            }
+            EventKind::Corrected { .. } => {
+                out.insert(e.turn);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The event id behind a trace handle: `r42` and `42` alike, the same pair
+/// `run_turn` accepts from the model, so a proposal the engine honoured is
+/// one this can follow.
+fn parse_result_handle(raw: &str) -> Option<u64> {
+    raw.trim()
+        .trim_start_matches(['r', 'R'])
+        .parse::<u64>()
+        .ok()
+}
+
+/// The `id` argument of an `inspect_result` call, if it named one.
+fn inspected_handle(args: &[(String, nscore::TaggedValue)]) -> Option<u64> {
+    args.iter()
+        .find(|(k, _)| k == "id")
+        .and_then(|(_, tv)| tv.value.as_str())
+        .and_then(parse_result_handle)
+}
+
 /// One line per event of `turn`: the trace text a note proposer reads.
 pub fn render_turn(events: &[Event], turn: u32) -> String {
     events
@@ -208,8 +334,45 @@ pub fn mine(session: &SessionId, events: &[Event], known_specs: &[ActionSpec]) -
             _ => None,
         })
         .collect();
+    // Which `ToolCalled` a `ToolReturned` answered, so the handle `r42` in an
+    // `inspect_result` argument can be resolved back to the action whose cap
+    // was too low.
+    let returned_of: HashMap<u64, u64> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolReturned { call, .. } => Some((e.id.0, call.0)),
+            _ => None,
+        })
+        .collect();
+    // The turn after a given turn, taken from the log rather than assumed to
+    // be `turn + 1`: a store that ever hands back a gap would otherwise make
+    // every drop look like it was followed by nothing.
+    let mut turn_order: Vec<u32> = Vec::new();
+    for e in events {
+        if !turn_order.contains(&e.turn) {
+            turn_order.push(e.turn);
+        }
+    }
+    let next_turn: HashMap<u32, u32> = turn_order.windows(2).map(|w| (w[0], w[1])).collect();
+    let troubled = troubled_turns(events);
+    let followed_by_trouble = |turn: u32| {
+        troubled.contains(&turn)
+            || next_turn
+                .get(&turn)
+                .is_some_and(|next| troubled.contains(next))
+    };
+
     let mut seen_denials: HashSet<(u32, String, String)> = HashSet::new();
     let mut counted_denials: HashSet<(u32, String, String)> = HashSet::new();
+    // Turns in which a `ModelCall` has already reported clipped characters.
+    // Built as the walk goes, which is what makes "and an `inspect_result`
+    // call followed" mean followed rather than merely co-occurred.
+    let mut clipped_so_far: HashSet<u32> = HashSet::new();
+    // Highest tier a turn's manifests have shown so far. A rise is the
+    // escalation `run_turn` performs when a tiered-out tool is proposed.
+    let mut tier_so_far: HashMap<u32, nscore::Tier> = HashMap::new();
+    let mut counted_drops: HashSet<(u32, String, String)> = HashSet::new();
+    let mut counted_inspections: HashSet<(u32, String)> = HashSet::new();
     let mut out = Vec::new();
     let sig = |e: &Event, kind: SignatureKind| Signature {
         session: session.clone(),
@@ -280,6 +443,80 @@ pub fn mine(session: &SessionId, events: &[Event], known_specs: &[ActionSpec]) -
             }
             EventKind::Corrected { text, .. } => {
                 out.push(sig(e, SignatureKind::Corrected { text: text.clone() }))
+            }
+            // M7 T5.3. Three signatures out of one event: `ModelCall` is the
+            // only record of what a context cost and what was taken out of
+            // it, and all three questions the phase leaves open are about
+            // that.
+            EventKind::ModelCall { manifest, .. } => {
+                if let Some(budget) = &manifest.budget {
+                    // Under the default `report` mode nothing was actually
+                    // dropped and `dropped` lists what enforcing would have
+                    // taken. That is the case worth mining: the whole point
+                    // of reporting first is to learn what enforcing would
+                    // cost before paying it.
+                    if followed_by_trouble(e.turn) {
+                        for d in &budget.dropped {
+                            // One signature per item, not per manifest: the
+                            // no-impact rate's denominator is drops, so its
+                            // numerator has to be drops too. Deduped across
+                            // the turn's iterations, which re-compute the
+                            // same fit against the same context.
+                            let key = (e.turn, d.block.clone(), d.detail.clone());
+                            if counted_drops.insert(key) {
+                                out.push(sig(
+                                    e,
+                                    SignatureKind::BudgetDropped {
+                                        block: d.block.clone(),
+                                        detail: d.detail.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+                if manifest.clipped_chars > 0 {
+                    clipped_so_far.insert(e.turn);
+                }
+                if let Some(tier) = manifest.tier {
+                    let highest = tier_so_far.entry(e.turn).or_insert(tier);
+                    if tier > *highest {
+                        out.push(sig(
+                            e,
+                            SignatureKind::Misrouted {
+                                from: *highest,
+                                to: tier,
+                            },
+                        ));
+                        *highest = tier;
+                    }
+                }
+            }
+            // `clipped_so_far` is filled by the walk itself, which is what
+            // makes this "an `inspect_result` call followed" rather than
+            // merely occurred in the same turn.
+            EventKind::ToolCalled { action, args }
+                if action == nsengine::turn::INSPECT_RESULT && clipped_so_far.contains(&e.turn) =>
+            {
+                // Which action's cap was too low. The `id` argument names the
+                // `ToolReturned` that was clipped, and that names the
+                // `ToolCalled` behind it. `?` when the model named a handle
+                // that is not in this log — the cap was still too low, and
+                // dropping the signature over an unresolvable argument would
+                // lose the count.
+                let clipped_action = inspected_handle(args)
+                    .and_then(|id| returned_of.get(&id))
+                    .and_then(|call| calls.get(call))
+                    .unwrap_or(&"?")
+                    .to_string();
+                if counted_inspections.insert((e.turn, clipped_action.clone())) {
+                    out.push(sig(
+                        e,
+                        SignatureKind::ResultClippedThenInspected {
+                            action: clipped_action,
+                        },
+                    ));
+                }
             }
             _ => {}
         }
@@ -508,6 +745,452 @@ mod tests {
         assert!(sigs.iter().all(|s| s.session.0 == "m"));
         assert_eq!(sigs[0].kind.lane(), "symbolic");
         assert_eq!(sigs[3].kind.lane(), "note");
+    }
+
+    // -----------------------------------------------------------------
+    // M7 T5.3
+    // -----------------------------------------------------------------
+
+    fn usage() -> Usage {
+        Usage {
+            role: "emitter".into(),
+            model: "m".into(),
+            prompt_tokens: 1_000,
+            completion_tokens: 10,
+            estimated: false,
+            attempts: 1,
+            latency_ms: 5,
+            tools_tokens: 0,
+        }
+    }
+
+    fn model_call(manifest: ContextManifest) -> EventKind {
+        EventKind::ModelCall {
+            usage: usage(),
+            manifest,
+        }
+    }
+
+    /// A manifest whose fit reported one drop. `Report` mode on purpose: it
+    /// is the default and the mode the no-impact rate has to be measured in.
+    fn would_drop(block: &str, detail: &str) -> ContextManifest {
+        ContextManifest {
+            budget: Some(BudgetReport {
+                limit: 6_000,
+                before: 7_000,
+                after: 6_400,
+                mode: BudgetMode::Report,
+                dropped: vec![Dropped {
+                    block: block.into(),
+                    detail: detail.into(),
+                    tokens: 150,
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn fallback() -> EventKind {
+        EventKind::Settled {
+            policy: ReplyPolicy::Verbatim {
+                text: format!("{} Reason: x.", nsengine::turn::FALLBACK_REPLY),
+            },
+        }
+    }
+
+    fn kinds(sigs: &[Signature]) -> Vec<&SignatureKind> {
+        sigs.iter().map(|s| &s.kind).collect()
+    }
+
+    fn mined(l: &EventLog) -> Vec<Signature> {
+        mine(&SessionId("m".into()), l.events(), &[spec("get_weather")])
+    }
+
+    /// The correlation is the signature. A drop followed by a fallback is the
+    /// evidence that the priority order took something the turn needed; a
+    /// drop followed by a normal turn is evidence that it did not, and is
+    /// exactly the 85% Self-GC reports and T2.2 needs before `budget_mode`
+    /// can go to `enforce`. Mining the second as a failure would invert the
+    /// number the phase exists to produce.
+    #[test]
+    fn a_drop_is_mined_only_when_trouble_follows_it() {
+        let mut l = log();
+        l.append(
+            1,
+            Timestamp(1),
+            EventKind::UserSaid {
+                text: "click the save button".into(),
+            },
+        );
+        l.append(1, Timestamp(2), model_call(would_drop("window", "t3")));
+        l.append(1, Timestamp(3), fallback());
+        l.append(1, Timestamp(4), EventKind::Replied { text: "…".into() });
+        // Turn 2 drops just as much and then works.
+        l.append(
+            2,
+            Timestamp(5),
+            EventKind::UserSaid {
+                text: "thanks".into(),
+            },
+        );
+        l.append(
+            2,
+            Timestamp(6),
+            model_call(would_drop("facts", "order.43.status")),
+        );
+        l.append(2, Timestamp(7), EventKind::Replied { text: "ok".into() });
+
+        let sigs = mined(&l);
+        let dropped: Vec<&SignatureKind> = kinds(&sigs)
+            .into_iter()
+            .filter(|k| matches!(k, SignatureKind::BudgetDropped { .. }))
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![&SignatureKind::BudgetDropped {
+                block: "window".into(),
+                detail: "t3".into(),
+            }],
+            "only the drop the fallback followed: {sigs:?}"
+        );
+    }
+
+    /// The user asking the same thing twice is the only trace a bad answer
+    /// leaves in a log that otherwise looks clean — the turn settled, the
+    /// reply was sent, no guard fired. Recorded turns 85 and 104 of the
+    /// 2026-09-02 session are both re-asks.
+    #[test]
+    fn a_drop_followed_by_the_same_question_again_is_a_re_ask() {
+        let ask = |l: &mut EventLog, turn: u32, text: &str| {
+            l.append(
+                turn,
+                Timestamp(turn as u64 * 10),
+                EventKind::UserSaid { text: text.into() },
+            );
+        };
+        let mut reasked = log();
+        ask(&mut reasked, 1, "co jsem ti řekl o rozpočtu?");
+        reasked.append(
+            1,
+            Timestamp(2),
+            model_call(would_drop("facts", "budget.total")),
+        );
+        reasked.append(1, Timestamp(3), EventKind::Replied { text: "…".into() });
+        // Same question, different punctuation and case.
+        ask(&mut reasked, 2, "Co jsem ti řekl o rozpočtu");
+        reasked.append(2, Timestamp(4), EventKind::Replied { text: "…".into() });
+
+        assert_eq!(
+            kinds(&mined(&reasked)),
+            vec![&SignatureKind::BudgetDropped {
+                block: "facts".into(),
+                detail: "budget.total".into(),
+            }]
+        );
+
+        let mut moved_on = log();
+        ask(&mut moved_on, 1, "co jsem ti řekl o rozpočtu?");
+        moved_on.append(
+            1,
+            Timestamp(2),
+            model_call(would_drop("facts", "budget.total")),
+        );
+        moved_on.append(1, Timestamp(3), EventKind::Replied { text: "…".into() });
+        ask(&mut moved_on, 2, "díky, to stačí");
+        moved_on.append(2, Timestamp(4), EventKind::Replied { text: "…".into() });
+
+        assert!(
+            mined(&moved_on).is_empty(),
+            "a drop the conversation carried on past is not a signature"
+        );
+    }
+
+    /// Deduped per item per turn, because the emitter re-fits the same
+    /// context on every iteration and would otherwise report one drop as
+    /// twelve. The count is a rate's numerator; inflating it would move the
+    /// number `budget_mode = enforce` is decided on.
+    #[test]
+    fn the_same_drop_across_iterations_of_one_turn_counts_once() {
+        let mut l = log();
+        l.append(
+            1,
+            Timestamp(1),
+            EventKind::UserSaid {
+                text: "open the folder".into(),
+            },
+        );
+        for i in 0..3 {
+            l.append(1, Timestamp(2 + i), model_call(would_drop("window", "t3")));
+        }
+        l.append(1, Timestamp(9), fallback());
+
+        let sigs = mined(&l);
+        assert_eq!(
+            sigs.iter()
+                .filter(|s| matches!(s.kind, SignatureKind::BudgetDropped { .. }))
+                .count(),
+            1,
+            "{sigs:?}"
+        );
+    }
+
+    /// The cap is one number for every tool and the recorded desktop session
+    /// says it should not be: `pointer_ui_read` runs 14,425 characters
+    /// against a median result of 24. An inspection following a clip is that
+    /// action asking for a bigger cap, in the currency the free tier meters.
+    #[test]
+    fn a_clipped_result_the_model_then_inspected_names_the_action() {
+        let mut l = log();
+        l.append(
+            1,
+            Timestamp(1),
+            EventKind::UserSaid {
+                text: "what is on the screen".into(),
+            },
+        );
+        let call = l
+            .append(
+                1,
+                Timestamp(2),
+                EventKind::ToolCalled {
+                    action: "pointer_ui_read".into(),
+                    args: vec![],
+                },
+            )
+            .id;
+        let returned = l
+            .append(
+                1,
+                Timestamp(3),
+                EventKind::ToolReturned {
+                    call,
+                    outcome: ToolOutcome::Ok {
+                        output: ToolOutput {
+                            summary: "node ".repeat(3_000),
+                            artifact: None,
+                            trust: Trust::External,
+                        },
+                    },
+                },
+            )
+            .id;
+        l.append(
+            1,
+            Timestamp(4),
+            model_call(ContextManifest {
+                clipped_chars: 13_225,
+                ..Default::default()
+            }),
+        );
+        l.append(
+            1,
+            Timestamp(5),
+            EventKind::ToolCalled {
+                action: nsengine::turn::INSPECT_RESULT.into(),
+                args: vec![(
+                    "id".into(),
+                    TaggedValue {
+                        value: serde_json::json!(format!("r{}", returned.0)),
+                        prov: Provenance::Residual,
+                        trust: Trust::External,
+                    },
+                )],
+            },
+        );
+
+        assert_eq!(
+            kinds(&mined(&l)),
+            vec![&SignatureKind::ResultClippedThenInspected {
+                action: "pointer_ui_read".into(),
+            }],
+            "the handle resolves back to the action whose cap was too low"
+        );
+    }
+
+    /// The negative that keeps the signature meaning something. A clip
+    /// nobody inspected is the cap working: the model read the head, decided
+    /// it had enough, and spent no extra request. That is what a cap is for,
+    /// and mining it would propose raising the number every time it did its
+    /// job.
+    #[test]
+    fn a_clipped_result_nobody_inspected_is_not_a_signature() {
+        let mut l = log();
+        l.append(
+            1,
+            Timestamp(1),
+            EventKind::UserSaid {
+                text: "what is on the screen".into(),
+            },
+        );
+        let call = l
+            .append(
+                1,
+                Timestamp(2),
+                EventKind::ToolCalled {
+                    action: "pointer_ui_read".into(),
+                    args: vec![],
+                },
+            )
+            .id;
+        l.append(
+            1,
+            Timestamp(3),
+            EventKind::ToolReturned {
+                call,
+                outcome: ToolOutcome::Ok {
+                    output: ToolOutput {
+                        summary: "node ".repeat(3_000),
+                        artifact: None,
+                        trust: Trust::External,
+                    },
+                },
+            },
+        );
+        l.append(
+            1,
+            Timestamp(4),
+            model_call(ContextManifest {
+                clipped_chars: 13_225,
+                ..Default::default()
+            }),
+        );
+        l.append(1, Timestamp(5), EventKind::Replied { text: "…".into() });
+        assert!(mined(&l).is_empty(), "{:?}", mined(&l));
+    }
+
+    /// And the other way round: an inspection with nothing clipped before it
+    /// says nothing about any cap. Ordering is what separates the two, so it
+    /// is checked rather than assumed.
+    #[test]
+    fn an_inspection_before_anything_was_clipped_is_not_a_signature() {
+        let mut l = log();
+        l.append(1, Timestamp(1), EventKind::UserSaid { text: "hm".into() });
+        l.append(
+            1,
+            Timestamp(2),
+            EventKind::ToolCalled {
+                action: nsengine::turn::INSPECT_RESULT.into(),
+                args: vec![(
+                    "id".into(),
+                    TaggedValue {
+                        value: serde_json::json!("r7"),
+                        prov: Provenance::Residual,
+                        trust: Trust::External,
+                    },
+                )],
+            },
+        );
+        l.append(
+            1,
+            Timestamp(3),
+            model_call(ContextManifest {
+                clipped_chars: 13_225,
+                ..Default::default()
+            }),
+        );
+        assert!(mined(&l).is_empty(), "{:?}", mined(&l));
+    }
+
+    /// The escalation in `run_turn` costs one emitter iteration — a request
+    /// off a fifty-a-day tier, spent on a wrong guess about the message. The
+    /// signature is what turns that into a cue the router can be given.
+    #[test]
+    fn a_tier_that_rises_inside_a_turn_is_a_misroute_and_a_steady_one_is_not() {
+        let mut l = log();
+        l.append(
+            1,
+            Timestamp(1),
+            EventKind::UserSaid {
+                text: "mohl bys otevřít ten soubor".into(),
+            },
+        );
+        for tier in [Tier::Chat, Tier::Task] {
+            l.append(
+                1,
+                Timestamp(2),
+                model_call(ContextManifest {
+                    tier: Some(tier),
+                    ..Default::default()
+                }),
+            );
+        }
+        // Turn 2 routes to Task and stays there over three iterations.
+        l.append(
+            2,
+            Timestamp(5),
+            EventKind::UserSaid {
+                text: "a ten druhý taky".into(),
+            },
+        );
+        for _ in 0..3 {
+            l.append(
+                2,
+                Timestamp(6),
+                model_call(ContextManifest {
+                    tier: Some(Tier::Task),
+                    ..Default::default()
+                }),
+            );
+        }
+
+        assert_eq!(
+            kinds(&mined(&l)),
+            vec![&SignatureKind::Misrouted {
+                from: Tier::Chat,
+                to: Tier::Task,
+            }],
+            "one signature, for the turn that escalated"
+        );
+    }
+
+    /// Names and lanes are the pass's whole interface to these: `Report`
+    /// counts by `name()` and the notes lane selects by `lane()`. A typo in
+    /// either is a signature that is mined and then never acted on.
+    #[test]
+    fn the_three_m7_signatures_are_named_and_sit_in_the_note_lane() {
+        for kind in [
+            SignatureKind::BudgetDropped {
+                block: "window".into(),
+                detail: "t3".into(),
+            },
+            SignatureKind::ResultClippedThenInspected {
+                action: "pointer_ui_read".into(),
+            },
+            SignatureKind::Misrouted {
+                from: Tier::Chat,
+                to: Tier::Task,
+            },
+        ] {
+            assert_eq!(
+                kind.lane(),
+                "note",
+                "{} is guidance, not a patch the symbolic gate can replay",
+                kind.name()
+            );
+        }
+        assert_eq!(
+            SignatureKind::BudgetDropped {
+                block: String::new(),
+                detail: String::new()
+            }
+            .name(),
+            "BudgetDropped"
+        );
+        assert_eq!(
+            SignatureKind::ResultClippedThenInspected {
+                action: String::new()
+            }
+            .name(),
+            "ResultClippedThenInspected"
+        );
+        assert_eq!(
+            SignatureKind::Misrouted {
+                from: Tier::Chat,
+                to: Tier::Deep
+            }
+            .name(),
+            "Misrouted"
+        );
     }
 
     #[test]
