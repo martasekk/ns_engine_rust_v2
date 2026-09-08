@@ -507,8 +507,31 @@ after Phase 5).
   | T2.5 `_rationale` ordering fix | done | `93bf508` |
   | T1.1 clip with a handle · T1.2 `inspect_result` | done | `37c6e37` |
   | T1.3 fold this turn's older steps | done | `ca3c7d8` |
-  | T0.2 `ns-app budget` | in progress | — |
-  | T0.3 baseline row | blocked on T0.2 | — |
+  | T0.2 `ns-app budget` | done | `76663d9` |
+  | T0.3 baseline row | done | `76663d9` |
+  | `[memory] trace_verbatim_lines` config key | done | `76663d9` |
+
+  **Phase 1 exit criterion, met.** `ns-app budget cli` on the recorded session
+  (`ns-run/ns.sqlite`, copied so the live store was untouched) reports the raw trace beside
+  the same trace as the engine would send it now — the second number computed by calling
+  `trace_for_prompt`, not by reimplementing it:
+
+  ```
+  turn      window  summary    trace     sent    chars  ~tokens  tools
+  t6          1026        0     9742     1314    10768     2692      1
+  t7          1327        0    14108     1311    15435     3858      1
+  total       9049        0    25986     4761    35035     8758     15
+  ```
+
+  Turn 7: 14,108 → 1,311 characters, against the criterion of "≤ 2k instead of ≥ 14k".
+  Across the session, 21,225 characters saved **per send** — and the emitter re-sends the
+  trace on every remaining iteration, so the turn-level saving is that figure multiplied by
+  however many iterations followed. `inspect_result` reaches the dropped tail, which is the
+  other half of the criterion.
+
+  The reconstruction is still a floor: it counts neither standing facts, nor the system
+  prompt, nor the tool schemas, and counts one send per turn rather than one per iteration.
+  The measured path (any session recorded from now on) has all of those.
 
   Two things learned while building, both recorded above: the rationale field was not
   actually first in the emitted schema (§T2.5), and the fold's verbatim budget has to count
