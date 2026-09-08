@@ -2808,6 +2808,26 @@ fn builtin_guards(confirm_irreversible: bool) -> Vec<Box<dyn nscore::Guard>> {
 mod tests {
     use super::*;
 
+    /// The builtin specs never pass through `HarnessBuilder::add_tool`, so
+    /// the assembly gate does not see them. They need the same check, or the
+    /// half of the legal set the engine owns itself is the unchecked half.
+    #[test]
+    fn every_builtin_spec_keeps_the_rationale_first() {
+        for spec in [
+            ask_clarification_spec(),
+            confirm_pending_spec(),
+            remember_fact_spec(),
+            forget_fact_spec(),
+            forget_all_spec(),
+            recall_spec(),
+            inspect_result_spec(),
+        ] {
+            let name = spec.name.clone();
+            spec.check_arg_names()
+                .unwrap_or_else(|e| panic!("builtin `{name}` breaks think-then-commit: {e}"));
+        }
+    }
+
     /// The default must stay the safe one: a config that says nothing about
     /// confirmation gets the gate.
     #[test]

@@ -28,6 +28,56 @@ pub struct ActionSpec {
     pub dedupe_tag: Option<String>,
 }
 
+/// The argument name that the think-then-commit rationale is injected under
+/// by `nsllm::schema::build_tools`. Duplicated as a byte literal rather than
+/// depended on, because `core` must not depend on `llm` — `check_arg_names`
+/// below is what keeps the two from drifting, and the emitter-side test
+/// asserts they still agree.
+pub const RATIONALE_ARG: &str = "_rationale";
+
+impl ActionSpec {
+    /// Reject argument names that would sort ahead of the injected
+    /// `_rationale` property.
+    ///
+    /// Strict-mode generation follows the order of the `properties` object,
+    /// which `serde_json` serializes as a `BTreeMap` (byte order) because
+    /// `preserve_order` is off — deliberately, since `Engine::call_key` and
+    /// `event_hash` both rely on equal objects serializing identically.
+    /// `_` is 0x5F, so the rationale lands first only for argument names
+    /// whose first byte is above it: lowercase ASCII (0x61+).
+    ///
+    /// Uppercase letters (0x41-0x5A) and digits (0x30-0x39) are **below**
+    /// `_` and would silently sort ahead of the rationale, reinstating the
+    /// exact defect M7 T2.5 fixed by renaming `rationale` to `_rationale`.
+    /// That defect was invisible for as long as it existed because the only
+    /// action exercising it had a single argument (`text`) that happened to
+    /// sort late. So this is checked rather than assumed.
+    pub fn check_arg_names(&self) -> Result<(), String> {
+        let Some(props) = self
+            .args_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+        else {
+            return Ok(());
+        };
+        for name in props.keys() {
+            if name.as_str() == RATIONALE_ARG {
+                continue;
+            }
+            if name.as_str() >= RATIONALE_ARG {
+                continue;
+            }
+            return Err(format!(
+                "action `{}`: argument `{}` sorts before `{}`, which would put it \
+                 ahead of the rationale in the compiled tool schema and defeat \
+                 think-then-commit; argument names must be lowercase ASCII",
+                self.name, name, RATIONALE_ARG
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegalActionSet {
     pub actions: Vec<ActionSpec>,
@@ -216,6 +266,66 @@ pub struct Incoming {
 mod tests {
     use super::*;
     use crate::event::{EventId, EventKind};
+
+    fn spec_with_args(args: serde_json::Value) -> ActionSpec {
+        ActionSpec {
+            name: "probe".into(),
+            description: "probe".into(),
+            args_schema: serde_json::json!({"type": "object", "properties": args}),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        }
+    }
+
+    #[test]
+    fn lowercase_argument_names_are_accepted() {
+        let spec = spec_with_args(serde_json::json!({
+            "button": {"type": "string"},
+            "x": {"type": "number"},
+            "query": {"type": "string"},
+        }));
+        assert!(spec.check_arg_names().is_ok());
+    }
+
+    /// The defect this guards against is a *recurrence*: the rationale was
+    /// originally named `rationale` and silently sorted wherever `r` fell
+    /// (M7 T2.5). Renaming it to `_rationale` fixed every argument name in
+    /// the workspace at the time, but `_` is 0x5F and uppercase letters and
+    /// digits sort below it — so the fix holds only for as long as nobody
+    /// adds an argument named like these.
+    #[test]
+    fn an_uppercase_or_digit_leading_argument_is_rejected() {
+        for bad in ["Button", "X", "2fa", "AAA"] {
+            let spec = spec_with_args(serde_json::json!({ bad: {"type": "string"} }));
+            let err = spec
+                .check_arg_names()
+                .expect_err("argument sorting before the rationale must be refused");
+            assert!(err.contains(bad), "error names the offending argument: {err}");
+        }
+    }
+
+    #[test]
+    fn the_rationale_argument_itself_is_not_flagged() {
+        let spec = spec_with_args(serde_json::json!({
+            RATIONALE_ARG: {"type": "string"},
+            "text": {"type": "string"},
+        }));
+        assert!(spec.check_arg_names().is_ok());
+    }
+
+    #[test]
+    fn a_spec_without_properties_is_vacuously_fine() {
+        let spec = ActionSpec {
+            name: "nullary".into(),
+            description: "takes nothing".into(),
+            args_schema: serde_json::json!({"type": "object"}),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        };
+        assert!(spec.check_arg_names().is_ok());
+    }
 
     #[test]
     fn legal_set_lookup() {

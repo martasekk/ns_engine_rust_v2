@@ -198,6 +198,55 @@ mod tests {
         );
     }
 
+    /// `core` cannot depend on `llm`, so `ActionSpec::check_arg_names` spells
+    /// the rationale key out again. That duplication is only safe if the two
+    /// are pinned together — this is the pin.
+    #[test]
+    fn the_name_core_validates_against_is_the_name_compiled_into_the_schema() {
+        assert_eq!(
+            RATIONALE,
+            nscore::RATIONALE_ARG,
+            "the injected property and the name the assembly gate validates \
+             against have drifted; think-then-commit is no longer checked"
+        );
+    }
+
+    /// The ordering property `build_tools` relies on, stated as an implication
+    /// rather than a spot check: any spec the assembly gate accepts compiles
+    /// to a schema whose first property is the rationale.
+    #[test]
+    fn every_spec_the_gate_accepts_compiles_rationale_first() {
+        let cases = [
+            serde_json::json!({"text": {"type": "string"}}),
+            serde_json::json!({"button": {"type": "string"}, "x": {"type": "number"}}),
+            serde_json::json!({"a": {"type": "string"}, "zzz": {"type": "string"}}),
+            serde_json::json!({}),
+        ];
+        for props in cases {
+            let spec = ActionSpec {
+                name: "probe".into(),
+                description: "probe".into(),
+                args_schema: serde_json::json!({"type": "object", "properties": props}),
+                side_effect: SideEffect::Pure,
+                residual_policy: Default::default(),
+                dedupe_tag: None,
+            };
+            spec.check_arg_names().expect("fixture is gate-clean");
+            let tools = build_tools(&LegalActionSet {
+                actions: vec![spec.clone()],
+            });
+            let compiled = tools.as_array().unwrap()[0]["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap();
+            assert_eq!(
+                compiled.keys().next().map(String::as_str),
+                Some(RATIONALE),
+                "gate-clean spec {:?} did not compile rationale-first",
+                spec.args_schema
+            );
+        }
+    }
+
     #[test]
     fn narrowed_set_narrows_tools() {
         let tools = build_tools(&LegalActionSet { actions: vec![] });

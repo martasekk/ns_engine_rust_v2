@@ -45,6 +45,8 @@ pub enum BuildError {
     DuplicateSlot(&'static str),
     #[error("duplicate tool name: {0}")]
     DuplicateTool(String),
+    #[error("{0}")]
+    BadArgName(String),
 }
 
 /// Validated wiring, consumed by the engine crate.
@@ -141,10 +143,15 @@ impl HarnessBuilder {
             .ok_or(BuildError::MissingSlot("consolidator"))?;
         let mut seen = HashSet::new();
         for t in &self.tools {
-            let name = t.spec().name.clone();
+            let spec = t.spec();
+            let name = spec.name.clone();
             if !seen.insert(name.clone()) {
                 return Err(BuildError::DuplicateTool(name));
             }
+            // Assembly is the right place for this: a spec whose argument
+            // names would defeat the rationale ordering is a programming
+            // error, and failing here means it can never reach a request.
+            spec.check_arg_names().map_err(BuildError::BadArgName)?;
         }
         Ok(HarnessParts {
             emitter,
@@ -299,6 +306,13 @@ mod tests {
                 dedupe_tag: None,
             })
         }
+
+        fn with_arg(name: &str, arg: &str) -> Self {
+            let mut t = NullTool::named(name);
+            t.0.args_schema =
+                serde_json::json!({"type": "object", "properties": { arg: {"type": "string"} }});
+            t
+        }
     }
     #[async_trait]
     impl Tool for NullTool {
@@ -358,6 +372,30 @@ mod tests {
             b.build().err(),
             Some(BuildError::DuplicateTool("echo".into()))
         );
+    }
+
+    /// A tool whose argument would outrank the rationale must never reach a
+    /// request. Assembly is where that is caught, so the failure is a
+    /// startup error and not a per-turn surprise.
+    #[test]
+    fn build_fails_on_an_argument_that_outranks_the_rationale() {
+        let mut b = HarnessBuilder::new();
+        fill_all(&mut b);
+        b.add_tool(Arc::new(NullTool::with_arg("shout", "Volume")));
+        match b.build() {
+            Err(BuildError::BadArgName(msg)) => {
+                assert!(msg.contains("shout") && msg.contains("Volume"), "{msg}");
+            }
+            other => panic!("expected BadArgName, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn build_accepts_ordinary_lowercase_arguments() {
+        let mut b = HarnessBuilder::new();
+        fill_all(&mut b);
+        b.add_tool(Arc::new(NullTool::with_arg("shout", "volume")));
+        assert!(b.build().is_ok());
     }
 
     #[test]
