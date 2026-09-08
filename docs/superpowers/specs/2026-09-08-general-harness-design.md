@@ -158,6 +158,15 @@ Generated code is **a value with provenance**, not an action:
 4. **Executing or installing it is `SideEffect::Irreversible`** and is a *separate* action,
    so `SideEffectGate` stages it and names what will run.
 
+**One emission detail, measured rather than assumed.** A source file must not travel as a JSON
+string argument: escaping and newlines make it the likeliest emission to arrive malformed and
+burn one of `max_emit_retries`. The 2026 format-tax work also shows the degradation from
+structured output originates in the *prompt's* formatting instruction, not the decoder's
+constraint — so the right split is to keep the **action choice constrained** (the legality
+guarantee is untouched) and let the **code payload come as free text**, recovered by a
+schema-aligned parse. That is BAML's SAP applied to the one field where it earns its keep,
+which is the narrow version of §2.2(a).
+
 The consequence is worth stating on its own:
 
 > Code generation converts "did the model do a good job", which is unanswerable, needs a
@@ -168,17 +177,65 @@ That is the strongest available argument for the neurosymbolic thesis, and it is
 domain where the engine's insistence on symbolic checks stops being a tax and becomes the
 reason it wins.
 
-### 4.3 What already supports it
+### 4.3 What already supports it — and what actively does not
+
+**Corrected 2026-09-08 by `docs/research/2026-09-08-codegen-decomposition-findings.md`.**
+The first version of this section claimed the clip was "exactly right for compiler output" and
+that the budget "already bounds" a fix loop. Both were written without measuring anything, and
+measurement says the harness as configured would make code generation *worse*:
+
+| file | ~tokens | × `prompt_budget_tokens` (6000) | × `tool_result_max_chars` (1200) |
+|---|---|---|---|
+| `crates/engine/src/turn.rs` | 33,995 | **5.7×** | **113×** |
+| `crates/engine/src/eval.rs` | 22,008 | 3.7× | 73× |
+
+One file in this workspace is six times the whole context ceiling. Reading it returns 1.1% of
+it. `max_iterations = 5` is short for compile-fix. The fold collapses this turn's earlier
+edits into a counted line, and in code editing — unlike clicking — what happened three steps
+ago *is* the state.
+
+That is not a flaw: M7 sized 6,000 tokens "so … a desktop turn's trace sit inside it with
+room". These are desktop numbers working correctly on a workload nothing like a desktop turn.
+
+**What genuinely supports it:**
 
 - **Compiler errors are refusals, and M7's fold never folds refusals** — "refusals are what
   steer the next proposal, and a model that cannot see why it was refused proposes it again".
-  The iteration loop for compile-fix-compile is already the right shape.
-- **The clip with a handle** (M7 T1.1) is exactly right for compiler output: a 14k error dump
-  clips to a head with an `inspect_result` handle, so the model can page to the error it needs
-  without the whole dump being re-sent on every iteration.
-- **The budget** already bounds what a long fix loop can cost.
+  The compile-fix loop is the right shape.
+- **`inspect_result` is the right primitive**, but addressed wrongly for code — see below.
 
-### 4.4 What it needs
+**What has to change, and it is not "raise the limits":**
+
+> A tool that returns 136 KB is the bug. The clip is a symptom-fixer.
+
+For a desktop control tree the head is representative, so a cap is honest. For a source file no
+prefix is representative — what is needed is at line 400, and paging there costs a request per
+page. So code tools must return **symbol-scoped slices** — this function, this impl block,
+addressed by name rather than character offset. Results then arrive at 1–3 KB, the existing cap
+never fires, and the model gets a unit of meaning rather than a truncated prefix. The engine
+has the paging primitive; it lacks semantic addressing. A code tier with its own budget is the
+safety net, not the fix.
+
+### 4.4 The failure mode that decides the design
+
+The white-box context-rot study (arXiv:2607.17937) reports that under a harmful context,
+**38 of 44 failed runs end with a success claim despite unresolved defects**, while requirement
+coverage stays at 93–95% and strict success falls to 37.5% — degradation "removes a few
+decisive obligations rather than the whole artifact".
+
+The dominant failure of a coding agent is therefore not writing bad code. It is **reporting
+done when it is not**. A judge asked "did this go well" is asking the failing component to
+grade itself; a compiler is not. M6 §13's "no model in the guard chain" is not conservatism
+here — it is the only thing that catches the modal failure.
+
+The same study measures the mitigation: a generic self-check recovers 5/10, while **a detailed
+external checklist restating every obligation recovers 10/10** (p = 0.0325). The engine already
+has two thirds of that — facts are small, explicit and external; guards are independently
+checkable. What is missing is *the obligations of the current task*: a checklist that survives
+the fold, the clip and the budget because it is the block that may never be dropped, and that a
+turn cannot be reported complete against while any row is unchecked.
+
+### 4.5 What it needs
 
 - A `Workspace` tool: a directory the engine owns, so "delete it" is real and a generated file
   can never land outside it. Path arguments must be validated against the workspace root —
@@ -272,7 +329,8 @@ tokens per request, which is where M7's whole budget effort pays out. The tiered
 4. **The SAP measurement** (§2.2a) — cheap, offline, and settles a question that would
    otherwise be re-argued every time a parse fails.
 5. **Code generation** (§4) — after 2 and 3, because it needs per-action tests to be safe and
-   benefits from derivation bounding its loops.
+   benefits from derivation bounding its loops. And it needs, in this order: symbol-scoped code
+   tools (§4.3), the obligations block (§4.4), then a code tier's budget as the safety net.
 6. **Turn resumption** (§5.2c) — with the port, not before it.
 
 ## 7. Not proposed
