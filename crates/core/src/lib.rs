@@ -1,4 +1,5 @@
 pub mod action;
+pub mod budget;
 pub mod event;
 pub mod learned;
 pub mod memory;
@@ -10,6 +11,7 @@ pub mod validate;
 pub mod value;
 
 pub use action::*;
+pub use budget::*;
 pub use event::*;
 pub use learned::*;
 pub use memory::*;

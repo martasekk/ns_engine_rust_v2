@@ -2721,6 +2721,93 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     assert_eq!(summaries, 1, "the summary still lands in the log");
 }
 
+/// Runs `turns` echo turns and returns every `ModelCall` the last turn made,
+/// with the budget config under test.
+async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, ContextManifest)> {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("budget".into());
+    let sink = Arc::new(UsageSink::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredEmitter {
+        inner: ScriptedEmitter::new(vec![]),
+        sink: sink.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            usage: Some(sink.clone()),
+            prompt_budget_tokens: limit,
+            budget_mode: mode,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    for turn in 1..=turns {
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: format!("message number {turn}, long enough to fill a window record"),
+        })
+        .await
+        .unwrap();
+    }
+    let events = store.load(&sid).await.unwrap();
+    events
+        .iter()
+        .filter(|ev| ev.turn == turns)
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } => Some((usage.clone(), manifest.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every model call records what the budget found, and under the default
+/// `report` mode the finding changes nothing. That pairing is the phase: the
+/// drops a budget *would* make are countable, against the fallbacks and
+/// re-asks that follow them, before a single one is made.
+#[tokio::test]
+async fn the_budget_is_reported_on_every_call_and_enforces_nothing_by_default() {
+    let calls = budgeted_run(BudgetMode::Report, 20, 4).await;
+    assert!(!calls.is_empty(), "the last turn made model calls");
+    let (_, manifest) = &calls[0];
+    let budget = manifest.budget.as_ref().expect("a budget report");
+    assert_eq!(budget.mode, BudgetMode::Report);
+    assert!(budget.over(), "20 tokens is deliberately too small");
+    assert!(!budget.dropped.is_empty(), "it says what it would drop");
+    assert!(budget.after < budget.before, "and what that would save");
+    assert_eq!(
+        manifest.window,
+        Some((1, 3)),
+        "but the call still carried the whole window: {:?}",
+        manifest.window
+    );
+}
+
+/// Enforcing trims the same things the report named, oldest window record
+/// first, and never empties the window — the last record is the immediately
+/// preceding turn, which is the failure the window exists to fix (M6 F3).
+#[tokio::test]
+async fn enforcing_the_budget_trims_the_window_it_reported() {
+    let calls = budgeted_run(BudgetMode::Enforce, 20, 4).await;
+    let (_, manifest) = &calls[0];
+    let budget = manifest.budget.as_ref().expect("a budget report");
+    assert_eq!(budget.mode, BudgetMode::Enforce);
+    assert!(budget.after < budget.before);
+    let window = manifest.window.expect("a window survives");
+    assert_eq!(window.1, 3, "the most recent record is kept: {window:?}");
+    assert!(window.0 > 1, "and older ones went: {window:?}");
+    assert!(budget
+        .dropped
+        .iter()
+        .any(|d| d.block == "window" && d.detail == "t1"));
+}
+
 /// A tool whose result is far past the cap. Not an invented shape: the
 /// recorded desktop session's two `pointer_ui_read` results were 14,425 and
 /// 10,025 characters against a median tool result of 24.

@@ -76,6 +76,18 @@ pub struct EngineConfig {
     /// are never folded, because they are what steer the next proposal.
     /// 0 disables the fold.
     pub trace_verbatim_lines: usize,
+    /// M7 T2.1: the ceiling the composed context is measured against, in
+    /// estimated tokens. 0 turns the budget off.
+    pub prompt_budget_tokens: u32,
+    /// Whether the budget acts on what it finds. `Report` — the default —
+    /// records the drops it would make and makes none, so the no-impact rate
+    /// can be measured before anything is dropped for real.
+    pub budget_mode: nscore::BudgetMode,
+    /// M7 T2.3: show the emitter its own size against its own ceiling.
+    /// An experiment, off by default: VISTA reports a large gain from it on
+    /// a Flash-class model, and whether a 3B emitter acts on the line at all
+    /// is exactly what the task set is for.
+    pub show_budget_line: bool,
     /// M7 T0.1: where the provider clients leave what each call cost. When
     /// set, the engine appends one `ModelCall` per call, with the manifest
     /// of what that call was shown. `None` — every scripted double, every
@@ -112,6 +124,9 @@ impl Default for EngineConfig {
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
             trace_verbatim_lines: 5,
+            prompt_budget_tokens: 6000,
+            budget_mode: nscore::BudgetMode::Report,
+            show_budget_line: false,
             usage: None,
         }
     }
@@ -761,7 +776,7 @@ impl Engine {
             let selected = self.select_facts(&scope, &incoming.text).await;
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
-            let ctx = nscore::EmitterContext {
+            let mut ctx = nscore::EmitterContext {
                 facts,
                 summary: state.summary.clone(),
                 window: state.window(self.cfg.window_turns),
@@ -775,7 +790,18 @@ impl Engine {
 
             // c. propose
             let mut confirmed_now = false;
-            let manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
+            // The budget runs before the manifest, so the manifest describes
+            // the context as sent rather than as composed (M7 T2.1). Under
+            // the default `report` mode nothing is dropped and the two are
+            // the same; the report still says what enforcing would have cost.
+            let budget = nscore::fit_emitter(
+                &mut ctx,
+                self.cfg.prompt_budget_tokens,
+                self.cfg.budget_mode,
+                &self.cfg.pinned_prefixes,
+            );
+            let mut manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
+            manifest.budget = Some(budget);
             let proposed = self.parts.emitter.propose(ctx, &legal).await;
             self.record_model_calls(&mut log, turn, &manifest);
             let mut proposal = match proposed {
@@ -1852,8 +1878,21 @@ impl Engine {
                         do_not_state,
                         do_not_repeat,
                     };
-                let manifest = reply_manifest(&make_ctx(vec![], vec![]), reply_clipped_chars);
-                let drafted = self.parts.replier.reply(make_ctx(vec![], vec![])).await;
+                // The reply context is fitted too, and reported on the same
+                // way. Its `turn_trace` is exempt: it is the material the
+                // reply narrates from, and the grounding interceptor flags a
+                // reply for stating anything absent from it — trimming it
+                // would manufacture the fabrications the interceptor catches.
+                let mut budgeted = make_ctx(vec![], vec![]);
+                let budget = nscore::fit_reply(
+                    &mut budgeted,
+                    self.cfg.prompt_budget_tokens,
+                    self.cfg.budget_mode,
+                    &self.cfg.pinned_prefixes,
+                );
+                let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
+                manifest.budget = Some(budget);
+                let drafted = self.parts.replier.reply(budgeted).await;
                 self.record_model_calls(&mut log, turn, &manifest);
                 match drafted {
                     Ok(draft) if self.cfg.reply_grounding_check => {
@@ -2483,6 +2522,9 @@ fn emitter_manifest(
         clipped_chars,
         tools,
         guidance: ctx.guidance.len(),
+        // Filled in by the caller, which is the only place that knows what
+        // the budget did to this context.
+        budget: None,
     }
 }
 
@@ -2498,6 +2540,7 @@ fn reply_manifest(ctx: &nscore::ReplyContext, clipped_chars: usize) -> nscore::C
         clipped_chars,
         tools: 0,
         guidance: ctx.guidance.len(),
+        budget: None,
     }
 }
 

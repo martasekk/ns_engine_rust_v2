@@ -123,6 +123,16 @@ pub struct MemorySection {
     /// fold. 0 turns the fold off.
     #[serde(default = "default_trace_verbatim_lines")]
     pub trace_verbatim_lines: usize,
+    /// Ceiling for the whole composed context, in estimated tokens (M7
+    /// T2.1). 0 turns the budget off.
+    #[serde(default = "default_prompt_budget_tokens")]
+    pub prompt_budget_tokens: u32,
+    /// "report" measures the drops and makes none; "enforce" applies them.
+    #[serde(default = "default_budget_mode")]
+    pub budget_mode: String,
+    /// Show the emitter its own size against its ceiling (M7 T2.3).
+    #[serde(default)]
+    pub show_budget_line: bool,
     /// Rolling summary cadence (M6 §5.1); 0 disables the layer.
     #[serde(default = "default_summary_every_turns")]
     pub summary_every_turns: usize,
@@ -177,6 +187,23 @@ fn default_trace_verbatim_lines() -> usize {
     5
 }
 
+/// Six thousand tokens of composed context. Not a model's limit — it is a
+/// working ceiling for the blocks the engine controls, chosen so the pieces
+/// M6 sizes (window ≈1k, facts ≈300, summary ≈250) plus a desktop turn's
+/// trace sit inside it with room, and so going over is a signal rather than
+/// a routine event.
+fn default_prompt_budget_tokens() -> u32 {
+    6000
+}
+
+/// Report, not enforce. The drops are recorded and not made until the share
+/// of them that leave the next turn unaffected has been measured on real
+/// sessions; Self-GC puts that at about 85% for its own prunes, and below
+/// something like it the priority order is wrong rather than the idea.
+fn default_budget_mode() -> String {
+    "report".into()
+}
+
 fn default_window_turns() -> usize {
     6
 }
@@ -205,6 +232,9 @@ impl Default for MemorySection {
             relevant_max: default_relevant_max(),
             fact_stale_days: default_fact_stale_days(),
             trace_verbatim_lines: default_trace_verbatim_lines(),
+            prompt_budget_tokens: default_prompt_budget_tokens(),
+            budget_mode: default_budget_mode(),
+            show_budget_line: false,
             summary_every_turns: default_summary_every_turns(),
             summary_rebuild_every: default_summary_rebuild_every(),
             summary_max_chars: default_summary_max_chars(),
@@ -231,6 +261,18 @@ impl MemorySection {
                 "[memory] remember_residual must be \"flag\" or \"never\", got {other:?}"
             )),
         }
+    }
+
+    /// Err names the bad value. A typo here would otherwise mean the budget
+    /// silently stayed in report mode, which looks exactly like a budget
+    /// that found nothing to drop.
+    pub fn budget_mode(&self) -> Result<nscore::BudgetMode, String> {
+        nscore::BudgetMode::parse(&self.budget_mode).ok_or_else(|| {
+            format!(
+                "[memory] budget_mode must be \"report\" or \"enforce\", got {:?}",
+                self.budget_mode
+            )
+        })
     }
 }
 

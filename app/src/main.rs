@@ -535,6 +535,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let budget_mode = match cfg.memory.budget_mode() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
     let engine_cfg = EngineConfig {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
@@ -560,6 +567,9 @@ async fn main() {
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
+        prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
+        budget_mode,
+        show_budget_line: cfg.memory.show_budget_line,
         usage: Some(usage),
     };
     let mut engine = Engine::new(parts, engine_cfg);

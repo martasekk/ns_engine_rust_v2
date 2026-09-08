@@ -79,6 +79,24 @@ fact_stale_days = 90          # unused this long -> cold (kept, searchable, not 
 # show is clipped with a handle (r42) that `inspect_result` reads the rest
 # from, so folding loses nothing that cannot be fetched back.
 trace_verbatim_lines = 5
+# A ceiling for the whole composed context — facts, summary, window, the
+# current turn — in estimated tokens at four characters each (M7 T2.1). Not
+# the model's limit: a working ceiling for the blocks the engine controls.
+# The system prompt is fixed and the tool schemas are measured separately
+# and exactly (`ns-app budget` reports them), so neither is counted here.
+# 0 turns the budget off.
+prompt_budget_tokens = 6000
+# "report" measures what it would drop and drops nothing; "enforce" applies
+# it. Report is the default on purpose: a context manager that drops is a
+# theory about which context does not matter, and `ns-app budget` is how the
+# theory gets tested first. Turn it on when the drops recorded here are
+# shown not to be followed by fallbacks, re-asks or corrections.
+budget_mode = "report"
+# Show the emitter one line naming its own size against the ceiling, and the
+# clipped results it could inspect. An experiment: VISTA reports a large gain
+# from it on a Flash-class model, and whether a 3B emitter acts on it here is
+# what the task set is for.
+show_budget_line = false
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said

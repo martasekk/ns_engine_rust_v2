@@ -92,6 +92,12 @@ pub struct ContextManifest {
     /// live in `learned.toml`, which the evolution pass rewrites.
     #[serde(default)]
     pub guidance: usize,
+    /// What the budget did, or would have done, to this context (M7 T2.1).
+    /// `None` when no budget was set. Under `report` mode this is the whole
+    /// point of the field: the drops that did *not* happen, so the no-impact
+    /// rate can be computed before any of them do.
+    #[serde(default)]
+    pub budget: Option<crate::budget::BudgetReport>,
 }
 
 /// Where a provider client leaves what a call cost, for the engine to pick
@@ -187,6 +193,7 @@ mod tests {
             clipped_chars: 13_225,
             tools: 17,
             guidance: 1,
+            budget: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<ContextManifest>(&json).unwrap(), m);
