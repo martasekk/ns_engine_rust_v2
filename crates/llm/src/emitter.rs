@@ -58,6 +58,11 @@ fn render_context(ctx: &EmitterContext) -> String {
             s.push_str(&format!("- {line}\n"));
         }
     }
+    // After the trace, because the results it names are in it (M7 T2.3).
+    if let Some(line) = &ctx.budget_line {
+        s.push_str(line);
+        s.push('\n');
+    }
     if ctx.pending_confirmation {
         s.push_str("Pending confirmation: awaiting the user's yes/no on the staged action.\n");
     }
@@ -145,8 +150,24 @@ impl Emitter for CloudEmitter {
             .ok_or_else(|| EmitError::Malformed("tool call has no name".into()))?
             .to_string();
         let args_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
-        let parsed: serde_json::Value = serde_json::from_str(args_str)
-            .map_err(|e| EmitError::Malformed(format!("unparseable arguments: {e}")))?;
+        // Strict first, always: the salvage pass sees nothing that parses, so
+        // the primary path keeps the behaviour it had. Only the arguments are
+        // repaired — the action name above stays whatever the provider sent,
+        // because the illegality guarantee rests on generation being
+        // constrained to the legal set (plan §T2.5).
+        let parsed: serde_json::Value = match serde_json::from_str(args_str) {
+            Ok(v) => v,
+            Err(e) => match crate::salvage::salvage_arguments(args_str) {
+                Some((v, repair)) => {
+                    // Repairing model output in silence would hide a provider
+                    // that needs replacing, and one salvaged call looks
+                    // exactly like a well-formed one from here on.
+                    eprintln!("emitter: repaired malformed tool arguments ({repair})");
+                    v
+                }
+                None => return Err(EmitError::Malformed(format!("unparseable arguments: {e}"))),
+            },
+        };
         let mut input = parsed.as_object().cloned().unwrap_or_default();
         // `_rationale` is the schema's name for it (see `schema::RATIONALE`).
         // The bare name is still accepted, because a shim that ignores
@@ -219,6 +240,7 @@ mod tests {
             pending_confirmation: false,
             rejections_this_turn: vec!["guard g: nope".into()],
             guidance: vec![],
+            budget_line: None,
         }
     }
 
@@ -349,9 +371,8 @@ mod tests {
         assert!(p.args.as_object().is_some_and(|o| o.is_empty()));
     }
 
-    #[tokio::test]
-    async fn unparseable_arguments_string_is_malformed() {
-        let mock = MockTransport::ok(vec![serde_json::json!({
+    fn raw_arguments(args: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
             "id": "gen_1",
             "choices": [{
                 "finish_reason": "tool_calls",
@@ -359,13 +380,35 @@ mod tests {
                     "role": "assistant", "content": null,
                     "tool_calls": [{
                         "id": "call_1", "type": "function",
-                        "function": {"name": "echo", "arguments": "{not json"}
+                        "function": {"name": "echo", "arguments": args}
                     }]
                 }
             }]
-        })]);
+        })]
+    }
+
+    /// Nothing in `{not json` is an object, so the salvage pass must not
+    /// rescue it: the engine still spends a retry, which is the right answer.
+    #[tokio::test]
+    async fn unparseable_arguments_string_is_malformed() {
+        let mock = MockTransport::ok(raw_arguments("{not json"));
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
         assert!(matches!(err, nscore::EmitError::Malformed(_)));
+    }
+
+    /// A fenced, single-quoted, trailing-comma'd argument object — one weak
+    /// shim's whole repertoire at once — used to cost one of
+    /// `max_emit_retries` per occurrence. It now proposes, and the rationale
+    /// is still stripped out of `args`.
+    #[tokio::test]
+    async fn salvageable_arguments_yield_a_proposal_instead_of_a_retry() {
+        let mock = MockTransport::ok(raw_arguments(
+            "```json\n{'_rationale': 'user asked', 'text': 'hi',}\n```",
+        ));
+        let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
+        assert_eq!(p.action, "echo");
+        assert_eq!(p.rationale, "user asked");
+        assert_eq!(p.args, serde_json::json!({"text": "hi"}));
     }
 
     #[tokio::test]

@@ -92,6 +92,16 @@ pub struct ContextManifest {
     /// live in `learned.toml`, which the evolution pass rewrites.
     #[serde(default)]
     pub guidance: usize,
+    /// Which tier this call was routed to (M7 Phase 3), and the cues that
+    /// decided it. `None` when no router is installed. Recorded because a
+    /// misroute is invisible in an answer — a `Chat` turn that needed a tool
+    /// looks like a model that would not act — and because the tools
+    /// fraction only means anything per tier: schemas are most of a `Task`
+    /// prompt and none of a `Chat` one.
+    #[serde(default)]
+    pub tier: Option<crate::router::Tier>,
+    #[serde(default)]
+    pub route_cues: Vec<String>,
     /// What the budget did, or would have done, to this context (M7 T2.1).
     /// `None` when no budget was set. Under `report` mode this is the whole
     /// point of the field: the drops that did *not* happen, so the no-impact
@@ -192,6 +202,8 @@ mod tests {
             trace_chars: 120,
             clipped_chars: 13_225,
             tools: 17,
+            tier: Some(crate::router::Tier::Task),
+            route_cues: vec!["click".into()],
             guidance: 1,
             budget: None,
         };

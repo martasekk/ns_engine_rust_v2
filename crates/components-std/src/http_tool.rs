@@ -199,6 +199,27 @@ mod tests {
         ) -> Result<Vec<nscore::TurnHit>, nscore::StoreError> {
             Ok(vec![])
         }
+        async fn put_session_digest(
+            &self,
+            _d: &nscore::SessionDigest,
+        ) -> Result<(), nscore::StoreError> {
+            Ok(())
+        }
+        async fn session_digests(
+            &self,
+            _s: &str,
+            _n: usize,
+        ) -> Result<Vec<nscore::SessionDigest>, nscore::StoreError> {
+            Ok(vec![])
+        }
+        async fn search_digests(
+            &self,
+            _s: &str,
+            _q: &str,
+            _k: usize,
+        ) -> Result<Vec<nscore::SessionDigest>, nscore::StoreError> {
+            Ok(vec![])
+        }
         async fn facts(&self, _s: &str, _p: &str) -> Result<Vec<nscore::Fact>, nscore::StoreError> {
             Ok(vec![])
         }

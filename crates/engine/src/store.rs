@@ -11,6 +11,10 @@ pub struct InMemoryStore {
     /// Every fact version, in insertion order (M6 §6.1: never overwritten).
     facts: Mutex<Vec<Fact>>,
     artifacts: Mutex<HashMap<ArtifactId, Vec<u8>>>,
+    /// One digest per session, replaced on rewrite (M7 §8). Keyed the way
+    /// the trait says writes are idempotent, so the map cannot hold the
+    /// duplicate a re-digested session would otherwise create.
+    digests: Mutex<HashMap<SessionId, nscore::SessionDigest>>,
 }
 
 impl InMemoryStore {
@@ -66,6 +70,7 @@ impl MemoryStore for InMemoryStore {
                 let hay = text.to_lowercase();
                 let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count() as f64;
                 nscore::TurnHit {
+                    session: session.clone(),
                     turn,
                     speaker,
                     text: text.clone(),
@@ -82,6 +87,68 @@ impl MemoryStore for InMemoryStore {
         });
         hits.truncate(k);
         Ok(hits)
+    }
+
+    async fn put_session_digest(&self, digest: &nscore::SessionDigest) -> Result<(), StoreError> {
+        self.digests
+            .lock()
+            .await
+            .insert(digest.session.clone(), digest.clone());
+        Ok(())
+    }
+
+    async fn session_digests(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<nscore::SessionDigest>, StoreError> {
+        let all = self.digests.lock().await;
+        let mut out: Vec<nscore::SessionDigest> =
+            all.values().filter(|d| d.scope == scope).cloned().collect();
+        // HashMap iteration order is not stable across runs, so the session
+        // id is the tiebreak: two digests written in the same millisecond
+        // must still come out in one order, or a replay diff moves.
+        out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.session.0.cmp(&a.session.0)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Substring match over the digest's own text, scored like
+    /// `search_turns`: this twin is what the engine's tests search, so it
+    /// has to return the same shape of answer as FTS5 does, not nothing.
+    async fn search_digests(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::SessionDigest>, StoreError> {
+        let tokens = nscore::query_tokens(query);
+        if tokens.is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        let mut scored: Vec<(usize, nscore::SessionDigest)> = self
+            .session_digests(scope, usize::MAX)
+            .await?
+            .into_iter()
+            .map(|d| {
+                let hay = format!(
+                    "{} {} {}",
+                    d.summary.topic,
+                    d.summary.established.join(" "),
+                    d.summary.open.join(" ")
+                )
+                .to_lowercase();
+                let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count();
+                (score, d)
+            })
+            .filter(|(score, _)| *score > 0)
+            .collect();
+        // `sort_by_key` is stable and the list is already in `at` DESC,
+        // session id DESC order, so equal scores keep that order instead of
+        // coming out in whatever order the HashMap iterated: a recall that
+        // is replayed has to return the same digests in the same places.
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        Ok(scored.into_iter().take(k).map(|(_, d)| d).collect())
     }
 
     async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
@@ -353,6 +420,120 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn digest(session: &str, scope: &str, topic: &str, at: u64) -> SessionDigest {
+        SessionDigest {
+            session: SessionId(session.into()),
+            scope: scope.into(),
+            summary: SessionSummary {
+                through_turn: 9,
+                topic: topic.into(),
+                established: vec!["the invoice was sent".into()],
+                open: vec![],
+                trust: Trust::External,
+                rebuilt_from: 1,
+            },
+            last_turn: 11,
+            at: Timestamp(at),
+        }
+    }
+
+    /// The twin is a real store, not a stub: a re-digested session replaces
+    /// its digest instead of adding a second one, and scope is a wall. Both
+    /// are what the engine's tests would otherwise prove nothing about.
+    #[tokio::test]
+    async fn session_digests_replace_by_session_and_stay_in_scope() {
+        let store = InMemoryStore::new();
+        store
+            .put_session_digest(&digest("s1", "global", "renewing the domain", 100))
+            .await
+            .unwrap();
+        store
+            .put_session_digest(&digest("s1", "global", "booking the flight", 200))
+            .await
+            .unwrap();
+        store
+            .put_session_digest(&digest("s2", "chat42", "renewing the domain", 300))
+            .await
+            .unwrap();
+        let global = store.session_digests("global", 5).await.unwrap();
+        assert_eq!(global.len(), 1, "one digest per session");
+        assert_eq!(global[0].summary.topic, "booking the flight");
+        assert_eq!(global[0].summary.trust, Trust::External, "trust survives");
+        assert_eq!(store.session_digests("chat42", 5).await.unwrap().len(), 1);
+        assert!(store.session_digests("other", 5).await.unwrap().is_empty());
+    }
+
+    /// A digest is found by a word of its own text, never by a word from a
+    /// digest of another scope.
+    #[tokio::test]
+    async fn search_digests_matches_summary_text_within_one_scope() {
+        let store = InMemoryStore::new();
+        store
+            .put_session_digest(&digest("s1", "global", "renewing the domain", 100))
+            .await
+            .unwrap();
+        store
+            .put_session_digest(&digest("s2", "chat42", "renewing the domain", 200))
+            .await
+            .unwrap();
+        let hits = store.search_digests("global", "domain", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session, SessionId("s1".into()));
+        // `established` is searched too, not just the topic.
+        assert_eq!(
+            store
+                .search_digests("global", "invoice", 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .search_digests("global", "unrelated", 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The trait's default `search_turns_in` — no store overrides it here —
+    /// must merge the sessions into one ranking, not concatenate them.
+    #[tokio::test]
+    async fn search_turns_in_merges_two_sessions_by_score() {
+        let store = InMemoryStore::new();
+        for (name, user) in [
+            ("s1", "where is the blue invoice folder"),
+            ("s2", "print the invoice"),
+            ("s3", "the blue invoice is late"),
+        ] {
+            let sid = SessionId(name.into());
+            let mut log = EventLog::new(sid.clone());
+            log.append(1, Timestamp(1), EventKind::UserSaid { text: user.into() });
+            store.append(&sid, log.events()).await.unwrap();
+        }
+        let sessions = [SessionId("s2".into()), SessionId("s1".into())];
+        let hits = store
+            .search_turns_in(&sessions, "blue invoice", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].session,
+            SessionId("s1".into()),
+            "two tokens beat one, whatever order the sessions came in: {hits:?}"
+        );
+        assert_eq!(hits[1].session, SessionId("s2".into()));
+        assert!(!hits.iter().any(|h| h.session.0 == "s3"));
+        // k caps the merged list, not each session.
+        assert_eq!(
+            store
+                .search_turns_in(&sessions, "blue invoice", 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

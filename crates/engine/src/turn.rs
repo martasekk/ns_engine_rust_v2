@@ -76,6 +76,10 @@ pub struct EngineConfig {
     /// are never folded, because they are what steer the next proposal.
     /// 0 disables the fold.
     pub trace_verbatim_lines: usize,
+    /// M7 Phase 3: decides each turn's tier before the first model call.
+    /// `None` — every scripted double and every replay — routes nothing and
+    /// behaves exactly as the engine did before the router existed.
+    pub router: Option<std::sync::Arc<dyn crate::router::Router>>,
     /// M7 T2.1: the ceiling the composed context is measured against, in
     /// estimated tokens. 0 turns the budget off.
     pub prompt_budget_tokens: u32,
@@ -124,6 +128,7 @@ impl Default for EngineConfig {
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
             trace_verbatim_lines: 5,
+            router: None,
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
@@ -429,17 +434,16 @@ impl Engine {
     /// facts lexically relevant to the current message, within
     /// `facts_in_context`. Dumping the whole store masks precision failures
     /// and irrelevant facts measurably degrade replies (findings §1).
-    async fn select_facts(&self, scope: &str, user_text: &str) -> Vec<nscore::Fact> {
+    /// The pinned core alone (M6 §6.5): current facts under
+    /// `pinned_prefixes`, newest-validated first. Shown at every tier —
+    /// a `Chat` turn that has forgotten the user's name is the failure the
+    /// facts block was added to fix, not a saving.
+    async fn pinned_facts(&self, scope: &str) -> Vec<nscore::Fact> {
         let live = self.parts.memory.facts(scope, "").await.unwrap_or_default();
         let mut pinned: Vec<nscore::Fact> = live
             .iter()
             .filter(|f| f.state == nscore::FactState::Current)
-            .filter(|f| {
-                self.cfg
-                    .pinned_prefixes
-                    .iter()
-                    .any(|p| f.key.starts_with(p))
-            })
+            .filter(|f| self.is_pinned(f))
             .cloned()
             .collect();
         pinned.sort_by(|a, b| {
@@ -448,6 +452,11 @@ impl Engine {
                 .then_with(|| a.key.cmp(&b.key))
         });
         pinned.truncate(self.cfg.pinned_max);
+        pinned
+    }
+
+    async fn select_facts(&self, scope: &str, user_text: &str) -> Vec<nscore::Fact> {
+        let pinned = self.pinned_facts(scope).await;
         let relevant = self
             .parts
             .memory
@@ -631,6 +640,119 @@ impl Engine {
     /// runs again at the end of the turn, and *that* one propagates. Ending
     /// the turn early on a store error would abandon it after the side effect
     /// rather than before.
+    /// Route this turn, or hand back `Task` when no router is installed —
+    /// which is what the engine did before there was one, so an engine
+    /// without a router is unchanged rather than differently behaved.
+    fn route_turn(
+        &self,
+        user_text: &str,
+        events: &[nscore::Event],
+        turn: u32,
+    ) -> crate::router::Route {
+        let Some(router) = &self.cfg.router else {
+            return crate::router::Route {
+                tier: nscore::Tier::Task,
+                cues: Vec::new(),
+            };
+        };
+        let state = fold(events);
+        // The same expiry rule the loop applies: a pending confirmation is
+        // live only on the turn after the one that staged it.
+        let pending_confirmation = state
+            .pending_confirmation
+            .filter(|_| state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false))
+            .is_some();
+        // Precise, and cheaper than reading it back out of a rendered record:
+        // did the turn immediately before this one actually call a tool.
+        let previous_turn_used_tools = events
+            .iter()
+            .any(|e| e.turn + 1 == turn && matches!(e.kind, EventKind::ToolCalled { .. }));
+        let tool_names: Vec<String> = self
+            .parts
+            .tools
+            .iter()
+            .map(|t| t.spec().name.clone())
+            .collect();
+        router.route(&crate::router::RouteInput {
+            user_text,
+            pending_confirmation,
+            previous_turn_used_tools,
+            tool_names: &tool_names,
+        })
+    }
+
+    /// The `recall` search itself (M6 §7): verbatim turns beyond the window
+    /// first, then live facts, with the lowest trust among them.
+    ///
+    /// One function because two callers need it — the `recall` action, and
+    /// the `Deep` tier running it pre-emptively (M7 Phase 3). Two copies
+    /// would drift, and the one that drifted would be the one a model reached
+    /// for after the other had already failed it.
+    async fn recall_outcome(
+        &self,
+        sid: &nscore::SessionId,
+        scope: &str,
+        query: &str,
+        turn: u32,
+    ) -> ToolOutcome {
+        let k = self.cfg.recall_top_k;
+        // Turns already visible in the window (and this one) add nothing.
+        let visible_from = turn.saturating_sub(self.cfg.window_turns as u32);
+        let mut lines: Vec<String> = Vec::new();
+        let mut trusts: Vec<nscore::Trust> = Vec::new();
+        let mut failure: Option<String> = None;
+        match self.parts.memory.search_turns(sid, query, k * 3).await {
+            Ok(hits) => {
+                for h in hits.into_iter().filter(|h| h.turn < visible_from).take(k) {
+                    trusts.push(if h.speaker == "user" {
+                        nscore::Trust::User
+                    } else {
+                        nscore::Trust::System
+                    });
+                    lines.push(format!("t{} {}: {}", h.turn, h.speaker, h.text));
+                }
+            }
+            Err(e) => failure = Some(e.to_string()),
+        }
+        match self.parts.memory.search_facts(scope, query, k).await {
+            Ok(facts) => {
+                for f in facts {
+                    trusts.push(f.trust);
+                    lines.push(format!(
+                        "from memory, {} is {}",
+                        f.key,
+                        value_text(&f.value)
+                    ));
+                }
+            }
+            Err(e) => failure = Some(e.to_string()),
+        }
+        match failure {
+            Some(detail) => ToolOutcome::Err {
+                kind: "store".into(),
+                detail,
+            },
+            None if lines.is_empty() => ToolOutcome::Ok {
+                output: nscore::ToolOutput {
+                    summary: "no matches".into(),
+                    artifact: None,
+                    trust: nscore::Trust::System,
+                },
+            },
+            // Joined, not JSON: brackets and escaped quotes are pure
+            // copy-bait for the reply model and buy nothing, since nothing
+            // parses this back (plan §3, phase 1). One line, because
+            // `turn_trace` is line-per-event.
+            None => ToolOutcome::Ok {
+                output: nscore::ToolOutput {
+                    summary: lines.join("; "),
+                    artifact: None,
+                    trust: nscore::min_trust(&trusts),
+                },
+            },
+        }
+    }
+
     /// Append one `ModelCall` for every provider call recorded since the
     /// last drain (M7 T0.1).
     ///
@@ -686,6 +808,44 @@ impl Engine {
             },
         );
 
+        // M7 Phase 3: what kind of turn this is, decided once and before any
+        // model call, from the message and this turn's own history only.
+        let routed = self.route_turn(&incoming.text, log.events(), turn);
+        let mut tier = routed.tier;
+        // `Deep` runs the recall itself rather than waiting to be asked for
+        // it. That is the saving: on a fifty-request day an emitter iteration
+        // spent proposing `recall` is a request that bought no progress, and
+        // the query the emitter would have passed is the user's own message.
+        // Recorded as a real call rather than injected as prompt text, so it
+        // enters the provenance index, carries its own trust, and replays.
+        if tier == nscore::Tier::Deep {
+            let args = serde_json::json!({ "query": incoming.text });
+            let spec = recall_spec();
+            let index = nsprovenance::index::ValueIndex::from_events(log.events());
+            let classified = nsprovenance::classify::classify_args(&args, &spec, &index, turn);
+            let call_id = log
+                .append(
+                    turn,
+                    now(),
+                    EventKind::ToolCalled {
+                        action: RECALL.into(),
+                        args: classified,
+                    },
+                )
+                .id;
+            let outcome = self
+                .recall_outcome(&sid, &scope, &incoming.text, turn)
+                .await;
+            log.append(
+                turn,
+                now(),
+                EventKind::ToolReturned {
+                    call: call_id,
+                    outcome,
+                },
+            );
+        }
+
         let mut rejections_this_turn: Vec<String> = Vec::new();
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
         let mut calls_this_turn: std::collections::HashSet<String> = Default::default();
@@ -717,13 +877,21 @@ impl Engine {
             } else {
                 // Narrowed schema (spec §2): actions rejected this turn are
                 // removed from the set the emitter sees next.
-                let mut actions: Vec<_> = self
-                    .parts
-                    .tools
-                    .iter()
-                    .map(|t| t.spec().clone())
-                    .filter(|s| !denied_this_turn.contains(&s.name))
-                    .collect();
+                // A `Chat` turn carries no tool schemas at all. With a desktop
+                // wired in that is ten of the seventeen schemas the emitter
+                // would otherwise re-send on every iteration of a turn that
+                // was never going to click anything. The synthetic actions
+                // stay legal at every tier: they are how a turn ends.
+                let mut actions: Vec<_> = if tier.allows_tools() {
+                    self.parts
+                        .tools
+                        .iter()
+                        .map(|t| t.spec().clone())
+                        .filter(|s| !denied_this_turn.contains(&s.name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 actions.push(ask_clarification_spec());
                 if !denied_this_turn.contains(REMEMBER_FACT) {
                     actions.push(remember_fact_spec());
@@ -773,7 +941,14 @@ impl Engine {
             // after it.
             let (trace_so_far, clipped_chars) =
                 trace_for_prompt(log.events(), turn, self.cfg.trace_verbatim_lines);
-            let selected = self.select_facts(&scope, &incoming.text).await;
+            // The pinned core is shown at every tier — it is what stops the
+            // emitter asking again for a name it already has (M6 F2). The
+            // query-relevant slice is what a `Chat` turn does without.
+            let selected = if tier.allows_relevant_facts() {
+                self.select_facts(&scope, &incoming.text).await
+            } else {
+                self.pinned_facts(&scope).await
+            };
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
             let mut ctx = nscore::EmitterContext {
@@ -786,6 +961,7 @@ impl Engine {
                 pending_confirmation: active_pending.is_some(),
                 rejections_this_turn: rejections_this_turn.clone(),
                 guidance: rules.guidance_for(&legal_names),
+                budget_line: None,
             };
 
             // c. propose
@@ -796,12 +972,21 @@ impl Engine {
             // the same; the report still says what enforcing would have cost.
             let budget = nscore::fit_emitter(
                 &mut ctx,
-                self.cfg.prompt_budget_tokens,
+                tier.budget(self.cfg.prompt_budget_tokens),
                 self.cfg.budget_mode,
                 &self.cfg.pinned_prefixes,
             );
+            if self.cfg.show_budget_line {
+                let clipped: Vec<String> = clipped_results(log.events(), turn)
+                    .into_iter()
+                    .map(result_handle)
+                    .collect();
+                ctx.budget_line = Some(budget.line(&clipped));
+            }
             let mut manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
             manifest.budget = Some(budget);
+            manifest.tier = self.cfg.router.is_some().then_some(tier);
+            manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose(ctx, &legal).await;
             self.record_model_calls(&mut log, turn, &manifest);
             let mut proposal = match proposed {
@@ -885,6 +1070,25 @@ impl Engine {
 
             // f. legality
             if !legal.contains(&proposal.action) {
+                // A misroute is not the model's mistake. If the action exists
+                // and only the tier was hiding it, widen the tier and ask
+                // again rather than recording a refusal: a refusal here would
+                // teach the emitter that a real action is illegal, and the
+                // narrowed schema would then keep it illegal for the rest of
+                // the turn. One iteration is the honest price of a wrong
+                // guess about the message (MemFlow's validator-retries, with
+                // no second model). The tier only ever rises, so this cannot
+                // loop.
+                let tiered_out = tier < nscore::Tier::Task
+                    && self
+                        .parts
+                        .tools
+                        .iter()
+                        .any(|t| t.spec().name == proposal.action);
+                if tiered_out {
+                    tier = nscore::Tier::Task;
+                    continue;
+                }
                 let reason = RejectReason::IllegalAction {
                     action: proposal.action.clone(),
                 };
@@ -1309,62 +1513,7 @@ impl Engine {
                     )
                     .id;
                 calls_this_turn.insert(Self::call_key(&proposal));
-                let k = self.cfg.recall_top_k;
-                // Turns already visible in the window (and this one) add nothing.
-                let visible_from = turn.saturating_sub(self.cfg.window_turns as u32);
-                let mut lines: Vec<String> = Vec::new();
-                let mut trusts: Vec<nscore::Trust> = Vec::new();
-                let mut failure: Option<String> = None;
-                match self.parts.memory.search_turns(&sid, &query, k * 3).await {
-                    Ok(hits) => {
-                        for h in hits.into_iter().filter(|h| h.turn < visible_from).take(k) {
-                            trusts.push(if h.speaker == "user" {
-                                nscore::Trust::User
-                            } else {
-                                nscore::Trust::System
-                            });
-                            lines.push(format!("t{} {}: {}", h.turn, h.speaker, h.text));
-                        }
-                    }
-                    Err(e) => failure = Some(e.to_string()),
-                }
-                match self.parts.memory.search_facts(&scope, &query, k).await {
-                    Ok(facts) => {
-                        for f in facts {
-                            trusts.push(f.trust);
-                            lines.push(format!(
-                                "from memory, {} is {}",
-                                f.key,
-                                value_text(&f.value)
-                            ));
-                        }
-                    }
-                    Err(e) => failure = Some(e.to_string()),
-                }
-                let outcome = match failure {
-                    Some(detail) => ToolOutcome::Err {
-                        kind: "store".into(),
-                        detail,
-                    },
-                    None if lines.is_empty() => ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: "no matches".into(),
-                            artifact: None,
-                            trust: nscore::Trust::System,
-                        },
-                    },
-                    // Joined, not JSON: brackets and escaped quotes are pure
-                    // copy-bait for the reply model and buy nothing, since
-                    // nothing parses this back (plan §3, phase 1). One line,
-                    // because `turn_trace` is line-per-event.
-                    None => ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: lines.join("; "),
-                            artifact: None,
-                            trust: nscore::min_trust(&trusts),
-                        },
-                    },
-                };
+                let outcome = self.recall_outcome(&sid, &scope, &query, turn).await;
                 log.append(
                     turn,
                     now(),
@@ -2522,6 +2671,8 @@ fn emitter_manifest(
         clipped_chars,
         tools,
         guidance: ctx.guidance.len(),
+        tier: None,
+        route_cues: Vec::new(),
         // Filled in by the caller, which is the only place that knows what
         // the budget did to this context.
         budget: None,
@@ -2540,6 +2691,8 @@ fn reply_manifest(ctx: &nscore::ReplyContext, clipped_chars: usize) -> nscore::C
         clipped_chars,
         tools: 0,
         guidance: ctx.guidance.len(),
+        tier: None,
+        route_cues: Vec::new(),
         budget: None,
     }
 }

@@ -17,10 +17,60 @@ pub struct AppConfig {
     pub evolution: EvolutionSection,
     #[serde(default)]
     pub memory: MemorySection,
+    #[serde(default)]
+    pub router: RouterSection,
     /// [pointer] — a desktop to drive, through the ns-pointer agent on it.
     /// Absent means no pointer actions are registered.
     #[serde(default)]
     pub pointer: Option<PointerSection>,
+}
+
+/// [router] — the cue lists that decide a turn's tier (M7 Phase 3).
+///
+/// Configuration rather than code because the lists are exactly what the
+/// evolution pass should be able to propose an addition to and gate: a
+/// `Misrouted` signature names the message that routed wrong, and a cue is
+/// the smallest patch that fixes it.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct RouterSection {
+    /// Off means every turn is `Task` — the whole legal set, the whole
+    /// context, exactly as the engine behaved before the router existed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Words that mean the answer is probably outside the window, so the
+    /// engine should search before proposing rather than spend an iteration
+    /// being asked to.
+    #[serde(default)]
+    pub recall_cues: Vec<String>,
+    /// Words that mean something is to be done, so the tools must be legal.
+    #[serde(default)]
+    pub task_cues: Vec<String>,
+}
+
+impl Default for RouterSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            recall_cues: Vec::new(),
+            task_cues: Vec::new(),
+        }
+    }
+}
+
+impl RouterSection {
+    /// Empty lists mean "keep the built-in ones", not "no cues": a `[router]`
+    /// section written to set `enabled` should not silently disarm the
+    /// routing it just switched on.
+    pub fn router(&self) -> nsengine::router::KeywordRouter {
+        let mut r = nsengine::router::KeywordRouter::default();
+        if !self.recall_cues.is_empty() {
+            r.recall_cues = self.recall_cues.clone();
+        }
+        if !self.task_cues.is_empty() {
+            r.task_cues = self.task_cues.clone();
+        }
+        r
+    }
 }
 
 /// [pointer] — where the ns-pointer agent listens and which env var holds

@@ -216,6 +216,27 @@ mod tests {
         ) -> Result<Vec<crate::traits::TurnHit>, StoreError> {
             Ok(vec![])
         }
+        async fn put_session_digest(
+            &self,
+            _d: &crate::traits::SessionDigest,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn session_digests(
+            &self,
+            _s: &str,
+            _n: usize,
+        ) -> Result<Vec<crate::traits::SessionDigest>, StoreError> {
+            Ok(vec![])
+        }
+        async fn search_digests(
+            &self,
+            _s: &str,
+            _q: &str,
+            _k: usize,
+        ) -> Result<Vec<crate::traits::SessionDigest>, StoreError> {
+            Ok(vec![])
+        }
         async fn facts(&self, _s: &str, _p: &str) -> Result<Vec<Fact>, StoreError> {
             Ok(vec![])
         }

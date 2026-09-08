@@ -376,6 +376,7 @@ mod tests {
             pending_confirmation: false,
             rejections_this_turn: vec!["guard g: no".into()],
             guidance: vec![],
+            budget_line: None,
         }
     }
 

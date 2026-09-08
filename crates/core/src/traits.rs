@@ -64,6 +64,12 @@ pub struct EmitterContext {
     pub rejections_this_turn: Vec<String>,
     /// Learned guidance notes (spec M5 §3.3): global + scoped to legal actions.
     pub guidance: Vec<String>,
+    /// The emitter's own size against its own ceiling, and the results it
+    /// could still page through (M7 T2.3). `None` unless
+    /// `show_budget_line` is on — it is an experiment: VISTA reports a large
+    /// gain from showing a model its budget, and whether a 3B emitter acts
+    /// on the line or merely reads it is what the task set is for.
+    pub budget_line: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,12 +216,32 @@ pub enum StoreError {
 /// One verbatim line of a recorded turn matched by `recall` (M6 §7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnHit {
+    /// Which conversation the line was said in. Recall reaches across
+    /// sessions (M7 §8), and a turn number alone does not identify a line
+    /// once more than one session can answer the query.
+    pub session: SessionId,
     pub turn: u32,
     /// "user" or "bot".
     pub speaker: &'static str,
     pub text: String,
     /// Higher is better; comparable only within one query.
     pub score: f64,
+}
+
+/// The last `SessionSummary` of a closed session, filed under its scope
+/// (M7 §8) — one level of coarsening above the session, and the only
+/// episodic memory that crosses sessions besides facts. No model call: the
+/// rolling summarizer already paid for the summary, and the digest is that
+/// summary made searchable after the session ends.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionDigest {
+    pub session: SessionId,
+    pub scope: String,
+    pub summary: crate::memory::SessionSummary,
+    /// Last turn of the session the digest covers.
+    pub last_turn: u32,
+    /// When the digest was written (unix ms).
+    pub at: crate::event::Timestamp,
 }
 
 #[async_trait]
@@ -230,6 +256,57 @@ pub trait MemoryStore: Send + Sync {
         query: &str,
         k: usize,
     ) -> Result<Vec<TurnHit>, StoreError>;
+    /// `search_turns` over several sessions at once, merged into one ranking
+    /// — what cross-session recall reads (M7 §8).
+    ///
+    /// The default is correct but spends one query per session; a store with
+    /// a real index overrides it with a single query, because recall runs on
+    /// the hot path and `recall_sessions` is 3 today only because nothing
+    /// cheaper existed.
+    async fn search_turns_in(
+        &self,
+        sessions: &[SessionId],
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<TurnHit>, StoreError> {
+        let mut out: Vec<TurnHit> = Vec::new();
+        for session in sessions {
+            // `k` from each session is enough: a hit in the merged top-k is
+            // necessarily in the top-k of its own session.
+            out.extend(self.search_turns(session, query, k).await?);
+        }
+        // Stable sort, so equal scores keep the caller's session order —
+        // callers pass the current session first, and M6 §7 ranks what was
+        // said in this conversation above what was said in an older one.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(k);
+        Ok(out)
+    }
+    /// Write the digest of a closed session (M7 §8), **replacing** any
+    /// digest that session already has. Idempotent by session id because a
+    /// session is closed and re-digested on every consolidator run, and two
+    /// rows for one session would double-count it in `session_digests`.
+    async fn put_session_digest(&self, digest: &SessionDigest) -> Result<(), StoreError>;
+    /// The `limit` most recently written digests of `scope`, newest first.
+    async fn session_digests(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionDigest>, StoreError>;
+    /// Digests of `scope` relevant to `query`, best first, at most `k`.
+    /// A digest is an index into older sessions, not a replacement for them:
+    /// callers rank these below the verbatim hits of `search_turns_in`
+    /// (M6 §7, verbatim first).
+    async fn search_digests(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<SessionDigest>, StoreError>;
     /// Live facts (`current` or `cold`) in `scope` whose key starts with
     /// `key_prefix`, key order. Superseded and forgotten versions are
     /// reachable through `fact_history` only.

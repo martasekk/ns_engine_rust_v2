@@ -2721,6 +2721,165 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     assert_eq!(summaries, 1, "the summary still lands in the log");
 }
 
+/// Records the legal action names it was offered on each iteration. What a
+/// tier does is decide that set, so that set is what a routing test asserts
+/// on — not the answer, which a scripted double controls anyway.
+struct RoutingProbe {
+    inner: ScriptedEmitter,
+    legal: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for RoutingProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.legal
+            .lock()
+            .expect("legal")
+            .push(legal.actions.iter().map(|a| a.name.clone()).collect());
+        self.inner.propose(ctx, legal).await
+    }
+}
+
+fn routed_engine(
+    proposals: Vec<Proposal>,
+    store: Arc<InMemoryStore>,
+    legal: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(RoutingProbe {
+        inner: ScriptedEmitter::new(proposals),
+        legal,
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            reply_grounding_check: false,
+            router: Some(Arc::new(nsengine::router::KeywordRouter::default())),
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+/// A conversational turn carries no tool schemas. With a desktop wired in
+/// that is ten of seventeen schemas removed from a turn that was never going
+/// to click anything — and the schemas are the part of an emitter prompt no
+/// context knob shrinks.
+#[tokio::test]
+async fn a_chat_turn_is_offered_no_tools() {
+    let store = Arc::new(InMemoryStore::new());
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    e.run_turn(Incoming {
+        session: SessionId("chat".into()),
+        text: "hello there, how are you".into(),
+    })
+    .await
+    .unwrap();
+
+    let offered = legal.lock().expect("legal").clone();
+    assert!(
+        !offered[0].contains(&"echo".to_string()),
+        "a chat turn carries no tool schemas: {:?}",
+        offered[0]
+    );
+    assert!(
+        offered[0].contains(&"ask_clarification".to_string()),
+        "but the synthetic actions stay — they are how a turn ends: {:?}",
+        offered[0]
+    );
+}
+
+/// A misroute costs one iteration and never a refusal. Recording
+/// `IllegalAction` here would teach the emitter that a real action is
+/// illegal, and the narrowed schema would then keep it illegal for the rest
+/// of the turn — the tier's guess would become the turn's verdict.
+#[tokio::test]
+async fn a_tool_proposed_on_a_chat_turn_widens_the_tier_instead_of_being_refused() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("misroute".into());
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e = routed_engine(
+        vec![echo_proposal("hi"), echo_proposal("hi")],
+        store.clone(),
+        legal.clone(),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "hello there, how are you".into(),
+    })
+    .await
+    .unwrap();
+
+    let offered = legal.lock().expect("legal").clone();
+    assert!(!offered[0].contains(&"echo".to_string()), "routed to chat");
+    assert!(
+        offered[1].contains(&"echo".to_string()),
+        "and widened on the next iteration: {:?}",
+        offered[1]
+    );
+    let events = store.load(&sid).await.unwrap();
+    assert!(
+        !events.iter().any(|ev| matches!(
+            &ev.kind,
+            EventKind::Rejected {
+                reason: RejectReason::IllegalAction { .. },
+                ..
+            }
+        )),
+        "no refusal was recorded"
+    );
+    assert_eq!(tool_calls(&events, "echo"), 1, "and the action ran");
+}
+
+/// The saving the Deep tier exists for: the engine runs the recall itself
+/// rather than spending an emitter iteration being asked for it. On a
+/// fifty-request day that iteration is a request that bought no progress.
+#[tokio::test]
+async fn a_deep_turn_recalls_before_the_first_proposal() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("deep".into());
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what did i tell you earlier about the budget".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|ev| kind_name(&ev.kind)).collect();
+    let recall_at = events
+        .iter()
+        .position(
+            |ev| matches!(&ev.kind, EventKind::ToolCalled { action, .. } if action == "recall"),
+        )
+        .expect("the engine recalled by itself");
+    let first_proposal = events
+        .iter()
+        .position(|ev| matches!(ev.kind, EventKind::Proposed { .. }));
+    assert!(
+        first_proposal.map(|p| recall_at < p).unwrap_or(true),
+        "before any model call: {kinds:?}"
+    );
+    // It is a real call in the log, not prompt text: that is what makes it
+    // reproducible on replay and visible to provenance.
+    assert!(events
+        .iter()
+        .any(|ev| matches!(&ev.kind, EventKind::ToolReturned { .. })));
+}
+
 /// Runs `turns` echo turns and returns every `ModelCall` the last turn made,
 /// with the budget config under test.
 async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, ContextManifest)> {

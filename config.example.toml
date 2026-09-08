@@ -97,6 +97,29 @@ budget_mode = "report"
 # from it on a Flash-class model, and whether a 3B emitter acts on it here is
 # what the task set is for.
 show_budget_line = false
+
+# What kind of turn this is, decided before any model call (M7 phase 3).
+#
+#   chat  the synthetic actions only, pinned facts, half the budget. With a
+#         desktop wired in this takes ten of seventeen tool schemas off a
+#         turn that was never going to click anything.
+#   task  everything legal, the whole context.
+#   deep  everything task has, and the engine runs `recall` itself before
+#         the first proposal instead of spending an emitter iteration being
+#         asked for it -- on a fifty-request day that iteration is a request
+#         that bought no progress.
+#
+# Symbolic, not a model: a judge here would cost a request and make routing
+# non-deterministic, and a replayed session has to route the way it did the
+# first time. A wrong guess is cheap -- proposing a tool the tier hid widens
+# the tier and re-asks, and never records a refusal.
+#
+# Empty lists keep the built-in cues (English and Czech, since this runs on
+# a Czech desktop and "co jsem" is how the question is actually asked).
+[router]
+enabled = true
+# recall_cues = ["before", "earlier", "last time", "co jsem", "minule"]
+# task_cues = ["click", "type", "open", "klikni", "otevři"]
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said

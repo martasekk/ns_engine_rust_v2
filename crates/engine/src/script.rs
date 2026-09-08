@@ -192,6 +192,7 @@ mod tests {
             pending_confirmation: false,
             rejections_this_turn: vec![],
             guidance: vec![],
+            budget_line: None,
         };
         let p1 = e.propose(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(p1.action, "echo");

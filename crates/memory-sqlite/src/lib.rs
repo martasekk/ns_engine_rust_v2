@@ -71,6 +71,33 @@ fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     })
 }
 
+/// Digest columns in `row_to_digest` order, qualified with the `d` alias
+/// every digest query gives the base table: the FTS index repeats `topic`,
+/// `established_json` and `open_json`, so an unqualified list is ambiguous
+/// in the join `search_digests` makes.
+const DIGEST_COLUMNS: &str = "d.session_id, d.scope, d.topic, d.established_json, d.open_json, \
+                              d.trust, d.through_turn, d.rebuilt_from, d.last_turn, d.at";
+
+fn row_to_digest(r: &rusqlite::Row<'_>) -> rusqlite::Result<nscore::SessionDigest> {
+    let established: String = r.get(3)?;
+    let open: String = r.get(4)?;
+    let trust: String = r.get(5)?;
+    Ok(nscore::SessionDigest {
+        session: SessionId(r.get(0)?),
+        scope: r.get(1)?,
+        summary: nscore::SessionSummary {
+            topic: r.get(2)?,
+            established: serde_json::from_str(&established).unwrap_or_default(),
+            open: serde_json::from_str(&open).unwrap_or_default(),
+            trust: parse_trust(&trust),
+            through_turn: r.get(6)?,
+            rebuilt_from: r.get(7)?,
+        },
+        last_turn: r.get(8)?,
+        at: Timestamp(r.get::<_, u64>(9)?),
+    })
+}
+
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(io_err)?;
@@ -95,6 +122,7 @@ impl SqliteStore {
         .map_err(io_err)?;
         Self::migrate_facts(&conn)?;
         Self::ensure_events_fts(&conn)?;
+        Self::ensure_session_digests(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -124,6 +152,89 @@ impl SqliteStore {
         if !existed {
             conn.execute_batch("INSERT INTO events_fts(events_fts) VALUES('rebuild')")
                 .map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// M7 §8: one digest per closed session — its last `SessionSummary`,
+    /// filed under the session's scope and made searchable.
+    ///
+    /// The summary is stored in columns rather than as one JSON blob so the
+    /// FTS index can cover the text a reader searches for (topic,
+    /// established, open) and nothing else: an index over a blob would also
+    /// match on field names and on `trust`, and `trust` has to stay a
+    /// queryable value — a digest built from External tool output stays
+    /// External (M6 §5.1, the laundering rule).
+    ///
+    /// `session_id` is the primary key because the trait says writes are
+    /// idempotent by session: the consolidator re-digests the same closed
+    /// sessions on every run.
+    ///
+    /// That is also why this table needs more than the insert trigger
+    /// `events` gets. `events` is append-only; a digest row is UPDATEd in
+    /// place, and an external-content FTS5 index does not follow the update
+    /// on its own — the old text would stay in the index and
+    /// `search_digests` would keep returning a topic the digest no longer
+    /// has. The update trigger deletes the old row from the index (the
+    /// `('delete', rowid, …)` form FTS5 requires, which needs the *old*
+    /// column values) before inserting the new one; the delete trigger is
+    /// the same pairing for a row that goes away, and costs nothing while
+    /// nothing deletes.
+    fn ensure_session_digests(conn: &Connection) -> Result<(), StoreError> {
+        let existed: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_digests_fts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(io_err)?
+            > 0;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_digests (
+                 session_id       TEXT PRIMARY KEY,
+                 scope            TEXT NOT NULL,
+                 topic            TEXT NOT NULL,
+                 established_json TEXT NOT NULL,
+                 open_json        TEXT NOT NULL,
+                 trust            TEXT NOT NULL,
+                 through_turn     INTEGER NOT NULL,
+                 rebuilt_from     INTEGER NOT NULL,
+                 last_turn        INTEGER NOT NULL,
+                 at               INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS session_digests_recent
+                 ON session_digests(scope, at DESC);
+             CREATE VIRTUAL TABLE IF NOT EXISTS session_digests_fts USING fts5(
+                 topic, established_json, open_json,
+                 content='session_digests', content_rowid='rowid'
+             );
+             CREATE TRIGGER IF NOT EXISTS session_digests_fts_ai
+             AFTER INSERT ON session_digests BEGIN
+                 INSERT INTO session_digests_fts(rowid, topic, established_json, open_json)
+                 VALUES (new.rowid, new.topic, new.established_json, new.open_json);
+             END;
+             CREATE TRIGGER IF NOT EXISTS session_digests_fts_au
+             AFTER UPDATE ON session_digests BEGIN
+                 INSERT INTO session_digests_fts(session_digests_fts, rowid, topic,
+                                                 established_json, open_json)
+                 VALUES ('delete', old.rowid, old.topic, old.established_json, old.open_json);
+                 INSERT INTO session_digests_fts(rowid, topic, established_json, open_json)
+                 VALUES (new.rowid, new.topic, new.established_json, new.open_json);
+             END;
+             CREATE TRIGGER IF NOT EXISTS session_digests_fts_ad
+             AFTER DELETE ON session_digests BEGIN
+                 INSERT INTO session_digests_fts(session_digests_fts, rowid, topic,
+                                                 established_json, open_json)
+                 VALUES ('delete', old.rowid, old.topic, old.established_json, old.open_json);
+             END;",
+        )
+        .map_err(io_err)?;
+        if !existed {
+            conn.execute_batch(
+                "INSERT INTO session_digests_fts(session_digests_fts) VALUES('rebuild')",
+            )
+            .map_err(io_err)?;
         }
         Ok(())
     }
@@ -277,35 +388,63 @@ impl MemoryStore for SqliteStore {
         query: &str,
         k: usize,
     ) -> Result<Vec<nscore::TurnHit>, StoreError> {
+        // One session is the one-element case of the same query; keeping a
+        // second copy of the FTS statement is how the two would drift.
+        self.search_turns_in(std::slice::from_ref(session), query, k)
+            .await
+    }
+
+    /// One FTS5 query with an `IN` list, not one query per session. Recall
+    /// runs on the hot path and M7 §8 has it search `recall_sessions` + 1
+    /// sessions on every `Deep` turn; the trait's default would prepare a
+    /// statement and walk the index once per session, which is the cost that
+    /// would make cross-session recall not worth turning on.
+    async fn search_turns_in(
+        &self,
+        sessions: &[SessionId],
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::TurnHit>, StoreError> {
         let Some(expr) = fts_query(query) else {
             return Ok(vec![]);
         };
-        if k == 0 {
+        if k == 0 || sessions.is_empty() {
             return Ok(vec![]);
         }
+        // ?1 is the MATCH expression, ?2..=?n+1 the sessions, ?n+2 the limit.
+        let placeholders = (2..2 + sessions.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit_param = sessions.len() + 2;
         let conn = self.conn.lock().await;
         let mut stmt = conn
-            .prepare(
-                "SELECT e.turn, e.kind_json, bm25(events_fts) AS score
+            .prepare(&format!(
+                "SELECT e.session_id, e.turn, e.kind_json, bm25(events_fts) AS score
                  FROM events_fts JOIN events e ON e.rowid = events_fts.rowid
-                 WHERE events_fts MATCH ?1 AND e.session_id = ?2
-                   AND (e.kind_json LIKE '{\"type\":\"UserSaid\"%'
-                        OR e.kind_json LIKE '{\"type\":\"Replied\"%')
-                 ORDER BY score, e.turn DESC LIMIT ?3",
-            )
+                 WHERE events_fts MATCH ?1 AND e.session_id IN ({placeholders})
+                   AND (e.kind_json LIKE '{{\"type\":\"UserSaid\"%'
+                        OR e.kind_json LIKE '{{\"type\":\"Replied\"%')
+                 ORDER BY score, e.turn DESC LIMIT ?{limit_param}"
+            ))
             .map_err(io_err)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() + 2);
+        params.push(expr.into());
+        params.extend(sessions.iter().map(|s| s.0.clone().into()));
+        params.push((k as i64).into());
         let rows = stmt
-            .query_map(rusqlite::params![expr, session.0, k as i64], |r| {
+            .query_map(rusqlite::params_from_iter(params), |r| {
                 Ok((
-                    r.get::<_, u32>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2)?,
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
                 ))
             })
             .map_err(io_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (turn, kind_json, score) = row.map_err(io_err)?;
+            let (session_id, turn, kind_json, score) = row.map_err(io_err)?;
             let kind: nscore::EventKind = serde_json::from_str(&kind_json).map_err(io_err)?;
             let (speaker, text) = match kind {
                 nscore::EventKind::UserSaid { text } => ("user", text),
@@ -313,6 +452,7 @@ impl MemoryStore for SqliteStore {
                 _ => continue,
             };
             out.push(nscore::TurnHit {
+                session: SessionId(session_id),
                 turn,
                 speaker,
                 text,
@@ -321,6 +461,88 @@ impl MemoryStore for SqliteStore {
             });
         }
         Ok(out)
+    }
+
+    async fn put_session_digest(&self, digest: &nscore::SessionDigest) -> Result<(), StoreError> {
+        let established = serde_json::to_string(&digest.summary.established).map_err(io_err)?;
+        let open = serde_json::to_string(&digest.summary.open).map_err(io_err)?;
+        let conn = self.conn.lock().await;
+        // Upsert, not `INSERT OR REPLACE`: REPLACE deletes the conflicting
+        // row to make room, and SQLite fires delete triggers for that delete
+        // only when `recursive_triggers` is on — it is off by default here,
+        // so the old row's text would survive in `session_digests_fts` and a
+        // stale topic would keep matching. `ON CONFLICT DO UPDATE` runs the
+        // update trigger, which does the FTS delete explicitly.
+        conn.execute(
+            "INSERT INTO session_digests (session_id, scope, topic, established_json, open_json,
+                                          trust, through_turn, rebuilt_from, last_turn, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 scope = excluded.scope, topic = excluded.topic,
+                 established_json = excluded.established_json,
+                 open_json = excluded.open_json, trust = excluded.trust,
+                 through_turn = excluded.through_turn, rebuilt_from = excluded.rebuilt_from,
+                 last_turn = excluded.last_turn, at = excluded.at",
+            rusqlite::params![
+                digest.session.0,
+                digest.scope,
+                digest.summary.topic,
+                established,
+                open,
+                trust_str(digest.summary.trust),
+                digest.summary.through_turn,
+                digest.summary.rebuilt_from,
+                digest.last_turn,
+                digest.at.0,
+            ],
+        )
+        .map_err(io_err)?;
+        Ok(())
+    }
+
+    async fn session_digests(
+        &self,
+        scope: &str,
+        limit: usize,
+    ) -> Result<Vec<nscore::SessionDigest>, StoreError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DIGEST_COLUMNS} FROM session_digests d WHERE d.scope = ?1
+                 ORDER BY d.at DESC, d.session_id DESC LIMIT ?2"
+            ))
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope, limit as i64], row_to_digest)
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
+    }
+
+    async fn search_digests(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::SessionDigest>, StoreError> {
+        let Some(expr) = fts_query(query) else {
+            return Ok(vec![]);
+        };
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DIGEST_COLUMNS} FROM session_digests_fts
+                 JOIN session_digests d ON d.rowid = session_digests_fts.rowid
+                 WHERE session_digests_fts MATCH ?1 AND d.scope = ?2
+                 ORDER BY bm25(session_digests_fts), d.at DESC LIMIT ?3"
+            ))
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![expr, scope, k as i64], row_to_digest)
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
     }
 
     async fn facts(&self, scope: &str, key_prefix: &str) -> Result<Vec<Fact>, StoreError> {
@@ -715,6 +937,202 @@ mod tests {
         let hits = store.search_turns(&sid, "noon", 5).await.unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.speaker == "bot"));
+    }
+
+    fn digest(session: &str, scope: &str, topic: &str, at: u64) -> SessionDigest {
+        SessionDigest {
+            session: SessionId(session.into()),
+            scope: scope.into(),
+            summary: SessionSummary {
+                through_turn: 9,
+                topic: topic.into(),
+                established: vec!["the invoice was sent".into()],
+                open: vec!["waiting on the reply".into()],
+                trust: Trust::External,
+                rebuilt_from: 1,
+            },
+            last_turn: 11,
+            at: Timestamp(at),
+        }
+    }
+
+    /// Pins the digest round trip, including the two things the columns
+    /// exist for: `trust` survives the write (M6 §5.1 — an External digest
+    /// must not launder into a System one), and the digest is still there
+    /// after a reopen.
+    #[tokio::test]
+    async fn session_digest_round_trips_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sqlite");
+        let d = digest("s1", "global", "renewing the domain", 100);
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store.put_session_digest(&d).await.unwrap();
+            assert_eq!(
+                store.session_digests("global", 5).await.unwrap(),
+                vec![d.clone()]
+            );
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let back = store.session_digests("global", 5).await.unwrap();
+        assert_eq!(back, vec![d]);
+        assert_eq!(back[0].summary.trust, Trust::External);
+    }
+
+    /// The FTS index is external-content over a table that is *rewritten*:
+    /// without the update trigger's `('delete', …)` half the old topic stays
+    /// indexed and `search_digests` keeps returning the digest by a word it
+    /// no longer contains.
+    #[tokio::test]
+    async fn rewriting_a_digest_replaces_the_row_and_its_fts_entry() {
+        let (_d, store) = tmp_store();
+        store
+            .put_session_digest(&digest("s1", "global", "renewing the domain", 100))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .search_digests("global", "domain", 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .put_session_digest(&digest("s1", "global", "booking the flight", 200))
+            .await
+            .unwrap();
+        let all = store.session_digests("global", 5).await.unwrap();
+        assert_eq!(all.len(), 1, "one digest per session, not two");
+        assert_eq!(all[0].summary.topic, "booking the flight");
+        assert!(
+            store
+                .search_digests("global", "domain", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the replaced topic must leave the index with the row"
+        );
+        assert_eq!(
+            store.search_digests("global", "flight", 5).await.unwrap()[0].session,
+            SessionId("s1".into())
+        );
+    }
+
+    /// A digest is searchable by a word of its topic, and scope is a wall:
+    /// digests of one scope are never an answer for another (M6 §6.6).
+    #[tokio::test]
+    async fn search_digests_matches_topic_text_and_never_crosses_scope() {
+        let (_d, store) = tmp_store();
+        store
+            .put_session_digest(&digest("s1", "global", "renewing the domain", 100))
+            .await
+            .unwrap();
+        store
+            .put_session_digest(&digest("s2", "chat42", "renewing the domain", 200))
+            .await
+            .unwrap();
+        let hits = store.search_digests("global", "domain", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session, SessionId("s1".into()));
+        assert!(store
+            .search_digests("global", "unrelated", 5)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.session_digests("chat42", 5).await.unwrap().len(), 1);
+        // `established` and `open` are indexed too, not just the topic.
+        assert_eq!(
+            store
+                .search_digests("chat42", "invoice", 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A database written before the digest index existed is indexed on
+    /// open, the way `events_fts` is — otherwise the first upgrade silently
+    /// loses every digest already written.
+    #[tokio::test]
+    async fn session_digests_fts_is_rebuilt_for_a_pre_existing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .put_session_digest(&digest("s1", "global", "renewing the domain", 100))
+                .await
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER session_digests_fts_ai;
+                 DROP TRIGGER session_digests_fts_au;
+                 DROP TRIGGER session_digests_fts_ad;
+                 DROP TABLE session_digests_fts;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .search_digests("global", "domain", 5)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Cross-session recall (M7 §8): one FTS query over both sessions, with
+    /// the hits of each ranked against the other and tagged with the session
+    /// they came from.
+    #[tokio::test]
+    async fn search_turns_in_ranks_two_sessions_together() {
+        let (_d, store) = tmp_store();
+        for (name, turn, user, bot) in [
+            ("s1", 1u32, "where is the invoice folder", "On the desktop."),
+            ("s2", 1, "print the invoice please", "Printed."),
+            ("s3", 1, "the invoice is late", "Noted."),
+        ] {
+            let sid = SessionId(name.into());
+            let mut log = EventLog::new(sid.clone());
+            log.append(
+                turn,
+                Timestamp(1),
+                EventKind::UserSaid { text: user.into() },
+            );
+            log.append(turn, Timestamp(2), EventKind::Replied { text: bot.into() });
+            store.append(&sid, log.events()).await.unwrap();
+        }
+        let sessions = [SessionId("s1".into()), SessionId("s2".into())];
+        let hits = store
+            .search_turns_in(&sessions, "invoice", 10)
+            .await
+            .unwrap();
+        let seen: std::collections::HashSet<&str> =
+            hits.iter().map(|h| h.session.0.as_str()).collect();
+        assert_eq!(seen, ["s1", "s2"].into_iter().collect());
+        assert!(hits.iter().all(|h| h.text.contains("invoice")));
+        assert!(
+            hits.windows(2).all(|w| w[0].score >= w[1].score),
+            "merged, best first: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|h| h.session.0 == "s3"),
+            "a session not asked for is not searched"
+        );
+        // Single-session `search_turns` is the same query with one id.
+        let one = store
+            .search_turns(&SessionId("s1".into()), "invoice", 10)
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].session, SessionId("s1".into()));
     }
 
     #[tokio::test]

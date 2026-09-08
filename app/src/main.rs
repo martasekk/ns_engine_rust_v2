@@ -567,6 +567,10 @@ async fn main() {
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
+        router: cfg
+            .router
+            .enabled
+            .then(|| Arc::new(cfg.router.router()) as Arc<dyn nsengine::router::Router>),
         prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
