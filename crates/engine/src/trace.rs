@@ -58,6 +58,12 @@ pub(crate) fn result_window(
     (chars[start..end].iter().collect(), start, end)
 }
 
+/// One human-readable line per this-turn event, each carrying the id of the
+/// event it came from where that id is a *handle* — that is, for tool
+/// results, which are the only lines a model can ask to see more of.
+///
+/// Split out from `turn_trace` so the clip and `inspect_result` name the same
+/// event. A handle the model cannot resolve is worse than no handle.
 fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
     // `ToolReturned` names the call it answers, not the action; the action is
     // on the `ToolCalled` it points at. The same resolution the fold in

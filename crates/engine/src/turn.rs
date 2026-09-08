@@ -2072,13 +2072,13 @@ impl Engine {
         // Implicit recall (spec §5): standing facts enter the reply
         // context; each recall bumps `uses` (lifecycle metadata for
         // the future consolidation pass).
-        let mut selected = self.select_facts(&scope, user_text).await;
+        let mut selected = self.select_facts(scope, user_text).await;
         for f in selected.iter_mut() {
             f.uses += 1;
             f.last_used = now();
             let _ = self.parts.memory.put_fact(f.clone()).await;
         }
-        let facts = self.fact_views(&scope, &selected).await;
+        let facts = self.fact_views(scope, &selected).await;
         // M6 §4.3: the reply model gets the user's message, the
         // verbatim window and the summary — not a counter string.
         let window = state.window(self.cfg.window_turns);
@@ -2334,13 +2334,6 @@ fn render_template(template: &str, vars: &serde_json::Value) -> String {
     }
     out
 }
-
-/// One human-readable line per this-turn event, each carrying the id of the
-/// event it came from where that id is a *handle* — that is, for tool
-/// results, which are the only lines a model can ask to see more of.
-///
-/// Split out from `turn_trace` so the clip and `inspect_result` name the same
-/// event. A handle the model cannot resolve is worse than no handle.
 
 /// Establish where each of a proposal's arguments came from.
 ///
