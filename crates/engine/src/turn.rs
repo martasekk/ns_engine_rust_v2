@@ -487,6 +487,30 @@ impl Engine {
         views
     }
 
+    /// Write everything appended so far to the store, without waiting for the
+    /// end of the turn.
+    ///
+    /// `run_turn` otherwise appends once, after `Replied`. Between an action
+    /// that really happened — a click on a desktop, a purged fact table — and
+    /// that append sit the turn's remaining iterations and the reply model, a
+    /// network call that can hang or fail. A crash anywhere in there leaves
+    /// the world changed and nothing in the log saying so, which is the one
+    /// inconsistency this engine's design does not otherwise permit: every
+    /// context is a projection of the log, so what the log missed did not
+    /// happen. Pure results are recomputable and do not pay for this.
+    ///
+    /// `MemoryStore::append` skips ids it already holds, so this costs one
+    /// statement and leaves the end-of-turn append writing exactly the
+    /// remainder. A failure here is reported and not fatal: the same append
+    /// runs again at the end of the turn, and *that* one propagates. Ending
+    /// the turn early on a store error would abandon it after the side effect
+    /// rather than before.
+    async fn flush(&self, sid: &nscore::SessionId, log: &EventLog, from: usize) {
+        if let Err(e) = self.parts.memory.append(sid, &log.events()[from..]).await {
+            eprintln!("store: {e}");
+        }
+    }
+
     pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
         let sid = incoming.session.clone();
         let scope = (self.cfg.scope_for)(&sid);
@@ -1054,6 +1078,7 @@ impl Engine {
                         outcome,
                     },
                 );
+                self.flush(&sid, &log, n_loaded).await;
                 continue;
             }
 
@@ -1258,6 +1283,7 @@ impl Engine {
                         outcome,
                     },
                 );
+                self.flush(&sid, &log, n_loaded).await;
                 continue;
             }
 
@@ -1328,6 +1354,7 @@ impl Engine {
                         outcome,
                     },
                 );
+                self.flush(&sid, &log, n_loaded).await;
                 continue;
             }
 
@@ -1481,6 +1508,9 @@ impl Engine {
                     outcome,
                 },
             );
+            if tool.spec().side_effect != nscore::SideEffect::Pure {
+                self.flush(&sid, &log, n_loaded).await;
+            }
             // loop: the emitter decides what happens next (typically respond_directly)
         }
 

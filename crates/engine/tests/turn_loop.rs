@@ -2719,3 +2719,129 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
         .count();
     assert_eq!(summaries, 1, "the summary still lands in the log");
 }
+
+/// Reports which events the store already held when the reply model was
+/// called. That is the observation point for the mid-turn flush: it runs
+/// after the turn's actions and before the turn's own end-of-turn append,
+/// which is exactly the window a crash would fall into.
+struct StoreAtReplyTime {
+    store: Arc<InMemoryStore>,
+    session: SessionId,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Replier for StoreAtReplyTime {
+    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
+        let events = self.store.load(&self.session).await.unwrap_or_default();
+        *self.seen.lock().expect("seen") = events
+            .iter()
+            .map(|e| kind_name(&e.kind).to_string())
+            .collect();
+        Ok("ok".into())
+    }
+}
+
+fn engine_watching_the_store(
+    proposals: Vec<Proposal>,
+    store: Arc<InMemoryStore>,
+    session: &SessionId,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
+    b.set_replier(Box::new(StoreAtReplyTime {
+        store: store.clone(),
+        session: session.clone(),
+        seen,
+    }));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig::default(),
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+/// An action that changed something outside the engine is in the store
+/// before anything slow runs after it. `run_turn` otherwise appends once,
+/// after `Replied`, and a crash between a fact write (or a click on a real
+/// desktop) and that append would leave the world changed with nothing in
+/// the log to say so.
+#[tokio::test]
+async fn a_side_effect_is_persisted_before_the_reply_model_runs() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("durable".into());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e = engine_watching_the_store(
+        vec![Proposal {
+            rationale: "durable".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": "user.name", "value": "Martin"}),
+        }],
+        store.clone(),
+        &sid,
+        seen.clone(),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "my name is Martin".into(),
+    })
+    .await
+    .unwrap();
+
+    let seen = seen.lock().expect("seen").clone();
+    assert!(
+        seen.contains(&"ToolReturned".to_string()),
+        "the fact write was still only in memory when the reply model ran: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&"Replied".to_string()),
+        "the turn was not over yet: {seen:?}"
+    );
+
+    // The end-of-turn append re-sends the same events. The store skips ids
+    // it already holds, so nothing is written twice.
+    let events = store.load(&sid).await.unwrap();
+    let ids: Vec<u64> = events.iter().map(|ev| ev.id.0).collect();
+    let mut ascending = ids.clone();
+    ascending.sort_unstable();
+    ascending.dedup();
+    assert_eq!(ids, ascending, "duplicated events: {ids:?}");
+    assert!(events
+        .iter()
+        .any(|ev| matches!(&ev.kind, EventKind::Replied { .. })));
+}
+
+/// The flush is scoped to effects that outlive a crash. A pure result can be
+/// recomputed by calling the tool again, so it does not pay for a write on
+/// every iteration of a long turn.
+#[tokio::test]
+async fn a_pure_tool_result_is_not_flushed_early() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("pure".into());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e =
+        engine_watching_the_store(vec![echo_proposal("hi")], store.clone(), &sid, seen.clone());
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "say hi".into(),
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        seen.lock().expect("seen").is_empty(),
+        "a pure turn writes nothing before its end: {:?}",
+        seen.lock().expect("seen")
+    );
+    assert!(store
+        .load(&sid)
+        .await
+        .unwrap()
+        .iter()
+        .any(|ev| matches!(&ev.kind, EventKind::ToolReturned { .. })));
+}
