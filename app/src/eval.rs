@@ -51,6 +51,20 @@ struct AbilityRow {
     recall_fired: bool,
     recall_hits: usize,
     flags: usize,
+    /// What M7's own phases did on this ability: characters the cap dropped,
+    /// `inspect_result` calls, budget drops, and tiers that rose mid-turn.
+    /// Zero on the six memory fixtures, and that is a measurement rather than
+    /// a placeholder — it says those fixtures exercise a different half of
+    /// the harness. `serde(default)` so ledgers written before these columns
+    /// existed still parse and still diff.
+    #[serde(default)]
+    clipped_chars: usize,
+    #[serde(default)]
+    inspections: usize,
+    #[serde(default)]
+    budget_drops: usize,
+    #[serde(default)]
+    escalations: usize,
     /// Why it failed. Empty on a pass, and then absent from the file: the
     /// interesting rows are the ones with text in this field.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -71,6 +85,10 @@ impl From<&Ability> for AbilityRow {
             recall_fired: a.recall_fired,
             recall_hits: a.recall_hits,
             flags: a.flags,
+            clipped_chars: a.clipped_chars,
+            inspections: a.inspections,
+            budget_drops: a.budget_drops,
+            escalations: a.escalations,
             detail: a.detail.clone(),
         }
     }
@@ -381,6 +399,10 @@ mod tests {
             recall_fired: false,
             recall_hits: 0,
             flags: 0,
+            clipped_chars: 0,
+            inspections: 0,
+            budget_drops: 0,
+            escalations: 0,
             detail: if passed {
                 String::new()
             } else {

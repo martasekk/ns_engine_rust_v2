@@ -1,5 +1,5 @@
-//! T5.1/T5.2, memory half: the six M6 Phase 7 memory abilities as a fixed,
-//! model-free task set (M7 plan §9).
+//! T5.1/T5.2: the nine abilities of the fixed, model-free task set (M7 plan
+//! §9) — the six M6 Phase 7 memory abilities, then the three desktop tasks.
 //!
 //! "Don't Blame the LLM" (2607.03691) is the whole design of this module: fix
 //! the model, vary the harness, measure. Every model here is a scripted
@@ -24,6 +24,20 @@
 //! session, and §4.6 maps turns 76, 85, 93, 104 and 114 of that session to
 //! what should happen now instead.
 //!
+//! **The two halves exercise different machinery, and the columns say so.**
+//! The memory fixtures never clip a result, never page one, never route a
+//! turn and never go over the budget: their four context columns are zeros,
+//! and those zeros are the evidence that the desktop half is measuring
+//! something the memory half cannot reach. The desktop tasks stand for the
+//! 2026-09-07 session, where two `pointer_ui_read` results were 14,425 and
+//! 10,025 characters against a median tool result of 24, and the harness
+//! re-sent the larger of them on every remaining iteration of the turn it
+//! landed in — under `ns-run`'s twelve-iteration budget, up to eleven more
+//! times, at roughly 3.6k tokens each (plan §2). They are graded on what the
+//! harness put in front of the model — the trace lines the emitter was
+//! shown, iteration by iteration — and never on what a double said about
+//! them.
+//!
 //! **Why this is library code and not a test.** It began as an integration
 //! test, which meant `cargo test` was the only thing that could run it and
 //! the numbers existed only in captured stdout. The plan's exit criterion is
@@ -34,11 +48,14 @@
 //! The doubles it needs (`script`, `store`) were already public for the same
 //! reason.
 
+use crate::router::KeywordRouter;
 use crate::script::*;
 use crate::store::{InMemoryStore, NoopConsolidator};
-use crate::turn::{Engine, EngineConfig, ASK_CLARIFICATION, FORGET_FACT, RECALL, REMEMBER_FACT};
+use crate::turn::{
+    Engine, EngineConfig, ASK_CLARIFICATION, FORGET_FACT, INSPECT_RESULT, RECALL, REMEMBER_FACT,
+};
 use nscore::*;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -95,7 +112,13 @@ fn render_prompt(ctx: &ReplyContext) -> String {
 
 /// One reply context, kept as strings so a fixture can ask what the model
 /// could read.
-#[derive(Clone)]
+///
+/// `Default` is the empty one, and it is not decoration: a turn that ran out
+/// of iterations settles on the fallback text without ever calling the reply
+/// model, so there is no context to grade. The fixture still owes the run a
+/// row — a missing row would read as "not run" rather than "failed" — so it
+/// grades the empty one and says why.
+#[derive(Clone, Default)]
 struct Shown {
     /// One `render_fact` line per fact, exactly as the prompt carries it —
     /// including the `(was "Martin" until 17:35 UTC)` marker, which is how a
@@ -154,6 +177,7 @@ impl Shown {
 /// The regeneration falls back to the inert marker.
 struct Probe {
     shown: Arc<Mutex<Vec<Shown>>>,
+    sink: Arc<UsageSink>,
     first_draft: Option<&'static str>,
     drafts: AtomicU32,
 }
@@ -168,10 +192,462 @@ impl Replier for Probe {
     async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
         let n = self.drafts.fetch_add(1, Ordering::SeqCst);
         self.shown.lock().unwrap().push(Shown::capture(&ctx));
+        self.sink.record(spent("replier"));
         match self.first_draft {
             Some(draft) if n == 0 => Ok(draft.into()),
             _ => Ok(INERT.into()),
         }
+    }
+}
+
+/// The emitter side of the same thing: the scripted double wrapped in what a
+/// provider client does at the end of a call.
+///
+/// It exists for one reason. The engine appends a `ModelCall` — the event
+/// carrying the [`ContextManifest`] of what that call was shown — once per
+/// `Usage` it drains from the sink, so a harness whose doubles leave nothing
+/// there records no manifests, and the four context columns would then have
+/// to be recomputed here from the log. A number a fixture computes for
+/// itself drifts from what the harness did, and then the set measures the
+/// test; the same argument [`Harness::counters`] is built on.
+struct MeteredEmitter {
+    inner: Box<dyn Emitter>,
+    sink: Arc<UsageSink>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for MeteredEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let proposed = self.inner.propose(ctx, legal).await;
+        self.sink.record(spent("emitter"));
+        proposed
+    }
+}
+
+/// What one call by a scripted double cost.
+///
+/// Zero tokens, marked estimated. There is no provider in this set, and a
+/// fabricated prompt size would sit in the eval ledger beside measured
+/// numbers with nothing to tell them apart — the objection `Usage::estimated`
+/// exists to answer. What this carries is the manifest attached to it by the
+/// engine; the prompt columns come from `estimate_tokens` over the context
+/// the fixture rendered itself.
+fn spent(role: &'static str) -> Usage {
+    Usage {
+        role: role.into(),
+        model: "scripted".into(),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        estimated: true,
+        attempts: 1,
+        latency_ms: 0,
+        tools_tokens: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The desktop the three task fixtures run against
+// ---------------------------------------------------------------------------
+
+/// The size of the larger of the two `pointer_ui_read` results in the
+/// 2026-09-07 session (plan §2). The median tool result in that session was
+/// 24 characters; one action produced 98% of the tool text.
+const RECORDED_CHARS: usize = 14_425;
+
+/// The control `find-and-click` reaches, and the first of the three
+/// `open-and-search` clicks. In the modal, so inside the first 1,200
+/// characters — the part the cap keeps.
+const HEAD_CONTROL: &str = "Uložit jako…";
+/// The other two, also inside the shown head.
+const SEARCH_CONTROL: &str = "Najít v listu";
+const RESULT_CONTROL: &str = "První výsledek";
+/// The control the third task reaches: the last line of the tree, thirteen
+/// thousand characters past the cap. Nothing but `inspect_result` can get to
+/// it, which is the point — if the third task can pass without following the
+/// handle, the fixture is measuring nothing.
+const TAIL_CONTROL: &str = "Sloučit buňky";
+/// Its click point. Unique in the tree, and the thing the emitter has to
+/// come away with: the name is in the user's message, the point is only ever
+/// in the tool's output.
+const TAIL_POINT: (i64, i64) = (1704, 928);
+
+/// The recorded control tree, as the `pointer_ui_read` fixture.
+///
+/// **Not `NullPlatform`, which the plan names (§9).** `ns-engine` does not
+/// depend on `ns-pointer` and should not start: the eval set would then pull
+/// a desktop backend — and its transport, its screen model and its platform
+/// code — into every crate that links the engine, to produce one string that
+/// this file can produce itself. What the plan actually asks of the fixture
+/// is its shape and its size, and both are recorded.
+///
+/// Shape from `UiView::render`: `MODAL (handle this before anything behind
+/// it):` first, because that is where the real tool puts whatever is
+/// blocking the screen, then one `role "name" (x,y)` line per control. Size
+/// from the session: [`RECORDED_CHARS`].
+fn control_tree() -> String {
+    // Names that never collide with the four the tasks reach, so a control
+    // is found because the harness carried the line it is on and not because
+    // some filler row happened to spell it.
+    const FILLER: &[(&str, &str)] = &[
+        ("menuitem", "Formát"),
+        ("menuitem", "Vložit"),
+        ("button", "Tučné"),
+        ("cell", "Řádek"),
+        ("text", "Sloupec"),
+        ("checkbox", "Zamknout"),
+        ("button", "Filtr"),
+        ("tab", "Sešit"),
+    ];
+    let mut s = String::from("MODAL (handle this before anything behind it):\n");
+    s.push_str("  dialog \"Uložit změny v sešitu?\" (960,472)\n");
+    s.push_str(&format!("  button \"{HEAD_CONTROL}\" (872,604)\n"));
+    s.push_str("  button \"Zahodit změny\" (976,604)\n");
+    s.push_str("  button \"Zrušit\" (1080,604)\n");
+    s.push_str(&format!("button \"{SEARCH_CONTROL}\" (1240,96)\n"));
+    s.push_str(&format!("button \"{RESULT_CONTROL}\" (1360,96)\n"));
+    let tail = format!(
+        "button \"{TAIL_CONTROL}\" ({},{})\n",
+        TAIL_POINT.0, TAIL_POINT.1
+    );
+    let mut len = s.chars().count();
+    let mut i = 0usize;
+    while len + tail.chars().count() < RECORDED_CHARS {
+        let (role, name) = FILLER[i % FILLER.len()];
+        // Coordinates on a grid that never lands on any of the four points
+        // above, so `control_at` cannot resolve a click to the wrong row.
+        let row = format!(
+            "{role} \"{name} {i}\" ({},{})\n",
+            120 + (i % 9) * 180,
+            96 + (i / 9) * 24
+        );
+        len += row.chars().count();
+        s.push_str(&row);
+        i += 1;
+    }
+    s.push_str(&tail);
+    s
+}
+
+/// The control at a point, in the tool's own rendering — or `None`, which is
+/// a click that hit nothing.
+///
+/// This is the world answering, not a double: a click is graded on what the
+/// screen says was under it, so a fixture that reached the wrong control
+/// fails loudly instead of passing on the fact that a click happened.
+fn control_at(x: i64, y: i64) -> Option<String> {
+    let point = format!(" ({x},{y})");
+    control_tree()
+        .lines()
+        .find(|l| l.ends_with(&point))
+        .map(|l| l.trim().trim_end_matches(&point).to_string())
+}
+
+fn tool_spec(
+    name: &str,
+    description: &str,
+    side_effect: SideEffect,
+    args: &[(&str, &str)],
+) -> ActionSpec {
+    let properties: serde_json::Map<String, serde_json::Value> = args
+        .iter()
+        .map(|(k, ty)| ((*k).to_string(), serde_json::json!({ "type": ty })))
+        .collect();
+    ActionSpec {
+        name: name.into(),
+        description: description.into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": args.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        }),
+        side_effect,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// The three pointer actions a desktop turn is made of, under the names the
+/// recorded session used.
+///
+/// `Irreversible` on the click and the keystroke is the real spec
+/// (`components-std/src/pointer_tool.rs`): whatever is under the pointer
+/// will be activated, and typed text goes to whatever has focus. It is why
+/// the desktop harness runs with `confirm_irreversible: false` — see
+/// [`Harness::desktop`].
+enum Desk {
+    Read,
+    Click,
+    Type,
+}
+
+struct DeskTool {
+    act: Desk,
+    spec: ActionSpec,
+}
+
+impl DeskTool {
+    fn read() -> Self {
+        Self {
+            act: Desk::Read,
+            spec: tool_spec(
+                "pointer_ui_read",
+                "The remote machine's controls as text — role, name and a clickable point \
+                 each. Anything blocking the screen is listed first under MODAL.",
+                SideEffect::Pure,
+                &[("query", "string")],
+            ),
+        }
+    }
+
+    fn click() -> Self {
+        Self {
+            act: Desk::Click,
+            spec: tool_spec(
+                "pointer_click",
+                "Click on the remote machine. Irreversible: whatever is under the pointer \
+                 will be activated.",
+                SideEffect::Irreversible,
+                &[("x", "integer"), ("y", "integer")],
+            ),
+        }
+    }
+
+    fn typing() -> Self {
+        Self {
+            act: Desk::Type,
+            spec: tool_spec(
+                "pointer_type",
+                "Type text on the remote machine. Irreversible: it goes to whatever has focus.",
+                SideEffect::Irreversible,
+                &[("text", "string")],
+            ),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DeskTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.spec
+    }
+
+    async fn call(&self, args: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        let text = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let n = |k: &str| args.get(k).and_then(serde_json::Value::as_i64);
+        let summary = match self.act {
+            // The query steers the real tool's text windows and never
+            // filters, "so a bad query cannot hide the control that was
+            // needed" — so the whole tree comes back whatever is asked for,
+            // which is exactly the cost this phase exists to bound.
+            Desk::Read => control_tree(),
+            Desk::Click => {
+                let (Some(x), Some(y)) = (n("x"), n("y")) else {
+                    return Err(ToolError::Failed {
+                        kind: "args".into(),
+                        detail: "needs numeric x and y".into(),
+                    });
+                };
+                match control_at(x, y) {
+                    Some(control) => format!("clicked {control} at ({x},{y})"),
+                    None => {
+                        return Err(ToolError::Failed {
+                            kind: "miss".into(),
+                            detail: format!("no control at ({x},{y})"),
+                        })
+                    }
+                }
+            }
+            Desk::Type => format!("typed {:?}", text("text")),
+        };
+        Ok(ToolOutput {
+            summary,
+            artifact: None,
+            // What the remote machine reports, not what the user said — the
+            // trust the real pointer tools return, and the reason a point
+            // copied out of a screen read does not trip the taint gate.
+            trust: Trust::System,
+        })
+    }
+}
+
+fn desktop_tools() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(DeskTool::read()),
+        Arc::new(DeskTool::click()),
+        Arc::new(DeskTool::typing()),
+    ]
+}
+
+/// One thing the desktop double is trying to do.
+///
+/// The *intent* is scripted; every argument it sends is read out of the
+/// trace the harness showed it. That split is the whole design: a double
+/// that carried the coordinates would pass with the screen read deleted.
+#[derive(Clone, Copy)]
+enum Step {
+    /// `pointer_ui_read` with this query. The queries differ between reads
+    /// because the repeat gate refuses an identical (action, args) call
+    /// twice in a turn, and because the real tool takes one.
+    Read(&'static str),
+    /// Get to this control and click it. Nothing here knows where it is: if
+    /// the trace carries its point, click it; if the trace says a result was
+    /// clipped, follow the handle first and look again.
+    Reach(&'static str),
+    Type(&'static str),
+}
+
+/// The click point the trace shows for a control, or `None` when the trace
+/// does not carry it — because the read has not happened, or because the cap
+/// clipped that part away.
+///
+/// Parsed out of the tool's own `role "name" (x,y)` rendering. A line the cap
+/// cut mid-coordinate has no closing bracket to find, so it reads as absent
+/// rather than as a wrong point.
+fn point_of(trace: &str, name: &str) -> Option<(i64, i64)> {
+    let opener = format!("\"{name}\" (");
+    let at = trace.find(&opener)?;
+    let rest = &trace[at + opener.len()..];
+    let close = rest.find(')')?;
+    let (x, y) = rest[..close].split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The handle in a clipped line — `…[r42: 14425 chars, 1200 shown — …]` —
+/// found the way an emitter reading its own prompt has to find it.
+fn handle_in(trace: &str) -> Option<String> {
+    let at = trace.find("[r")?;
+    let handle: String = trace[at + 1..]
+        .chars()
+        .take_while(|c| *c == 'r' || c.is_ascii_digit())
+        .collect();
+    (handle.len() > 1).then_some(handle)
+}
+
+/// The outcome lines of a trace, the fold's counted line included — since
+/// that line is what an older outcome becomes.
+///
+/// Compared between iterations to tell "my last proposal ran" from "my last
+/// proposal never happened". The second is what a misroute looks like from
+/// inside the emitter: the engine widens the tier and asks again without
+/// recording a refusal, and the double has to ask for the same thing rather
+/// than skipping a step that nothing carried out.
+fn outcomes_in(trace: &[String]) -> String {
+    trace
+        .iter()
+        .filter(|l| l.contains("ToolReturned(") || l.starts_with("earlier this turn"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether the trace shows the click that finishes a [`Step::Reach`]: the
+/// tool's own report of what was under the pointer, on one line. Both halves
+/// have to be on the same line — in the third task the control's name is
+/// also in an `inspect_result` window a few lines above.
+fn reached(outcomes: &str, name: &str) -> bool {
+    outcomes
+        .lines()
+        .any(|l| l.contains("ok: clicked ") && l.contains(name))
+}
+
+/// The desktop emitter double: it reads the trace it was shown and acts on
+/// what is in it.
+///
+/// The counterpart of `turn_loop.rs`'s `HandleFollowingEmitter`, with a plan
+/// behind it. Everything it needs — a control's point, a clipped result's
+/// handle — it takes out of `trace_so_far`, so every one of these three
+/// tasks fails if the harness stops carrying that material, which is the
+/// only reason a pass is worth recording.
+struct DesktopEmitter {
+    traces: Arc<Mutex<Vec<Vec<String>>>>,
+    plan: Mutex<Plan>,
+}
+
+struct Plan {
+    steps: VecDeque<Step>,
+    current: Option<Step>,
+    /// The outcomes visible when `current` was taken up.
+    seen: String,
+}
+
+impl DesktopEmitter {
+    fn new(traces: Arc<Mutex<Vec<Vec<String>>>>, steps: Vec<Step>) -> Self {
+        Self {
+            traces,
+            plan: Mutex::new(Plan {
+                steps: steps.into(),
+                current: None,
+                seen: String::new(),
+            }),
+        }
+    }
+}
+
+fn proposal(action: &str, args: serde_json::Value) -> Proposal {
+    Proposal {
+        rationale: "desktop task".into(),
+        action: action.into(),
+        args,
+    }
+}
+
+fn settle() -> Proposal {
+    proposal("respond_directly", serde_json::json!({}))
+}
+
+#[async_trait::async_trait]
+impl Emitter for DesktopEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.traces.lock().unwrap().push(ctx.trace_so_far.clone());
+        let trace = ctx.trace_so_far.join("\n");
+        let outcomes = outcomes_in(&ctx.trace_so_far);
+        let mut plan = self.plan.lock().unwrap();
+        // A step is finished when its effect is in the trace, and only then.
+        // `Reach` is finished by the click, never by the inspection it took
+        // to find where to click — otherwise the third task would step past
+        // its own goal the moment paging worked.
+        let finished = match plan.current {
+            None => true,
+            Some(Step::Reach(name)) => reached(&outcomes, name),
+            Some(_) => plan.seen != outcomes,
+        };
+        if finished {
+            plan.current = plan.steps.pop_front();
+            plan.seen = outcomes;
+        }
+        let Some(step) = plan.current else {
+            return Ok(settle());
+        };
+        Ok(match step {
+            Step::Read(query) => proposal("pointer_ui_read", serde_json::json!({"query": query})),
+            Step::Type(text) => proposal("pointer_type", serde_json::json!({"text": text})),
+            Step::Reach(name) => match point_of(&trace, name) {
+                Some((x, y)) => proposal("pointer_click", serde_json::json!({"x": x, "y": y})),
+                None => match handle_in(&trace).filter(|_| legal.contains(INSPECT_RESULT)) {
+                    Some(id) => {
+                        proposal(INSPECT_RESULT, serde_json::json!({"id": id, "query": name}))
+                    }
+                    // Not in the trace and nothing left to page: the control
+                    // is out of reach. Saying so ends the turn, rather than
+                    // spending the remaining iterations rediscovering it —
+                    // and the fixture then fails on the click that never
+                    // happened, which is the honest failure.
+                    None => {
+                        plan.steps.clear();
+                        plan.current = None;
+                        settle()
+                    }
+                },
+            },
+        })
     }
 }
 
@@ -195,8 +671,21 @@ fn clock(ticks: Arc<AtomicU64>) -> Box<dyn Fn() -> Timestamp + Send + Sync> {
 struct Harness {
     store: Arc<InMemoryStore>,
     shown: Arc<Mutex<Vec<Shown>>>,
+    /// What the *emitter* was shown, one entry per iteration: this turn's
+    /// trace lines exactly as `trace_for_prompt` produced them, clip and fold
+    /// applied. The reply context is captured by [`Probe`]; this is the other
+    /// half, and it is the half the desktop tasks are graded on — the trace
+    /// is the block that is re-sent on every iteration, so it is where a wide
+    /// result is paid for again and again.
+    traces: Arc<Mutex<Vec<Vec<String>>>>,
     sessions: Mutex<Vec<SessionId>>,
     ticks: Arc<AtomicU64>,
+    /// Where the doubles leave a `Usage` so the engine appends a `ModelCall`
+    /// with the manifest of what that call was shown (see [`MeteredEmitter`]).
+    usage: Arc<UsageSink>,
+    /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
+    /// decides the tools, the router and the iteration budget below.
+    desktop: bool,
 }
 
 impl Harness {
@@ -204,13 +693,52 @@ impl Harness {
         Self {
             store: Arc::new(InMemoryStore::new()),
             shown: Arc::new(Mutex::new(Vec::new())),
+            traces: Arc::new(Mutex::new(Vec::new())),
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(UsageSink::new()),
+            desktop: false,
+        }
+    }
+
+    /// The same harness with a desktop wired into it.
+    fn desktop() -> Self {
+        Self {
+            desktop: true,
+            ..Self::new()
         }
     }
 
     async fn turn(&self, session: &SessionId, text: &str, script: Vec<Proposal>) -> Vec<Shown> {
         self.turn_drafting(session, text, script, None).await
+    }
+
+    async fn turn_drafting(
+        &self,
+        session: &SessionId,
+        text: &str,
+        script: Vec<Proposal>,
+        first_draft: Option<&'static str>,
+    ) -> Vec<Shown> {
+        self.run(
+            session,
+            text,
+            Box::new(ScriptedEmitter::new(script)),
+            first_draft,
+        )
+        .await
+    }
+
+    /// One desktop turn, driven by a plan of intents whose arguments the
+    /// emitter has to find in what it was shown ([`DesktopEmitter`]).
+    async fn desktop_turn(&self, session: &SessionId, text: &str, plan: Vec<Step>) -> Vec<Shown> {
+        self.run(
+            session,
+            text,
+            Box::new(DesktopEmitter::new(self.traces.clone(), plan)),
+            None,
+        )
+        .await
     }
 
     /// Runs one turn on a freshly built engine over the shared store.
@@ -221,11 +749,11 @@ impl Harness {
     /// nothing a turn learned lives in the engine. It is also what these
     /// fixtures need — `ScriptedEmitter` pops one queue for its whole life, so
     /// one engine could not both remember on turn 1 and stay quiet on turn 2.
-    async fn turn_drafting(
+    async fn run(
         &self,
         session: &SessionId,
         text: &str,
-        script: Vec<Proposal>,
+        emitter: Box<dyn Emitter>,
         first_draft: Option<&'static str>,
     ) -> Vec<Shown> {
         {
@@ -236,30 +764,61 @@ impl Harness {
         }
         let before = self.shown.lock().unwrap().len();
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(ScriptedEmitter::new(script)));
+        b.set_emitter(Box::new(MeteredEmitter {
+            inner: emitter,
+            sink: self.usage.clone(),
+        }));
         b.set_replier(Box::new(Probe {
             shown: self.shown.clone(),
+            sink: self.usage.clone(),
             first_draft,
             drafts: AtomicU32::new(0),
         }));
         b.set_memory(self.store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
-        b.add_tool(Arc::new(EchoTool::new()));
-        let mut engine = Engine::with_clock(
-            b.build().unwrap(),
+        // The double replies with a fixed marker rather than prose, and that
+        // marker is verbatim in the window from turn 2 on, so the echo
+        // monitor would fire on every turn and measure nothing.
+        // `turn_loop.rs` turns it off on its own doubles for the same reason.
+        // The grounding check stays on: it is the interceptor the abstention
+        // fixture grades.
+        let common = EngineConfig {
+            max_echo_ratio: 1.1,
+            usage: Some(self.usage.clone()),
+            ..EngineConfig::default()
+        };
+        let cfg = if self.desktop {
+            for t in desktop_tools() {
+                b.add_tool(t);
+            }
             EngineConfig {
-                // The double replies with a fixed marker rather than prose,
-                // and that marker is verbatim in the window from turn 2 on,
-                // so the echo monitor would fire on every turn and measure
-                // nothing. `turn_loop.rs` turns it off on its own doubles for
-                // the same reason. The grounding check stays on: it is the
-                // interceptor the abstention fixture grades.
-                max_echo_ratio: 1.1,
-                ..EngineConfig::default()
-            },
-            clock(self.ticks.clone()),
-        );
+                // `ns-run`'s own numbers (app/src/config.rs), because these
+                // three tasks stand for turns that machine actually ran: a
+                // desktop task is ten to fifteen actions over as many
+                // iterations, and five verbatim outcomes is what that
+                // default was chosen for. Stated rather than inherited —
+                // both are what the mutation check moves.
+                max_iterations: 12,
+                trace_verbatim_lines: 5,
+                // Unattended. `pointer_click` and `pointer_type` are
+                // `Irreversible`, so with the gate on every desktop turn
+                // would stage its first click and end there, and these
+                // fixtures would grade the confirmation flow — which is M6's
+                // and is graded in `turn_loop.rs` — instead of what twelve
+                // iterations put in front of the model.
+                confirm_irreversible: false,
+                // The real router, not a stub. `tier` is one of the columns,
+                // and a fixture that decided the tier itself would report a
+                // routing nothing routed.
+                router: Some(Arc::new(KeywordRouter::default())),
+                ..common
+            }
+        } else {
+            b.add_tool(Arc::new(EchoTool::new()));
+            common
+        };
+        let mut engine = Engine::with_clock(b.build().unwrap(), cfg, clock(self.ticks.clone()));
         engine
             .run_turn(Incoming {
                 session: session.clone(),
@@ -274,6 +833,46 @@ impl Harness {
     /// a regeneration counts, which is the point of counting it.
     fn reply_calls(&self) -> usize {
         self.shown.lock().unwrap().len()
+    }
+
+    /// The largest trace any emitter iteration was shown. The plan's metric
+    /// for phase 1: the trace is rebuilt and re-sent on every iteration, so
+    /// this number, not the tool's output, is what a wide result costs.
+    fn peak_trace_chars(&self) -> usize {
+        self.traces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.iter().map(|l| l.chars().count()).sum())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Every emitter trace, in the order the iterations happened.
+    fn traces(&self) -> Vec<Vec<String>> {
+        self.traces.lock().unwrap().clone()
+    }
+
+    /// Every successful tool outcome, as the model was shown it, in order.
+    ///
+    /// Read back off the log rather than remembered by the tool double: a
+    /// click is graded on what the harness recorded happening, not on what a
+    /// fixture believes it asked for.
+    async fn outcomes(&self) -> Vec<String> {
+        let sessions = self.sessions.lock().unwrap().clone();
+        let mut out = Vec::new();
+        for sid in sessions {
+            for e in self.store.load(&sid).await.unwrap() {
+                if let EventKind::ToolReturned {
+                    outcome: ToolOutcome::Ok { output },
+                    ..
+                } = &e.kind
+                {
+                    out.push(output.summary.clone());
+                }
+            }
+        }
+        out
     }
 
     /// The largest reply prompt the fixture ever built — the plan's "peak
@@ -304,6 +903,11 @@ impl Harness {
                     _ => None,
                 })
                 .collect();
+            // The tier the previous model call of *this* turn ran at. Tier
+            // only ever rises, and only within a turn — the router decides
+            // afresh at every turn boundary — so a rise between two adjacent
+            // calls of one turn is an escalation and nothing else is.
+            let mut previous_tier: Option<(u32, Tier)> = None;
             for e in &events {
                 match &e.kind {
                     EventKind::UserSaid { .. } => c.turns += 1,
@@ -313,8 +917,36 @@ impl Harness {
                             c.clarifications += 1;
                         }
                     }
-                    EventKind::ToolCalled { .. } => c.tool_calls += 1,
+                    EventKind::ToolCalled { action, .. } => {
+                        c.tool_calls += 1;
+                        if action == INSPECT_RESULT {
+                            c.inspections += 1;
+                        }
+                    }
                     EventKind::ReplyFlagged { .. } => c.flags += 1,
+                    // What each model call was shown (M7 T0.1). Read off the
+                    // manifest rather than recomputed here: the manifest is
+                    // built from the context immediately before it is moved
+                    // into the call, so it cannot drift from what was sent.
+                    EventKind::ModelCall { manifest, .. } => {
+                        c.clipped_chars += manifest.clipped_chars;
+                        c.budget_drops += manifest
+                            .budget
+                            .as_ref()
+                            .map(|b| b.dropped.len())
+                            .unwrap_or(0);
+                        if let Some(tier) = manifest.tier {
+                            if tier == Tier::Chat {
+                                c.chat_calls += 1;
+                            }
+                            if let Some((turn, was)) = previous_tier {
+                                if turn == e.turn && tier > was {
+                                    c.escalations += 1;
+                                }
+                            }
+                            previous_tier = Some((e.turn, tier));
+                        }
+                    }
                     EventKind::ToolReturned {
                         call,
                         outcome: ToolOutcome::Ok { output },
@@ -348,6 +980,17 @@ struct Counters {
     recall_hits: usize,
     flags: usize,
     clarifications: usize,
+    /// The four M7 numbers, summed over every model call the fixture made.
+    clipped_chars: usize,
+    inspections: usize,
+    budget_drops: usize,
+    escalations: usize,
+    /// Model calls made at `Tier::Chat`. Not a reported column — one number
+    /// per row is enough — but the two find-and-click tasks are graded on it
+    /// being zero: a desktop instruction that routed to `Chat` would spend an
+    /// iteration discovering its tools, and `escalations == 0` alone cannot
+    /// tell that apart from a turn that never proposed one.
+    chat_calls: usize,
 }
 
 fn remember(key: &str, value: &str) -> Proposal {
@@ -383,9 +1026,13 @@ fn recall_for(query: &str) -> Proposal {
 
 /// One ability, graded, with the numbers the plan asks each run to report
 /// (§9): completion, requests, prompt size, peak prompt, tool calls, recall
-/// hits. `inspect_result` calls, fit drops and tier are the desktop half's
-/// and the later phases' columns; nothing in the memory half clips a result
-/// or routes a turn, so they would be six zeroes.
+/// hits, clipped chars, `inspect_result` calls, fit drops and tier.
+///
+/// The last four are the desktop half's, and they are zero on all six memory
+/// rows. That is not padding — it is the statement that the two halves
+/// exercise different machinery: a memory fixture that started clipping
+/// results, or a desktop fixture that stopped, would show it in a column
+/// rather than in a failure nobody could locate.
 ///
 /// Every field is public because the eval ledger row is these numbers and
 /// nothing else: a row that carried a re-derived copy of them would be a
@@ -409,6 +1056,34 @@ pub struct Ability {
     pub recall_hits: usize,
     /// Grounding-interceptor flags (M6 §4.5).
     pub flags: usize,
+    /// Characters the per-line cap kept out of a prompt, summed over every
+    /// model call of the fixture (`ContextManifest::clipped_chars`). Summed
+    /// rather than maxed because that is what the cap actually saved: a wide
+    /// result is re-sent on every remaining iteration, so one 14,425-char
+    /// screen read costs its clip again at each of them.
+    pub clipped_chars: usize,
+    /// `inspect_result` calls — the other half of the cap. Zero is right
+    /// when everything needed was in the shown head; on the task whose
+    /// target is only past the cap, zero is the failure.
+    pub inspections: usize,
+    /// Blocks the budget dropped, or would have dropped under `report` mode
+    /// (`ContextManifest::budget.dropped`), summed over the fixture's calls.
+    ///
+    /// Zero on all nine, and measured rather than assumed: every call carries
+    /// a budget report, and every one of them came in under the ceiling. That
+    /// is the ceiling working as `ns-run` sized it — 6,000 tokens "chosen so
+    /// … a desktop turn's trace sit inside it with room, and so going over is
+    /// a signal rather than a routine event". The clip is what keeps it
+    /// there: uncapped, the two screen reads the fold leaves verbatim in
+    /// open-and-search are 28,850 characters — 7,212 tokens — on their own,
+    /// before a fact or a window record. A fixture rigged to force a drop
+    /// would be reporting a ceiling nothing runs at.
+    pub budget_drops: usize,
+    /// Times the tier rose inside a turn: a message routed to `Chat` whose
+    /// emitter then proposed a real tool. One iteration is the price of that
+    /// guess, and it is a request, which is the resource the free tier
+    /// meters — so it is counted rather than assumed harmless.
+    pub escalations: usize,
     /// Empty on a pass; on a failure, every condition that failed and what
     /// the harness showed instead.
     pub detail: String,
@@ -434,6 +1109,10 @@ impl Ability {
             recall_fired: c.recall_calls > 0,
             recall_hits: c.recall_hits,
             flags: c.flags,
+            clipped_chars: c.clipped_chars,
+            inspections: c.inspections,
+            budget_drops: c.budget_drops,
+            escalations: c.escalations,
             detail: fails.join("; "),
         }
     }
@@ -450,9 +1129,10 @@ fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
 
 /// Header, rule and every row through one set of widths, so a column cannot
 /// drift out of line with its heading when a number grows.
-fn row_line(cells: [&str; 11]) -> String {
+fn row_line(cells: [&str; 15]) -> String {
     format!(
-        "  {:<24}  {:<4}  {:>5}  {:>4}  {:>6}  {:>4}  {:>4}  {:>5}  {:<6}  {:>4}  {:>5}\n",
+        "  {:<24}  {:<4}  {:>5}  {:>4}  {:>6}  {:>4}  {:>4}  {:>5}  {:<6}  {:>4}  {:>5}  \
+         {:>7}  {:>5}  {:>5}  {:>4}\n",
         cells[0],
         cells[1],
         cells[2],
@@ -464,14 +1144,18 @@ fn row_line(cells: [&str; 11]) -> String {
         cells[8],
         cells[9],
         cells[10],
+        cells[11],
+        cells[12],
+        cells[13],
+        cells[14],
     )
 }
 
 pub fn render_table(rows: &[Ability]) -> String {
-    let mut out = String::from("\nM7 T5.1 — memory abilities, scripted model\n\n");
+    let mut out = String::from("\nM7 T5.1 — memory and desktop abilities, scripted model\n\n");
     out.push_str(&row_line([
         "ability", "pass", "turns", "reqs", "prompt", "~tok", "peak", "tools", "recall", "hits",
-        "flags",
+        "flags", "clipped", "insp", "drops", "esc",
     ]));
     out.push_str(&row_line([
         "------------------------",
@@ -485,6 +1169,10 @@ pub fn render_table(rows: &[Ability]) -> String {
         "------",
         "----",
         "-----",
+        "-------",
+        "-----",
+        "-----",
+        "----",
     ]));
     for r in rows {
         out.push_str(&row_line([
@@ -499,6 +1187,10 @@ pub fn render_table(rows: &[Ability]) -> String {
             if r.recall_fired { "yes" } else { "no" },
             &r.recall_hits.to_string(),
             &r.flags.to_string(),
+            &r.clipped_chars.to_string(),
+            &r.inspections.to_string(),
+            &r.budget_drops.to_string(),
+            &r.escalations.to_string(),
         ]));
     }
     out.push_str(&format!(
@@ -946,6 +1638,299 @@ async fn selective_forgetting() -> Ability {
 }
 
 // ---------------------------------------------------------------------------
+// The three desktop tasks (M7 plan §9, T5.1)
+// ---------------------------------------------------------------------------
+
+/// What this turn's trace may cost, in characters.
+///
+/// `trace_verbatim_lines` (5) outcomes at the 1,200-character cap, plus the
+/// fold's counted line and the short bookkeeping lines around them. It is the
+/// bound the two mechanisms promise together, and it does not grow with the
+/// turn: a task that reads the screen three times pays for two of them, not
+/// three, and would pay 43,275 characters for three without them.
+const TRACE_CEILING: usize = 6_500;
+
+/// **Open and search.** One desktop turn: read the screen, act on what came
+/// back, read it again, act again — eight actions over ten iterations.
+///
+/// The recorded turn this stands for is the 2026-09-07 one that carried a
+/// 14,425-character `pointer_ui_read` in its trace: on `main` that result was
+/// rebuilt into `trace_so_far` on every remaining iteration, uncapped, at
+/// roughly 3.6k tokens each — up to eleven more times under `ns-run`'s
+/// twelve-iteration budget (plan §2). What is graded is exactly that — not
+/// the answer, which a double controls anyway, but the size of the trace the
+/// emitter was handed on each of the ten iterations.
+///
+/// Two mechanisms have to hold for it to pass and they fail differently: the
+/// clip keeps any one line inside 1,200 characters, and the fold keeps only
+/// the last five outcomes verbatim and counts the rest into one line. Remove
+/// the clip and the ceiling breaks; remove the fold and the counted line is
+/// missing while the ceiling still holds. Both are checked.
+///
+/// The message is conversational, so the router sends it to `Chat` and the
+/// first proposal is a misroute — the tier widens, no refusal is recorded,
+/// and one iteration is the price. That path is a request on a fifty-request
+/// day, so it is counted rather than assumed free.
+async fn desktop_open_and_search() -> Ability {
+    let h = Harness::desktop();
+    let sid = SessionId("eval-desktop-open".into());
+    let shown = h
+        .desktop_turn(
+            &sid,
+            // No task cue and no tool name anywhere in it: `KeywordRouter`
+            // has nothing to go on and routes to `Chat`.
+            "let's get that invoice sorted out, i want the totals right",
+            vec![
+                Step::Read("uložit"),
+                Step::Reach(HEAD_CONTROL),
+                Step::Type("faktura 2026-09"),
+                Step::Read("najít"),
+                Step::Reach(SEARCH_CONTROL),
+                Step::Type("celkem"),
+                Step::Read("výsledek"),
+                Step::Reach(RESULT_CONTROL),
+            ],
+        )
+        .await;
+    let graded = shown.first().cloned().unwrap_or_default();
+
+    let mut fails = Vec::new();
+    let c = h.counters().await;
+    require(&mut fails, !shown.is_empty(), || {
+        "the turn never reached the reply model — it ran out of iterations".into()
+    });
+    // The actions completed. Read off the log, and off the tool's own report
+    // of what was under the pointer: three clicks that landed somewhere else
+    // would otherwise pass as three clicks.
+    let outcomes = h.outcomes().await;
+    for control in [HEAD_CONTROL, SEARCH_CONTROL, RESULT_CONTROL] {
+        require(
+            &mut fails,
+            outcomes
+                .iter()
+                .any(|o| o.starts_with("clicked") && o.contains(control)),
+            || format!("{control:?} was never clicked; the turn did: {outcomes:?}"),
+        );
+    }
+    require(&mut fails, c.tool_calls == 8, || {
+        format!(
+            "{} tool calls, want the 8 the task is made of",
+            c.tool_calls
+        )
+    });
+    // The clip.
+    require(&mut fails, h.peak_trace_chars() <= TRACE_CEILING, || {
+        format!(
+            "the emitter was shown {} characters of trace, over the {TRACE_CEILING} the clip \
+             and the fold bound it to; one raw screen read is {}",
+            h.peak_trace_chars(),
+            control_tree().chars().count()
+        )
+    });
+    // The fold. Its counted line is the only evidence that the older steps
+    // were summarized rather than re-sent, and with the fold off the ceiling
+    // above still holds — so this condition is what separates them.
+    require(
+        &mut fails,
+        h.traces()
+            .iter()
+            .any(|t| t.iter().any(|l| l.starts_with("earlier this turn ("))),
+        || "no folded line in any trace: every step was re-sent verbatim".into(),
+    );
+    require(&mut fails, c.clipped_chars > 0, || {
+        "nothing was clipped, so this turn measures nothing about the cap".into()
+    });
+    // Everything the task needed was in the head the cap keeps, so paging
+    // would have been a request that bought nothing.
+    require(&mut fails, c.inspections == 0, || {
+        format!(
+            "{} inspections for controls already in the shown head",
+            c.inspections
+        )
+    });
+    // The misroute, once, and paid for once.
+    require(&mut fails, c.escalations == 1, || {
+        format!(
+            "{} escalations; a conversational opener should cost exactly one",
+            c.escalations
+        )
+    });
+    require(&mut fails, c.chat_calls == 1, || {
+        format!(
+            "{} calls at the Chat tier, want the single misrouted one",
+            c.chat_calls
+        )
+    });
+    Ability::build("desktop open-and-search", &graded, &h, &c, fails)
+}
+
+/// **Find and click.** Reach a control by name, from one screen read.
+///
+/// The control is in the modal, and the modal is what the real tool prints
+/// first — so its line is inside the 1,200 characters the cap keeps, and the
+/// emitter can take the point straight out of the trace it was shown. What
+/// is graded is that it got there *and* that the rest of the tree never
+/// entered a prompt: the largest prompt this fixture ever built is smaller
+/// than one raw `pointer_ui_read`, and the tree's last control — thirteen
+/// thousand characters in — is in none of them.
+///
+/// The recorded failure is the reason the task file already tells the model
+/// to avoid `ui_read`: one action produced 98% of the tool text in that
+/// session, and the advice was to not look at the screen. The point of the
+/// cap is that looking at the screen stops costing that.
+async fn desktop_find_and_click() -> Ability {
+    let h = Harness::desktop();
+    let sid = SessionId("eval-desktop-find".into());
+    let shown = h
+        .desktop_turn(
+            &sid,
+            // "klikni" is a task cue, so this routes to `Task` from the
+            // message and no iteration is spent discovering it.
+            "klikni na Uložit jako v tom dialogu na obrazovce",
+            vec![Step::Read("uložit"), Step::Reach(HEAD_CONTROL)],
+        )
+        .await;
+    let graded = shown.first().cloned().unwrap_or_default();
+
+    let mut fails = Vec::new();
+    let c = h.counters().await;
+    let outcomes = h.outcomes().await;
+    require(
+        &mut fails,
+        outcomes
+            .iter()
+            .any(|o| o.starts_with("clicked") && o.contains(HEAD_CONTROL)),
+        || format!("{HEAD_CONTROL:?} was never clicked; the turn did: {outcomes:?}"),
+    );
+    require(&mut fails, c.tool_calls == 2, || {
+        format!("{} tool calls, want a read and a click", c.tool_calls)
+    });
+    // The whole tree never entered a prompt. Two independent readings of
+    // that: no prompt is even as large as one screen read, and the control
+    // at the far end of the tree is in none of them. The first could be
+    // satisfied by a prompt that carried the tree and nothing else; the
+    // second could not.
+    let tree = control_tree().chars().count();
+    require(&mut fails, h.peak_chars() < tree, || {
+        format!(
+            "the largest prompt was {} characters against a {tree}-character screen read",
+            h.peak_chars()
+        )
+    });
+    require(&mut fails, !graded.shows(TAIL_CONTROL), || {
+        format!("the end of the tree reached the reply prompt: {TAIL_CONTROL:?}")
+    });
+    require(
+        &mut fails,
+        !h.traces()
+            .iter()
+            .any(|t| t.join("\n").contains(TAIL_CONTROL)),
+        || "the end of the tree reached an emitter prompt".into(),
+    );
+    require(&mut fails, c.clipped_chars > 0, || {
+        "nothing was clipped, so nothing here is about the cap".into()
+    });
+    // The control was in the shown head, so the handle was not needed.
+    require(&mut fails, c.inspections == 0, || {
+        format!("{} inspections for a control the cap kept", c.inspections)
+    });
+    require(&mut fails, c.escalations + c.chat_calls == 0, || {
+        format!(
+            "a desktop instruction routed to Chat: {} calls there, {} escalations",
+            c.chat_calls, c.escalations
+        )
+    });
+    Ability::build("desktop find-and-click", &graded, &h, &c, fails)
+}
+
+/// **The clipped tail.** The control exists only past the cap.
+///
+/// This is the one that proves the handle is not decoration. `Sloučit buňky`
+/// is the last line of the 14,425-character tree, thirteen thousand
+/// characters past what the cap shows, so no prompt in this turn can carry
+/// its point: the only route to it is the handle the clipped line names —
+/// `[r42: 14425 chars, 1200 shown — inspect_result to see more]` — and the
+/// `inspect_result` action, which the engine offers only while something is
+/// actually clipped.
+///
+/// The failure it stands for is the one the branch commit that added the cap
+/// left open: capping the trace fixed the cost and made the dropped text
+/// unreachable from the prompt, so the only recovery was running the tool
+/// again — which on a desktop is neither free nor guaranteed to return the
+/// same screen (plan §2).
+///
+/// Graded on the inspection having happened, not only on the click landing.
+/// If this task can pass with no `inspect_result` call then the target was
+/// not past the cap and the fixture is measuring nothing — which is exactly
+/// what raising the cap does to it.
+async fn desktop_clipped_tail() -> Ability {
+    let h = Harness::desktop();
+    let sid = SessionId("eval-desktop-tail".into());
+    let shown = h
+        .desktop_turn(
+            &sid,
+            "klikni na Sloučit buňky v panelu formátování",
+            vec![Step::Read("sloučit"), Step::Reach(TAIL_CONTROL)],
+        )
+        .await;
+    let graded = shown.first().cloned().unwrap_or_default();
+
+    let mut fails = Vec::new();
+    let c = h.counters().await;
+    let outcomes = h.outcomes().await;
+    require(&mut fails, c.inspections >= 1, || {
+        "the tail was reached without inspect_result — the target is not past the cap".into()
+    });
+    require(
+        &mut fails,
+        outcomes
+            .iter()
+            .any(|o| o.starts_with("clicked") && o.contains(TAIL_CONTROL)),
+        || format!("{TAIL_CONTROL:?} was never clicked; the turn did: {outcomes:?}"),
+    );
+    require(&mut fails, c.tool_calls == 3, || {
+        format!(
+            "{} tool calls, want a read, an inspection and a click",
+            c.tool_calls
+        )
+    });
+    // And the point arrived through the handle and nothing else. The first
+    // trace that carries it must be the one carrying the inspection window:
+    // an `inspect_result` outcome is the only tool summary here that begins
+    // with a handle, so `ok: r` identifies it and no screen read or click
+    // can be mistaken for one.
+    let point = format!("({},{})", TAIL_POINT.0, TAIL_POINT.1);
+    let traces = h.traces();
+    match traces.iter().position(|t| t.join("\n").contains(&point)) {
+        Some(at) => require(
+            &mut fails,
+            traces[at].join("\n").contains("ToolReturned(ok: r"),
+            || {
+                format!(
+                    "the control's point reached a prompt some other way than the handle:\n{}",
+                    traces[at].join("\n")
+                )
+            },
+        ),
+        None => fails.push("no prompt ever carried the control's point".into()),
+    }
+    let tree = control_tree().chars().count();
+    require(&mut fails, h.peak_chars() < tree, || {
+        format!(
+            "the largest prompt was {} characters against a {tree}-character screen read",
+            h.peak_chars()
+        )
+    });
+    require(&mut fails, c.escalations + c.chat_calls == 0, || {
+        format!(
+            "a desktop instruction routed to Chat: {} calls there, {} escalations",
+            c.chat_calls, c.escalations
+        )
+    });
+    Ability::build("desktop clipped tail", &graded, &h, &c, fails)
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -964,6 +1949,9 @@ pub async fn run_all() -> Vec<Ability> {
         knowledge_updates().await,
         abstention().await,
         selective_forgetting().await,
+        desktop_open_and_search().await,
+        desktop_find_and_click().await,
+        desktop_clipped_tail().await,
     ]
 }
 
@@ -988,6 +1976,10 @@ mod tests {
             recall_fired: false,
             recall_hits: 0,
             flags: 0,
+            clipped_chars: 13_225,
+            inspections: 2,
+            budget_drops: 1,
+            escalations: 1,
             detail: detail.into(),
         };
         let table = render_table(&[
@@ -1002,16 +1994,23 @@ mod tests {
             "a failing row must name the condition, not just the ability:\n{table}"
         );
         // The numbers are the row, so every one of them has to be in it.
-        for n in ["9", "19", "512", "128", "700"] {
+        for n in ["9", "19", "512", "128", "700", "13225"] {
             assert!(table.contains(n), "{n} missing from:\n{table}");
+        }
+        // Including the four the desktop half is about, by heading as well as
+        // by value: a column nobody can name in the printed table is a column
+        // nobody reads.
+        for heading in ["clipped", "insp", "drops", "esc"] {
+            assert!(table.contains(heading), "{heading} missing from:\n{table}");
         }
     }
 
     /// `ns-app eval` diffs two ledger rows position by position and the test
-    /// harness asserts "all six". Both break silently if the set ever
-    /// returns a different number of rows or reorders them.
+    /// harness asserts the whole set. Both break silently if the set ever
+    /// returns a different number of rows or reorders them. Memory first,
+    /// desktop after: the order is the file's and the ledger's.
     #[tokio::test]
-    async fn run_all_returns_the_six_abilities_in_a_fixed_order() {
+    async fn run_all_returns_the_nine_abilities_in_a_fixed_order() {
         let names: Vec<&str> = run_all().await.iter().map(|r| r.ability).collect();
         assert_eq!(
             names,
@@ -1022,7 +2021,126 @@ mod tests {
                 "knowledge updates",
                 "abstention",
                 "selective forgetting",
+                "desktop open-and-search",
+                "desktop find-and-click",
+                "desktop clipped tail",
             ]
         );
+    }
+
+    /// The claim the four new columns exist to make: the two halves exercise
+    /// different machinery.
+    ///
+    /// Nothing in the memory half clips a result, pages one, goes over the
+    /// budget or routes a turn, so all four read zero there — and a memory
+    /// fixture that started clipping, or a desktop one that stopped, would
+    /// otherwise be a fixture quietly measuring something other than what its
+    /// name says. `harness_eval.rs` grades whether the nine pass; this grades
+    /// whether they are still about what they claim to be about.
+    #[tokio::test]
+    async fn the_two_halves_move_different_columns() {
+        let rows = run_all().await;
+        // The columns are the subject of this assertion, so a failure has to
+        // print them.
+        println!("{}", render_table(&rows));
+        let (memory, desktop) = rows.split_at(6);
+        for r in memory {
+            assert_eq!(
+                (
+                    r.clipped_chars,
+                    r.inspections,
+                    r.budget_drops,
+                    r.escalations
+                ),
+                (0, 0, 0, 0),
+                "{} is a memory fixture and reaches none of the M7 machinery",
+                r.ability
+            );
+        }
+        assert!(
+            desktop.iter().all(|r| r.clipped_chars > 0),
+            "every desktop task clips the screen read it is built on"
+        );
+        assert!(
+            desktop.iter().any(|r| r.inspections > 0),
+            "one of them has to page past the cap, or the handle is untested"
+        );
+        assert!(
+            desktop.iter().any(|r| r.escalations > 0),
+            "one of them has to start conversational, or the misroute path is untested"
+        );
+    }
+
+    /// The desktop fixture has to be the recorded size and the wrong shape
+    /// would be invisible in a passing row.
+    ///
+    /// Three properties, each of which a task depends on: the tree is the
+    /// size of the larger recorded `pointer_ui_read`; the control the second
+    /// task reaches is inside the 1,200 characters the cap shows; and the
+    /// control the third task reaches is far outside them. Let the third one
+    /// drift inside the cap and that task passes with `inspect_result` never
+    /// called and nothing measured — which is precisely what the mutation
+    /// check does to it on purpose.
+    #[test]
+    fn the_control_tree_is_the_recorded_size_and_its_tail_is_past_the_cap() {
+        let tree = control_tree();
+        let chars = tree.chars().count();
+        // To within one control line: the tree is filled a whole row at a
+        // time, so it lands within about forty characters of the record.
+        assert!(
+            (RECORDED_CHARS - 60..=RECORDED_CHARS + 60).contains(&chars),
+            "{chars} characters, want about the recorded {RECORDED_CHARS}"
+        );
+        let head: String = tree.chars().take(1_200).collect();
+        assert!(
+            head.starts_with("MODAL"),
+            "the real tool puts what is blocking the screen first:\n{head}"
+        );
+        assert!(
+            head.contains(HEAD_CONTROL) && head.contains(SEARCH_CONTROL),
+            "find-and-click reaches its controls out of the shown head"
+        );
+        assert!(
+            !head.contains(TAIL_CONTROL),
+            "the third task's control must not be in the part the cap keeps"
+        );
+        let at = tree
+            .find(TAIL_CONTROL)
+            .expect("the tail control is in the tree");
+        assert!(
+            tree[..at].chars().count() > 13_000,
+            "the tail sits {} characters in; it has to be far past the cap",
+            tree[..at].chars().count()
+        );
+        assert_eq!(
+            tree.matches(TAIL_CONTROL).count(),
+            1,
+            "and only once, or an inspect_result query would anchor on the wrong one"
+        );
+        // The world's answer to a click, which is what a task is graded on.
+        assert_eq!(
+            control_at(TAIL_POINT.0, TAIL_POINT.1).as_deref(),
+            Some("button \"Sloučit buňky\"")
+        );
+        assert_eq!(control_at(1, 1), None, "a click that hit nothing says so");
+    }
+
+    /// The double reads the point out of the trace and nothing else. Given a
+    /// trace with the line in it, it finds the point; given the clipped line,
+    /// it finds the handle instead — the two halves of what makes a desktop
+    /// pass mean something about the harness.
+    #[test]
+    fn the_desktop_double_reads_points_and_handles_out_of_what_it_was_shown() {
+        let shown = "ToolReturned(ok: MODAL (handle this before anything behind it):\n  \
+                     button \"Uložit jako…\" (872,604)";
+        assert_eq!(point_of(shown, HEAD_CONTROL), Some((872, 604)));
+        assert_eq!(point_of(shown, TAIL_CONTROL), None);
+        let clipped = "ToolReturned(ok: MODAL…) [r42: 14425 chars, 1200 shown — \
+                       inspect_result to see more]";
+        assert_eq!(handle_in(clipped).as_deref(), Some("r42"));
+        assert_eq!(handle_in(shown), None, "nothing was clipped");
+        // A line the cap cut mid-coordinate reads as absent, not as a wrong
+        // point: a click on a half-read coordinate would land somewhere.
+        assert_eq!(point_of("button \"Uložit jako…\" (872", HEAD_CONTROL), None);
     }
 }
