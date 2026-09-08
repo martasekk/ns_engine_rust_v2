@@ -581,3 +581,47 @@ after Phase 5).
   - *`budget_mode = "enforce"`.* Written, tested, and off. It turns on when `ns-app budget`
     over real sessions shows an acceptable no-impact rate, which is now measurable and was
     not before.
+
+- 2026-09-08, close: Phase 5 built. **Every phase of this plan is now implemented.**
+
+  | Task | State | Commit |
+  |---|---|---|
+  | T5.2 `ns-app eval` + ledger row and diff | done | `f77e404` |
+  | T5.3 `BudgetDropped` · `ResultClippedThenInspected` · `Misrouted` | done | `f77e404` |
+  | T5.1 desktop half — three tasks over a 14k control tree | done | `2187025` |
+
+  `ns-app eval` on the finished branch, offline, no requests spent:
+
+  ```
+    ability                   pass  turns  reqs  prompt  ~tok  peak  tools  clipped   insp  drops   esc
+    information extraction    ok        9    21     550   137   628      3        0      0      0     0
+    multi-session reasoning   ok        2     5      83    20   148      1        0      0      0     0
+    temporal reasoning        ok       12    26     461   115   496      2        0      0      0     0
+    knowledge updates         ok        3     8     287    71   287      2        0      0      0     0
+    abstention                ok        2     7     226    56   226      2        0      0      0     0
+    selective forgetting      ok       10    22     395    98   406      2        0      0      0     0
+    desktop open-and-search   ok        1    11    2963   740  2963      8   185458      0      0     1
+    desktop find-and-click    ok        1     4    1447   361  1447      2    39741      0      0     0
+    desktop clipped tail      ok        1     5    1696   424  1696      3    52988      1      0     0
+    9/9 abilities pass.
+  ```
+
+  461 tests, clippy clean. The four rightmost columns are why the desktop half had to exist:
+  the six memory abilities report zero for everything M7 built, so on its own the set could
+  not have caught a regression in any of this year's work.
+
+  **Two limits found by building, both recorded at the code:**
+
+  - *The three new signatures are notes, not symbolic candidates*, though §9 asks for
+    symbolic. `Patch` is `NormalizeArg | AliasAction` and `verify_patch` replays sessions
+    against a patched `LearnedRules`; a per-action `tool_result_max_chars` and a router cue
+    are `EngineConfig` read at startup — outside both the object the gate patches and the one
+    replay varies. Making them symbolic needs `Patch` to grow variants first, and having the
+    signatures counted is what makes that worth doing.
+  - *`--live` is refused rather than accepted.* The task set drives the engine with in-crate
+    doubles and `ns-engine` does not depend on `ns-llm`, so there is no live arm to run.
+    `eval_request_cap` is unbuilt for the same reason.
+
+  **Budget drops read zero on all nine, and that is the ceiling working**: uncapped, the two
+  screen reads the fold leaves verbatim in open-and-search are 7,212 tokens by themselves. No
+  fixture was rigged to force a drop, because that would report a ceiling nothing runs at.
