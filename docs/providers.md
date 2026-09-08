@@ -232,9 +232,20 @@ schemas sent with it.
 ns-app budget <session>     # requests, tokens and trace size, per turn
 ```
 
-`ns-app providers`, `ns-app dump <session>`, `ns-app budget <session>` and
-`ns-app evolve --dry-run` all run **in a terminal**, not at the `you>`
-prompt — typing them into the chat just sends them to the model as text.
+`ns-app eval` runs the fixed task set against scripted doubles — no key, no
+network, no requests spent — and exits non-zero if an ability regressed. It
+is the "fix the model, vary the harness" check (2607.03691): run it before
+each harness release, and the ledger row says which release moved which
+ability.
+
+```bash
+ns-app eval [<ledger-path>]  # default eval-ledger.json
+```
+
+`ns-app providers`, `ns-app dump <session>`, `ns-app budget <session>`,
+`ns-app eval` and `ns-app evolve --dry-run` all run **in a terminal**, not at
+the `you>` prompt — typing them into the chat just sends them to the model as
+text.
 
 ---
 
