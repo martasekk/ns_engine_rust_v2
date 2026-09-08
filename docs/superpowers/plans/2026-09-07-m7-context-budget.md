@@ -542,3 +542,42 @@ after Phase 5).
   Deferred to the config pass that follows T0.2, to avoid two writers in `app/`:
   `[memory] tool_result_max_chars` and `trace_verbatim_lines` exist as `EngineConfig` fields
   with the plan's defaults (1200, 5) but are not yet readable from `config.toml`.
+
+- 2026-09-08, later: Phases 2, 3 and 4 built, plus the two items from the review of T2.4/T2.5.
+
+  | Task | State | Commit |
+  |---|---|---|
+  | T2.1 `ContextBudget` / `fit` · T2.2 report-before-enforce | done | `77346e5` |
+  | T2.3 budget line (off by default) | done | `0c1426d` |
+  | Phase 3 router, tiers, escalate-on-misroute | done | `0c1426d` |
+  | BAML-style salvage, fallback branch only | done | `0c1426d` |
+  | Phase 4 storage: digests, FTS, `search_turns_in` | done | `0c1426d` |
+  | T5.1 memory-ability task set | done | `0c1426d` |
+  | Phase 4 read side: cross-session recall | done | `9adeb1b` |
+
+  **Deviations, each deliberate and each recorded at the code:**
+
+  - *The budget never empties the window* (T2.1). The plan's order drops window records
+    first and without a floor; the last record is the immediately preceding turn, and losing
+    it is M6's F3, which the window exists to fix.
+  - *`fit` does not touch the trace.* The fold (T1.3) already bounds it deterministically and
+    keeps refusals; a second budget-driven trimmer over the same lines could drop one.
+  - *No dedicated `Earlier sessions:` block* (Phase 4). The digests go through `recall`
+    instead — one retrieval path, ranked, appearing when they match rather than every turn.
+    That is what M6's own precision finding asks for, and it buys provenance, trust
+    propagation and replay, none of which a prompt block would have.
+  - *The tools fraction is reported per tier* rather than per turn only, which is the "per
+    state" the review asked for: schemas are most of a `Task` prompt and none of a `Chat` one.
+
+  **Not built, with triggers:**
+
+  - *The scope digest* (Phase 4's ρ over the last N digests). A second summarization layer
+    over material that is already searchable, costing a request on a fifty-a-day budget, with
+    no measured gain over per-session digests. Trigger: a recall that returns nothing useful
+    because the answer was spread across sessions rather than stated in one.
+  - *Escalation to a stronger emitter* (§10). Unchanged: the decision stands, and on the free
+    tier there is no second model to escalate to. Phase 3's tier escalation is the
+    validator-retries shape without a second model.
+  - *`budget_mode = "enforce"`.* Written, tested, and off. It turns on when `ns-app budget`
+    over real sessions shows an acceptable no-impact rate, which is now measurable and was
+    not before.
