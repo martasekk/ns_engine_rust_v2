@@ -418,7 +418,7 @@ pub fn render(reports: &[Report]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::InMemoryStore;
+    use nsengine::store::InMemoryStore;
 
     /// The corpus's own honesty check. A "paraphrase" that reuses the line's
     /// vocabulary would make the arm pass by construction and the trigger

@@ -1,7 +1,7 @@
 //! `ns-app eval [<ledger-path>]` — the memory task set as a release gate
 //! (M7 plan T5.2).
 //!
-//! The set is `nsengine::eval`: six abilities, every model a scripted double.
+//! The set is `nstestkit::eval`: six abilities, every model a scripted double.
 //! This command runs it, prints the table, appends one row to the eval ledger
 //! and diffs that row against the previous one. It exits non-zero when an
 //! ability failed, which is the whole of what makes it a gate rather than a
@@ -21,7 +21,7 @@
 //! ledger already uses, and a run killed mid-write must leave the previous
 //! rows intact rather than half a file.
 
-use nsengine::eval::{render_table, run_all, Ability};
+use nstestkit::eval::{render_table, run_all, Ability};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -301,7 +301,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
 /// permission to build something, and a gate that went red on it would make
 /// the measurement something to avoid taking.
 pub async fn run_paraphrase() -> i32 {
-    use nsengine::paraphrase;
+    use nstestkit::paraphrase;
 
     let k = nsengine::turn::EngineConfig::default().recall_top_k;
     let mut reports = Vec::new();

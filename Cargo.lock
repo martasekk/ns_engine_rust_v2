@@ -605,6 +605,7 @@ dependencies = [
  "ns-llm",
  "ns-memory-sqlite",
  "ns-pointer",
+ "ns-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -721,6 +722,17 @@ version = "0.1.0"
 dependencies = [
  "ns-core",
  "serde_json",
+]
+
+[[package]]
+name = "ns-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ns-core",
+ "ns-engine",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ ns-llm = { path = "../crates/llm" }
 ns-components-std = { path = "../crates/components-std" }
 ns-memory-sqlite = { path = "../crates/memory-sqlite" }
 ns-evolution = { path = "../crates/evolution" }
+ns-testkit = { path = "../crates/testkit" }
 ns-pointer = { path = "../crates/pointer" }
 arc-swap = { workspace = true }
 tokio = { workspace = true }

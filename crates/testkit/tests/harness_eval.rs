@@ -1,6 +1,6 @@
 //! The task set as a test (M7 plan §9, T5.1).
 //!
-//! The set itself is `nsengine::eval` — library code, so that `ns-app eval`
+//! The set itself is `nstestkit::eval` — library code, so that `ns-app eval`
 //! (T5.2) can run the same fixtures as a release gate without a test runner.
 //! This file is the other caller: `cargo test` fails the build when an
 //! ability regresses, which is what keeps a regression from reaching the gate
@@ -10,7 +10,7 @@
 //! tasks over a control tree of the recorded size, which are what exercise
 //! M7's own phases — the clip and its handle, the fold, and the router.
 
-use nsengine::eval::{render_table, run_all};
+use nstestkit::eval::{render_table, run_all};
 
 #[tokio::test]
 async fn the_memory_and_desktop_abilities_pass_against_a_fixed_model() {

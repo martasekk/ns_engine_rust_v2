@@ -1,0 +1,21 @@
+[package]
+name = "ns-testkit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nstestkit"
+
+# Depends on the engine rather than living inside it. The ability set and the
+# paraphrase arm drive a real `Engine` through scripted doubles; nothing on the
+# turn path drives them back. Keeping them here means the shipping `nsengine`
+# artifact no longer carries ~2,600 lines with no production caller — and it is
+# the seam M8 T4.3 wanted: a crate free to depend on `ns-llm` as well, so
+# `ns-app eval --live` becomes possible without `ns-engine` ever depending on a
+# model client.
+[dependencies]
+ns-core = { path = "../core" }
+ns-engine = { path = "../engine" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }

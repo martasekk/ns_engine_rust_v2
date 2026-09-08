@@ -48,10 +48,10 @@
 //! The doubles it needs (`script`, `store`) were already public for the same
 //! reason.
 
-use crate::router::KeywordRouter;
-use crate::script::*;
-use crate::store::{InMemoryStore, NoopConsolidator};
-use crate::turn::{
+use nsengine::router::KeywordRouter;
+use nsengine::script::*;
+use nsengine::store::{InMemoryStore, NoopConsolidator};
+use nsengine::turn::{
     Engine, EngineConfig, ASK_CLARIFICATION, FORGET_FACT, INSPECT_RESULT, RECALL, REMEMBER_FACT,
 };
 use nscore::*;

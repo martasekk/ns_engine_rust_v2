@@ -10,6 +10,7 @@ members = [
     "crates/pointer",
     "crates/components-std",
     "crates/evolution",
+    "crates/testkit",
     "app",
 ]
 
