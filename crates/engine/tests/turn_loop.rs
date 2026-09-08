@@ -200,6 +200,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",
         EventKind::ReplyEchoed { .. } => "ReplyEchoed",
         EventKind::Summarized { .. } => "Summarized",
+        EventKind::ModelCall { .. } => "ModelCall",
     }
 }
 
@@ -2718,6 +2719,126 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
         .filter(|e| matches!(e.kind, EventKind::Summarized { .. }))
         .count();
     assert_eq!(summaries, 1, "the summary still lands in the log");
+}
+
+/// Stands in for a provider client: leaves a `Usage` in the same sink
+/// `OpenRouterClient` writes to, so the engine's half of the accounting can
+/// be tested without a network.
+struct MeteredEmitter {
+    inner: ScriptedEmitter,
+    sink: Arc<UsageSink>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for MeteredEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let proposed = self.inner.propose(ctx, legal).await;
+        self.sink.record(Usage {
+            role: "emitter".into(),
+            model: "test-model".into(),
+            prompt_tokens: 900,
+            completion_tokens: 20,
+            estimated: false,
+            attempts: 2,
+            latency_ms: 11,
+            tools_tokens: 300,
+        });
+        proposed
+    }
+}
+
+/// A turn records what each provider call cost and what it was shown, and
+/// records it where nothing can read it back into a prompt: `ModelCall` is
+/// infrastructure, so replay ignores it and the fold renders nothing from
+/// it. Measuring a turn must not change the turn.
+#[tokio::test]
+async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("metered".into());
+    store
+        .put_fact(Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sink = Arc::new(UsageSink::new());
+
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredEmitter {
+        inner: ScriptedEmitter::new(vec![echo_proposal("hi")]),
+        sink: sink.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            usage: Some(sink.clone()),
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "say hi".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let calls: Vec<(&Usage, &ContextManifest)> = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } => Some((usage, manifest)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one per emitter iteration: the echo, then respond_directly"
+    );
+    let (usage, manifest) = calls[0];
+    assert_eq!(usage.role, "emitter");
+    assert_eq!(usage.prompt_tokens, 900);
+    assert_eq!(usage.attempts, 2, "retries are part of what a call cost");
+    assert_eq!(
+        manifest.fact_keys,
+        vec!["user.name".to_string()],
+        "which facts were in front of the model, for later attribution"
+    );
+    assert!(manifest.tools > 0, "the legal set is prompt too");
+    assert_eq!(
+        manifest.trace_lines, 0,
+        "nothing had happened yet on the first iteration"
+    );
+    assert!(
+        calls[1].1.trace_lines > 0,
+        "the second iteration was shown the echo result"
+    );
+
+    // Infrastructure: invisible to replay, and to the models.
+    let normalized = nsengine::replay::normalize(&events);
+    assert!(
+        !normalized.iter().any(|line| line.contains("ModelCall")),
+        "replay must not diverge on accounting: {normalized:?}"
+    );
+    let state = nsengine::state::fold(&events);
+    assert!(
+        !state.records[0].did.iter().any(|d| d.contains("ModelCall")),
+        "no did line: {:?}",
+        state.records[0].did
+    );
 }
 
 /// Reports which events the store already held when the reply model was

@@ -432,14 +432,21 @@ async fn main() {
     let rules = load_rules_or_exit(&cfg);
     let tools = build_tools(&cfg).await;
 
+    // M7 T0.1: one sink for the three roles. The engine drains it after each
+    // of its own calls, and those never overlap, so every record lands on
+    // the `ModelCall` of the call that produced it.
+    let usage = Arc::new(nscore::UsageSink::new());
+
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(nsllm::emitter::CloudEmitter::new(
-        client_for(&emitter_target, transport.clone(), &emitter_key),
+        client_for(&emitter_target, transport.clone(), &emitter_key)
+            .with_usage_sink(usage.clone(), "emitter"),
         emitter_target.model.clone(),
     )));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
-            client_for(&replier_target, transport.clone(), &replier_key),
+            client_for(&replier_target, transport.clone(), &replier_key)
+                .with_usage_sink(usage.clone(), "replier"),
             replier_target.model.clone(),
         )
         .with_prompt_cache(replier_target.prompt_cache),
@@ -464,7 +471,8 @@ async fn main() {
         let target = role_or_exit(&cfg, Role::Summarizer);
         match target.key() {
             Some(role_key) => {
-                let c = client_for(&target, transport.clone(), &role_key);
+                let c = client_for(&target, transport.clone(), &role_key)
+                    .with_usage_sink(usage.clone(), "summarizer");
                 b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(
                     c,
                     target.model.clone(),
@@ -524,6 +532,7 @@ async fn main() {
         summary_max_chars: cfg.memory.summary_max_chars,
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
+        usage: Some(usage),
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!(

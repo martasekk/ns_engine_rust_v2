@@ -237,9 +237,49 @@ measures it as an arm.
 
 **T2.4 Tool schemas.** `build_tools` sends every legal tool's description and JSON schema
 on every emitter request: with the desktop wired in that is 10 pointer tools, `get_time`
-and up to six synthetic actions, each with a `rationale` property. Unmeasured. T0.2
-reports it as its own column; if it is more than a quarter of an emitter prompt, the
-descriptions get shortened and Phase 3's tiering is the structural fix.
+and up to six synthetic actions, each with a rationale property. **Measured as of T0.1**:
+`Usage::tools_tokens` records the serialized `tools` array per call, so
+`tools_tokens / prompt_tokens` is the fraction, per turn and per legal set. T0.2 reports it
+as a column.
+
+What that fraction decides is *not* whether to restructure the schema. Under a quarter,
+shortening descriptions is housekeeping, and Phase 3's tiering already takes the pointer
+schemas off `Chat` turns. Only if pointer-heavy states push it toward 60% is anything
+structural warranted — and the usual candidate, collapsing N flat strict tools into one
+union-typed tool, would be paid for where this workspace can least afford it. N flat strict
+tools is the most portable construct available; strict-mode *unions* are the worst-supported
+thing on weak OpenAI shims, which is to say on `ollama`, `llamacpp` and `lmstudio` — three of
+the seven shipped presets, and the endpoints whose failures `CloudEmitter`'s text-only and
+empty-message fallbacks already document. Portability here is an asset, not an accident. The
+union rewrite is a measurement question, and the measurement now exists.
+
+**T2.5 The rationale field was not first, and that was load-bearing** *(found and fixed
+during T0.1)*. Findings 2026-09-01 adopt "free-text `rationale` field FIRST in the proposal
+schema" as the mitigation for the constraint tax — constrained decoding degrading task
+accuracy — and the parent spec §172 repeats it: "FIRST field in the emitted schema
+(think-then-commit)". `build_tools` injected it as `obj["properties"]["rationale"]`, and
+`serde_json::Map` is a `BTreeMap` unless the `preserve_order` feature is on, which it is not
+here. Properties therefore serialize alphabetically, and under strict mode it is `properties`
+order that shapes generation. The field landed wherever `r` sorts: after `button` for
+`pointer_click`, after `key` and `modifiers` for `pointer_type`, after `address`, `id`,
+`path` or `query` elsewhere. The one action it was right for is `echo`, whose sole argument
+is `text` — which is why the existing test passed. That test asserted the order of
+`required`, a `Vec`, which was correct all along.
+
+Fixed by renaming the schema key to `_rationale` (0x5F sorts before every lowercase letter),
+**not** by enabling `preserve_order`. The audit that settled it: `Engine::call_key` builds the
+repeat gate's identity as `action + args` serialized, resting in a comment on "equal objects
+serialize identically", so a global ordering change would silently stop the gate catching the
+repeated-call failure it exists for; and `event_hash` re-serializes whole events, args
+included, for a chain `verify_chain` recomputes. `ArtifactId::for_content` (raw bytes) and
+`Note::hash_of` (strings) are unaffected; `Patch::hash` carries no `Value` today, though its
+comment claims canonical JSON. The emitter still strips a bare `rationale` too, for shims
+that ignore `strict` and generate from the description instead.
+
+BAML-style tolerant parsing of a malformed tool call belongs in `CloudEmitter`'s existing
+fallback branch, not on the primary path: the primary path's illegality guarantee comes from
+the provider constraining generation to the legal set, and that is worth more than the
+parses it would recover.
 
 Exit: `enforce` on the fixture set never exceeds the cap; replay fixtures unchanged;
 `ns-app budget` shows the per-turn would-drop list on `cli`.

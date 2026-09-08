@@ -48,6 +48,10 @@ pub struct OpenRouterClient {
     /// Opt-in wire log (NS_TRACE); `label` names the role in each entry.
     trace: Option<Arc<crate::trace::Trace>>,
     label: String,
+    /// Where each successful call's cost is left for the engine (M7 T0.1);
+    /// `role` names the caller in the record.
+    usage_sink: Option<Arc<nscore::UsageSink>>,
+    role: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +76,18 @@ impl OpenRouterClient {
             throttle: None,
             trace: None,
             label: String::new(),
+            usage_sink: None,
+            role: String::new(),
         }
+    }
+
+    /// Report what every successful call costs, tagged with the role that
+    /// made it. Without a sink the client keeps its old behaviour exactly:
+    /// nothing is measured and nothing is recorded.
+    pub fn with_usage_sink(mut self, sink: Arc<nscore::UsageSink>, role: &str) -> Self {
+        self.usage_sink = Some(sink);
+        self.role = role.to_string();
+        self
     }
 
     /// Log every request and response to the shared trace, tagged with the
@@ -126,7 +141,10 @@ impl OpenRouterClient {
             let outcome = self.transport.post(&url, &headers, &request).await;
             self.trace_attempt(&url, attempt, started.elapsed(), &request, &outcome);
             match outcome {
-                Ok(resp) if (200..300).contains(&resp.status) => return Ok(resp.body),
+                Ok(resp) if (200..300).contains(&resp.status) => {
+                    self.record_usage(&request, &resp.body, attempt + 1, started.elapsed());
+                    return Ok(resp.body);
+                }
                 Ok(resp) if resp.status == 429 || resp.status >= 500 => {
                     last_err = ApiError::Status {
                         status: resp.status,
@@ -144,6 +162,59 @@ impl OpenRouterClient {
             }
         }
         Err(last_err)
+    }
+
+    /// One `Usage` per successful call.
+    ///
+    /// `attempts` counts the HTTP requests it took to get here, not the
+    /// successes: a 429 retried twice spent three requests out of a daily
+    /// fifty, and a report that called that one request would understate the
+    /// only budget that runs out.
+    ///
+    /// The token counts are the provider's own when it sends a `usage`
+    /// block. When it does not — several OpenAI-compatible shims omit it —
+    /// they are `chars / 4` over the serialized request and the returned
+    /// message, and `estimated` says so. The request is measured as it went
+    /// on the wire, JSON envelope and tool schemas included, because that is
+    /// what was paid for.
+    fn record_usage(
+        &self,
+        request: &serde_json::Value,
+        body: &serde_json::Value,
+        attempts: u32,
+        took: std::time::Duration,
+    ) {
+        let Some(sink) = &self.usage_sink else { return };
+        let count = |v: &serde_json::Value| v.as_u64().map(|n| n as u32);
+        let usage = &body["usage"];
+        let (prompt_tokens, completion_tokens, estimated) = match (
+            count(&usage["prompt_tokens"]),
+            count(&usage["completion_tokens"]),
+        ) {
+            (Some(prompt), Some(completion)) => (prompt, completion, false),
+            _ => (
+                nscore::estimate_tokens(request.to_string().len()),
+                nscore::estimate_tokens(body["choices"][0]["message"].to_string().len()),
+                true,
+            ),
+        };
+        // Measured here because this is where the request exists: the engine
+        // never sees the `tools` array, which `schema::build_tools` compiles
+        // inside the emitter.
+        let tools_tokens = match request.get("tools") {
+            Some(tools) => nscore::estimate_tokens(tools.to_string().len()),
+            None => 0,
+        };
+        sink.record(nscore::Usage {
+            role: self.role.clone(),
+            model: request["model"].as_str().unwrap_or_default().to_string(),
+            prompt_tokens,
+            completion_tokens,
+            estimated,
+            attempts,
+            latency_ms: took.as_millis() as u32,
+            tools_tokens,
+        });
     }
 
     /// One trace line per attempt: retries and the failures that caused them
@@ -194,6 +265,87 @@ mod tests {
         let body = c.chat(serde_json::json!({"model": "m"})).await.unwrap();
         assert_eq!(body["id"], "msg_1");
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    /// The provider's own numbers when it sends them, and the size of the
+    /// `tools` array beside them: the fraction of an emitter prompt that is
+    /// action schema is the measurement that decides whether the schema
+    /// layout needs changing at all.
+    #[tokio::test]
+    async fn usage_is_recorded_with_the_providers_numbers_and_the_tools_size() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1234, "completion_tokens": 56}
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "echo"}}]);
+        c.chat(serde_json::json!({"model": "m", "tools": tools.clone()}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        assert_eq!(recorded.len(), 1);
+        let u = &recorded[0];
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1234, 56));
+        assert!(!u.estimated, "the provider reported these");
+        assert_eq!(u.role, "emitter");
+        assert_eq!(u.model, "m");
+        assert_eq!(u.attempts, 1);
+        assert_eq!(
+            u.tools_tokens,
+            nscore::estimate_tokens(tools.to_string().len())
+        );
+        assert!(u.tools_tokens > 0 && u.tools_tokens < u.prompt_tokens);
+    }
+
+    /// Several OpenAI-compatible shims send no `usage` block at all, and
+    /// those are the endpoints a small-model deployment actually runs on.
+    /// An estimate that says it is one is better than a zero that does not.
+    #[tokio::test]
+    async fn a_provider_without_a_usage_block_is_estimated_and_says_so() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "a reply of some length"}}]
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "replier");
+        c.chat(serde_json::json!({"model": "local", "messages": []}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        let u = &recorded[0];
+        assert!(u.estimated);
+        assert!(u.prompt_tokens > 0 && u.completion_tokens > 0);
+        assert_eq!(u.tools_tokens, 0, "no tools were sent");
+    }
+
+    /// A free tier meters requests, not successes: a call that needed a
+    /// retry spent two of the day's fifty, and a report saying "one call"
+    /// would understate the only budget that runs out.
+    #[tokio::test]
+    async fn attempts_count_the_requests_a_call_really_cost() {
+        let mock = MockTransport::new(vec![
+            Ok(HttpResponse {
+                status: 429,
+                body: serde_json::json!({"error": "rate"}),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::json!({"usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
+            }),
+        ]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        c.chat(serde_json::json!({})).await.unwrap();
+        assert_eq!(sink.drain()[0].attempts, 2);
+    }
+
+    /// Without a sink the client is exactly what it was.
+    #[tokio::test]
+    async fn no_sink_records_nothing() {
+        let mock = MockTransport::ok(vec![serde_json::json!({"id": "x"})]);
+        client(mock).chat(serde_json::json!({})).await.unwrap();
     }
 
     #[tokio::test]

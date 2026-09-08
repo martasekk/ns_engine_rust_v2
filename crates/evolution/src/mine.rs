@@ -141,7 +141,11 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
     events
         .iter()
         .filter(|e| e.turn == turn)
+        // What the turn cost is not something a note proposer can act on,
+        // and this text is itself a prompt.
+        .filter(|e| !matches!(e.kind, EventKind::ModelCall { .. }))
         .map(|e| match &e.kind {
+            EventKind::ModelCall { .. } => unreachable!("filtered above"),
             EventKind::UserSaid { text } => format!("UserSaid: {text}"),
             EventKind::Proposed { proposal } => {
                 format!("Proposed: {} {}", proposal.action, proposal.args)

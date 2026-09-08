@@ -79,6 +79,14 @@ pub enum EventKind {
     Summarized {
         summary: crate::memory::SessionSummary,
     },
+    /// What one provider call cost and what it was shown (M6 §9, M7 T0.1).
+    /// Infrastructure: replay ignores it, the fold does not turn it into a
+    /// `did:` line, and no context ever contains it — measuring a turn must
+    /// not change it.
+    ModelCall {
+        usage: crate::usage::Usage,
+        manifest: crate::usage::ContextManifest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

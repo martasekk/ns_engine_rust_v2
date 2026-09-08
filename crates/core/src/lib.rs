@@ -5,6 +5,7 @@ pub mod memory;
 pub mod plugin;
 pub mod time;
 pub mod traits;
+pub mod usage;
 pub mod validate;
 pub mod value;
 
@@ -15,5 +16,6 @@ pub use memory::*;
 pub use plugin::*;
 pub use time::*;
 pub use traits::*;
+pub use usage::*;
 pub use validate::*;
 pub use value::*;

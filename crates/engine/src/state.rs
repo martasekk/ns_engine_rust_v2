@@ -195,7 +195,12 @@ pub fn fold(events: &[Event]) -> SessionState {
             // something the models need to see again: the final Replied is
             // the record. Keeping a copied draft out of the window is half
             // the point of catching it.
-            EventKind::ReplyFlagged { .. } | EventKind::ReplyEchoed { .. } => {}
+            // Cost accounting, not behaviour: a `did:` line saying what the
+            // turn spent would put the measurement into the context being
+            // measured.
+            EventKind::ReplyFlagged { .. }
+            | EventKind::ReplyEchoed { .. }
+            | EventKind::ModelCall { .. } => {}
             EventKind::Summarized { summary } => {
                 s.summary = Some(summary.clone());
                 s.summaries += 1;

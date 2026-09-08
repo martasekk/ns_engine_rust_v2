@@ -148,8 +148,17 @@ impl Emitter for CloudEmitter {
         let parsed: serde_json::Value = serde_json::from_str(args_str)
             .map_err(|e| EmitError::Malformed(format!("unparseable arguments: {e}")))?;
         let mut input = parsed.as_object().cloned().unwrap_or_default();
+        // `_rationale` is the schema's name for it (see `schema::RATIONALE`).
+        // The bare name is still accepted, because a shim that ignores
+        // `strict` generates from the description rather than the schema and
+        // several of them are exactly the endpoints this workspace ships
+        // presets for. Leaving a stray `rationale` in `args` would not fail
+        // validation — `validate_args` checks required keys, not unknown
+        // ones — it would quietly travel into classification and into the
+        // repeat gate's identity.
         let rationale = input
-            .remove("rationale")
+            .remove(crate::schema::RATIONALE)
+            .or_else(|| input.remove("rationale"))
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
         Ok(Proposal {

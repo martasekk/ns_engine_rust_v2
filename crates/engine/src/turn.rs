@@ -71,6 +71,11 @@ pub struct EngineConfig {
     /// override that suspends injection the moment a person touches the mouse,
     /// the arming chord, and the badge's pie menu.
     pub confirm_irreversible: bool,
+    /// M7 T0.1: where the provider clients leave what each call cost. When
+    /// set, the engine appends one `ModelCall` per call, with the manifest
+    /// of what that call was shown. `None` — every scripted double, every
+    /// replay — measures nothing and writes nothing.
+    pub usage: Option<std::sync::Arc<nscore::UsageSink>>,
 }
 
 impl Default for EngineConfig {
@@ -101,6 +106,7 @@ impl Default for EngineConfig {
             recall_top_k: 5,
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
+            usage: None,
         }
     }
 }
@@ -431,12 +437,28 @@ impl Engine {
             caps: &self.cfg.caps,
             facts: &facts,
         };
-        let draft = match self.parts.summarizer.summarize(input).await {
+        // The manifest for this call: the summarizer is shown the standing
+        // facts and a range of verbatim records, and no tools or trace.
+        let manifest = nscore::ContextManifest {
+            fact_keys: facts.iter().map(|f| f.key.clone()).collect(),
+            summary_through: previous.map(|s| s.through_turn),
+            window: window_range(&records),
+            ..Default::default()
+        };
+        let summarized = self.parts.summarizer.summarize(input).await;
+        // The log is opened before the outcome is known, because a summarizer
+        // that spent a request and produced nothing usable has still spent
+        // it. Leaving that call undrained would attribute it to whichever
+        // turn came next; recording it says plainly that a request bought
+        // no summary.
+        let mut log = EventLog::from_events(sid.clone(), stored);
+        self.record_model_calls(&mut log, state.turn, &manifest);
+        let draft = match summarized {
             Ok(Some(d)) => d,
-            Ok(None) => return Ok(false),
+            Ok(None) => return self.persist_summary_events(sid, &log, n_loaded).await,
             Err(e) => {
                 eprintln!("summarizer: {e}");
-                return Ok(false);
+                return self.persist_summary_events(sid, &log, n_loaded).await;
             }
         };
         // A summary built from external tool output stays external: the
@@ -451,7 +473,6 @@ impl Engine {
             rebuilt_from,
         };
         summary.clamp(self.cfg.summary_max_chars);
-        let mut log = EventLog::from_events(sid.clone(), stored);
         log.append(
             state.turn,
             (self.clock)(),
@@ -462,6 +483,22 @@ impl Engine {
             .append(sid, &log.events()[n_loaded..])
             .await?;
         Ok(true)
+    }
+
+    /// Persist whatever the summary attempt appended and report that no
+    /// summary was written. On the failure paths that is the `ModelCall` of
+    /// a request that bought nothing — the one thing worth keeping from a
+    /// summary that did not happen.
+    async fn persist_summary_events(
+        &self,
+        sid: &nscore::SessionId,
+        log: &EventLog,
+        from: usize,
+    ) -> Result<bool, EngineError> {
+        if log.events().len() > from {
+            self.parts.memory.append(sid, &log.events()[from..]).await?;
+        }
+        Ok(false)
     }
 
     /// Views of `facts` for the contexts; pinned keys carry the value they
@@ -505,6 +542,36 @@ impl Engine {
     /// runs again at the end of the turn, and *that* one propagates. Ending
     /// the turn early on a store error would abandon it after the side effect
     /// rather than before.
+    /// Append one `ModelCall` for every provider call recorded since the
+    /// last drain (M7 T0.1).
+    ///
+    /// Called immediately after each of the engine's own model calls, so
+    /// what the sink returns is that call's and the manifest describes what
+    /// it was shown. The three call sites never overlap: the rolling summary
+    /// runs while the loop waits for the next message, never beside a turn.
+    ///
+    /// Retries inside one call do not appear as separate events — they are
+    /// counted in `Usage::attempts`, because the thing a reader wants to
+    /// know is what one decision cost, requests included.
+    fn record_model_calls(
+        &self,
+        log: &mut EventLog,
+        turn: u32,
+        manifest: &nscore::ContextManifest,
+    ) {
+        let Some(sink) = &self.cfg.usage else { return };
+        for usage in sink.drain() {
+            log.append(
+                turn,
+                (self.clock)(),
+                EventKind::ModelCall {
+                    usage,
+                    manifest: manifest.clone(),
+                },
+            );
+        }
+    }
+
     async fn flush(&self, sid: &nscore::SessionId, log: &EventLog, from: usize) {
         if let Err(e) = self.parts.memory.append(sid, &log.events()[from..]).await {
             eprintln!("store: {e}");
@@ -607,7 +674,7 @@ impl Engine {
             // Clipped: this is the line that is re-sent on every iteration,
             // so an uncapped tool result is paid for again at every step
             // after it.
-            let trace_so_far: Vec<String> = trace_for_prompt(log.events(), turn);
+            let (trace_so_far, clipped_chars) = trace_for_prompt(log.events(), turn);
             let selected = self.select_facts(&scope, &incoming.text).await;
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
@@ -625,7 +692,10 @@ impl Engine {
 
             // c. propose
             let mut confirmed_now = false;
-            let mut proposal = match self.parts.emitter.propose(ctx, &legal).await {
+            let manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
+            let proposed = self.parts.emitter.propose(ctx, &legal).await;
+            self.record_model_calls(&mut log, turn, &manifest);
+            let mut proposal = match proposed {
                 Ok(p) => p,
                 Err(e) => {
                     // Four failure classes, three recoveries. A refused or
@@ -1565,7 +1635,8 @@ impl Engine {
                 // stays uncapped: `render_echo` measures the reply against the
                 // full material, and capping there would change what that
                 // number means.
-                let trace = trace_for_prompt(log.events(), turn).join("\n");
+                let (trace_lines, reply_clipped_chars) = trace_for_prompt(log.events(), turn);
+                let trace = trace_lines.join("\n");
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
                 // the future consolidation pass).
@@ -1593,7 +1664,10 @@ impl Engine {
                         do_not_state,
                         do_not_repeat,
                     };
-                match self.parts.replier.reply(make_ctx(vec![], vec![])).await {
+                let manifest = reply_manifest(&make_ctx(vec![], vec![]), reply_clipped_chars);
+                let drafted = self.parts.replier.reply(make_ctx(vec![], vec![])).await;
+                self.record_model_calls(&mut log, turn, &manifest);
+                match drafted {
                     Ok(draft) if self.cfg.reply_grounding_check => {
                         // M6 §4.5. Two checks, one of which acts.
                         //
@@ -1642,11 +1716,13 @@ impl Engine {
                                     spans: spans.clone(),
                                 },
                             );
-                            self.parts
-                                .replier
-                                .reply(make_ctx(spans, vec![]))
-                                .await
-                                .unwrap_or(draft)
+                            let regenerated =
+                                self.parts.replier.reply(make_ctx(spans, vec![])).await;
+                            // The regeneration is a second billed call, and
+                            // the point of counting it is to know what the
+                            // grounding check costs.
+                            self.record_model_calls(&mut log, turn, &manifest);
+                            regenerated.unwrap_or(draft)
                         }
                     }
                     Ok(draft) => draft,
@@ -1891,12 +1967,66 @@ fn clip_trace_line(line: &str, max: usize) -> String {
     format!("{head}… [{} more characters]", total - max)
 }
 
-/// The trace as the models should see it: every line clipped.
-fn trace_for_prompt(events: &[nscore::Event], turn: u32) -> Vec<String> {
-    turn_trace(events, turn)
+/// The trace as the models should see it: every line clipped, and the
+/// characters the cap removed.
+///
+/// The second number is what the budget report is about. It is the
+/// difference between the text a tool produced and the text the model was
+/// shown, and until it is recorded there is no way to tell a cap that is
+/// saving a turn from one that is hiding the answer.
+fn trace_for_prompt(events: &[nscore::Event], turn: u32) -> (Vec<String>, usize) {
+    let mut dropped = 0;
+    let lines = turn_trace(events, turn)
         .lines()
-        .map(|l| clip_trace_line(l, TRACE_LINE_MAX_CHARS))
-        .collect()
+        .map(|line| {
+            let clipped = clip_trace_line(line, TRACE_LINE_MAX_CHARS);
+            dropped += line.chars().count().saturating_sub(TRACE_LINE_MAX_CHARS);
+            clipped
+        })
+        .collect();
+    (lines, dropped)
+}
+
+/// The inclusive turn range of a verbatim window; `None` when it is empty.
+fn window_range(window: &[nscore::TurnRecord]) -> Option<(u32, u32)> {
+    match (window.first(), window.last()) {
+        (Some(first), Some(last)) => Some((first.turn, last.turn)),
+        _ => None,
+    }
+}
+
+/// What the emitter was shown, in keys (M7 T0.1). Built from the context
+/// immediately before it is moved into the call, so the two cannot drift.
+fn emitter_manifest(
+    ctx: &nscore::EmitterContext,
+    tools: usize,
+    clipped_chars: usize,
+) -> nscore::ContextManifest {
+    nscore::ContextManifest {
+        fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
+        summary_through: ctx.summary.as_ref().map(|s| s.through_turn),
+        window: window_range(&ctx.window),
+        trace_lines: ctx.trace_so_far.len(),
+        trace_chars: ctx.trace_so_far.iter().map(|l| l.chars().count()).sum(),
+        clipped_chars,
+        tools,
+        guidance: ctx.guidance.len(),
+    }
+}
+
+/// What the replier was shown. `tools` is zero: the reply model is given no
+/// action schema at all, which is half of why it is the cheaper of the two.
+fn reply_manifest(ctx: &nscore::ReplyContext, clipped_chars: usize) -> nscore::ContextManifest {
+    nscore::ContextManifest {
+        fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
+        summary_through: ctx.summary.as_ref().map(|s| s.through_turn),
+        window: window_range(&ctx.window),
+        trace_lines: ctx.turn_trace.lines().count(),
+        trace_chars: ctx.turn_trace.chars().count(),
+        clipped_chars,
+        tools: 0,
+        guidance: ctx.guidance.len(),
+    }
 }
 
 /// The guards every engine runs, before the harness's own.
