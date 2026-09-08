@@ -2025,138 +2025,8 @@ impl Engine {
                 None => format!("[{id}] {vars}"),
             },
             ReplyPolicy::Generate => {
-                let state = fold(log.events());
-                // Clipped for the same reason, though this one is built once
-                // per turn rather than once per iteration. `turn_trace` itself
-                // stays uncapped: `render_echo` measures the reply against the
-                // full material, and capping there would change what that
-                // number means.
-                let (trace_lines, reply_clipped_chars) =
-                    trace_for_prompt(
-                        log.events(),
-                        turn,
-                        self.cfg.trace_verbatim_lines,
-                        self.cfg.tool_result_max_chars,
-                    );
-                let trace = trace_lines.join("\n");
-                // Implicit recall (spec §5): standing facts enter the reply
-                // context; each recall bumps `uses` (lifecycle metadata for
-                // the future consolidation pass).
-                let mut selected = self.select_facts(&scope, &incoming.text).await;
-                for f in selected.iter_mut() {
-                    f.uses += 1;
-                    f.last_used = now();
-                    let _ = self.parts.memory.put_fact(f.clone()).await;
-                }
-                let facts = self.fact_views(&scope, &selected).await;
-                // M6 §4.3: the reply model gets the user's message, the
-                // verbatim window and the summary — not a counter string.
-                let window = state.window(self.cfg.window_turns);
-                let guidance = rules.guidance_for_reply();
-                let make_ctx =
-                    |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
-                        persona: self.cfg.persona.clone(),
-                        facts: facts.clone(),
-                        summary: state.summary.clone(),
-                        window: window.clone(),
-                        caps: self.cfg.caps,
-                        user_text: incoming.text.clone(),
-                        turn_trace: trace.clone(),
-                        guidance: guidance.clone(),
-                        do_not_state,
-                        do_not_repeat,
-                    };
-                // The reply context is fitted too, and reported on the same
-                // way. Its `turn_trace` is exempt: it is the material the
-                // reply narrates from, and the grounding interceptor flags a
-                // reply for stating anything absent from it — trimming it
-                // would manufacture the fabrications the interceptor catches.
-                let mut budgeted = make_ctx(vec![], vec![]);
-                let budget = nscore::fit_reply(
-                    &mut budgeted,
-                    self.cfg.prompt_budget_tokens,
-                    self.cfg.budget_mode,
-                    &self.cfg.pinned_prefixes,
-                );
-                let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
-                manifest.budget = Some(budget);
-                let drafted = self.parts.replier.reply(budgeted).await;
-                self.record_model_calls(&mut log, turn, &manifest);
-                match drafted {
-                    Ok(draft) if self.cfg.reply_grounding_check => {
-                        // M6 §4.5. Two checks, one of which acts.
-                        //
-                        // `ungrounded` gates: a claim nothing above supports
-                        // is named and the reply regenerated once, and the
-                        // second draft stands whatever it says.
-                        //
-                        // `echoed` only observes. The 2026-09-04 ablation
-                        // (plan §7–§8) scored it over four control arms: 21
-                        // firings, zero true positives. `echo_ratio` is
-                        // reference-free, so it cannot tell a copied engine
-                        // artifact from the same short correct answer given
-                        // twice — the two have identical verbatim overlap,
-                        // and the historical parrots (0.80–1.00) and the
-                        // false positives (0.60–1.00) overlap completely, so
-                        // no threshold separates them either. Both loop
-                        // detectors this borrows from are monitors, at far
-                        // more conservative thresholds. So it is logged, and
-                        // nothing is regenerated on it: the observability is
-                        // what found all of this, and it is free.
-                        let ctx = make_ctx(vec![], vec![]);
-                        let echo_material = crate::ground::echo_material(&ctx);
-                        if let Some(span) =
-                            crate::echo::echoed(&draft, &echo_material, self.cfg.max_echo_ratio)
-                        {
-                            log.append(
-                                turn,
-                                now(),
-                                EventKind::ReplyEchoed {
-                                    draft: draft.clone(),
-                                    span,
-                                    ratio: crate::echo::echo_ratio(&draft, &echo_material),
-                                },
-                            );
-                        }
-                        let material = crate::ground::Material::from_context(&ctx);
-                        let spans = crate::ground::ungrounded(&draft, &material);
-                        if spans.is_empty() {
-                            draft
-                        } else {
-                            log.append(
-                                turn,
-                                now(),
-                                EventKind::ReplyFlagged {
-                                    draft: draft.clone(),
-                                    spans: spans.clone(),
-                                },
-                            );
-                            let regenerated =
-                                self.parts.replier.reply(make_ctx(spans, vec![])).await;
-                            // The regeneration is a second billed call, and
-                            // the point of counting it is to know what the
-                            // grounding check costs.
-                            self.record_model_calls(&mut log, turn, &manifest);
-                            regenerated.unwrap_or(draft)
-                        }
-                    }
-                    Ok(draft) => draft,
-                    Err(e) => {
-                        // F7: a replier failure is an event, not just a
-                        // fallback text — mining and audits must see it.
-                        log.append(
-                            turn,
-                            now(),
-                            EventKind::ReplyFailed {
-                                detail: e.to_string(),
-                            },
-                        );
-                        format!(
-                            "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
-                            explain_error(&e.to_string())
-                        )
-                    }
-                }
+                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn)
+                    .await
             }
         };
 
@@ -2167,6 +2037,156 @@ impl Engine {
             .append(&sid, &log.events()[n_loaded..])
             .await?;
         Ok(text)
+    }
+
+    /// Draft the user-facing reply from the trace of what happened.
+    ///
+    /// Was the tail of a match arm inside `run_turn`, which left the most
+    /// expensive phase of the turn as the one with no name. It is a phase:
+    /// it selects facts, fits a budget, calls a model, and may call it a
+    /// second time when the grounding check fires — the only place besides
+    /// the emitter loop that spends a request.
+    async fn generate_reply(
+        &self,
+        scope: &str,
+        user_text: &str,
+        rules: &nscore::LearnedRules,
+        log: &mut EventLog,
+        turn: u32,
+    ) -> String {
+        let now = &self.clock;
+        let state = fold(log.events());
+        // Clipped for the same reason, though this one is built once
+        // per turn rather than once per iteration. `turn_trace` itself
+        // stays uncapped: `render_echo` measures the reply against the
+        // full material, and capping there would change what that
+        // number means.
+        let (trace_lines, reply_clipped_chars) =
+            trace_for_prompt(
+                log.events(),
+                turn,
+                self.cfg.trace_verbatim_lines,
+                self.cfg.tool_result_max_chars,
+            );
+        let trace = trace_lines.join("\n");
+        // Implicit recall (spec §5): standing facts enter the reply
+        // context; each recall bumps `uses` (lifecycle metadata for
+        // the future consolidation pass).
+        let mut selected = self.select_facts(&scope, user_text).await;
+        for f in selected.iter_mut() {
+            f.uses += 1;
+            f.last_used = now();
+            let _ = self.parts.memory.put_fact(f.clone()).await;
+        }
+        let facts = self.fact_views(&scope, &selected).await;
+        // M6 §4.3: the reply model gets the user's message, the
+        // verbatim window and the summary — not a counter string.
+        let window = state.window(self.cfg.window_turns);
+        let guidance = rules.guidance_for_reply();
+        let make_ctx =
+            |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
+                persona: self.cfg.persona.clone(),
+                facts: facts.clone(),
+                summary: state.summary.clone(),
+                window: window.clone(),
+                caps: self.cfg.caps,
+                user_text: user_text.to_string(),
+                turn_trace: trace.clone(),
+                guidance: guidance.clone(),
+                do_not_state,
+                do_not_repeat,
+            };
+        // The reply context is fitted too, and reported on the same
+        // way. Its `turn_trace` is exempt: it is the material the
+        // reply narrates from, and the grounding interceptor flags a
+        // reply for stating anything absent from it — trimming it
+        // would manufacture the fabrications the interceptor catches.
+        let mut budgeted = make_ctx(vec![], vec![]);
+        let budget = nscore::fit_reply(
+            &mut budgeted,
+            self.cfg.prompt_budget_tokens,
+            self.cfg.budget_mode,
+            &self.cfg.pinned_prefixes,
+        );
+        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
+        manifest.budget = Some(budget);
+        let drafted = self.parts.replier.reply(budgeted).await;
+        self.record_model_calls(log, turn, &manifest);
+        match drafted {
+            Ok(draft) if self.cfg.reply_grounding_check => {
+                // M6 §4.5. Two checks, one of which acts.
+                //
+                // `ungrounded` gates: a claim nothing above supports
+                // is named and the reply regenerated once, and the
+                // second draft stands whatever it says.
+                //
+                // `echoed` only observes. The 2026-09-04 ablation
+                // (plan §7–§8) scored it over four control arms: 21
+                // firings, zero true positives. `echo_ratio` is
+                // reference-free, so it cannot tell a copied engine
+                // artifact from the same short correct answer given
+                // twice — the two have identical verbatim overlap,
+                // and the historical parrots (0.80–1.00) and the
+                // false positives (0.60–1.00) overlap completely, so
+                // no threshold separates them either. Both loop
+                // detectors this borrows from are monitors, at far
+                // more conservative thresholds. So it is logged, and
+                // nothing is regenerated on it: the observability is
+                // what found all of this, and it is free.
+                let ctx = make_ctx(vec![], vec![]);
+                let echo_material = crate::ground::echo_material(&ctx);
+                if let Some(span) =
+                    crate::echo::echoed(&draft, &echo_material, self.cfg.max_echo_ratio)
+                {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::ReplyEchoed {
+                            draft: draft.clone(),
+                            span,
+                            ratio: crate::echo::echo_ratio(&draft, &echo_material),
+                        },
+                    );
+                }
+                let material = crate::ground::Material::from_context(&ctx);
+                let spans = crate::ground::ungrounded(&draft, &material);
+                if spans.is_empty() {
+                    draft
+                } else {
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::ReplyFlagged {
+                            draft: draft.clone(),
+                            spans: spans.clone(),
+                        },
+                    );
+                    let regenerated =
+                        self.parts.replier.reply(make_ctx(spans, vec![])).await;
+                    // The regeneration is a second billed call, and
+                    // the point of counting it is to know what the
+                    // grounding check costs.
+                    self.record_model_calls(log, turn, &manifest);
+                    regenerated.unwrap_or(draft)
+                }
+            }
+            Ok(draft) => draft,
+            Err(e) => {
+                // F7: a replier failure is an event, not just a
+                // fallback text — mining and audits must see it.
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ReplyFailed {
+                        detail: e.to_string(),
+                    },
+                );
+                format!(
+                    "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
+                    explain_error(&e.to_string())
+                )
+            }
+        }
     }
 
     /// Outer loop: recv → run_turn → send, until the channel closes. With
