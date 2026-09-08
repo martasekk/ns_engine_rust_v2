@@ -130,6 +130,14 @@ summary_rebuild_every = 3
 summary_max_chars = 800
 summary_input_max_chars = 6000
 recall_top_k = 5              # hits per source for the recall action (FTS5 over the log)
+# How many earlier conversations of this scope `recall` also searches (M7
+# phase 4). Only sessions the consolidator has digested count as earlier
+# ones, and a digest is the session's last rolling summary copied — so
+# cross-session memory costs no extra model call. Verbatim lines from an
+# earlier session rank above the digest of it; the digest is there to say
+# what a whole conversation was about, which no single line does. 0 keeps
+# recall inside the current conversation.
+recall_sessions = 3
 
 # The summary model defaults to the emitter's model and provider. One line
 # moves just this role onto a local model:

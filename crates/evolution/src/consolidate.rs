@@ -14,6 +14,63 @@ pub struct ConsolidateConfig {
     pub dry_run: bool,
 }
 
+/// Write one digest per session that has a rolling summary (M7 Phase 4).
+///
+/// A digest is the session's *last* `SessionSummary`, copied — so it costs no
+/// model call at all. The summary was already paid for during the session,
+/// off the user's critical path, and re-summarizing it here would spend a
+/// request to produce something the log already holds.
+///
+/// Idempotent by session id: the consolidator runs on every idle period, and
+/// a session gains turns between runs, so the digest is rewritten rather than
+/// duplicated. `put_session_digest` upserts, and the FTS index follows.
+///
+/// `scope` is one value because the CLI maps every session to `global`
+/// (M6 §15). A multi-user channel will need this to become the same mapping
+/// `EngineConfig::scope_for` applies, and the digest table already carries
+/// the column for it.
+pub async fn write_session_digests(
+    store: &dyn MemoryStore,
+    scope: &str,
+    dry_run: bool,
+    now: Timestamp,
+) -> Result<usize, StoreError> {
+    let mut written = 0;
+    for session in store.sessions().await? {
+        let events = store.load(&session).await?;
+        let Some(summary) = last_summary(&events) else {
+            // No summary means the session never outgrew its window. There is
+            // nothing to digest that `search_turns_in` cannot already reach
+            // verbatim, and verbatim is the better source (findings §1).
+            continue;
+        };
+        let last_turn = events.iter().map(|e| e.turn).max().unwrap_or(0);
+        written += 1;
+        if dry_run {
+            continue;
+        }
+        store
+            .put_session_digest(&nscore::SessionDigest {
+                session: session.clone(),
+                scope: scope.to_string(),
+                summary,
+                last_turn,
+                at: now,
+            })
+            .await?;
+    }
+    Ok(written)
+}
+
+/// The last `Summarized` event of a session, which is the summary in force
+/// when it ended.
+fn last_summary(events: &[nscore::Event]) -> Option<nscore::SessionSummary> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        nscore::EventKind::Summarized { summary } => Some(summary.clone()),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ConsolidationReport {
     pub cold: usize,
@@ -21,14 +78,16 @@ pub struct ConsolidationReport {
     pub merged: usize,
     /// (scope, kept key, other key): same squashed key, different values.
     pub conflicting: Vec<(String, String, String)>,
+    /// Sessions whose digest was written or refreshed (M7 Phase 4).
+    pub digests: usize,
 }
 
 impl std::fmt::Display for ConsolidationReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "facts: cold {}, purged external {}, merged {}",
-            self.cold, self.purged_external, self.merged
+            "facts: cold {}, purged external {}, merged {}; digests {}",
+            self.cold, self.purged_external, self.merged, self.digests
         )?;
         for (scope, keep, other) in &self.conflicting {
             write!(f, "\n  conflicting keys in {scope}: {keep} vs {other}")?;
@@ -114,6 +173,77 @@ mod tests {
     use nsengine::store::InMemoryStore;
 
     const DAY: u64 = 86_400_000;
+
+    /// A session is digested from the summary it already has, so the step
+    /// costs no model call — and a session that never outgrew its window has
+    /// no summary and is skipped, because `search_turns_in` reaches its
+    /// turns verbatim and verbatim is the better source (findings §1).
+    #[tokio::test]
+    async fn a_session_with_a_summary_is_digested_and_one_without_is_skipped() {
+        let store = InMemoryStore::new();
+        let with = nscore::SessionId("long".into());
+        let without = nscore::SessionId("short".into());
+        let mut log = nscore::EventLog::new(with.clone());
+        log.append(
+            1,
+            Timestamp(1),
+            nscore::EventKind::UserSaid { text: "hi".into() },
+        );
+        log.append(
+            7,
+            Timestamp(2),
+            nscore::EventKind::Summarized {
+                summary: nscore::SessionSummary {
+                    through_turn: 4,
+                    topic: "the vault".into(),
+                    established: vec![],
+                    open: vec![],
+                    trust: nscore::Trust::User,
+                    rebuilt_from: 1,
+                },
+            },
+        );
+        store.append(&with, log.events()).await.unwrap();
+        let mut short = nscore::EventLog::new(without.clone());
+        short.append(
+            1,
+            Timestamp(1),
+            nscore::EventKind::UserSaid { text: "hi".into() },
+        );
+        store.append(&without, short.events()).await.unwrap();
+
+        let written = write_session_digests(&store, "global", false, Timestamp(9))
+            .await
+            .unwrap();
+        assert_eq!(written, 1, "only the session that had a summary");
+        let digests = store.session_digests("global", 10).await.unwrap();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].session, with);
+        assert_eq!(digests[0].summary.topic, "the vault");
+        assert_eq!(digests[0].last_turn, 7, "the last turn, not the summary's");
+
+        // Idempotent: the consolidator runs on every idle period, and a
+        // session gains turns between runs.
+        write_session_digests(&store, "global", false, Timestamp(10))
+            .await
+            .unwrap();
+        assert_eq!(store.session_digests("global", 10).await.unwrap().len(), 1);
+
+        // A dry run counts and writes nothing.
+        let fresh = InMemoryStore::new();
+        fresh.append(&with, log.events()).await.unwrap();
+        assert_eq!(
+            write_session_digests(&fresh, "global", true, Timestamp(9))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(fresh
+            .session_digests("global", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     fn fact(key: &str, value: &str, validated: u64) -> Fact {
         Fact {

@@ -183,6 +183,10 @@ pub struct MemorySection {
     /// Show the emitter its own size against its ceiling (M7 T2.3).
     #[serde(default)]
     pub show_budget_line: bool,
+    /// How many earlier sessions of the scope `recall` searches beyond this
+    /// one (M7 Phase 4). 0 keeps recall inside the current conversation.
+    #[serde(default = "default_recall_sessions")]
+    pub recall_sessions: usize,
     /// Rolling summary cadence (M6 §5.1); 0 disables the layer.
     #[serde(default = "default_summary_every_turns")]
     pub summary_every_turns: usize,
@@ -254,6 +258,14 @@ fn default_budget_mode() -> String {
     "report".into()
 }
 
+/// Three earlier conversations. Recall is precision-bound, not
+/// coverage-bound — irrelevant memory measurably degrades a reply
+/// (findings 2026-09-02 §1) — and a lexical index over every session anyone
+/// ever had would return its best match whether or not it meant anything.
+fn default_recall_sessions() -> usize {
+    3
+}
+
 fn default_window_turns() -> usize {
     6
 }
@@ -285,6 +297,7 @@ impl Default for MemorySection {
             prompt_budget_tokens: default_prompt_budget_tokens(),
             budget_mode: default_budget_mode(),
             show_budget_line: false,
+            recall_sessions: default_recall_sessions(),
             summary_every_turns: default_summary_every_turns(),
             summary_rebuild_every: default_summary_rebuild_every(),
             summary_max_chars: default_summary_max_chars(),
@@ -731,6 +744,10 @@ impl EvolutionSection {
             regression_replay_cap: self.regression_replay_cap,
             dry_run,
             fact_stale_days,
+            // The CLI maps every session to one scope (M6 §15), so digests
+            // are written under it. A multi-user channel replaces this with
+            // the same mapping `scope_for` applies.
+            digest_scope: "global".into(),
         }
     }
     /// Driver B interval; None when disabled or set to 0.

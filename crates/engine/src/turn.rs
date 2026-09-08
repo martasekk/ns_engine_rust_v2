@@ -76,6 +76,10 @@ pub struct EngineConfig {
     /// are never folded, because they are what steer the next proposal.
     /// 0 disables the fold.
     pub trace_verbatim_lines: usize,
+    /// M7 Phase 4: how many earlier sessions of the scope `recall` searches
+    /// beyond this one. 0 keeps recall inside the current conversation, as
+    /// it was before digests existed.
+    pub recall_sessions: usize,
     /// M7 Phase 3: decides each turn's tier before the first model call.
     /// `None` — every scripted double and every replay — routes nothing and
     /// behaves exactly as the engine did before the router existed.
@@ -128,6 +132,7 @@ impl Default for EngineConfig {
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
             trace_verbatim_lines: 5,
+            recall_sessions: 3,
             router: None,
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
@@ -714,6 +719,46 @@ impl Engine {
             }
             Err(e) => failure = Some(e.to_string()),
         }
+        // Then the sessions before this one (M7 Phase 4). Only digested
+        // sessions are searched, which is exactly what "an earlier
+        // conversation" means here: the consolidator writes a digest once a
+        // session has a summary, so one still in progress is not among them.
+        if self.cfg.recall_sessions > 0 {
+            match self
+                .parts
+                .memory
+                .session_digests(scope, self.cfg.recall_sessions + 1)
+                .await
+            {
+                Ok(digests) => {
+                    let earlier: Vec<nscore::SessionId> = digests
+                        .into_iter()
+                        .map(|d| d.session)
+                        .filter(|s| s != sid)
+                        .take(self.cfg.recall_sessions)
+                        .collect();
+                    if !earlier.is_empty() {
+                        match self.parts.memory.search_turns_in(&earlier, query, k).await {
+                            Ok(hits) => {
+                                for h in hits.into_iter().take(k) {
+                                    trusts.push(if h.speaker == "user" {
+                                        nscore::Trust::User
+                                    } else {
+                                        nscore::Trust::System
+                                    });
+                                    lines.push(format!(
+                                        "in an earlier conversation, t{} {}: {}",
+                                        h.turn, h.speaker, h.text
+                                    ));
+                                }
+                            }
+                            Err(e) => failure = Some(e.to_string()),
+                        }
+                    }
+                }
+                Err(e) => failure = Some(e.to_string()),
+            }
+        }
         match self.parts.memory.search_facts(scope, query, k).await {
             Ok(facts) => {
                 for f in facts {
@@ -726,6 +771,25 @@ impl Engine {
                 }
             }
             Err(e) => failure = Some(e.to_string()),
+        }
+        // Digests last. They are summaries of summaries, and the controlled
+        // ablation this design rests on puts extracted artifacts 16–22 points
+        // below verbatim text (findings 2026-09-02 §1). They earn their place
+        // by answering what a whole earlier conversation was about, which no
+        // single verbatim line does.
+        if self.cfg.recall_sessions > 0 {
+            match self.parts.memory.search_digests(scope, query, k).await {
+                Ok(digests) => {
+                    for d in digests.into_iter().filter(|d| &d.session != sid) {
+                        trusts.push(d.summary.trust);
+                        lines.push(format!(
+                            "an earlier conversation (through t{}) was about: {}",
+                            d.last_turn, d.summary.topic
+                        ));
+                    }
+                }
+                Err(e) => failure = Some(e.to_string()),
+            }
         }
         match failure {
             Some(detail) => ToolOutcome::Err {

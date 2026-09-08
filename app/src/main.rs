@@ -567,6 +567,7 @@ async fn main() {
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
+        recall_sessions: cfg.memory.recall_sessions,
         router: cfg
             .router
             .enabled

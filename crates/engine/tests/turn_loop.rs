@@ -2721,6 +2721,81 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     assert_eq!(summaries, 1, "the summary still lands in the log");
 }
 
+/// Memory across sessions, without a new prompt block: the digested
+/// sessions of a scope are searched by the same `recall` the model already
+/// has, and by the `Deep` tier running it unasked. Verbatim lines from the
+/// earlier conversation rank above the digest of it, because the ablation
+/// this design rests on puts extracted artifacts well below verbatim text.
+#[tokio::test]
+async fn recall_reaches_earlier_sessions_of_the_same_scope() {
+    let store = Arc::new(InMemoryStore::new());
+    let old = SessionId("yesterday".into());
+    let new = SessionId("today".into());
+
+    // An earlier conversation, and the digest the consolidator would write
+    // for it once it had a rolling summary.
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    e.run_turn(Incoming {
+        session: old.clone(),
+        text: "the deployment password is kept in the vault".into(),
+    })
+    .await
+    .unwrap();
+    store
+        .put_session_digest(&SessionDigest {
+            session: old.clone(),
+            scope: "global".into(),
+            summary: SessionSummary {
+                through_turn: 1,
+                topic: "where the deployment password is kept".into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::User,
+                rebuilt_from: 1,
+            },
+            last_turn: 1,
+            at: Timestamp(1),
+        })
+        .await
+        .unwrap();
+
+    // A new conversation, asking about it. The recall cue routes this Deep,
+    // so the engine searches before proposing anything.
+    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    e.run_turn(Incoming {
+        session: new.clone(),
+        text: "what did i tell you earlier about the deployment password".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&new).await.unwrap();
+    let recalled = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.summary.clone()),
+            _ => None,
+        })
+        .expect("the deep tier recalled");
+    assert!(
+        recalled.contains("in an earlier conversation"),
+        "a verbatim line from the earlier session: {recalled}"
+    );
+    assert!(
+        recalled.contains("vault"),
+        "and it carries what was actually said: {recalled}"
+    );
+    let verbatim_at = recalled.find("in an earlier conversation");
+    let digest_at = recalled.find("was about:");
+    if let (Some(v), Some(d)) = (verbatim_at, digest_at) {
+        assert!(v < d, "verbatim ranks above the digest: {recalled}");
+    }
+}
+
 /// Records the legal action names it was offered on each iteration. What a
 /// tier does is decide that set, so that set is what a routing test asserts
 /// on — not the answer, which a scripted double controls anyway.

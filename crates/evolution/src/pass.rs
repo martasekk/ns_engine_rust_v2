@@ -31,6 +31,10 @@ pub struct PassConfig {
     pub dry_run: bool,
     /// M6 §6.2: a live fact neither validated nor used this long goes cold.
     pub fact_stale_days: u64,
+    /// M7 Phase 4: the scope session digests are written under. One value
+    /// because the CLI maps every session to `global` (M6 §15); a
+    /// multi-user channel turns this into the mapping `scope_for` applies.
+    pub digest_scope: String,
 }
 
 impl Default for PassConfig {
@@ -42,6 +46,7 @@ impl Default for PassConfig {
             regression_replay_cap: 200,
             dry_run: false,
             fact_stale_days: 90,
+            digest_scope: "global".into(),
         }
     }
 }
@@ -277,6 +282,18 @@ impl EvolutionPass {
                 stale_ms: self.cfg.fact_stale_days.saturating_mul(86_400_000),
                 dry_run: self.cfg.dry_run,
             },
+            Timestamp(now),
+        )
+        .await?;
+
+        // 6c. Session digests (M7 Phase 4): the last rolling summary of each
+        //     session, copied into a searchable table so recall can reach
+        //     across sessions. No model call — the summary was already paid
+        //     for while the session ran.
+        report.consolidation.digests = crate::consolidate::write_session_digests(
+            store,
+            &self.cfg.digest_scope,
+            self.cfg.dry_run,
             Timestamp(now),
         )
         .await?;
