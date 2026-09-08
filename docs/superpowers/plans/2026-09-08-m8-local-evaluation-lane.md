@@ -248,3 +248,53 @@ capability it cannot measure.
 - 2026-09-08: plan written against `m7-context-budget` @ `8d18018`. Nothing built yet; T0.1
   (the merge) is the first step. The two numbers this plan exists to produce — the paraphrased
   recall miss rate (§4) and κ for a local evaluator (§5) — are both unmeasured today.
+
+- 2026-09-08, later: **Phase 0 built.** Branch `worktree-m8-plan`, based on
+  `m7-context-budget` — the merge in T0.1 is a fast-forward and is left for a human to push,
+  so this branch carries M7 forward rather than re-landing it.
+
+  | Task | State | Note |
+  |---|---|---|
+  | T0.1 verify the merged tip | done | 465 tests pass, clippy clean with `-D warnings` |
+  | T0.2 `tool_result_max_chars` settable | done | see the deviation below |
+  | T0.2 `trace_verbatim_lines` settable | **already was** | see the deviation below |
+  | T0.3 `[models]` section + startup probe | done | `app/src/models.rs` |
+
+  **Two deviations, both from M7 §13 being half right about what it had deferred:**
+
+  - *`trace_verbatim_lines` was never unwired.* It is an `EngineConfig` field, a `[memory]`
+    key with a default, and is threaded at `app/src/main.rs` — it has been settable since
+    `76663d9`. M7's note recorded both knobs as deferred; only one was.
+  - *`tool_result_max_chars` was not an `EngineConfig` field at all*, but a private
+    `const TRACE_LINE_MAX_CHARS = 1200` in `turn.rs`, read from six places. Making it
+    settable was therefore a thread-it-through change rather than a config line: the const
+    survives as `pub DEFAULT_TOOL_RESULT_MAX_CHARS`, the engine's single source for the
+    default, and `trace_for_prompt`, `clipped_results`, `fold_older_steps`, `fold_descriptor`
+    and `render_budget` all take the cap as an argument now.
+
+  **Behaviour-preserving, checked against the recorded session rather than argued.**
+  `ns-app budget cli` on a copy of `ns-run/ns.sqlite` reproduces M7's Phase 1 rows exactly at
+  the default cap, and moves when the cap moves:
+
+  ```
+  turn      window  summary    trace     sent    chars  ~tokens  tools
+  t6          1026        0     9742     1314    10768     2692      1     # cap 1200, = M7
+  t7          1327        0    14108     1311    15435     3858      1     # cap 1200, = M7
+  t6          1026        0     9742      513    10768     2692      1     # cap 400
+  t7          1327        0    14108      510    15435     3858      1     # cap 400
+  ```
+
+  The session has grown from 7 turns to 18 since M7 measured it, so only the per-turn rows
+  are comparable; t6 and t7 match to the character.
+
+  **T0.3 note.** The probe is a `/health` GET over `TcpStream` rather than the `reqwest`
+  already in the tree, because a probe should fail the way a probe fails — a pooled,
+  redirect-following, TLS-capable client aimed at loopback answers a slightly different
+  question than "is something on that port speaking HTTP right now". It reports the loaded
+  model list, so "running but loaded nothing the lane needs" reads differently from "not
+  running". Verified against the live service, which answers
+  `{"ok": true, "loaded": ["embed", "ocr", "vision"]}` — note **no reranker**: nsmodels
+  loads it only under `--rerank`, which Phase 2's T2.3 will need and should check for by
+  name rather than assume.
+
+  Still unmeasured, unchanged: the paraphrased recall miss rate (§4) and κ (§5).

@@ -184,6 +184,7 @@ pub fn render_budget(
     window_turns: usize,
     caps: Caps,
     verbatim_lines: usize,
+    tool_result_max_chars: usize,
 ) -> String {
     if events.is_empty() {
         return "budget: no events for this session — `ns-app dump <session_id>` shows the log.\n"
@@ -195,7 +196,13 @@ pub fn render_budget(
     {
         render_measured(events)
     } else {
-        render_reconstructed(events, window_turns, caps, verbatim_lines)
+        render_reconstructed(
+        events,
+        window_turns,
+        caps,
+        verbatim_lines,
+        tool_result_max_chars,
+    )
     }
 }
 
@@ -283,6 +290,7 @@ fn render_reconstructed(
     window_turns: usize,
     caps: Caps,
     verbatim_lines: usize,
+    tool_result_max_chars: usize,
 ) -> String {
     let mut rows: Vec<Reconstructed> = Vec::new();
     for turn in turns(events) {
@@ -303,8 +311,13 @@ fn render_reconstructed(
                 .map(|s| nscore::render_summary(s).chars().count())
                 .unwrap_or_default(),
             trace_chars: nsengine::turn::turn_trace(events, turn).chars().count(),
-            sent_trace_chars: nsengine::turn::trace_for_prompt(events, turn, verbatim_lines)
-                .0
+            sent_trace_chars: nsengine::turn::trace_for_prompt(
+                events,
+                turn,
+                verbatim_lines,
+                tool_result_max_chars,
+            )
+            .0
                 .join("\n")
                 .chars()
                 .count(),
@@ -431,6 +444,10 @@ mod tests {
     use super::*;
     use nscore::{EventLog, SessionId, Timestamp};
 
+    /// The engine's own default, so these numbers stay the ones a default
+    /// deployment would see.
+    const DEFAULT_CAP: usize = nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS;
+
     fn usage(role: &str, attempts: u32, prompt: u32, tools_tokens: u32) -> Usage {
         Usage {
             role: role.into(),
@@ -505,7 +522,7 @@ mod tests {
             usage("replier", 1, 800, 0),
             manifest(0, 900, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -544,7 +561,7 @@ mod tests {
             usage("replier", 1, 2_000, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         assert!(row.contains("20.0%"), "200 of 1000 emitter tokens: {row}");
@@ -567,7 +584,7 @@ mod tests {
         let mut guessed = usage("replier", 1, 100, 0);
         guessed.estimated = true;
         call(&mut log, 2, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
 
         assert!(
             out.lines().any(|l| l.starts_with("t1 ")),
@@ -598,7 +615,7 @@ mod tests {
             },
         );
         replied(&mut log, 2, "je poledne");
-        let out = render_budget(log.events(), 6, Caps::default(), 5);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
 
         assert!(out.contains("estimated (reconstructed)"), "{out}");
         assert!(out.contains("A floor, not a measurement"), "{out}");
@@ -674,7 +691,7 @@ mod tests {
             },
         );
         replied(&mut log, 1, "a browser window");
-        let out = render_budget(log.events(), 6, Caps::default(), 5);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
 
         let t1 = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = t1.split_whitespace().collect();
@@ -693,7 +710,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_says_so_instead_of_printing_a_table() {
-        let out = render_budget(&[], 6, Caps::default(), 5);
+        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP);
         assert!(out.contains("no events for this session"), "{out}");
         assert!(!out.contains("turn"), "no header for nothing: {out}");
     }

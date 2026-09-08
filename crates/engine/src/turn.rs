@@ -76,6 +76,15 @@ pub struct EngineConfig {
     /// are never folded, because they are what steer the next proposal.
     /// 0 disables the fold.
     pub trace_verbatim_lines: usize,
+    /// M8 T0.2: how many characters of one tool result reach the prompt
+    /// before the clip takes over and leaves a handle in its place.
+    ///
+    /// Settable because the right value is a property of the tools a
+    /// deployment actually runs: a `pointer_ui_read` over a 14k control tree
+    /// and a two-line shell result do not want the same cap, and until this
+    /// could move, `ns-app budget`'s drop count had nothing to be compared
+    /// against.
+    pub tool_result_max_chars: usize,
     /// M7 Phase 4: how many earlier sessions of the scope `recall` searches
     /// beyond this one. 0 keeps recall inside the current conversation, as
     /// it was before digests existed.
@@ -132,6 +141,7 @@ impl Default for EngineConfig {
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
             trace_verbatim_lines: 5,
+            tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
             router: None,
             prompt_budget_tokens: 6000,
@@ -967,7 +977,7 @@ impl Engine {
                 // action in the schema that can only fail is a way for a
                 // small model to spend an iteration discovering that.
                 if !denied_this_turn.contains(INSPECT_RESULT)
-                    && !clipped_results(log.events(), turn).is_empty()
+                    && !clipped_results(log.events(), turn, self.cfg.tool_result_max_chars).is_empty()
                 {
                     actions.push(inspect_result_spec());
                 }
@@ -1004,7 +1014,12 @@ impl Engine {
             // so an uncapped tool result is paid for again at every step
             // after it.
             let (trace_so_far, clipped_chars) =
-                trace_for_prompt(log.events(), turn, self.cfg.trace_verbatim_lines);
+                trace_for_prompt(
+                    log.events(),
+                    turn,
+                    self.cfg.trace_verbatim_lines,
+                    self.cfg.tool_result_max_chars,
+                );
             // The pinned core is shown at every tier — it is what stops the
             // emitter asking again for a name it already has (M6 F2). The
             // query-relevant slice is what a `Chat` turn does without.
@@ -1041,7 +1056,8 @@ impl Engine {
                 &self.cfg.pinned_prefixes,
             );
             if self.cfg.show_budget_line {
-                let clipped: Vec<String> = clipped_results(log.events(), turn)
+                let clipped: Vec<String> =
+                    clipped_results(log.events(), turn, self.cfg.tool_result_max_chars)
                     .into_iter()
                     .map(result_handle)
                     .collect();
@@ -1602,7 +1618,8 @@ impl Engine {
                     .map(str::trim)
                     .filter(|q| !q.is_empty());
                 let handle = raw_id.and_then(parse_result_handle);
-                let available = clipped_results(log.events(), turn);
+                let available =
+                    clipped_results(log.events(), turn, self.cfg.tool_result_max_chars);
                 let Some(id) = handle.filter(|id| available.contains(id)) else {
                     let known: Vec<String> = available.iter().map(|i| result_handle(*i)).collect();
                     let detail = format!(
@@ -1646,7 +1663,7 @@ impl Engine {
                 calls_this_turn.insert(Self::call_key(&proposal));
                 let text = result_text(log.events(), turn, id).unwrap_or_default();
                 let total = text.chars().count();
-                let (window, start, end) = result_window(&text, query, page, TRACE_LINE_MAX_CHARS);
+                let (window, start, end) = result_window(&text, query, page, self.cfg.tool_result_max_chars);
                 let outcome = if window.is_empty() {
                     // Either the query matched nothing or the pages ran out.
                     // Both are answers, and both mean asking again is a
@@ -2062,7 +2079,12 @@ impl Engine {
                 // full material, and capping there would change what that
                 // number means.
                 let (trace_lines, reply_clipped_chars) =
-                    trace_for_prompt(log.events(), turn, self.cfg.trace_verbatim_lines);
+                    trace_for_prompt(
+                        log.events(),
+                        turn,
+                        self.cfg.trace_verbatim_lines,
+                        self.cfg.tool_result_max_chars,
+                    );
                 let trace = trace_lines.join("\n");
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
@@ -2434,7 +2456,7 @@ struct TraceEntry {
 }
 
 /// `pointer_move ×3 ok` — how one folded outcome is counted.
-fn fold_descriptor(entry: &TraceEntry) -> String {
+fn fold_descriptor(entry: &TraceEntry, max_chars: usize) -> String {
     let action = entry.action.as_deref().unwrap_or("action");
     let outcome = if entry.line.starts_with("ToolReturned(err") {
         "err"
@@ -2443,7 +2465,7 @@ fn fold_descriptor(entry: &TraceEntry) -> String {
     };
     match entry
         .handle
-        .filter(|_| entry.line.chars().count() > TRACE_LINE_MAX_CHARS)
+        .filter(|_| entry.line.chars().count() > max_chars)
     {
         Some(id) => format!("{action} {outcome} ({}, clipped)", result_handle(id)),
         None => format!("{action} {outcome}"),
@@ -2463,7 +2485,7 @@ fn fold_descriptor(entry: &TraceEntry) -> String {
 /// entrainment plan §9 rules out: nothing here is a model's paraphrase.
 /// The fold is a count, produced deterministically, and the full trace is
 /// still in the log for `ns-app echo` to measure against.
-fn fold_older_steps(entries: Vec<TraceEntry>, verbatim: usize) -> Vec<TraceEntry> {
+fn fold_older_steps(entries: Vec<TraceEntry>, verbatim: usize, max_chars: usize) -> Vec<TraceEntry> {
     // The budget counts *outcomes*, not lines. Counting lines put five
     // `Proposed`/`Rejected` lines of churn in the verbatim window and folded
     // the turn's one real result away — and the result is what the replier
@@ -2490,7 +2512,7 @@ fn fold_older_steps(entries: Vec<TraceEntry>, verbatim: usize) -> Vec<TraceEntry
         }
         folded_steps += 1;
         if entry.foldable {
-            folded.push(fold_descriptor(&entry));
+            folded.push(fold_descriptor(&entry, max_chars));
         }
     }
     if folded_steps == 0 {
@@ -2551,7 +2573,13 @@ pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
 /// counted rather than silently cut, so a model that needs the rest knows to
 /// narrow its query — `pointer_ui_find` over `pointer_ui_read` — instead of
 /// concluding the screen is empty.
-const TRACE_LINE_MAX_CHARS: usize = 1200;
+/// The default for `EngineConfig::tool_result_max_chars`, and the value every
+/// scripted double and replay runs at.
+///
+/// A constant until M8 T0.2: the cap was the one number in the clip that
+/// could not be moved without a rebuild, which made "is this cap saving a
+/// turn or hiding the answer" an unaskable question on a real machine.
+pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 1200;
 
 /// Clip one trace line, on a character boundary, saying what was dropped and
 /// — for a tool result — how to get it.
@@ -2648,17 +2676,14 @@ pub fn trace_for_prompt(
     events: &[nscore::Event],
     turn: u32,
     verbatim_lines: usize,
+    max_chars: usize,
 ) -> (Vec<String>, usize) {
     let mut dropped = 0;
-    let lines = fold_older_steps(trace_entries(events, turn), verbatim_lines)
+    let lines = fold_older_steps(trace_entries(events, turn), verbatim_lines, max_chars)
         .into_iter()
         .map(|entry| {
-            dropped += entry
-                .line
-                .chars()
-                .count()
-                .saturating_sub(TRACE_LINE_MAX_CHARS);
-            clip_trace_line(&entry.line, TRACE_LINE_MAX_CHARS, entry.handle)
+            dropped += entry.line.chars().count().saturating_sub(max_chars);
+            clip_trace_line(&entry.line, max_chars, entry.handle)
         })
         .collect();
     (lines, dropped)
@@ -2703,10 +2728,10 @@ fn result_trust(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> nsc
 /// Derived from this turn's own events, never from the store: legality that
 /// depends on stored state makes replay from a fresh store diverge, which is
 /// the rule M6 §15 records after `forget_all` was written that way once.
-fn clipped_results(events: &[nscore::Event], turn: u32) -> Vec<nscore::EventId> {
+fn clipped_results(events: &[nscore::Event], turn: u32, max_chars: usize) -> Vec<nscore::EventId> {
     trace_entries(events, turn)
         .into_iter()
-        .filter(|entry| entry.line.chars().count() > TRACE_LINE_MAX_CHARS)
+        .filter(|entry| entry.line.chars().count() > max_chars)
         .filter_map(|entry| entry.handle)
         .collect()
 }
@@ -2815,7 +2840,7 @@ mod tests {
     fn a_short_trace_line_is_left_alone() {
         let line = "ToolReturned(ok: moved to (960, 540))";
         let handle = Some(nscore::EventId(7));
-        assert_eq!(clip_trace_line(line, TRACE_LINE_MAX_CHARS, handle), line);
+        assert_eq!(clip_trace_line(line, DEFAULT_TOOL_RESULT_MAX_CHARS, handle), line);
         assert_eq!(clip_trace_line("exactly ten", 11, handle), "exactly ten");
     }
 
@@ -2881,7 +2906,7 @@ mod tests {
     }
 
     fn folded(entries: Vec<TraceEntry>, verbatim: usize) -> Vec<String> {
-        fold_older_steps(entries, verbatim)
+        fold_older_steps(entries, verbatim, DEFAULT_TOOL_RESULT_MAX_CHARS)
             .into_iter()
             .map(|e| e.line)
             .collect()

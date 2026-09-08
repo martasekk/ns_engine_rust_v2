@@ -19,10 +19,68 @@ pub struct AppConfig {
     pub memory: MemorySection,
     #[serde(default)]
     pub router: RouterSection,
+    /// [models] — the local model service (nsmodels) the evaluation lane may
+    /// use. Absent, or `enabled = false`, means nothing reaches for it.
+    #[serde(default)]
+    pub models: ModelsSection,
     /// [pointer] — a desktop to drive, through the ns-pointer agent on it.
     /// Absent means no pointer actions are registered.
     #[serde(default)]
     pub pointer: Option<PointerSection>,
+}
+
+/// [models] — the local CPU model service, for the evaluation lane only
+/// (M8 T0.3).
+///
+/// `~/models` (nsmodels) serves embeddings and a cross-encoder reranker on
+/// loopback, warm, because a cold load is ~30 s and a per-call subprocess is
+/// a thousand times the cost of a warm request. What it is here for is the
+/// free tier: `openrouter/free` allows about fifty requests a day, and an
+/// evaluation lane that spends one of them per graded turn competes with the
+/// work it is grading.
+///
+/// What it may not be is a decision. M6 §13 stands unchanged — no model in
+/// the guard chain and no model-decided applies — and a local model does not
+/// acquire an exception by being free. Its output enters as a signal and
+/// becomes a gate only on a measured true-positive rate, which is what
+/// `evaluator_min_kappa` will be for.
+///
+/// Off by default, and a service that is not answering degrades the lane
+/// rather than failing it: this is the behaviour `adgen-eval::local_vision`
+/// and `ns-pointerd`'s OCR tools already have, and it is why they stay usable
+/// on a machine where the server is not always up.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ModelsSection {
+    /// Whether anything may call the service at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Where it listens. 7374 is nsmodels' own default, one past
+    /// `ns-pointerd`'s 7373.
+    #[serde(default = "default_models_base_url")]
+    pub base_url: String,
+    /// How long one request may take before the signal is counted
+    /// unavailable. Short on purpose: the pass runs while the harness waits
+    /// for the next message, and a hung scorer would hold that wait open.
+    #[serde(default = "default_models_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for ModelsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_models_base_url(),
+            timeout_ms: default_models_timeout_ms(),
+        }
+    }
+}
+
+fn default_models_base_url() -> String {
+    "http://127.0.0.1:7374".into()
+}
+
+fn default_models_timeout_ms() -> u64 {
+    2000
 }
 
 /// [router] — the cue lists that decide a turn's tier (M7 Phase 3).
@@ -173,6 +231,12 @@ pub struct MemorySection {
     /// fold. 0 turns the fold off.
     #[serde(default = "default_trace_verbatim_lines")]
     pub trace_verbatim_lines: usize,
+    /// How many characters of one tool result reach the prompt before the
+    /// clip leaves a handle in its place (M7 T1.1, settable since M8 T0.2).
+    /// The right value depends on the tools a deployment runs: a control
+    /// tree and a two-line shell result do not want the same cap.
+    #[serde(default = "default_tool_result_max_chars")]
+    pub tool_result_max_chars: usize,
     /// Ceiling for the whole composed context, in estimated tokens (M7
     /// T2.1). 0 turns the budget off.
     #[serde(default = "default_prompt_budget_tokens")]
@@ -241,6 +305,13 @@ fn default_trace_verbatim_lines() -> usize {
     5
 }
 
+/// The engine's own default, not a second opinion about it: a copy here
+/// would drift, and the drift would show up as a budget report that
+/// disagreed with the prompt it claimed to measure.
+fn default_tool_result_max_chars() -> usize {
+    nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS
+}
+
 /// Six thousand tokens of composed context. Not a model's limit — it is a
 /// working ceiling for the blocks the engine controls, chosen so the pieces
 /// M6 sizes (window ≈1k, facts ≈300, summary ≈250) plus a desktop turn's
@@ -294,6 +365,7 @@ impl Default for MemorySection {
             relevant_max: default_relevant_max(),
             fact_stale_days: default_fact_stale_days(),
             trace_verbatim_lines: default_trace_verbatim_lines(),
+            tool_result_max_chars: default_tool_result_max_chars(),
             prompt_budget_tokens: default_prompt_budget_tokens(),
             budget_mode: default_budget_mode(),
             show_budget_line: false,
@@ -1082,6 +1154,49 @@ mod tests {
         assert_eq!(cfg.memory.summary_rebuild_every, 3);
         let off = AppConfig::parse("[memory]\nsummary_every_turns = 0\n").unwrap();
         assert_eq!(off.memory.summary_every_turns, 0);
+    }
+
+    /// The cap M7 left as a `const`: a default deployment sees exactly the
+    /// number the engine was measured at, and a deployment whose tools
+    /// produce something else can say so without a rebuild.
+    #[test]
+    fn tool_result_max_chars_defaults_to_the_engine_constant_and_parses() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(
+            cfg.memory.tool_result_max_chars,
+            nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS
+        );
+        assert_eq!(cfg.memory.tool_result_max_chars, 1200);
+        let cfg = AppConfig::parse("[memory]\ntool_result_max_chars = 400\n").unwrap();
+        assert_eq!(cfg.memory.tool_result_max_chars, 400);
+        // The other M7 knob, asserted beside it: both are settable now, and
+        // a regression that unwires one should not be reported as passing
+        // because the other still parses.
+        let cfg = AppConfig::parse("[memory]\ntrace_verbatim_lines = 2\n").unwrap();
+        assert_eq!(cfg.memory.trace_verbatim_lines, 2);
+    }
+
+    /// Absent `[models]` is the normal case and must mean "reach for
+    /// nothing": the service is a machine-local convenience, and a config
+    /// written before it existed has to keep behaving as it did.
+    #[test]
+    fn models_section_is_off_unless_asked_for() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!(!cfg.models.enabled);
+        assert_eq!(cfg.models.base_url, "http://127.0.0.1:7374");
+        assert_eq!(cfg.models.timeout_ms, 2000);
+
+        // Naming the section is not the same as switching it on.
+        let cfg = AppConfig::parse("[models]\n").unwrap();
+        assert!(!cfg.models.enabled);
+
+        let cfg = AppConfig::parse(
+            "[models]\nenabled = true\nbase_url = \"http://127.0.0.1:9999\"\ntimeout_ms = 500\n",
+        )
+        .unwrap();
+        assert!(cfg.models.enabled);
+        assert_eq!(cfg.models.base_url, "http://127.0.0.1:9999");
+        assert_eq!(cfg.models.timeout_ms, 500);
     }
 
     #[test]

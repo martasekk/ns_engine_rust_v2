@@ -1,6 +1,7 @@
 mod budget;
 mod config;
 mod eval;
+mod models;
 
 use config::{AppConfig, Role, RoleTarget};
 use nscore::{HarnessBuilder, SessionId, Tool};
@@ -418,6 +419,7 @@ async fn main() {
                 cfg.memory.window_turns,
                 cfg.memory.caps(),
                 cfg.memory.trace_verbatim_lines,
+                cfg.memory.tool_result_max_chars,
             )
         );
         return;
@@ -502,6 +504,10 @@ async fn main() {
     // stdin, plus the desktop's compose box when there is one to read. The
     // agent has offered that channel since 2026-09-05 and nothing collected
     // it; a line typed into the badge went into the outbox and stopped there.
+    // Says whether the local model service is answering, when one is asked
+    // for. Before the channel so the line lands with the other startup
+    // reports rather than in the middle of the first turn.
+    models::announce(&cfg.models).await;
     let cli = nschannel_cli::CliChannel::new_stdio();
     match desktop_messages(&cfg).await {
         Some(client) => b.set_channel(Box::new(
@@ -584,6 +590,7 @@ async fn main() {
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
+        tool_result_max_chars: cfg.memory.tool_result_max_chars,
         recall_sessions: cfg.memory.recall_sessions,
         router: cfg
             .router
