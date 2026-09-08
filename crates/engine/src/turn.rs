@@ -71,6 +71,11 @@ pub struct EngineConfig {
     /// override that suspends injection the moment a person touches the mouse,
     /// the arming chord, and the badge's pie menu.
     pub confirm_irreversible: bool,
+    /// M7 T1.3: how many of this turn's own tool *outcomes* stay verbatim in
+    /// the prompt. Older ones are folded into a single counted line; refusals
+    /// are never folded, because they are what steer the next proposal.
+    /// 0 disables the fold.
+    pub trace_verbatim_lines: usize,
     /// M7 T0.1: where the provider clients leave what each call cost. When
     /// set, the engine appends one `ModelCall` per call, with the manifest
     /// of what that call was shown. `None` — every scripted double, every
@@ -106,6 +111,7 @@ impl Default for EngineConfig {
             recall_top_k: 5,
             // The safe default: ask before anything irreversible.
             confirm_irreversible: true,
+            trace_verbatim_lines: 5,
             usage: None,
         }
     }
@@ -750,7 +756,8 @@ impl Engine {
             // Clipped: this is the line that is re-sent on every iteration,
             // so an uncapped tool result is paid for again at every step
             // after it.
-            let (trace_so_far, clipped_chars) = trace_for_prompt(log.events(), turn);
+            let (trace_so_far, clipped_chars) =
+                trace_for_prompt(log.events(), turn, self.cfg.trace_verbatim_lines);
             let selected = self.select_facts(&scope, &incoming.text).await;
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
@@ -1815,7 +1822,8 @@ impl Engine {
                 // stays uncapped: `render_echo` measures the reply against the
                 // full material, and capping there would change what that
                 // number means.
-                let (trace_lines, reply_clipped_chars) = trace_for_prompt(log.events(), turn);
+                let (trace_lines, reply_clipped_chars) =
+                    trace_for_prompt(log.events(), turn, self.cfg.trace_verbatim_lines);
                 let trace = trace_lines.join("\n");
                 // Implicit recall (spec §5): standing facts enter the reply
                 // context; each recall bumps `uses` (lifecycle metadata for
@@ -2086,17 +2094,34 @@ fn render_template(template: &str, vars: &serde_json::Value) -> String {
 ///
 /// Split out from `turn_trace` so the clip and `inspect_result` name the same
 /// event. A handle the model cannot resolve is worse than no handle.
-fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<(Option<nscore::EventId>, String)> {
+fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
+    // `ToolReturned` names the call it answers, not the action; the action is
+    // on the `ToolCalled` it points at. The same resolution the fold in
+    // state.rs does, for the same reason: a count of "pointer_move ×3" needs
+    // a name, and `call 17` is not one.
+    let mut action_of: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for e in events.iter().filter(|e| e.turn == turn) {
+        if let EventKind::ToolCalled { action, .. } = &e.kind {
+            action_of.insert(e.id.0, action.clone());
+        }
+    }
     events
         .iter()
         .filter(|e| e.turn == turn)
         .filter_map(|e| match &e.kind {
-            EventKind::Proposed { proposal } => {
-                Some((None, format!("Proposed({})", proposal.action)))
-            }
-            EventKind::Rejected { reason, .. } => Some((
-                None,
-                match reason {
+            EventKind::Proposed { proposal } => Some(TraceEntry {
+                handle: None,
+                action: Some(proposal.action.clone()),
+                rejection: false,
+                foldable: false,
+                line: format!("Proposed({})", proposal.action),
+            }),
+            EventKind::Rejected { reason, .. } => Some(TraceEntry {
+                handle: None,
+                action: None,
+                rejection: true,
+                foldable: false,
+                line: match reason {
                     RejectReason::Malformed { detail } => format!("Rejected(malformed: {detail})"),
                     // Named as an endpoint problem, because this line is fed back
                     // to the emitter as context: telling it three times a turn
@@ -2112,18 +2137,141 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<(Option<nscore::Eve
                         format!("Rejected(guard {guard}: {reason})")
                     }
                 },
-            )),
-            EventKind::ToolReturned { outcome, .. } => Some(match outcome {
-                ToolOutcome::Ok { output } => {
-                    (Some(e.id), format!("ToolReturned(ok: {})", output.summary))
-                }
-                ToolOutcome::Err { kind, detail } => {
-                    (None, format!("ToolReturned(err {kind}: {detail})"))
-                }
             }),
+            EventKind::ToolReturned { outcome, call } => {
+                let action = action_of.get(&call.0).cloned();
+                Some(match outcome {
+                    ToolOutcome::Ok { output } => TraceEntry {
+                        handle: Some(e.id),
+                        action,
+                        rejection: false,
+                        foldable: true,
+                        line: format!("ToolReturned(ok: {})", output.summary),
+                    },
+                    ToolOutcome::Err { kind, detail } => TraceEntry {
+                        handle: None,
+                        action,
+                        rejection: false,
+                        foldable: true,
+                        line: format!("ToolReturned(err {kind}: {detail})"),
+                    },
+                })
+            }
             _ => None,
         })
         .collect()
+}
+
+/// One line of this turn's trace, with what the prompt renderer needs to
+/// decide how much of it to send.
+struct TraceEntry {
+    /// The result this line can be paged through with `inspect_result`.
+    handle: Option<nscore::EventId>,
+    /// The action behind the line, for the fold's counts.
+    action: Option<String>,
+    /// A refusal. Never folded: refusals are what steer the next proposal,
+    /// and a model that cannot see why it was refused proposes it again —
+    /// which is the failure the repeat gate exists to stop and the schema
+    /// narrowing exists to prevent recurring.
+    rejection: bool,
+    /// Whether the fold may summarize this line into a count. Outcomes may;
+    /// `Proposed` lines are dropped by the fold instead, since the outcome
+    /// line beneath them already names the action.
+    foldable: bool,
+    line: String,
+}
+
+/// `pointer_move ×3 ok` — how one folded outcome is counted.
+fn fold_descriptor(entry: &TraceEntry) -> String {
+    let action = entry.action.as_deref().unwrap_or("action");
+    let outcome = if entry.line.starts_with("ToolReturned(err") {
+        "err"
+    } else {
+        "ok"
+    };
+    match entry
+        .handle
+        .filter(|_| entry.line.chars().count() > TRACE_LINE_MAX_CHARS)
+    {
+        Some(id) => format!("{action} {outcome} ({}, clipped)", result_handle(id)),
+        None => format!("{action} {outcome}"),
+    }
+}
+
+/// Collapse the turn's older steps into one line, keeping the last
+/// `verbatim` of them and every refusal in full.
+///
+/// The measured arm of "Less Context, Better Agents" (2606.10209): last-N
+/// tool spans plus a summary of the rest took completion from 71% to 92%
+/// while cutting tokens to a third. This is the within-a-turn half of that
+/// shape — the cross-turn half is M6's window and rolling summary, and is
+/// untouched.
+///
+/// It is emphatically *not* the consolidated window that the 2026-09-04
+/// entrainment plan §9 rules out: nothing here is a model's paraphrase.
+/// The fold is a count, produced deterministically, and the full trace is
+/// still in the log for `ns-app echo` to measure against.
+fn fold_older_steps(entries: Vec<TraceEntry>, verbatim: usize) -> Vec<TraceEntry> {
+    // The budget counts *outcomes*, not lines. Counting lines put five
+    // `Proposed`/`Rejected` lines of churn in the verbatim window and folded
+    // the turn's one real result away — and the result is what the replier
+    // narrates from, so the reply then stated something its own prompt no
+    // longer contained. A trace is mostly bookkeeping; the outcomes are the
+    // part with content in them.
+    let outcomes: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.foldable)
+        .map(|(i, _)| i)
+        .collect();
+    if verbatim == 0 || outcomes.len() <= verbatim {
+        return entries;
+    }
+    let keep_from = outcomes[outcomes.len() - verbatim];
+    let mut folded: Vec<String> = Vec::new();
+    let mut folded_steps = 0usize;
+    let mut kept: Vec<TraceEntry> = Vec::new();
+    for (i, entry) in entries.into_iter().enumerate() {
+        if i >= keep_from || entry.rejection {
+            kept.push(entry);
+            continue;
+        }
+        folded_steps += 1;
+        if entry.foldable {
+            folded.push(fold_descriptor(&entry));
+        }
+    }
+    if folded_steps == 0 {
+        return kept;
+    }
+    // Equal descriptors are counted rather than repeated: eight moves in a
+    // row is one fact about the turn, not eight.
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for d in folded {
+        match counts.iter_mut().find(|(seen, _)| *seen == d) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((d, 1)),
+        }
+    }
+    let summary = counts
+        .into_iter()
+        .map(|(d, n)| if n > 1 { format!("{d} ×{n}") } else { d })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let line = if summary.is_empty() {
+        format!("earlier this turn: {folded_steps} steps")
+    } else {
+        format!("earlier this turn ({folded_steps} steps): {summary}")
+    };
+    let mut out = vec![TraceEntry {
+        handle: None,
+        action: None,
+        rejection: false,
+        foldable: false,
+        line,
+    }];
+    out.extend(kept);
+    out
 }
 
 /// One human-readable line per this-turn event: outcomes AND refusal reasons.
@@ -2132,7 +2280,7 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<(Option<nscore::Eve
 pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
     trace_entries(events, turn)
         .into_iter()
-        .map(|(_, line)| line)
+        .map(|entry| entry.line)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2240,13 +2388,21 @@ fn inspect_page(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> usi
 /// difference between the text a tool produced and the text the model was
 /// shown, and until it is recorded there is no way to tell a cap that is
 /// saving a turn from one that is hiding the answer.
-fn trace_for_prompt(events: &[nscore::Event], turn: u32) -> (Vec<String>, usize) {
+fn trace_for_prompt(
+    events: &[nscore::Event],
+    turn: u32,
+    verbatim_lines: usize,
+) -> (Vec<String>, usize) {
     let mut dropped = 0;
-    let lines = trace_entries(events, turn)
+    let lines = fold_older_steps(trace_entries(events, turn), verbatim_lines)
         .into_iter()
-        .map(|(handle, line)| {
-            dropped += line.chars().count().saturating_sub(TRACE_LINE_MAX_CHARS);
-            clip_trace_line(&line, TRACE_LINE_MAX_CHARS, handle)
+        .map(|entry| {
+            dropped += entry
+                .line
+                .chars()
+                .count()
+                .saturating_sub(TRACE_LINE_MAX_CHARS);
+            clip_trace_line(&entry.line, TRACE_LINE_MAX_CHARS, entry.handle)
         })
         .collect();
     (lines, dropped)
@@ -2294,8 +2450,8 @@ fn result_trust(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> nsc
 fn clipped_results(events: &[nscore::Event], turn: u32) -> Vec<nscore::EventId> {
     trace_entries(events, turn)
         .into_iter()
-        .filter(|(handle, line)| handle.is_some() && line.chars().count() > TRACE_LINE_MAX_CHARS)
-        .filter_map(|(handle, _)| handle)
+        .filter(|entry| entry.line.chars().count() > TRACE_LINE_MAX_CHARS)
+        .filter_map(|entry| entry.handle)
         .collect()
 }
 
@@ -2428,6 +2584,128 @@ mod tests {
         let denial = clip_trace_line(&line, 100, None);
         assert!(denial.contains("more characters]"), "{denial}");
         assert!(!denial.contains(INSPECT_RESULT), "{denial}");
+    }
+
+    fn outcome(action: &str, id: u64, text: &str) -> TraceEntry {
+        TraceEntry {
+            handle: Some(nscore::EventId(id)),
+            action: Some(action.into()),
+            rejection: false,
+            foldable: true,
+            line: format!("ToolReturned(ok: {text})"),
+        }
+    }
+
+    fn proposed(action: &str) -> TraceEntry {
+        TraceEntry {
+            handle: None,
+            action: Some(action.into()),
+            rejection: false,
+            foldable: false,
+            line: format!("Proposed({action})"),
+        }
+    }
+
+    fn refusal(text: &str) -> TraceEntry {
+        TraceEntry {
+            handle: None,
+            action: None,
+            rejection: true,
+            foldable: false,
+            line: format!("Rejected({text})"),
+        }
+    }
+
+    fn folded(entries: Vec<TraceEntry>, verbatim: usize) -> Vec<String> {
+        fold_older_steps(entries, verbatim)
+            .into_iter()
+            .map(|e| e.line)
+            .collect()
+    }
+
+    /// The regression that produced this rule. Counting *lines* let five
+    /// `Proposed`/`Rejected` lines of churn fill the verbatim window and
+    /// folded the turn's one real result away — after which the reply model
+    /// narrated a result its own prompt no longer contained. The budget
+    /// counts outcomes, so the only outcome always survives.
+    #[test]
+    fn the_fold_never_swallows_the_only_outcome() {
+        let entries = vec![
+            proposed("echo"),
+            outcome("echo", 4, "echo: hi"),
+            proposed("echo"),
+            refusal("guard repeat_gate: identical call to 'echo'"),
+            proposed("echo"),
+            refusal("illegal action: echo"),
+        ];
+        let lines = folded(entries, 5);
+        assert!(
+            lines.iter().any(|l| l.contains("echo: hi")),
+            "the result must survive: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_fold_keeps_recent_outcomes_and_every_refusal_and_counts_the_rest() {
+        let mut entries = vec![refusal("guard taint_policy: external")];
+        for i in 0..4 {
+            entries.push(proposed("pointer_move"));
+            entries.push(outcome("pointer_move", 10 + i, "moved"));
+        }
+        entries.push(outcome("pointer_click", 20, "clicked (389, 1056)"));
+        let lines = folded(entries, 2);
+
+        assert!(
+            lines[0].starts_with("earlier this turn ("),
+            "the fold leads: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("pointer_move ok ×3"),
+            "equal steps are counted, not repeated: {}",
+            lines[0]
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("taint_policy")),
+            "a refusal is never folded — it is what steers the next proposal: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("clicked (389, 1056)")),
+            "the last outcomes stay verbatim: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("moved")).count(),
+            1,
+            "one of the four moves is recent enough to keep: {lines:?}"
+        );
+    }
+
+    /// A folded result keeps its handle in the summary, so the page is still
+    /// reachable after the line that carried it is gone.
+    #[test]
+    fn a_folded_clipped_result_still_names_its_handle() {
+        let big = outcome("pointer_ui_read", 42, &"node ".repeat(400));
+        let entries = vec![big, outcome("a", 1, "x"), outcome("b", 2, "y")];
+        let lines = folded(entries, 2);
+        assert!(
+            lines[0].contains("pointer_ui_read ok (r42, clipped)"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn the_fold_is_off_below_the_budget_and_at_zero() {
+        let entries = || vec![outcome("a", 1, "x"), outcome("b", 2, "y")];
+        assert_eq!(folded(entries(), 5).len(), 2, "nothing to fold");
+        let many = || {
+            vec![
+                outcome("a", 1, "x"),
+                outcome("b", 2, "y"),
+                outcome("c", 3, "z"),
+            ]
+        };
+        assert_eq!(folded(many(), 0).len(), 3, "0 disables the fold");
+        assert_eq!(folded(many(), 1).len(), 2, "fold line plus the last one");
     }
 
     #[test]
