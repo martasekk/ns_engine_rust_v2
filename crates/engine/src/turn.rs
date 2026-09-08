@@ -290,6 +290,74 @@ fn recall_spec() -> nscore::ActionSpec {
     }
 }
 
+/// Engine-owned synthetic action: read more of a clipped tool result
+/// (M7 T1.2).
+pub const INSPECT_RESULT: &str = "inspect_result";
+
+fn inspect_result_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: INSPECT_RESULT.into(),
+        description: "Read more of a tool result that was shown clipped. `id` is the handle in \
+                      the trace, like r42. With `query`, returns the part of the result around \
+                      the first match; without one, the next part. For a desktop, prefer \
+                      pointer_ui_find, which searches the live screen instead."
+            .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "query": { "type": "string" }
+            },
+            "required": ["id"]
+        }),
+        side_effect: nscore::SideEffect::Pure,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// The window of a clipped result to show for one `inspect_result` call.
+///
+/// With a query, the window is anchored a little before the first
+/// case-insensitive match, so the match arrives with the context that makes
+/// it usable — for a control tree, the role and name that precede a point.
+/// Without one, it is the next page: `page` is how many unqueried
+/// inspections of this result the turn has already made, which is a fact
+/// about this turn's own events and so survives replay.
+///
+/// Deliberately a character window and not a split on the separator some
+/// tool happens to use. The engine knows nothing about any tool's output
+/// format, and a per-tool table of separators here is the same magic-number
+/// table the pointer design refused for modal keywords.
+fn result_window(
+    text: &str,
+    query: Option<&str>,
+    page: usize,
+    max: usize,
+) -> (String, usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let start = match query {
+        Some(q) if !q.trim().is_empty() => {
+            let hay = text.to_lowercase();
+            match hay.find(&q.trim().to_lowercase()) {
+                // `find` is a byte offset; convert to a character index so the
+                // window never splits a Czech control name in half.
+                Some(byte) => {
+                    let char_index = text[..byte].chars().count();
+                    char_index.saturating_sub(max / 8)
+                }
+                None => return (String::new(), 0, chars.len()),
+            }
+        }
+        _ => page.saturating_mul(max),
+    };
+    if start >= chars.len() {
+        return (String::new(), start, chars.len());
+    }
+    let end = (start + max).min(chars.len());
+    (chars[start..end].iter().collect(), start, end)
+}
+
 /// What to do with a remembered value nothing in the session grounds
 /// (M6 §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,6 +710,14 @@ impl Engine {
                 if !denied_this_turn.contains(RECALL) {
                     actions.push(recall_spec());
                 }
+                // Offered only while there is something to inspect. An
+                // action in the schema that can only fail is a way for a
+                // small model to spend an iteration discovering that.
+                if !denied_this_turn.contains(INSPECT_RESULT)
+                    && !clipped_results(log.events(), turn).is_empty()
+                {
+                    actions.push(inspect_result_spec());
+                }
                 // Forgetting is legal only while it can mean something: not
                 // after a fact was written this turn (seen live: "my name is
                 // now Peter" ended in forget_fact + a staged forget_all) and
@@ -797,7 +873,15 @@ impl Engine {
             // with small models that ignore "never repeat a completed action"
             // in the prompt. Recorded as a guard denial so the narrowed schema
             // drops the action for the rest of the turn.
-            if calls_this_turn.contains(&Self::call_key(&proposal)) {
+            // `inspect_result` is the exception, and not a weakening of the
+            // gate: the gate's premise is that an identical call yields no
+            // new information, and for a paging action that premise is
+            // simply false — the same call is how the next page is asked
+            // for. It cannot run away either: the pages end, and an
+            // exhausted result leaves the schema.
+            if proposal.action != INSPECT_RESULT
+                && calls_this_turn.contains(&Self::call_key(&proposal))
+            {
                 let reason = format!(
                     "identical call to '{}' already executed this turn",
                     proposal.action
@@ -1247,6 +1331,102 @@ impl Engine {
                             trust: nscore::min_trust(&trusts),
                         },
                     },
+                };
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+                continue;
+            }
+
+            // f8. inspect_result (M7 T1.2): the other half of the cap. The
+            // whole result is in the log; this pages through it without
+            // running the tool again, which on a desktop is neither free nor
+            // guaranteed to return the same screen.
+            if proposal.action == INSPECT_RESULT {
+                let raw_id = proposal.args.get("id").and_then(|v| v.as_str());
+                let query = proposal
+                    .args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty());
+                let handle = raw_id.and_then(parse_result_handle);
+                let available = clipped_results(log.events(), turn);
+                let Some(id) = handle.filter(|id| available.contains(id)) else {
+                    let known: Vec<String> = available.iter().map(|i| result_handle(*i)).collect();
+                    let detail = format!(
+                        "no clipped result named {:?} this turn; available: {}",
+                        raw_id.unwrap_or(""),
+                        if known.is_empty() {
+                            "none".to_string()
+                        } else {
+                            known.join(", ")
+                        }
+                    );
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::Rejected {
+                            proposal_of: pid,
+                            reason: RejectReason::Malformed {
+                                detail: format!("{INSPECT_RESULT}: {detail}"),
+                            },
+                        },
+                    );
+                    rejections_this_turn.push(format!("{INSPECT_RESULT}: {detail}"));
+                    denied_this_turn.insert(INSPECT_RESULT.to_string());
+                    continue;
+                };
+                let spec = inspect_result_spec();
+                let index = nsprovenance::index::ValueIndex::from_events(log.events());
+                let classified_args =
+                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let page = inspect_page(log.events(), turn, id);
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: INSPECT_RESULT.into(),
+                            args: classified_args,
+                        },
+                    )
+                    .id;
+                calls_this_turn.insert(Self::call_key(&proposal));
+                let text = result_text(log.events(), turn, id).unwrap_or_default();
+                let total = text.chars().count();
+                let (window, start, end) = result_window(&text, query, page, TRACE_LINE_MAX_CHARS);
+                let outcome = if window.is_empty() {
+                    // Either the query matched nothing or the pages ran out.
+                    // Both are answers, and both mean asking again is a
+                    // wasted iteration — so the action leaves the schema.
+                    denied_this_turn.insert(INSPECT_RESULT.to_string());
+                    ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: match query {
+                                Some(q) => format!("{} has no match for {q:?}", result_handle(id)),
+                                None => format!("no more of {}", result_handle(id)),
+                            },
+                            artifact: None,
+                            trust: result_trust(log.events(), turn, id),
+                        },
+                    }
+                } else {
+                    ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: format!(
+                                "{} chars {start}-{end} of {total}: {window}",
+                                result_handle(id)
+                            ),
+                            artifact: None,
+                            trust: result_trust(log.events(), turn, id),
+                        },
+                    }
                 };
                 log.append(
                     turn,
@@ -1900,39 +2080,59 @@ fn render_template(template: &str, vars: &serde_json::Value) -> String {
     out
 }
 
-/// One human-readable line per this-turn event: outcomes AND refusal reasons.
-/// Public because `ns-app echo` reconstructs, from a stored log, the material
-/// a reply was shown — and a second rendering of it would drift.
-pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
+/// One human-readable line per this-turn event, each carrying the id of the
+/// event it came from where that id is a *handle* — that is, for tool
+/// results, which are the only lines a model can ask to see more of.
+///
+/// Split out from `turn_trace` so the clip and `inspect_result` name the same
+/// event. A handle the model cannot resolve is worse than no handle.
+fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<(Option<nscore::EventId>, String)> {
     events
         .iter()
         .filter(|e| e.turn == turn)
         .filter_map(|e| match &e.kind {
-            EventKind::Proposed { proposal } => Some(format!("Proposed({})", proposal.action)),
-            EventKind::Rejected { reason, .. } => Some(match reason {
-                RejectReason::Malformed { detail } => format!("Rejected(malformed: {detail})"),
-                // Named as an endpoint problem, because this line is fed back
-                // to the emitter as context: telling it three times a turn
-                // that it produced bad output, while the endpoint was down,
-                // is teaching it the wrong lesson about its own behaviour.
-                RejectReason::ProviderUnavailable { status, detail } => {
-                    format!("(provider unavailable: HTTP {status}: {detail})")
-                }
-                RejectReason::IllegalAction { action } => {
-                    format!("Rejected(illegal action: {action})")
-                }
-                RejectReason::GuardDenied { guard, reason } => {
-                    format!("Rejected(guard {guard}: {reason})")
-                }
-            }),
+            EventKind::Proposed { proposal } => {
+                Some((None, format!("Proposed({})", proposal.action)))
+            }
+            EventKind::Rejected { reason, .. } => Some((
+                None,
+                match reason {
+                    RejectReason::Malformed { detail } => format!("Rejected(malformed: {detail})"),
+                    // Named as an endpoint problem, because this line is fed back
+                    // to the emitter as context: telling it three times a turn
+                    // that it produced bad output, while the endpoint was down,
+                    // is teaching it the wrong lesson about its own behaviour.
+                    RejectReason::ProviderUnavailable { status, detail } => {
+                        format!("(provider unavailable: HTTP {status}: {detail})")
+                    }
+                    RejectReason::IllegalAction { action } => {
+                        format!("Rejected(illegal action: {action})")
+                    }
+                    RejectReason::GuardDenied { guard, reason } => {
+                        format!("Rejected(guard {guard}: {reason})")
+                    }
+                },
+            )),
             EventKind::ToolReturned { outcome, .. } => Some(match outcome {
-                ToolOutcome::Ok { output } => format!("ToolReturned(ok: {})", output.summary),
+                ToolOutcome::Ok { output } => {
+                    (Some(e.id), format!("ToolReturned(ok: {})", output.summary))
+                }
                 ToolOutcome::Err { kind, detail } => {
-                    format!("ToolReturned(err {kind}: {detail})")
+                    (None, format!("ToolReturned(err {kind}: {detail})"))
                 }
             }),
             _ => None,
         })
+        .collect()
+}
+
+/// One human-readable line per this-turn event: outcomes AND refusal reasons.
+/// Public because `ns-app echo` reconstructs, from a stored log, the material
+/// a reply was shown — and a second rendering of it would drift.
+pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
+    trace_entries(events, turn)
+        .into_iter()
+        .map(|(_, line)| line)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1953,18 +2153,84 @@ pub fn turn_trace(events: &[nscore::Event], turn: u32) -> String {
 /// concluding the screen is empty.
 const TRACE_LINE_MAX_CHARS: usize = 1200;
 
-/// Clip one trace line, on a character boundary, saying what was dropped.
+/// Clip one trace line, on a character boundary, saying what was dropped and
+/// — for a tool result — how to get it.
+///
+/// The dropped text is not gone: the whole result is in the log, inside the
+/// `ToolReturned` event this line came from. Naming that event turns the cap
+/// from a loss into a page boundary, which is the difference between an
+/// agent that narrows its query and one that concludes the screen is empty.
+/// Without a handle the only recovery is running the tool again, and on a
+/// desktop that is neither free nor guaranteed to return the same thing.
 ///
 /// Char boundaries rather than bytes: these lines carry window titles and
 /// control names, which on this machine are Czech, and slicing a UTF-8
 /// sequence in half would panic.
-fn clip_trace_line(line: &str, max: usize) -> String {
+fn clip_trace_line(line: &str, max: usize, handle: Option<nscore::EventId>) -> String {
     let total = line.chars().count();
     if total <= max {
         return line.to_string();
     }
     let head: String = line.chars().take(max).collect();
-    format!("{head}… [{} more characters]", total - max)
+    match handle {
+        Some(id) => format!(
+            "{head}… [{}: {total} chars, {max} shown — {INSPECT_RESULT} to see more]",
+            result_handle(id)
+        ),
+        None => format!("{head}… [{} more characters]", total - max),
+    }
+}
+
+/// How a tool result is named in a prompt: `r42` for event 42.
+///
+/// Short because it is repeated in every clipped line, and prefixed because a
+/// bare number in a trace reads as data from the tool rather than as an
+/// address.
+fn result_handle(id: nscore::EventId) -> String {
+    format!("r{}", id.0)
+}
+
+/// The event id behind a handle, accepting `r42` and `42` alike. A small
+/// model that echoes the number without the prefix has still identified the
+/// result it means.
+fn parse_result_handle(raw: &str) -> Option<nscore::EventId> {
+    raw.trim()
+        .trim_start_matches(['r', 'R'])
+        .parse::<u64>()
+        .ok()
+        .map(nscore::EventId)
+}
+
+/// Unqueried inspections of `id` already made this turn — the page number of
+/// the next one. Read out of this turn's own events, so a replay pages
+/// identically.
+fn inspect_page(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> usize {
+    events
+        .iter()
+        .filter(|e| e.turn == turn)
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolCalled { action, args } if action == INSPECT_RESULT => Some(args),
+            _ => None,
+        })
+        .filter(|args| {
+            let arg = |name: &str| {
+                args.iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, tv)| tv.value.clone())
+            };
+            let same = arg("id")
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .and_then(parse_result_handle)
+                == Some(id);
+            let unqueried = arg("query")
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(|q| q.trim().is_empty())
+                .unwrap_or(true);
+            same && unqueried
+        })
+        .count()
 }
 
 /// The trace as the models should see it: every line clipped, and the
@@ -1976,15 +2242,61 @@ fn clip_trace_line(line: &str, max: usize) -> String {
 /// saving a turn from one that is hiding the answer.
 fn trace_for_prompt(events: &[nscore::Event], turn: u32) -> (Vec<String>, usize) {
     let mut dropped = 0;
-    let lines = turn_trace(events, turn)
-        .lines()
-        .map(|line| {
-            let clipped = clip_trace_line(line, TRACE_LINE_MAX_CHARS);
+    let lines = trace_entries(events, turn)
+        .into_iter()
+        .map(|(handle, line)| {
             dropped += line.chars().count().saturating_sub(TRACE_LINE_MAX_CHARS);
-            clipped
+            clip_trace_line(&line, TRACE_LINE_MAX_CHARS, handle)
         })
         .collect();
     (lines, dropped)
+}
+
+/// The full text of a tool result recorded this turn, by handle.
+///
+/// Only `Ok` outcomes: an error's detail is already short and is never
+/// clipped, so there is nothing behind it to page through.
+fn result_text(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> Option<String> {
+    events
+        .iter()
+        .find(|e| e.id == id && e.turn == turn)
+        .and_then(|e| match &e.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.summary.clone()),
+            _ => None,
+        })
+}
+
+/// The trust of the result behind a handle, so an inspected window carries
+/// the trust of the tool that produced it rather than `System` by default.
+fn result_trust(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> nscore::Trust {
+    events
+        .iter()
+        .find(|e| e.id == id && e.turn == turn)
+        .and_then(|e| match &e.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.trust),
+            _ => None,
+        })
+        .unwrap_or(nscore::Trust::System)
+}
+
+/// Handles of this turn's results that the cap actually shortened — the set
+/// `inspect_result` is legal over.
+///
+/// Derived from this turn's own events, never from the store: legality that
+/// depends on stored state makes replay from a fresh store diverge, which is
+/// the rule M6 §15 records after `forget_all` was written that way once.
+fn clipped_results(events: &[nscore::Event], turn: u32) -> Vec<nscore::EventId> {
+    trace_entries(events, turn)
+        .into_iter()
+        .filter(|(handle, line)| handle.is_some() && line.chars().count() > TRACE_LINE_MAX_CHARS)
+        .filter_map(|(handle, _)| handle)
+        .collect()
 }
 
 /// The inclusive turn range of a verbatim window; `None` when it is empty.
@@ -2082,8 +2394,9 @@ mod tests {
     #[test]
     fn a_short_trace_line_is_left_alone() {
         let line = "ToolReturned(ok: moved to (960, 540))";
-        assert_eq!(clip_trace_line(line, TRACE_LINE_MAX_CHARS), line);
-        assert_eq!(clip_trace_line("exactly ten", 11), "exactly ten");
+        let handle = Some(nscore::EventId(7));
+        assert_eq!(clip_trace_line(line, TRACE_LINE_MAX_CHARS, handle), line);
+        assert_eq!(clip_trace_line("exactly ten", 11, handle), "exactly ten");
     }
 
     /// The case the cap exists for: a `pointer_ui_read` rendered to one line.
@@ -2093,18 +2406,84 @@ mod tests {
     #[test]
     fn a_long_trace_line_keeps_its_head_and_says_what_was_dropped() {
         let line = format!("ToolReturned(ok: {})", "node ".repeat(500));
-        let clipped = clip_trace_line(&line, 100);
+        let clipped = clip_trace_line(&line, 100, Some(nscore::EventId(42)));
         assert!(
             clipped.starts_with("ToolReturned(ok: node node"),
             "{clipped}"
         );
+        // The drop is visible, and addressable: the handle names the event
+        // the rest is still sitting in.
         assert!(
-            clipped.contains("more characters]"),
-            "the drop must be visible: {clipped}"
+            clipped.contains(&format!(
+                "[r42: {} chars, 100 shown — inspect_result to see more]",
+                line.chars().count()
+            )),
+            "{clipped}"
         );
         // 100 kept, plus the note.
         assert_eq!(clipped.chars().take(100).count(), 100);
         assert!(clipped.chars().count() < line.chars().count());
+        // A line with no result behind it — a guard denial — still says what
+        // it dropped, but promises nothing that can be fetched.
+        let denial = clip_trace_line(&line, 100, None);
+        assert!(denial.contains("more characters]"), "{denial}");
+        assert!(!denial.contains(INSPECT_RESULT), "{denial}");
+    }
+
+    #[test]
+    fn a_handle_round_trips_and_tolerates_a_bare_number() {
+        let id = nscore::EventId(42);
+        assert_eq!(result_handle(id), "r42");
+        assert_eq!(parse_result_handle("r42"), Some(id));
+        assert_eq!(parse_result_handle(" R42 "), Some(id));
+        assert_eq!(parse_result_handle("42"), Some(id), "a bare number is one");
+        assert_eq!(parse_result_handle("rubbish"), None);
+    }
+
+    /// Paging is by character window, and the window is anchored a little
+    /// before a match so the match arrives with the context that makes it
+    /// usable — in a control tree, the role and name that precede a point.
+    #[test]
+    fn a_result_window_pages_and_anchors_on_a_query() {
+        let text: String = (0..50)
+            .map(|i| format!("button \"item{i}\" ({i},{i}) | "))
+            .collect();
+        let total = text.chars().count();
+
+        let (first, start, end) = result_window(&text, None, 0, 100);
+        assert_eq!((start, end), (0, 100));
+        assert!(first.starts_with("button \"item0\""));
+        let (second, start, _) = result_window(&text, None, 1, 100);
+        assert_eq!(start, 100);
+        assert_ne!(first, second, "page 1 is not page 0");
+
+        // Past the end is empty rather than an error: "no more" is an answer.
+        assert!(result_window(&text, None, 999, 100).0.is_empty());
+
+        let (hit, start, _) = result_window(&text, Some("item47"), 0, 100);
+        assert!(hit.contains("item47"), "{hit}");
+        assert!(start > 0, "anchored at the match, not at the top");
+        assert!(
+            hit.contains("button"),
+            "the match arrives with its context: {hit}"
+        );
+        assert!(result_window(&text, Some("nothing here"), 0, 100)
+            .0
+            .is_empty());
+        assert_eq!(total, text.chars().count());
+    }
+
+    /// The window counts characters, because these results carry Czech
+    /// control names and an emoji round-trips through the clipboard test.
+    #[test]
+    fn a_result_window_never_splits_a_character() {
+        let text = "Průzkumník souborů 🐎 Zrušit Tlačítko Systémové hodiny".repeat(4);
+        for max in 1..40 {
+            let (window, _, _) = result_window(&text, None, 0, max);
+            assert_eq!(window.chars().count(), max);
+        }
+        let (window, _, _) = result_window(&text, Some("Zrušit"), 0, 20);
+        assert!(window.contains("Zrušit"), "{window}");
     }
 
     /// Window titles and control names on this machine are Czech, and the
@@ -2114,7 +2493,7 @@ mod tests {
     fn clipping_never_splits_a_character() {
         let line = "Průzkumník souborů 🐎 Zrušit Tlačítko Systémové hodiny";
         for max in 1..line.chars().count() {
-            let clipped = clip_trace_line(line, max);
+            let clipped = clip_trace_line(line, max, Some(nscore::EventId(1)));
             assert!(clipped.chars().count() >= max, "max {max}: {clipped}");
         }
     }

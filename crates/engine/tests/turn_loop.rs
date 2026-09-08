@@ -2721,6 +2721,190 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     assert_eq!(summaries, 1, "the summary still lands in the log");
 }
 
+/// A tool whose result is far past the cap. Not an invented shape: the
+/// recorded desktop session's two `pointer_ui_read` results were 14,425 and
+/// 10,025 characters against a median tool result of 24.
+struct WideTool {
+    spec: ActionSpec,
+}
+
+impl WideTool {
+    fn new() -> Self {
+        Self {
+            spec: ActionSpec {
+                name: "wide".into(),
+                description: "read the whole screen".into(),
+                args_schema: serde_json::json!({"type": "object", "properties": {}}),
+                side_effect: SideEffect::Pure,
+                residual_policy: Default::default(),
+                dedupe_tag: None,
+            },
+        }
+    }
+
+    /// The last control is only reachable past the cap, so a test that finds
+    /// it has proved the whole path rather than the first page.
+    fn screen() -> String {
+        (0..200)
+            .map(|i| format!("button \"item{i}\" ({i},{i}) | "))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WideTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.spec
+    }
+    async fn call(&self, _a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            summary: Self::screen(),
+            artifact: None,
+            trust: Trust::External,
+        })
+    }
+}
+
+/// Finds the handle in the trace it was shown and follows it, the way the
+/// real emitter would have to. Proves the clipped line carries an address a
+/// reader can act on, rather than only a number of lost characters.
+struct HandleFollowingEmitter {
+    traces: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    legal: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for HandleFollowingEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.traces
+            .lock()
+            .expect("traces")
+            .push(ctx.trace_so_far.clone());
+        self.legal.lock().expect("legal").push(
+            legal
+                .actions
+                .iter()
+                .map(|a| a.name.clone())
+                .collect::<Vec<_>>(),
+        );
+        let trace = ctx.trace_so_far.join("\n");
+        let proposal = |action: &str, args: serde_json::Value| Proposal {
+            rationale: "test".into(),
+            action: action.into(),
+            args,
+        };
+        if trace.is_empty() {
+            return Ok(proposal("wide", serde_json::json!({})));
+        }
+        if let Some(at) = trace.find("[r") {
+            let handle: String = trace[at + 1..]
+                .chars()
+                .take_while(|c| *c == 'r' || c.is_ascii_digit())
+                .collect();
+            if legal.contains("inspect_result") && !trace.contains("item199") {
+                return Ok(proposal(
+                    "inspect_result",
+                    serde_json::json!({"id": handle, "query": "item199"}),
+                ));
+            }
+        }
+        Ok(proposal("respond_directly", serde_json::json!({})))
+    }
+}
+
+/// The cap and its escape hatch, end to end: a result too big to show is
+/// clipped with a handle, the handle is offered as an action only because
+/// something was clipped, and following it reaches text that was never in
+/// the prompt.
+#[tokio::test]
+async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("clipped".into());
+    let traces = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(HandleFollowingEmitter {
+        traces: traces.clone(),
+        legal: legal.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(WideTool::new()));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            reply_grounding_check: false,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what is on the screen".into(),
+    })
+    .await
+    .unwrap();
+
+    // Offered only once there is something to inspect.
+    let legal = legal.lock().expect("legal").clone();
+    assert!(
+        !legal[0].contains(&"inspect_result".to_string()),
+        "nothing was clipped yet: {:?}",
+        legal[0]
+    );
+    assert!(
+        legal[1].contains(&"inspect_result".to_string()),
+        "a clipped result makes it legal: {:?}",
+        legal[1]
+    );
+
+    // What the emitter was actually shown: a clipped line naming the event
+    // the rest is still in.
+    let traces = traces.lock().expect("traces").clone();
+    let clipped = traces[1].join("\n");
+    assert!(clipped.contains("inspect_result to see more]"), "{clipped}");
+    assert!(
+        !clipped.contains("item199"),
+        "the tail must be past the cap, or the test proves nothing"
+    );
+    assert!(clipped.chars().count() < WideTool::screen().chars().count() / 2);
+
+    // And following the handle reaches it.
+    let events = store.load(&sid).await.unwrap();
+    let inspected = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } if output.summary.starts_with('r') => Some(output.clone()),
+            _ => None,
+        })
+        .expect("an inspect_result outcome");
+    assert!(
+        inspected.summary.contains("item199"),
+        "the query anchored the window on the match: {}",
+        inspected.summary
+    );
+    assert_eq!(
+        inspected.trust,
+        Trust::External,
+        "an inspected window keeps the trust of the tool that produced it"
+    );
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ToolCalled { action, .. } if action == "inspect_result"
+    )));
+}
+
 /// Stands in for a provider client: leaves a `Usage` in the same sink
 /// `OpenRouterClient` writes to, so the engine's half of the accounting can
 /// be tested without a network.
