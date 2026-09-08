@@ -477,6 +477,27 @@ async fn main() {
     let emitter_key = key_or_exit(&emitter_target);
     let replier_key = key_or_exit(&replier_target);
 
+    // Settled before anything is built or dialled. `build_tools` opens the
+    // pointer socket and arms an agent; failing after that on a typo in
+    // `[memory]` means the config was rejected only once it had already
+    // reached out to another machine. Every semantic check the chat path
+    // needs happens here, in one place, while the process still holds
+    // nothing.
+    let remember_residual = match cfg.memory.remember_residual() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
+    let budget_mode = match cfg.memory.budget_mode() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
     let tools = build_tools(&cfg).await;
@@ -553,18 +574,15 @@ async fn main() {
         b.add_tool(t.clone());
     }
 
-    let parts = b.build().expect("harness assembly");
-    let remember_residual = match cfg.memory.remember_residual() {
-        Ok(r) => r,
+    // Assembly is a gate, not a formality: it refuses a missing slot, a
+    // duplicated one, two tools claiming the same name, and an action whose
+    // arguments would outrank the rationale in the compiled schema. An
+    // `expect` here reported all four as a panic with a backtrace, which is
+    // the least useful form for the only errors a user can actually fix.
+    let parts = match b.build() {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("config.toml: {e}");
-            std::process::exit(1);
-        }
-    };
-    let budget_mode = match cfg.memory.budget_mode() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("config.toml: {e}");
+            eprintln!("ns-harness: cannot assemble the harness: {e}");
             std::process::exit(1);
         }
     };
