@@ -861,8 +861,7 @@ impl Engine {
         if tier == nscore::Tier::Deep {
             let args = serde_json::json!({ "query": incoming.text });
             let spec = recall_spec();
-            let index = nsprovenance::index::ValueIndex::from_events(log.events());
-            let classified = nsprovenance::classify::classify_args(&args, &spec, &index, turn);
+            let classified = classify(log.events(), &args, &spec, turn);
             let call_id = log
                 .append(
                     turn,
@@ -1258,9 +1257,7 @@ impl Engine {
                     continue;
                 };
                 let ask_spec = ask_clarification_spec();
-                let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args =
-                    nsprovenance::classify::classify_args(&proposal.args, &ask_spec, &index, turn);
+                let classified_args = classify(log.events(), &proposal.args, &ask_spec, turn);
                 let classified = ClassifiedProposal {
                     proposal: proposal.clone(),
                     args: classified_args,
@@ -1372,9 +1369,7 @@ impl Engine {
                     continue;
                 }
                 let fact_spec = remember_fact_spec();
-                let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args =
-                    nsprovenance::classify::classify_args(&proposal.args, &fact_spec, &index, turn);
+                let classified_args = classify(log.events(), &proposal.args, &fact_spec, turn);
                 let prov = classified_args
                     .iter()
                     .find(|(k, _)| k == "value")
@@ -1545,9 +1540,7 @@ impl Engine {
                     continue;
                 };
                 let spec = recall_spec();
-                let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args =
-                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
                         turn,
@@ -1612,9 +1605,7 @@ impl Engine {
                     continue;
                 };
                 let spec = inspect_result_spec();
-                let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args =
-                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let page = inspect_page(log.events(), turn, id);
                 let call_id = log
                     .append(
@@ -1727,9 +1718,7 @@ impl Engine {
                     continue;
                 }
                 let spec = forget_fact_spec();
-                let index = nsprovenance::index::ValueIndex::from_events(log.events());
-                let classified_args =
-                    nsprovenance::classify::classify_args(&proposal.args, &spec, &index, turn);
+                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
                         turn,
@@ -1866,9 +1855,7 @@ impl Engine {
             }
 
             // g. classify args against the session's history (spec §5.4)
-            let index = nsprovenance::index::ValueIndex::from_events(log.events());
-            let classified_args =
-                nsprovenance::classify::classify_args(&proposal.args, tool.spec(), &index, turn);
+            let classified_args = classify(log.events(), &proposal.args, tool.spec(), turn);
             let classified = ClassifiedProposal {
                 proposal: proposal.clone(),
                 args: classified_args.clone(),
@@ -2334,6 +2321,28 @@ fn render_template(template: &str, vars: &serde_json::Value) -> String {
 ///
 /// Split out from `turn_trace` so the clip and `inspect_result` name the same
 /// event. A handle the model cannot resolve is worse than no handle.
+
+/// Establish where each of a proposal's arguments came from.
+///
+/// Seven places in the turn loop built this pair by hand — rebuild the value
+/// index from the session's events, then classify against it — and provenance
+/// is the mechanism that decides what a guard is allowed to conclude about an
+/// argument. Seven copies of it is seven places a change has to be made and
+/// six places it can be forgotten, which is the shape of an invariant that
+/// eventually holds in most of the codebase.
+///
+/// The index is rebuilt per call rather than cached because it is derived
+/// from the log, and the log grows within a turn: a value copied out of a
+/// tool result three steps ago must be groundable now.
+fn classify(
+    events: &[nscore::Event],
+    args: &serde_json::Value,
+    spec: &nscore::ActionSpec,
+    turn: u32,
+) -> Vec<(String, nscore::TaggedValue)> {
+    let index = nsprovenance::index::ValueIndex::from_events(events);
+    nsprovenance::classify::classify_args(args, spec, &index, turn)
+}
 
 /// The guards every engine runs, before the harness's own.
 ///
