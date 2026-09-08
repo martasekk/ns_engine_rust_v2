@@ -2388,7 +2388,11 @@ fn inspect_page(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> usi
 /// difference between the text a tool produced and the text the model was
 /// shown, and until it is recorded there is no way to tell a cap that is
 /// saving a turn from one that is hiding the answer.
-fn trace_for_prompt(
+/// Public alongside `turn_trace` and for the same reason: `ns-app budget`
+/// reports the raw trace against the one actually sent, and a second
+/// implementation of the clip and the fold would drift from this one, which
+/// would make the saving it reports a fiction.
+pub fn trace_for_prompt(
     events: &[nscore::Event],
     turn: u32,
     verbatim_lines: usize,

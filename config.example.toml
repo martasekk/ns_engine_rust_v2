@@ -72,6 +72,13 @@ pinned_prefixes = ["user."]   # always shown, newest first, with the value they 
 pinned_max = 5
 relevant_max = 5
 fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
+# How many of a turn's own tool outcomes stay verbatim in the prompt (M7
+# T1.3). Older ones fold into one counted line — "earlier this turn (7
+# steps): pointer_move ok x3 ..." — and refusals never fold, since they are
+# what steer the next proposal. 0 turns the fold off. A result too big to
+# show is clipped with a handle (r42) that `inspect_result` reads the rest
+# from, so folding loses nothing that cannot be fetched back.
+trace_verbatim_lines = 5
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said

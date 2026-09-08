@@ -1,3 +1,4 @@
+mod budget;
 mod config;
 
 use config::{AppConfig, Role, RoleTarget};
@@ -395,6 +396,32 @@ async fn main() {
         return;
     }
 
+    // `ns-app budget <session_id>`: requests, tokens and characters per turn
+    // (M7 T0.2). Needs no API key — the cost was recorded when the calls
+    // were made, and a session recorded before `ModelCall` existed is
+    // reconstructed from the log rather than re-run.
+    if args.get(1).map(String::as_str) == Some("budget") {
+        let Some(session) = args.get(2) else {
+            eprintln!("usage: ns-app budget <session_id>");
+            std::process::exit(2);
+        };
+        let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
+            .expect("open sqlite store");
+        let events = nscore::MemoryStore::load(&store, &SessionId(session.clone()))
+            .await
+            .expect("load session");
+        print!(
+            "{}",
+            budget::render_budget(
+                &events,
+                cfg.memory.window_turns,
+                cfg.memory.caps(),
+                cfg.memory.trace_verbatim_lines,
+            )
+        );
+        return;
+    }
+
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane
     // needs no key; without one the notes lane is skipped with a warning.
     if args.get(1).map(String::as_str) == Some("evolve") {
@@ -532,6 +559,7 @@ async fn main() {
         summary_max_chars: cfg.memory.summary_max_chars,
         summary_input_max_chars: cfg.memory.summary_input_max_chars,
         recall_top_k: cfg.memory.recall_top_k,
+        trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
         usage: Some(usage),
     };
     let mut engine = Engine::new(parts, engine_cfg);

@@ -118,6 +118,11 @@ pub struct MemorySection {
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
+    /// How many of a turn's own tool outcomes stay verbatim in the prompt
+    /// (M7 T1.3). Older ones fold into one counted line; refusals never
+    /// fold. 0 turns the fold off.
+    #[serde(default = "default_trace_verbatim_lines")]
+    pub trace_verbatim_lines: usize,
     /// Rolling summary cadence (M6 §5.1); 0 disables the layer.
     #[serde(default = "default_summary_every_turns")]
     pub summary_every_turns: usize,
@@ -165,6 +170,13 @@ fn default_fact_stale_days() -> u64 {
     90
 }
 
+/// Five outcomes. A desktop turn runs to twelve iterations and most of them
+/// are moves and clicks whose whole content is "it worked"; five keeps the
+/// recent screen reads, which are the ones with anything in them.
+fn default_trace_verbatim_lines() -> usize {
+    5
+}
+
 fn default_window_turns() -> usize {
     6
 }
@@ -192,6 +204,7 @@ impl Default for MemorySection {
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
             fact_stale_days: default_fact_stale_days(),
+            trace_verbatim_lines: default_trace_verbatim_lines(),
             summary_every_turns: default_summary_every_turns(),
             summary_rebuild_every: default_summary_rebuild_every(),
             summary_max_chars: default_summary_max_chars(),

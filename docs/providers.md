@@ -222,9 +222,19 @@ jq -s 'map(.response.usage.total_tokens // 0) | add' wire.jsonl   # tokens
 jq -r '"\(.role)\t\(.ms)ms\t\(.status)"' wire.jsonl            # per call
 ```
 
-`ns-app providers`, `ns-app dump <session>` and `ns-app evolve --dry-run`
-all run **in a terminal**, not at the `you>` prompt — typing them into the
-chat just sends them to the model as text.
+Since M7 the log answers the token question by itself, without a wire trace:
+one `ModelCall` event per provider call carries the usage the provider
+reported (or a flagged `chars/4` estimate when it reported none), the
+requests the call really cost including retries, and the size of the tool
+schemas sent with it.
+
+```bash
+ns-app budget <session>     # requests, tokens and trace size, per turn
+```
+
+`ns-app providers`, `ns-app dump <session>`, `ns-app budget <session>` and
+`ns-app evolve --dry-run` all run **in a terminal**, not at the `you>`
+prompt — typing them into the chat just sends them to the model as text.
 
 ---
 
