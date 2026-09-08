@@ -431,14 +431,17 @@ async fn main() {
     // between two runs moved because the harness changed. Exits non-zero when
     // an ability failed, so a release script can gate on it.
     if args.get(1).map(String::as_str) == Some("eval") {
-        let ledger = match eval::parse_args(&args[2..]) {
+        let parsed = match eval::parse_args(&args[2..]) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
         };
-        std::process::exit(eval::run(&ledger).await);
+        if parsed.paraphrase {
+            std::process::exit(eval::run_paraphrase().await);
+        }
+        std::process::exit(eval::run(&parsed.ledger).await);
     }
 
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane

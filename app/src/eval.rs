@@ -252,14 +252,86 @@ fn diff_lines(previous: Option<&Row>, current: &Row) -> String {
 }
 
 /// `ns-app eval [<ledger-path>]` → the ledger to append to.
-pub fn parse_args(args: &[String]) -> Result<PathBuf, String> {
-    match args {
-        [] => Ok(PathBuf::from(DEFAULT_LEDGER)),
-        [path] if !path.starts_with('-') => Ok(PathBuf::from(path)),
-        other => Err(format!(
-            "usage: ns-app eval [<ledger-path>] (got {other:?})"
-        )),
+#[derive(Debug, Clone, PartialEq)]
+pub struct Args {
+    pub ledger: PathBuf,
+    /// Run the paraphrased-recall arm instead of the ability set (M8 T1.2).
+    ///
+    /// A separate mode rather than an extra column, because it grades a
+    /// different thing: the ability set grades the harness and gates a
+    /// release on it, while this measures a *retriever* and decides a design
+    /// question that M6 §12.8 left open. Folding the second into the first
+    /// would make a fired trigger look like a regression, which it is not —
+    /// it is the trigger doing its job.
+    pub paraphrase: bool,
+}
+
+pub fn parse_args(args: &[String]) -> Result<Args, String> {
+    let mut ledger = None;
+    let mut paraphrase = false;
+    for a in args {
+        match a.as_str() {
+            "--paraphrase" => paraphrase = true,
+            path if !path.starts_with('-') && ledger.is_none() => {
+                ledger = Some(PathBuf::from(path))
+            }
+            other => {
+                return Err(format!(
+                    "usage: ns-app eval [<ledger-path>] [--paraphrase] (got {other:?})"
+                ))
+            }
+        }
     }
+    Ok(Args {
+        ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
+        paraphrase,
+    })
+}
+
+/// `ns-app eval --paraphrase` — the M6 §12.8 measurement, against both
+/// retrievers (M8 T1.2).
+///
+/// Both, because they are not the same retriever and only one of them ships.
+/// `InMemoryStore::search_turns` counts query tokens found in the line;
+/// `SqliteStore` runs FTS5 `bm25` over an index. The ability suite has only
+/// ever exercised the first. A trigger decided on it would be a decision
+/// about test scaffolding.
+///
+/// Exits 0 whatever the number is. A fired trigger is not a failure — it is
+/// permission to build something, and a gate that went red on it would make
+/// the measurement something to avoid taking.
+pub async fn run_paraphrase() -> i32 {
+    use nsengine::paraphrase;
+
+    let k = nsengine::turn::EngineConfig::default().recall_top_k;
+    let mut reports = Vec::new();
+
+    let memory = nsengine::store::InMemoryStore::new();
+    reports.push(paraphrase::measure(&memory, "in-memory (token hits)", k).await);
+
+    // A throwaway database rather than the live one: the corpus writes
+    // twelve sessions, and a measurement that left them in `ns.sqlite` would
+    // be editing the thing every other number here is read from.
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("paraphrase: no temp dir for the sqlite arm ({e})");
+            return 2;
+        }
+    };
+    match nsmemory_sqlite::SqliteStore::open(&dir.path().join("paraphrase.sqlite")) {
+        Ok(sqlite) => {
+            reports.push(paraphrase::measure(&sqlite, "sqlite (fts5 bm25)", k).await);
+        }
+        Err(e) => eprintln!("paraphrase: the sqlite arm did not run ({e})"),
+    }
+
+    print!("{}", paraphrase::render(&reports));
+    println!(
+        "  k = {k} (recall_top_k), {} cases, no model calls and no requests spent.",
+        paraphrase::corpus().len()
+    );
+    0
 }
 
 /// The commit the harness was built from, read out of `.git` rather than
@@ -613,12 +685,35 @@ mod tests {
 
     #[test]
     fn eval_args_accept_nothing_or_one_path() {
-        assert_eq!(parse_args(&[]), Ok(PathBuf::from(DEFAULT_LEDGER)));
-        assert_eq!(
-            parse_args(&["other.json".to_string()]),
-            Ok(PathBuf::from("other.json"))
-        );
-        assert!(parse_args(&["--live".to_string()]).is_err());
+        let plain = parse_args(&[]).unwrap();
+        assert_eq!(plain.ledger, PathBuf::from(DEFAULT_LEDGER));
+        assert!(!plain.paraphrase);
+
+        let named = parse_args(&["other.json".to_string()]).unwrap();
+        assert_eq!(named.ledger, PathBuf::from("other.json"));
+
         assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
+    }
+
+    /// `--paraphrase` is the M8 arm; `--live` is still the flag M7 refused,
+    /// and adding one must not have quietly opened the other.
+    #[test]
+    fn the_paraphrase_arm_is_a_flag_and_live_is_still_refused() {
+        let arm = parse_args(&["--paraphrase".to_string()]).unwrap();
+        assert!(arm.paraphrase);
+        assert_eq!(arm.ledger, PathBuf::from(DEFAULT_LEDGER));
+
+        // It composes with a ledger path, in either order.
+        for args in [
+            vec!["runs.json".to_string(), "--paraphrase".to_string()],
+            vec!["--paraphrase".to_string(), "runs.json".to_string()],
+        ] {
+            let parsed = parse_args(&args).unwrap();
+            assert!(parsed.paraphrase);
+            assert_eq!(parsed.ledger, PathBuf::from("runs.json"));
+        }
+
+        assert!(parse_args(&["--live".to_string()]).is_err());
+        assert!(parse_args(&["--paraphrases".to_string()]).is_err());
     }
 }

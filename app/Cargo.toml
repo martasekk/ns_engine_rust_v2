@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
+# Runtime, not just tests: `ns-app eval --paraphrase` measures the sqlite
+# retriever in a throwaway database rather than the live one.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }

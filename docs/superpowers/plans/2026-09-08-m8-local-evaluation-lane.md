@@ -298,3 +298,74 @@ capability it cannot measure.
   name rather than assume.
 
   Still unmeasured, unchanged: the paraphrased recall miss rate (§4) and κ (§5).
+
+- 2026-09-08, later still: **Phase 1 built, and the §12.8 trigger has fired.**
+
+  | Task | State | Note |
+  |---|---|---|
+  | T1.1 paraphrase corpus, 12 cases, cs + en | done | `crates/engine/src/paraphrase.rs` |
+  | T1.2 `ns-app eval --paraphrase`, both retrievers | done | `app/src/eval.rs` |
+  | T1.3 lexical baseline | done | the table below |
+
+  **The measurement M6 has owed since September 2:**
+
+  ```
+  retriever                    verbatim     miss paraphrase     miss
+  ------------------------------------------------------------------
+  in-memory (token hits)         12/12        0%      3/12       75%
+  sqlite (fts5 bm25)             12/12        0%      2/12       83%
+  ```
+
+  The control arm is 12/12 on both, so the paraphrase number is about vocabulary and not
+  about a broken harness. **83% ≫ 20%: M6 §12.8 permits embeddings.**
+
+  **Two deviations from §4 as written, both making the number harder rather than easier:**
+
+  - *Both retrievers, not one.* §4 said "today's bm25". The ability suite runs on
+    `InMemoryStore`, whose `search_turns` counts token hits; what ships is `SqliteStore`'s
+    FTS5 `bm25`. Those are different retrievers, and a trigger decided on the one that does
+    not ship would be a decision about test scaffolding. They disagree — 75% against 83% —
+    which is the argument for having measured both.
+  - *One pooled session, not one session per case.* The first cut gave each case its own
+    session, making the target one of four candidates with `recall_top_k` at 5 — so a
+    retriever that returned everything would have scored 12/12 without ranking anything.
+    The number survived only because lexical search drops zero-score lines and returns
+    nothing at all. That is a real failure mode, but resting the measurement on it would
+    have made this arm useless for comparing anything against. All twelve cases now share
+    one session; every query is asked against all 48 lines.
+
+  The corpus polices itself: `every_paraphrase_actually_paraphrases` fails the build if a
+  paraphrase shares more than 30% of its tokens with the line, **or** if a verbatim control
+  shares less than 40%. Two cases were caught by it while being written.
+
+  **What Phase 3 is now allowed to be, measured rather than assumed.** With the trigger
+  fired, the obvious next question is whether a local embedder actually fixes what bm25
+  missed. Probed against the same corpus and the same 48-line pool, on the live nsmodels
+  service (e5-small, and the cross-encoder loaded with `serve --rerank`):
+
+  | retrieval | paraphrase miss |
+  |---|---|
+  | sqlite fts5 bm25 — what ships | **83%** |
+  | e5-small vectors, top-5 | 33% |
+  | vector top-20 → cross-encoder rerank → top-5 | 25% |
+  | cross-encoder over the whole pool → top-5 | **17%** |
+
+  Three things follow, and they change §6:
+
+  1. **A plain union of bm25 and vector candidates buys nothing here.** bm25's two hits are
+     a strict subset of the vector arm's eight. T3.2's fusion is still right for not
+     *losing* lexical exact matches, but it must not be sold as the thing that closes the
+     gap.
+  2. **The coarse retrieval is the bottleneck, not the reranker.** At `COARSE = 20` two
+     targets never reach the reranker at all; widened to the whole pool, the same reranker
+     takes the miss rate to 17% — under the threshold. So T3.2's coarse `k` has to be
+     generous, and "how generous" is now a tunable with a measurement behind it rather than
+     a guess.
+  3. **The two irreducible misses are both the identity question** ("who am I, remind me" /
+     "kdo jsem, připomeň mi to" against a line where the user introduced themselves). Those
+     are exactly the cases the engine answers from *pinned facts*, not from `recall` — M6
+     pins `user.*` — so in the running system they never depend on this path. Worth stating
+     plainly: the residual failure of the retriever is concentrated where the retriever is
+     not what answers.
+
+  Still unmeasured: κ for a local evaluator (§5). That is Phase 2.
