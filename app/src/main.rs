@@ -652,7 +652,7 @@ fn render_echo(events: &[nscore::Event], window_turns: usize, caps: nscore::Caps
             .collect();
         let state = nsengine::state::fold(&before);
         let window = state.window(window_turns);
-        let mut material = nsengine::turn::turn_trace(events, ev.turn);
+        let mut material = nsengine::trace::turn_trace(events, ev.turn);
         if let Some(s) = &state.summary {
             material.push('\n');
             material.push_str(&nscore::render_summary(s));

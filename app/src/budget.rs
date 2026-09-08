@@ -310,8 +310,8 @@ fn render_reconstructed(
                 .as_ref()
                 .map(|s| nscore::render_summary(s).chars().count())
                 .unwrap_or_default(),
-            trace_chars: nsengine::turn::turn_trace(events, turn).chars().count(),
-            sent_trace_chars: nsengine::turn::trace_for_prompt(
+            trace_chars: nsengine::trace::turn_trace(events, turn).chars().count(),
+            sent_trace_chars: nsengine::trace::trace_for_prompt(
                 events,
                 turn,
                 verbatim_lines,
@@ -446,7 +446,7 @@ mod tests {
 
     /// The engine's own default, so these numbers stay the ones a default
     /// deployment would see.
-    const DEFAULT_CAP: usize = nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS;
+    const DEFAULT_CAP: usize = nsengine::trace::DEFAULT_TOOL_RESULT_MAX_CHARS;
 
     fn usage(role: &str, attempts: u32, prompt: u32, tools_tokens: u32) -> Usage {
         Usage {

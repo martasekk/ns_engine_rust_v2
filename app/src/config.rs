@@ -309,7 +309,7 @@ fn default_trace_verbatim_lines() -> usize {
 /// would drift, and the drift would show up as a budget report that
 /// disagreed with the prompt it claimed to measure.
 fn default_tool_result_max_chars() -> usize {
-    nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS
+    nsengine::trace::DEFAULT_TOOL_RESULT_MAX_CHARS
 }
 
 /// Six thousand tokens of composed context. Not a model's limit — it is a
@@ -1164,7 +1164,7 @@ mod tests {
         let cfg = AppConfig::parse("").unwrap();
         assert_eq!(
             cfg.memory.tool_result_max_chars,
-            nsengine::turn::DEFAULT_TOOL_RESULT_MAX_CHARS
+            nsengine::trace::DEFAULT_TOOL_RESULT_MAX_CHARS
         );
         assert_eq!(cfg.memory.tool_result_max_chars, 1200);
         let cfg = AppConfig::parse("[memory]\ntool_result_max_chars = 400\n").unwrap();
