@@ -3,7 +3,9 @@
 **Status:** plan, 2026-09-08. Written against `m7-context-budget` @ `8d18018` (20 commits ahead
 of `main` @ `a478d46`; `main` is fully contained in it, so the merge is a fast-forward).
 
-**Evidence base:** `docs/research/2026-09-07-context-budget-findings.md` (the 2026 brief),
+**Evidence base:** `docs/research/2026-09-08-local-retrieval-and-lane-findings.md` (the
+sweep and the Temporal/judge reading behind §5 and §6),
+`docs/research/2026-09-07-context-budget-findings.md` (the 2026 brief),
 `docs/research/2026-09-02-memory-findings.md`, and the measured numbers in
 `~/models` (nsmodels), a CPU-only local model service on `127.0.0.1:7374`.
 
@@ -115,13 +117,27 @@ offline, spending no requests. The total is the §12.8 trigger, evaluated for th
 
 ## 5. Phase 2 — The evaluation lane, with a local scorer (2–3 days)
 
-M6 Phase 5's tasks, built in its order, with one substitution at the judge.
+M6 Phase 5's tasks, with one substitution at the judge — and, since
+`2026-09-08-local-retrieval-and-lane-findings.md` §3, **a gate in the middle rather than one
+straight run**.
+
+**T2.1 ships and is measured before anything else in this phase is built.** M6's exit
+criterion for Phase 5 is "`ns-app evolve --dry-run` reports ≥ 10 `UserReask` / `BadReply`
+signatures where today it reports zero" — and `UserReask` is a *symbolic* signature. It may
+already be met with no model in the lane at all. Finding that out first costs half a day and
+decides whether the rest of this phase is the point or the enrichment; it also gives κ
+something real to be computed against, which it would not have if the checks and the scorer
+arrived together. The 2026 reliability literature pushes the same way: judges are unstable
+on re-ask, and simple deterministic scorers can beat them on exactly the axis an evolution
+gate needs.
 
 | Task | Files | Test |
 |---|---|---|
 | T2.1 symbolic checks — re-ask, ungrounded reply, question-ignored. **No model, always on** | `crates/evolution/src/evaluate.rs` (new) | M6's own criterion: the recorded session yields `UserReask` for turns 52–60, 67, 90, 100, 105 and `UngroundedReply` for turn 69 |
 | T2.2 `Evaluator` trait; `ScriptedEvaluator` (tests); `ClientEvaluator` (the paid judge, unchanged from M6 §8.3) | `evaluate.rs` | fence-tolerant parse; invalid JSON → `Err`, counted unverified |
 | T2.3 `LocalEvaluator` over `/embed` + `/rerank`: it scores *similarity and ranking*, never a verdict — reply-vs-question relevance, reply-vs-shown-facts grounding, re-ask clustering | `evaluate.rs`, `crates/evolution/src/local.rs` (new) | server down → every signal `Unavailable`, pass completes, nothing counted; scores are ranks, never thresholds (nsmodels' own finding: e5-small's cosine range is compressed, true match 0.898 vs unrelated 0.862) |
+| **T2.3a a grade is a recorded value.** The score, the scorer's id and its model revision are written into the log as one event; no replay path may call a model | `core/src/event.rs`, `evaluate.rs`, `pass.rs` | **grade a session, stop the service, replay — the grades are identical.** See below |
+| **T2.3b the retry table**, so a refused connection is not retried like a timeout | `crates/evolution/src/local.rs` | connection refused disables the lane for the rest of the pass after one attempt; a timeout or 5xx gets exactly one retry; malformed JSON is `Err` and counted unverified, never `Unavailable` |
 | T2.4 `observations` table + FTS5; observer writes from grades; dedupe; origin + trust; `relevance_count` on recall | `crates/memory-sqlite`, `crates/core/src/traits.rs`, `crates/evolution/src/pass.rs` | same turn observed twice writes once; External origin yields External trust |
 | T2.5 new signatures, reply-scope notes, `guidance_for_reply`, `ReplyContext.guidance` | `evolution/src/mine.rs`, `core/src/learned.rs`, `llm/src/replier.rs` | a reply note renders after the current-turn block |
 | T2.6 gate: `TurnOutcome::Graded`; live-replier probe behind `reply_probe`; Unverified path when off | `evolution/src/notes.rs`, `pass.rs` | with `reply_probe = false` a reply-scope candidate is Unverified and listed |
@@ -135,6 +151,18 @@ exactly what a paid judge below threshold produces. The lane's contract does not
 bill does. And the three jobs T2.3 takes are ranking jobs by their nature: "is this reply about
 the question that was asked", "does this reply's content appear in what the prompt showed it",
 "is this turn a re-ask of that one". None of them is a verdict.
+
+**T2.3a is Temporal's `SideEffect`, and it prevents a real bug.** Temporal executes
+non-deterministic work once, records the result in the event history, and returns the
+recorded result on replay rather than re-executing. This engine has the same replay property
+and the same exposure: `fold()` is the replay, and `verify_patch` replays recorded sessions
+to decide whether a symbolic candidate earns its verdict. If a grade were recomputed by
+calling a model at replay time, then replay would need a Python service running to reproduce
+a Rust session; a weight change would silently rewrite history; and the same patch could pass
+and then fail with no code change, which empties a ledger verdict of meaning. Recording the
+scorer's identity beside the score is the `MutableSideEffect` half — drift shows up in a diff
+instead of disappearing into a number. Cheap now, a migration of everything already graded
+later.
 
 **What T2.3 may not do**, recorded at the code: it may not decide an apply, may not enter the
 guard chain, may not run in-turn (M6 §8.7's deferral is unchanged — this is the offline pass,
@@ -153,14 +181,53 @@ section stays unbuilt and §9 records the number that kept it unbuilt.
 
 The shape is not a free choice. The brief's traversal row (findings §391) prescribes: classify
 intent first, then tier and budget; coarse vector → rerank; graph traversal only for the deep
-tier. M7 built the classifier and the tiers (Phase 3 router). So:
+tier. M7 built the classifier and the tiers (Phase 3 router).
+
+**The settings below are measured, not guessed**
+(`2026-09-08-local-retrieval-and-lane-findings.md` §1), and they correct what the first
+version of this section said:
+
+| retrieval | paraphrase miss | ms/query (CPU) |
+|---|---|---|
+| sqlite fts5 bm25 — what ships | **83%** | — |
+| e5-small, top-5, no rerank | 33% | ~4 |
+| e5-small, coarse 48 → rerank | 17% | 1865 |
+| bge-m3, top-5, no rerank | 25% | ~33 |
+| **bge-m3, coarse 10 → rerank** | **8%** | **509** |
+| bge-m3, coarse 20 → rerank | 17% | 1035 |
+| bge-m3, coarse 48 → rerank | 17% | 1979 |
+
+Three corrections follow, and the earlier text had all three wrong:
+
+- *"The coarse `k` has to be generous" was an artifact of the weaker embedder.* With bge-m3,
+  **wider is worse**: k=10 beats k=20, 30 and 48 and is two to four times cheaper. Every
+  candidate past the tenth is another chance for the cross-encoder to promote a distractor.
+  This is the caveat the fusion literature names — widening the candidate set improves mean
+  nDCG while making recall@5 worse on the hardest slice.
+- *Fusion is a guard, not the fix.* bm25's hits are a strict subset of the vector arm's, and
+  on ten of twelve paraphrases bm25 returns nothing at all, so there is no second list to
+  fuse. T3.2 stays, but its justification is that an exact-match query must never lose to a
+  semantic near-miss — and if RRF is used, its constant is k ∈ [1, 10], not the customary 60,
+  which is tuned for lists of hundreds.
+- *The embedder is `--model quality` (bge-m3), not the nsmodels default.* The default is
+  chosen for throughput; this is a recall problem.
+
+**And what is honest to claim from twelve cases:** the gap between 8% and 17% is one case,
+inside the noise of a set this size. What survives a single case flipping is the direction —
+bm25 at 83% against anything embedding-based at ≤33%, bge-m3 dominating e5-small at every
+`k`, and coarse-10 being at least as good as wider while costing a fraction. The precise
+optimum is not established and must not be hard-coded as though it were: `coarse_k` is a
+config key with a default of 10 and a measurement behind it, not a constant.
+
+So:
 
 | Task | Files | Test |
 |---|---|---|
-| T3.1 `embeddings` table keyed by event rowid; backfill in the idle pass, never in a turn | `crates/memory-sqlite/src/lib.rs`, `evolution/src/pass.rs` | backfill is resumable; a turn never blocks on an embedding |
+| T3.1 `embeddings` table keyed by event rowid; backfill in the idle pass, never in a turn; the embedder is bge-m3 | `crates/memory-sqlite/src/lib.rs`, `evolution/src/pass.rs` | backfill is resumable; a turn never blocks on an embedding; a stored vector records which model produced it, so a model change invalidates rather than silently mixes |
 | T3.2 hybrid `search_turns`: bm25 candidates ∪ vector candidates, fused by rank (not score), then `/rerank` over the union, top-k | `memory-sqlite/src/lib.rs` | with the server down, results are exactly today's bm25 results — same order, same count |
 | T3.3 the hybrid path is reachable **only from the `Task`/deep tier**; `Chat` recall stays lexical | `crates/engine/src/router.rs`, `turn.rs` | a `Chat` turn issues no `/embed` call |
 | T3.4 re-run `ns-app eval --paraphrase`; the miss rate is the exit criterion | `eval.rs` | miss rate below 20%, with the verbatim arm not regressed |
+| T3.5 `[recall] coarse_k` (default 10) and the rerank latency budget | `app/src/config.rs`, `router.rs` | a deep-tier recall that would exceed the budget falls back to lexical rather than holding the turn |
 
 Rank fusion rather than score fusion is deliberate and is nsmodels' own measured finding: e5-small's
 cosine range is compressed enough that a threshold is meaningless, so **rank, never threshold**.
@@ -356,11 +423,15 @@ capability it cannot measure.
      a strict subset of the vector arm's eight. T3.2's fusion is still right for not
      *losing* lexical exact matches, but it must not be sold as the thing that closes the
      gap.
-  2. **The coarse retrieval is the bottleneck, not the reranker.** At `COARSE = 20` two
+  2. ~~**The coarse retrieval is the bottleneck, not the reranker.** At `COARSE = 20` two
      targets never reach the reranker at all; widened to the whole pool, the same reranker
-     takes the miss rate to 17% — under the threshold. So T3.2's coarse `k` has to be
-     generous, and "how generous" is now a tunable with a measurement behind it rather than
-     a guess.
+     takes the miss rate to 17%. So T3.2's coarse `k` has to be generous.~~
+     **Superseded the same day** by the sweep in
+     `2026-09-08-local-retrieval-and-lane-findings.md` §1: this was an artifact of probing
+     e5-small only. With bge-m3 the relation inverts — coarse-10 beats 20, 30 and 48, and
+     costs a quarter as much. Left visible rather than deleted, because "one model's recall
+     ceiling read as a property of the pipeline" is the kind of mistake worth being able to
+     recognise a second time.
   3. **The two irreducible misses are both the identity question** ("who am I, remind me" /
      "kdo jsem, připomeň mi to" against a line where the user introduced themselves). Those
      are exactly the cases the engine answers from *pinned facts*, not from `recall` — M6
@@ -369,3 +440,33 @@ capability it cannot measure.
      not what answers.
 
   Still unmeasured: κ for a local evaluator (§5). That is Phase 2.
+
+- 2026-09-08, research pass before Phase 2. No code; `2026-09-08-local-retrieval-and-lane-findings.md`
+  and the revisions to §5 and §6 above. Prompted by the observation that §6 was about to be
+  built on a conclusion drawn from one embedder.
+
+  **What it changed:**
+
+  - *§6's coarse `k`.* Reversed — see the strikethrough above. bge-m3 at coarse-10 reaches
+    **8% miss at ~0.5 s/query**, against bm25's 83%. The deep-tier-only rule now has a
+    latency number instead of an intuition.
+  - *§6's fusion.* Re-cast from "the fix" to "a guard for the verbatim arm", because bm25
+    returns nothing at all on ten of twelve paraphrases and there is no second list to fuse.
+  - *§5's ordering.* T2.1 — the symbolic checks, no model — is now built and measured
+    **before** the rest of Phase 2, because M6's own exit criterion for Phase 5 may already
+    be met without a model, and κ needs a baseline to be computed against.
+  - *§5 grew two tasks.* T2.3a (a grade is a recorded value; no replay path calls a model)
+    and T2.3b (the retry table). Both come from reading Temporal against the *pass* rather
+    than the turn loop, which is what M7 §3 had mapped.
+
+  **The one that would have been a bug:** without T2.3a, `verify_patch` — which replays
+  recorded sessions to settle a candidate — would have been verifying against a moving
+  target, and a patch could pass and later fail with no code change. Temporal's `SideEffect`
+  is the same problem with a name and a fix: execute once, record the result, return the
+  record on replay.
+
+  **Not adopted, with the reason:** Temporal itself (M7 §3's trigger is unchanged, and it is
+  not this deployment); heartbeats (Temporal's own guidance excludes sub-second loopback
+  calls); a second-stage LLM reranker (that is the request cost this plan exists to avoid);
+  fine-tuning an embedder (no labelled set — twelve adversarial cases are an instrument, not
+  training data).
