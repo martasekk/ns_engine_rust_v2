@@ -1,6 +1,7 @@
 mod budget;
 mod config;
 mod eval;
+mod grade;
 mod models;
 
 use config::{AppConfig, Role, RoleTarget};
@@ -442,6 +443,29 @@ async fn main() {
             std::process::exit(eval::run_paraphrase().await);
         }
         std::process::exit(eval::run(&parsed.ledger).await);
+    }
+
+    // `ns-app grade [--local] [--split dev|held|all]`: what an evaluator is
+    // worth against a hundred labelled turns (M8 T2.7). No key. The symbolic
+    // arm needs no network either; `--local` dials nsmodels and degrades if it
+    // is not there.
+    if args.get(1).map(String::as_str) == Some("grade") {
+        let parsed = match grade::parse_args(&args[2..]) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+        let code = grade::run_cmd(
+            &parsed,
+            &cfg.models.base_url,
+            cfg.models.timeout_ms,
+            cfg.models.reask_cosine,
+            cfg.models.relevance_cut,
+        )
+        .await;
+        std::process::exit(code);
     }
 
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane

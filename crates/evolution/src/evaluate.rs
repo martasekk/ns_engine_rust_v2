@@ -166,8 +166,45 @@ fn is_pleasantry(tokens: &[String]) -> bool {
     tokens.is_empty() || tokens.iter().all(|t| PLEASANTRIES.contains(&t.as_str()))
 }
 
-/// One user turn, reduced to what the checks compare.
-struct TurnView {
+/// Whether `again` is a re-ask of `first`, and in which band.
+///
+/// The one definition of "asked twice" in the engine. [`evaluate`] applies it
+/// backwards over a session's user turns; [`SymbolicEvaluator`] applies it
+/// forwards from a turn to its follow-up. Two vantages on the same relation,
+/// and they must not be able to disagree — a corpus that measured one while
+/// the pass ran the other would be measuring nothing.
+pub fn reask_band(first: &str, again: &str, min_jaccard: f32) -> Option<ReaskBand> {
+    let a = content_tokens(first);
+    let b = content_tokens(again);
+    if is_pleasantry(&a) || is_pleasantry(&b) {
+        return None;
+    }
+    if a == b {
+        return Some(ReaskBand::Repeat);
+    }
+    let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
+    (jaccard(&sa, &sb) >= min_jaccard).then_some(ReaskBand::Reformulated)
+}
+
+/// I5: the user asked something and the reply shares no content word with it.
+///
+/// Weak, and measured weak — see [`SignatureKind::IgnoredQuestion`].
+pub fn ignores_question(user: &str, reply: &str) -> bool {
+    if !user.contains('?') {
+        return false;
+    }
+    let asked = content_tokens(user);
+    let answered: HashSet<String> = content_tokens(reply).into_iter().collect();
+    !asked.is_empty() && !answered.is_empty() && !asked.iter().any(|t| answered.contains(t))
+}
+
+/// One user turn of a session log, reduced to what the checks compare.
+///
+/// The pass-side view. [`TurnView`] is the evaluator-side one — same turn,
+/// different vantage: this is assembled from events, that one is handed to a
+/// scorer.
+struct SessionTurn {
     turn: u32,
     user_event: nscore::EventId,
     user_tokens: Vec<String>,
@@ -183,13 +220,13 @@ struct TurnView {
     flagged: Vec<(nscore::EventId, Vec<String>)>,
 }
 
-fn views(events: &[Event]) -> Vec<TurnView> {
-    let mut out: Vec<TurnView> = Vec::new();
+fn views(events: &[Event]) -> Vec<SessionTurn> {
+    let mut out: Vec<SessionTurn> = Vec::new();
     for e in events {
         // A turn enters the list when its `UserSaid` does, so a log that
         // opens mid-turn contributes nothing rather than a half view.
         if let EventKind::UserSaid { text } = &e.kind {
-            out.push(TurnView {
+            out.push(SessionTurn {
                 turn: e.turn,
                 user_event: e.id,
                 user_tokens: content_tokens(text),
@@ -236,23 +273,22 @@ pub fn evaluate(session: &SessionId, events: &[Event], cfg: &EvaluateConfig) -> 
     for (i, v) in views.iter().enumerate() {
         // ---- Re-ask (M6 §8.2, findings §1) -------------------------------
         if !is_pleasantry(&v.user_tokens) {
-            let here: HashSet<&str> = v.user_tokens.iter().map(String::as_str).collect();
             let from = i.saturating_sub(cfg.reask_lookback);
             let mut times = 0u32;
             let mut band: Option<ReaskBand> = None;
             for prior in &views[from..i] {
-                if prior.user_tokens == v.user_tokens {
-                    times += 1;
-                    band = Some(ReaskBand::Repeat);
-                } else {
-                    let there: HashSet<&str> =
-                        prior.user_tokens.iter().map(String::as_str).collect();
-                    if jaccard(&here, &there) >= cfg.reask_jaccard {
+                match reask_band(&prior.user_text, &v.user_text, cfg.reask_jaccard) {
+                    Some(ReaskBand::Repeat) => {
+                        times += 1;
+                        band = Some(ReaskBand::Repeat);
+                    }
+                    Some(ReaskBand::Reformulated) => {
                         times += 1;
                         // An exact repeat anywhere in the window wins: the
                         // band names the strongest evidence, not the last.
                         band.get_or_insert(ReaskBand::Reformulated);
                     }
+                    None => {}
                 }
             }
             if let Some(band) = band {
@@ -307,10 +343,7 @@ pub fn evaluate(session: &SessionId, events: &[Event], cfg: &EvaluateConfig) -> 
         // unlike that band it has no exact half to fall back on. It is
         // counted, it is note-lane, and it is not a κ proxy.
         if let Some(reply) = &v.reply {
-            let asked = v.user_text.contains('?');
-            let reply_tokens: HashSet<String> = content_tokens(reply).into_iter().collect();
-            let shared = v.user_tokens.iter().any(|t| reply_tokens.contains(t));
-            if asked && !v.user_tokens.is_empty() && !reply_tokens.is_empty() && !shared {
+            if ignores_question(&v.user_text, reply) {
                 sigs.push(Signature {
                     session: session.clone(),
                     turn: v.turn,
@@ -348,6 +381,211 @@ pub fn evaluate(session: &SessionId, events: &[Event], cfg: &EvaluateConfig) -> 
     }
 
     sigs
+}
+
+// ---------------------------------------------------------------------------
+// The evaluator layer (M6 §8.3, M8 T2.2)
+// ---------------------------------------------------------------------------
+
+/// What went wrong with a turn, in the one vocabulary the lane uses.
+///
+/// The codes are Higashinaka et al.'s where they have one
+/// (`docs/research/2026-09-09-symbolic-evaluation-findings.md` §2); the
+/// projection the gate consumes is [`Issue::is_problem`], because "did the
+/// evaluator see a problem here" is the binary κ is computed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Issue {
+    None,
+    /// The user asked the same thing again.
+    Reask,
+    /// I5 — the reply is about something else.
+    IgnoredQuestion,
+    /// I6 — the turn was asked to act and did not.
+    IgnoredRequest,
+    /// The reply states something nothing it was shown supports.
+    Ungrounded,
+    /// The user's next message contradicts a fact the reply stated.
+    Correction,
+}
+
+impl Issue {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Issue::None => "none",
+            Issue::Reask => "reask",
+            Issue::IgnoredQuestion => "ignored_question",
+            Issue::IgnoredRequest => "ignored_request",
+            Issue::Ungrounded => "ungrounded",
+            Issue::Correction => "correction",
+        }
+    }
+    pub fn is_problem(self) -> bool {
+        !matches!(self, Issue::None)
+    }
+}
+
+/// Everything an evaluator of any kind may look at.
+///
+/// M6 §8.3's `TurnView` carries the window, the facts and the summary; this
+/// one carries `shown`, which is those three already rendered the way the
+/// replier saw them. The distinction is T2.3a's: an evaluator must judge
+/// against the recorded material, not against a context rebuilt at grading
+/// time, and a view that hands it the pieces invites the rebuild.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnView<'a> {
+    pub user: &'a str,
+    /// Facts and this turn's trace, as rendered into the reply prompt.
+    pub shown: &'a [&'a str],
+    /// The turn called a tool or proposed a real action.
+    pub acted: bool,
+    /// The router put this turn in the tier that means "something is to be
+    /// done".
+    pub task_tier: bool,
+    pub reply: &'a str,
+    pub next_user: Option<&'a str>,
+}
+
+/// A grade, and who produced it.
+///
+/// The identity field is not bookkeeping. T2.3a's invariant is that a grade is
+/// a recorded value and no replay path recomputes it; recording *which* scorer
+/// produced it is the `MutableSideEffect` half, so a weight change shows up as
+/// a diff instead of disappearing into a number. The 2026 transfer audit
+/// (`docs/research/2026-09-09-local-evaluator-findings.md` §1) is why that
+/// matters more than it looks: a metric whose ranking inverts between datasets
+/// will certainly move when its weights do.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnGrade {
+    pub issue: Issue,
+    /// 0 no, 1 partly, 2 yes (M6 §8.3).
+    pub answers_user: u8,
+    pub grounded: bool,
+    /// The evaluator's id, e.g. `symbolic` or `local:bge-m3`.
+    pub scorer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum GradeError {
+    /// The scorer could not be reached. Not a failure of the turn, and not
+    /// counted against anything — the pass completes and the ledger records
+    /// the gap.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+    /// The scorer answered with something unusable. Counted unverified, and
+    /// deliberately *not* `Unavailable`: a malformed answer is a defect worth
+    /// seeing, and folding it into "the service was down" would hide it.
+    #[error("invalid: {0}")]
+    Invalid(String),
+}
+
+#[async_trait::async_trait]
+pub trait Evaluator: Send + Sync {
+    /// Stable identity, recorded with every grade.
+    fn id(&self) -> String;
+    async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError>;
+}
+
+/// The checks of [`evaluate`], applied to one turn instead of a session.
+///
+/// No model, no network, never fails. It is the baseline every other evaluator
+/// is measured against, and the proxy set T2.7 calibrates them on.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolicEvaluator {
+    pub cfg: EvaluateConfig,
+}
+
+impl SymbolicEvaluator {
+    /// Structural facts about the turn that no scorer improves on, so every
+    /// evaluator shares them rather than re-deciding them.
+    ///
+    /// I6 is structural by construction (the router's recorded tier against
+    /// the log of what was done) and grounding is span attribution, which an
+    /// embedding cannot do — it can say two texts are alike, not which words
+    /// of one are unsupported by the other. A local scorer that re-derived
+    /// either would be adding a model to a decision that did not need one.
+    pub fn structural(&self, view: &TurnView<'_>) -> (bool, Vec<String>) {
+        let ignored_request = view.task_tier && !view.acted;
+        let material = nsengine::ground::Material::from_parts(view.shown);
+        let spans = nsengine::ground::ungrounded(view.reply, &material);
+        (ignored_request, spans)
+    }
+
+    /// Precedence when several checks fire, strongest evidence first.
+    ///
+    /// Structural before recorded before follow-up before lexical: I6 is two
+    /// logged facts, grounding is the shipping interceptor, a re-ask is the
+    /// user's own next message, and I5 is a token-overlap heuristic measured
+    /// at 0 for 2 (`SignatureKind::IgnoredQuestion`). A single label has to
+    /// pick one, and picking the weakest would make the corpus grade the
+    /// heuristic rather than the evaluator.
+    pub fn resolve(ignored_request: bool, ungrounded: bool, reask: bool, ignored_q: bool) -> Issue {
+        if ignored_request {
+            Issue::IgnoredRequest
+        } else if ungrounded {
+            Issue::Ungrounded
+        } else if reask {
+            Issue::Reask
+        } else if ignored_q {
+            Issue::IgnoredQuestion
+        } else {
+            Issue::None
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Evaluator for SymbolicEvaluator {
+    fn id(&self) -> String {
+        "symbolic".into()
+    }
+
+    async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError> {
+        let (ignored_request, spans) = self.structural(view);
+        let reask = view
+            .next_user
+            .and_then(|n| reask_band(view.user, n, self.cfg.reask_jaccard))
+            .is_some();
+        let ignored_q = ignores_question(view.user, view.reply);
+        // `Correction` is deliberately unreachable here, and the corpus will
+        // say so: it needs the follow-up to *contradict* the reply, which is
+        // an entailment judgement and not a lexical one. Producing it from a
+        // heuristic would be inventing agreement.
+        let issue = SymbolicEvaluator::resolve(ignored_request, !spans.is_empty(), reask, ignored_q);
+        Ok(TurnGrade {
+            issue,
+            answers_user: if ignored_q || ignored_request { 0 } else { 2 },
+            grounded: spans.is_empty(),
+            scorer: self.id(),
+        })
+    }
+}
+
+/// A fixed answer per user text, for tests that need an evaluator with known
+/// behaviour rather than a real one (M6 §8.3's `ScriptedEvaluator`).
+#[derive(Default)]
+pub struct ScriptedEvaluator {
+    pub answers: std::collections::HashMap<String, Result<Issue, GradeError>>,
+    pub default: Option<Issue>,
+}
+
+#[async_trait::async_trait]
+impl Evaluator for ScriptedEvaluator {
+    fn id(&self) -> String {
+        "scripted".into()
+    }
+    async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError> {
+        let issue = match self.answers.get(view.user) {
+            Some(Ok(i)) => *i,
+            Some(Err(e)) => return Err(e.clone()),
+            None => self.default.unwrap_or(Issue::None),
+        };
+        Ok(TurnGrade {
+            issue,
+            answers_user: if issue.is_problem() { 0 } else { 2 },
+            grounded: issue != Issue::Ungrounded,
+            scorer: self.id(),
+        })
+    }
 }
 
 #[cfg(test)]

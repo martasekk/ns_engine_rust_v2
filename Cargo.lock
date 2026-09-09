@@ -669,6 +669,7 @@ dependencies = [
  "ns-core",
  "ns-engine",
  "ns-llm",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -731,6 +732,7 @@ dependencies = [
  "async-trait",
  "ns-core",
  "ns-engine",
+ "ns-evolution",
  "serde_json",
  "tokio",
 ]

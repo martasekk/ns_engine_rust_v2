@@ -575,3 +575,156 @@ capability it cannot measure.
   cannot be read at all.
 
   Still unmeasured: κ (§5). That needs T2.2/T2.3, which are next.
+
+- 2026-09-09, later: **T2.2, T2.3 and T2.7's statistics built, and κ measured on
+  a hundred labelled turns.** Research first —
+  `docs/research/2026-09-09-local-evaluator-findings.md` — then the corpus, then
+  the evaluators, then the number.
+
+  | Task | State | Note |
+  |---|---|---|
+  | T2.2 `Evaluator` trait, `SymbolicEvaluator`, `ScriptedEvaluator` | done | `crates/evolution/src/evaluate.rs` |
+  | T2.3 `LocalEvaluator` over `/embed` + `/rerank` | done | `crates/evolution/src/local.rs` |
+  | T2.3b the retry table | done | with one correction, below |
+  | T2.7 the statistics (κ, AC1, PABAK, interval, decisiveness) | done | `crates/evolution/src/kappa.rs`; the *gate* is not wired yet |
+  | — the labelled corpus T2.7 needed and the plan did not name | done | `crates/testkit/src/grading.rs`, `ns-app grade` |
+
+  ### The measurement, on the held-out half
+
+  ```
+  scorer: symbolic (held-out)            scorer: local (held-out)
+    none              15/20                none              17/20
+    reask              6/7                 reask              6/7
+    ignored_question   3/7                 ignored_question   6/7
+    ignored_request    5/5                 ignored_request    5/5
+    ungrounded         5/5                 ungrounded         5/5
+    correction         3/5                 correction         1/5
+  kappa 0.501 [0.255, 0.746]             kappa 0.628 [0.409, 0.848]
+  raw 0.755  ac1 0.520                   raw 0.816  ac1 0.638
+
+  local vs symbolic: kappa 0.466 [0.217, 0.715]
+  ```
+
+  ### Why a corpus had to come first, and why n = 100
+
+  Everything M8 had measured rested on n = 12 or n = 20. T2.7 gates on
+  `evaluator_min_kappa = 0.4`; the sample-size treatment for κ intervals
+  (Donner & Eliasziw) puts **n ≈ 96** on a ±0.2 interval, which is exactly the
+  resolution "is this above 0.4" needs. Twenty turns cannot answer it — not
+  because the session is unrepresentative but because the statistic is not
+  estimable there. So: a hundred turns, fifty Czech and fifty English, forty
+  clean and sixty failures across five kinds, split development and held-out,
+  policing itself the way the paraphrase corpus does (its invariants caught six
+  of my own mislabelled cases while it was being written).
+
+  **And it is labelled, which the plan did not ask for and should have.** M6
+  §8.5 calibrates an evaluator against the *symbolic proxies* — agreement
+  between two raters of unknown accuracy. With gold labels there are three
+  numbers, and the third only means something given the first two.
+
+  ### The finding that changes T2.7
+
+  Look at the three κ values together. The local scorer agrees with the labels
+  at **0.628** and with the symbolic proxies at **0.466**. The gate as specified
+  reads the second number. **It would score the better evaluator as barely
+  passing, and for the right reason: the proxy it is being compared against is
+  the worse rater.** κ against a proxy measures agreement, not accuracy, and
+  when the proxy is wrong, agreeing with it is the failure.
+
+  This does not retire the proxies — they are free, always available and run on
+  every turn, and no labelled corpus exists at run time. It does mean:
+
+  - `evaluator_min_kappa` must be read as *"has this evaluator not diverged from
+    the checks"*, never as *"is this evaluator good"*, and the ledger row should
+    say which reference the κ was computed against (findings §1's "report the
+    construct, not just the score");
+  - the corpus κ is the accuracy number, it is computed offline by `ns-app
+    grade`, and it is what should decide whether a scorer is admitted at all;
+  - a scorer below the proxy threshold but above the corpus one is a case for
+    looking at the disagreements, not for automatic demotion.
+
+  ### The cuts were fitted, on the development half only
+
+  Both new signals reduce to a score and a cut, which is a fit; the 2026
+  cross-dataset audit measured 0.172 AUROC of regret for fits chosen without a
+  held-out half. So `ns-app grade --sweep` picks them, **and the flag pins
+  itself to `--split dev`** — `--split held --sweep` is not an error to warn
+  about, it is the mistake the split exists to make impossible.
+
+  ```
+  best on dev: kappa=0.682 at reask_cosine=0.6273049 relevance_cut=4.84e-4
+    the embedder adds 8 re-asks the lexical band missed;
+    the cross-encoder calls 9 replies off-topic
+  ablation, same cuts:
+    both signals            kappa=0.682
+    embedder only           kappa=0.588
+    cross-encoder only      kappa=0.574
+    neither (lexical only)  kappa=0.456
+  ```
+
+  Both signals earn their place, and dev 0.682 → held-out 0.628 is a fit that
+  transferred rather than one that memorised.
+
+  ### What is honest to claim from n = 49 a side
+
+  **The two intervals overlap** — [0.255, 0.746] against [0.409, 0.848]. At
+  forty-nine cases a side, this corpus cannot separate 0.50 from 0.63. What
+  survives is the direction and its consistency: local beats symbolic on the
+  development half *and* on the held-out half, the ablation says both signals
+  contribute, and the per-kind table names where the gain is (`ignored_question`
+  3/7 → 6/7, clean 15/20 → 17/20). The precise gap is not established, and
+  splitting the corpus is what cost the power to establish it — a real price for
+  the discipline, worth paying and worth stating.
+
+  ### Where every evaluator is still blind
+
+  `correction` — the follow-up contradicts a fact the reply stated. Symbolic
+  catches 3 of 5 *by accident* (a correction that reuses the question's words
+  trips the re-ask band); local catches 1. Neither can, and neither is being
+  asked to: contradiction is an entailment judgement, and both of these are
+  similarity scorers. **This is the concrete case for T2.2's paid
+  `ClientEvaluator`**, which is now the only open thing in Phase 2 that costs a
+  request — and it is one signal, not a whole lane.
+
+  ### Three corrections the build made to things this plan asserted
+
+  - **T2.3b's refusal branch does not fire on this box.** The retry table was
+    written around `connection refused`. Measured: dialling a closed loopback
+    port here **times out**, with no `ConnectionRefused` anywhere in the error's
+    source chain — Windows drops rather than resets. So the lane now also gives
+    up after two consecutive unreachable calls, and the reason is arithmetic: at
+    the 2 s default with one retry, a hundred-turn pass against a service that
+    is merely *off* would have spent four hundred seconds discovering it. The
+    test asserts the property (give up fast, stay given up) rather than the
+    mechanism it was assumed to arrive by. Matching the error *message* was
+    considered and rejected: Windows localises it, and this box says
+    "cílový počítač je aktivně odmítl".
+  - **bge-m3's cosine is not compressed, and the reranker returns
+    probabilities.** `2026-09-08-…-lane-findings` and nsmodels' README both
+    carry "rank, never threshold", measured on **e5-small** (true match 0.898
+    against 0.862 unrelated). On the development half bge-m3's follow-up cosine
+    runs 0.309 → 1.000, which is a usable spread, and the cross-encoder returns
+    0.000 → 0.999 — a probability, not a logit. The first version of the sweep
+    searched a logit grid and reported its best result at the grid's edge, which
+    is the grid saying it was drawn in the wrong place. The candidates are now
+    the observed values themselves, which removes the whole class of mistake.
+  - **`ground.rs` has two blind spots the corpus surfaced**, both while checking
+    that its own labels agreed with the shipping interceptor. A Czech reply that
+    *inflects* a fact it was shown is flagged as unsupported — "24hodinovém"
+    against a stored "24hodinový" — because `Material::contains` is a substring
+    test. And a fabricated proper name at the **start of a sentence** is invisible,
+    because `extract_claims` skips sentence-initial capitals to avoid flagging
+    ordinary openers. Neither is fixed here; both are recorded, and the corpus
+    routes around them so its labels stay true to what ships.
+
+  ### Also in this change
+
+  `ns-app grade [--local] [--sweep] [--split dev|held|all]`; `[models]
+  reask_cosine` and `relevance_cut`, carrying the swept values at full
+  precision, with a note that rounding a fitted cut changes the setting;
+  `nsevolution::kappa` refusing to be read as κ alone. 518 tests, clippy clean.
+
+  **Still not built:** the gate itself (T2.6's `TurnOutcome::Graded`, the
+  `reply_probe`), the observations table (T2.4), the new signatures and
+  reply-scope notes (T2.5), the budget (T2.8), and `ClientEvaluator` (T2.2's
+  paid half — now with a measured reason to exist).

@@ -16,6 +16,9 @@ name = "nstestkit"
 [dependencies]
 ns-core = { path = "../core" }
 ns-engine = { path = "../engine" }
+# The corpus grades evaluators, so it needs the crate they live in. No cycle:
+# `ns-evolution` depends on core, engine and llm, and never on this.
+ns-evolution = { path = "../evolution" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

@@ -13,4 +13,5 @@
 //! consolidator on its ordinary path, and it is the hard dependency of
 //! `ns-evolution`'s `verify_patch` gate.
 pub mod eval;
+pub mod grading;
 pub mod paraphrase;

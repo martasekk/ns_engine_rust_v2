@@ -3,7 +3,9 @@
 pub mod consolidate;
 pub mod evaluate;
 pub mod files;
+pub mod kappa;
 pub mod ledger;
+pub mod local;
 pub mod mine;
 pub mod notes;
 pub mod pass;

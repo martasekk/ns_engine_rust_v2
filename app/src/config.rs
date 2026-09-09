@@ -63,6 +63,20 @@ pub struct ModelsSection {
     /// for the next message, and a hung scorer would hold that wait open.
     #[serde(default = "default_models_timeout_ms")]
     pub timeout_ms: u64,
+    /// Cosine at or above which a follow-up is the same question again
+    /// (M8 T2.3).
+    ///
+    /// **Chosen on the development half of `nstestkit::grading` and nowhere
+    /// else** — `ns-app grade --sweep` is what picks it, and the flag refuses
+    /// to run against the held-out half. A cut fitted on the data a number is
+    /// quoted from is the failure the 2026 transfer audit measured at 0.172
+    /// AUROC of regret.
+    #[serde(default = "default_reask_cosine")]
+    pub reask_cosine: f32,
+    /// Cross-encoder score below which the reply is not about the question.
+    /// Chosen the same way, on the same half.
+    #[serde(default = "default_relevance_cut")]
+    pub relevance_cut: f32,
 }
 
 impl Default for ModelsSection {
@@ -71,6 +85,8 @@ impl Default for ModelsSection {
             enabled: false,
             base_url: default_models_base_url(),
             timeout_ms: default_models_timeout_ms(),
+            reask_cosine: default_reask_cosine(),
+            relevance_cut: default_relevance_cut(),
         }
     }
 }
@@ -79,6 +95,18 @@ fn default_models_base_url() -> String {
     "http://127.0.0.1:7374".into()
 }
 
+/// Swept on the development half, 2026-09-09: the exact value the sweep
+/// picked, not a rounded one. Rounding a fitted cut changes the setting and
+/// quietly makes the held-out number a measurement of something else.
+fn default_reask_cosine() -> f32 {
+    0.627_304_9
+}
+/// Likewise. Small because the cross-encoder emits a probability, not a
+/// logit, and an off-topic reply scores very near zero: the development half
+/// put the median at 0.050 and the 25th percentile at 0.001.
+fn default_relevance_cut() -> f32 {
+    0.000_484_392
+}
 fn default_models_timeout_ms() -> u64 {
     2000
 }
