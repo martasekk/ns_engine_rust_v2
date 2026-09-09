@@ -70,6 +70,57 @@ pub enum SignatureKind {
         from: nscore::Tier,
         to: nscore::Tier,
     },
+    /// The user asked the same thing again (M6 §8.2, M8 T2.1).
+    ///
+    /// Produced by [`crate::evaluate`], not by this module: mining reads what
+    /// the harness did, and this reads what the user had to do about it. It
+    /// lives in the same enum because a signature is a signature — the gate,
+    /// the ledger and the note proposer should not learn two vocabularies for
+    /// "this turn went wrong".
+    ///
+    /// `band` is load-bearing. Only [`crate::evaluate::ReaskBand::Repeat`] is
+    /// a calibration proxy for T2.7; the reformulated band is counted while
+    /// its true-positive rate is unmeasured.
+    UserReask {
+        times: u32,
+        band: crate::evaluate::ReaskBand,
+    },
+    /// The in-turn grounding interceptor flagged this turn's first draft
+    /// (M6 §4.5, §8.2) and the reply was regenerated with the spans named.
+    ///
+    /// A recorded value, surfaced — never a re-run of the check. See
+    /// [`crate::evaluate`] for why the pass cannot rebuild the material the
+    /// replier was shown, and T2.3a for why it would be wrong to try.
+    UngroundedReply {
+        spans: Vec<String>,
+    },
+    /// The user asked a question and the reply shares no content word with it
+    /// (M6 §8.2; I5 in Higashinaka et al.'s taxonomy).
+    ///
+    /// Weak, and the spec says so: a reply that answers in different words is
+    /// indistinguishable from one that ignored the question, by exactly the
+    /// mechanism M8 Phase 1 measured at a 75–83% miss rate.
+    ///
+    /// **Measured 0 for 2 on the recorded session** (T2.1, 2026-09-09), and
+    /// both false positives are instructive rather than fixable. Turn 13 asks
+    /// "what time is it?" and is answered "It is currently 09:36:12 UTC on
+    /// Tuesday, 2026-09-08" — a correct answer states the *value*, not the
+    /// question's words. Turn 17's question mark is not a question mark at
+    /// all: it is the console's rendering of "koš", and Czech inflection then
+    /// keeps "vysyp" from matching "vysypání".
+    ///
+    /// So it follows `crates/engine/src/echo.rs`'s precedent exactly — counted, never
+    /// acting, because the observability is what found this and it is free.
+    /// It is not a κ proxy and must not become one on this evidence.
+    IgnoredQuestion,
+    /// The router put the turn in the `Task` tier — the engine's own recorded
+    /// judgement that the message wanted something done — and the turn then
+    /// proposed nothing and called nothing (I6 in the same taxonomy).
+    ///
+    /// The mirror of [`SignatureKind::Misrouted`], out of the same manifest
+    /// field: there the tier was too narrow and the turn widened it; here it
+    /// was wide enough and nothing happened.
+    IgnoredRequest,
 }
 
 impl SignatureKind {
@@ -102,6 +153,10 @@ impl SignatureKind {
             SignatureKind::BudgetDropped { .. } => "BudgetDropped",
             SignatureKind::ResultClippedThenInspected { .. } => "ResultClippedThenInspected",
             SignatureKind::Misrouted { .. } => "Misrouted",
+            SignatureKind::UserReask { .. } => "UserReask",
+            SignatureKind::UngroundedReply { .. } => "UngroundedReply",
+            SignatureKind::IgnoredQuestion => "IgnoredQuestion",
+            SignatureKind::IgnoredRequest => "IgnoredRequest",
         }
     }
 }

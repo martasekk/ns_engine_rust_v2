@@ -470,3 +470,108 @@ capability it cannot measure.
   calls); a second-stage LLM reranker (that is the request cost this plan exists to avoid);
   fine-tuning an embedder (no labelled set — twelve adversarial cases are an instrument, not
   training data).
+
+- 2026-09-09: **T2.1 built and measured.** Research first —
+  `docs/research/2026-09-09-symbolic-evaluation-findings.md` — then
+  `crates/evolution/src/evaluate.rs`, wired into the pass beside `mine`.
+
+  | Task | State | Note |
+  |---|---|---|
+  | T2.1 symbolic checks, no model, always on | done | 14 unit tests; `evolve --dry-run` now names the turns |
+
+  **The run, on a copy of `ns-run/ns.sqlite`:**
+
+  ```
+  sessions: 1 (skipped broken: 0)
+  signatures:
+    FallbackReply: 3 (turns 2, 4, 12)
+    IgnoredQuestion: 2 (turns 13, 17)
+    UserReask: 7 (turns 4, 9, 10, 17, 18, 19, 20)
+  candidates: 0
+  ```
+
+  **M6's exit criterion cannot be evaluated as written, and this is the first
+  thing to say.** It names "turns 52–60, 67, 90, 100, 105" of the recorded
+  session, and `ns.sqlite` now holds **one session of twenty turns** — the log
+  those numbers were written against was reset between M6 and now (`echo.rs`
+  still cites "session `cli`, turns 137–158", which are also gone). The
+  ≥ 10 threshold was set against a log five times longer than the one that
+  exists. What can be said is the rate: **7 `UserReask` in 20 turns, where
+  today the pass reports zero**, with no model and no request spent. On the
+  session the criterion was written for that is roughly 37.
+
+  So T2.1 answers the question §5 asked it to answer — *how much of Phase 5
+  lands with nothing in the lane that costs a request* — with: most of the
+  volume. What it does not deliver is `BadReply`, which is a model signature
+  by definition and belongs to T2.2/T2.3.
+
+  **Three deviations from §5's one-line description, all from the research pass:**
+
+  - *Re-ask reports a band, not a boolean.* M6's rule is normalized equality;
+    findings §1 points out that this is the Jaccard = 1.0 corner of the
+    standard query-reformulation feature set, and that M8 Phase 1 already
+    measured what that corner costs here (75–83% of
+    same-question-different-words missed). So `UserReask` carries
+    `band: Repeat | Reformulated`, and **only `Repeat` is a κ proxy** for
+    T2.7 — the reformulated band is counted while its true-positive rate is
+    unmeasured, which is how it gets measured.
+  - *A fourth check, `IgnoredRequest`.* Higashinaka et al.'s taxonomy splits
+    "ignore" into five categories; M6 specified I5 (question) and called it
+    weak. I6 (request) is the one **this** harness can detect precisely,
+    because the router already recorded its own judgement that the turn wanted
+    an action (`ModelCall.manifest.tier`) and the log shows whether one was
+    taken. No text is compared. It is the mirror of `Misrouted` out of the
+    same field. It reports **0 here** — this log predates `ModelCall`
+    entirely, so no turn carries a tier — and is covered by unit tests only
+    until a session recorded under M7 exists.
+  - *`UngroundedReply` surfaces the recorded flag; it does not re-run the
+    check.* That is T2.3a's invariant arriving one task early, and here it is
+    not caution but correctness: `Material` is built from the persona, the
+    fact *values* and the window, and the log carries neither the persona nor
+    the values. A check run against a partly reconstructed context reports
+    unsupported claims whose support was merely unrecoverable. M6 §8.3 says
+    "judged against exactly what the replier saw"; exactly is the word. The
+    gain is real anyway — `ReplyFlagged` reached the pass only as rendered
+    text for a note proposer to read, and is now a signature that can be
+    counted, gated and calibrated. It reports 0 here because the log has none.
+
+  **`IgnoredQuestion` fired twice and was wrong twice**, and the two failures
+  are worth more than the check:
+
+  - turn 13, "what time is it?" answered "It is currently 09:36:12 UTC on
+    Tuesday, 2026-09-08" — a correct answer states the **value**, not the
+    question's words;
+  - turn 17, whose question mark is not one: it is the console's rendering of
+    "koš". Czech inflection then keeps "vysyp" from matching "vysypání".
+
+  This is `echo.rs`'s situation exactly (21 firings, zero true positives), and
+  it gets `echo.rs`'s treatment: counted, note-lane, **never a proxy and never
+  acting**, with the 0-for-2 recorded at the enum. It is not tuned against
+  n = 2.
+
+  **What the re-ask check missed, and why it is the right miss.** Turn 15 asks
+  in Czech what turn 14 asked in English; turn 16 is turn 15 mojibake'd past
+  the Jaccard threshold. Neither is reachable lexically — they are the
+  paraphrase problem in its two hardest forms — and reaching them is T2.3's
+  job, not this check's. Turn 20 is the one arguable firing: it repeats turn
+  19, which had just succeeded.
+
+  **One finding that changes a later task.** T2.7 gates on
+  `evaluator_min_kappa = 0.4` against these proxies, and the proxies are rare
+  by construction. That is the regime of the κ **prevalence paradox** — high
+  observed agreement, κ near zero or negative, and no comparability between
+  sessions of different prevalence. `evaluator_min_kappa` as written is a
+  threshold on a number that moves with how bad the graded session was.
+  Findings §3 records what T2.7 should carry instead: κ beside its 2×2
+  contingency, the prevalence and Gwet's AC1; an under-powered κ reported as
+  `insufficient` and treated as below threshold; and the proxy set named in
+  the ledger row, because changing it changes the number. M6 §8.5 already
+  refused raw agreement for overstating by 33–41 points — this is the same
+  error with the sign flipped.
+
+  **Also in this change:** `[evolution] reask_jaccard` (default 0.6, a guess
+  and labelled one), and `evolve --dry-run` now prints the turns each
+  signature fired on — without which an exit criterion written in turn numbers
+  cannot be read at all.
+
+  Still unmeasured: κ (§5). That needs T2.2/T2.3, which are next.

@@ -758,6 +758,13 @@ pub struct EvolutionSection {
     pub max_notes: usize,
     #[serde(default = "default_replay_cap")]
     pub regression_replay_cap: usize,
+    /// M8 T2.1. Jaccard over content tokens at or above which two user turns
+    /// are the same question in different words. A key rather than a
+    /// constant because the number is a guess with no corpus behind it yet
+    /// (`2026-09-09-symbolic-evaluation-findings.md` §1) — the exact-repeat
+    /// band, which is what T2.7 will calibrate against, does not depend on it.
+    #[serde(default = "default_reask_jaccard")]
+    pub reask_jaccard: f32,
 }
 
 /// 0.6: a reply more than half of which is one lifted run is a copy, not
@@ -787,6 +794,9 @@ fn default_max_notes() -> usize {
 fn default_replay_cap() -> usize {
     200
 }
+fn default_reask_jaccard() -> f32 {
+    0.6
+}
 
 impl Default for EvolutionSection {
     fn default() -> Self {
@@ -799,6 +809,7 @@ impl Default for EvolutionSection {
             probe_budget_turns: default_probe_budget(),
             max_notes: default_max_notes(),
             regression_replay_cap: default_replay_cap(),
+            reask_jaccard: default_reask_jaccard(),
         }
     }
 }
@@ -820,6 +831,10 @@ impl EvolutionSection {
             // are written under it. A multi-user channel replaces this with
             // the same mapping `scope_for` applies.
             digest_scope: "global".into(),
+            evaluate: nsevolution::evaluate::EvaluateConfig {
+                reask_jaccard: self.reask_jaccard,
+                ..Default::default()
+            },
         }
     }
     /// Driver B interval; None when disabled or set to 0.

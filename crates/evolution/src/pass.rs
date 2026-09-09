@@ -2,6 +2,7 @@
 //! chain-verify sessions → mine → symbolic lane → corrections as facts →
 //! notes lane → apply (atomic file + hot swap) → ledger. Implements
 //! `Consolidator`, so the idle driver and `ns-app evolve` share one path.
+use crate::evaluate::{evaluate, EvaluateConfig};
 use crate::files::{load_rules, save_rules_atomic, FileError};
 use crate::ledger::{Evidence, Ledger, LedgerEntry, Verdict};
 use crate::mine::{mine, render_turn, Signature, SignatureKind};
@@ -35,6 +36,10 @@ pub struct PassConfig {
     /// because the CLI maps every session to `global` (M6 §15); a
     /// multi-user channel turns this into the mapping `scope_for` applies.
     pub digest_scope: String,
+    /// M8 T2.1: the symbolic evaluation checks. Nested rather than flattened
+    /// because the lane is going to grow an evaluator, a κ threshold and a
+    /// turn budget beside these, and they belong together.
+    pub evaluate: EvaluateConfig,
 }
 
 impl Default for PassConfig {
@@ -47,6 +52,7 @@ impl Default for PassConfig {
             dry_run: false,
             fact_stale_days: 90,
             digest_scope: "global".into(),
+            evaluate: EvaluateConfig::default(),
         }
     }
 }
@@ -73,6 +79,13 @@ pub struct Report {
     pub sessions: usize,
     pub skipped_broken: usize,
     pub signatures: BTreeMap<&'static str, usize>,
+    /// The turns each signature fired on, in order, deduplicated.
+    ///
+    /// A count says a check works; only the turns say *what it found*, and
+    /// M6's exit criterion for Phase 5 is written in turn numbers
+    /// ("`UserReask` for turns 52–60, 67, 90, 100, 105"). A dry run that
+    /// cannot be read against that sentence cannot settle it.
+    pub signature_turns: BTreeMap<&'static str, Vec<u32>>,
     pub candidates: Vec<CandidateReport>,
     pub probe_turns_used: u32,
     pub facts_written: usize,
@@ -90,7 +103,13 @@ impl std::fmt::Display for Report {
         )?;
         writeln!(f, "signatures:")?;
         for (k, n) in &self.signatures {
-            writeln!(f, "  {k}: {n}")?;
+            match self.signature_turns.get(k) {
+                Some(turns) if !turns.is_empty() => {
+                    let list: Vec<String> = turns.iter().map(u32::to_string).collect();
+                    writeln!(f, "  {k}: {n} (turns {})", list.join(", "))?;
+                }
+                _ => writeln!(f, "  {k}: {n}")?,
+            }
         }
         writeln!(f, "candidates: {}", self.candidates.len())?;
         for c in &self.candidates {
@@ -193,13 +212,28 @@ impl EvolutionPass {
         }
         report.sessions = sessions.len();
 
-        // 4. Mine.
+        // 4. Mine, then evaluate.
+        //
+        // Two sources, one list. `mine` reads what the harness did; `evaluate`
+        // (M8 T2.1) reads what the user had to do about it — a re-ask, a
+        // recorded grounding flag, an ignored question or request. The second
+        // costs nothing: no model, no network, no store access, so it runs on
+        // every turn of every pass and needs no budget of its own until an
+        // evaluator that spends requests arrives behind it (T2.8).
         let mut sigs: Vec<Signature> = Vec::new();
         for (sid, events) in &sessions {
             sigs.extend(mine(sid, events, &self.known_specs));
+            sigs.extend(evaluate(sid, events, &self.cfg.evaluate));
         }
         for s in &sigs {
             *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
+            let turns = report.signature_turns.entry(s.kind.name()).or_default();
+            if !turns.contains(&s.turn) {
+                turns.push(s.turn);
+            }
+        }
+        for turns in report.signature_turns.values_mut() {
+            turns.sort_unstable();
         }
 
         // `working` accumulates this run's accepted candidates so later ones
