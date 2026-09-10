@@ -184,7 +184,7 @@ impl ProbeRunner for LiveProbe {
             reply_grounding_check: false,
             ..EngineConfig::default()
         };
-        let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
+        let engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
         for text in d.user_inputs {
             engine
                 .run_turn(Incoming {

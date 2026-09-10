@@ -55,7 +55,7 @@ fn echo_proposal(text: &str) -> Proposal {
 #[tokio::test]
 async fn happy_path_tool_then_reply() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
     let sid = SessionId("s1".into());
     let reply = e
         .run_turn(Incoming {
@@ -93,7 +93,7 @@ async fn guard_denial_is_logged_and_turn_still_replies() {
         action: "echo".into(),
         reason: "blocked".into(),
     });
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![guard], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![guard], store.clone());
     let sid = SessionId("s2".into());
     let reply = e
         .run_turn(Incoming {
@@ -128,7 +128,7 @@ async fn illegal_action_is_rejected_then_falls_through() {
         action: "nuke".into(),
         args: serde_json::json!({}),
     };
-    let mut e = engine_with(vec![bad], vec![], store.clone());
+    let e = engine_with(vec![bad], vec![], store.clone());
     let sid = SessionId("s3".into());
     let _ = e
         .run_turn(Incoming {
@@ -154,7 +154,7 @@ async fn illegal_action_is_rejected_then_falls_through() {
 #[tokio::test]
 async fn second_turn_continues_same_log() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![],
         store.clone(),
@@ -234,7 +234,7 @@ async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -293,7 +293,7 @@ async fn a_reply_copied_out_of_its_own_prompt_is_logged_but_not_regenerated() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -336,7 +336,7 @@ async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("ground2".into());
     // ScriptedReplier echoes the trace, which is material by definition.
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "say hi".into(),
@@ -360,7 +360,7 @@ async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
         reply_grounding_check: false,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("off".into()),
@@ -418,7 +418,7 @@ async fn emitter_context_includes_this_turn_actions() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -466,7 +466,7 @@ async fn persona_flows_from_config_to_reply_context() {
         persona: "Tomáš the salesbot".into(),
         ..Default::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("p1".into()),
@@ -506,7 +506,7 @@ async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -546,7 +546,7 @@ async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
 #[tokio::test]
 async fn real_classification_tags_user_input_and_residual() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "echo".into(),
             action: "echo".into(),
@@ -642,7 +642,7 @@ fn engine_with_tools(
 #[tokio::test]
 async fn irreversible_action_is_staged_not_executed() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with_tools(
+    let e = engine_with_tools(
         vec![Proposal {
             rationale: "wipe".into(),
             action: "wipe".into(),
@@ -694,7 +694,7 @@ async fn denied_action_is_removed_from_next_legal_set() {
         action: "echo".into(),
         reason: "no".into(),
     });
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![guard],
         store.clone(),
@@ -766,7 +766,7 @@ async fn never_residual_rejection_forces_clarification() {
     // The emitter invents an order id the user never gave, then obediently
     // asks a clarification question (the only remaining legal action).
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with_tools(
+    let e = engine_with_tools(
         vec![
             Proposal {
                 rationale: "cancel".into(),
@@ -812,7 +812,7 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
     let sid = SessionId("cf1".into());
     // Turn 1: propose wipe -> staged, asks for confirmation.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "wipe".into(),
                 action: "wipe".into(),
@@ -830,7 +830,7 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
     }
     // Turn 2: user says yes; emitter proposes confirm_pending.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "user confirmed".into(),
                 action: "confirm_pending".into(),
@@ -869,7 +869,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("cf2".into());
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "wipe".into(),
                 action: "wipe".into(),
@@ -887,7 +887,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     }
     // Turn 2: user changes the subject; scripted emitter falls through to respond_directly.
     {
-        let mut e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
+        let e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
         e.run_turn(Incoming {
             session: sid.clone(),
             text: "actually, what time is it?".into(),
@@ -897,7 +897,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     }
     // Turn 3: a late confirm_pending must be rejected as illegal and nothing runs.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "late yes".into(),
                 action: "confirm_pending".into(),
@@ -957,7 +957,7 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(42)),
@@ -1020,7 +1020,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     let sid = SessionId("facts5".into());
 
     // A grounded restatement promotes an unverified fact to full confidence.
-    let mut e = engine_with(vec![remember("Martin")], vec![], store.clone());
+    let e = engine_with(vec![remember("Martin")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "my name is Martin".into(),
@@ -1040,7 +1040,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     assert_eq!(f.trust, Trust::User);
 
     // A new value supersedes: the old version stays in history with valid_to.
-    let mut e = engine_with(vec![remember("Peter")], vec![], store.clone());
+    let e = engine_with(vec![remember("Peter")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "call me Peter".into(),
@@ -1059,7 +1059,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
 
     // An ungrounded value is flagged under the default policy: half
     // confidence, and a residual restatement only creeps up.
-    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    let e = engine_with(vec![remember("Zed")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "whatever".into(),
@@ -1075,7 +1075,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
         Timestamp(43),
         "coarse clock: still sorts after the previous version"
     );
-    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    let e = engine_with(vec![remember("Zed")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "ok".into(),
@@ -1142,7 +1142,7 @@ async fn facts_in_context_are_pinned_plus_relevant_with_previous_values() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -1236,7 +1236,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
     let sid = SessionId("sum".into());
     let calls: Arc<std::sync::Mutex<Vec<(bool, u32, u32)>>> = Default::default();
     // turn 1 fetches external content; every other turn responds directly
-    let mut e = summarizing_engine(
+    let e = summarizing_engine(
         vec![Proposal {
             rationale: "".into(),
             action: "fetch".into(),
@@ -1297,7 +1297,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -1331,7 +1331,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
 async fn summarizer_failure_appends_nothing_and_zero_cadence_disables() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("sumfail".into());
-    let mut e = summarizing_engine(
+    let e = summarizing_engine(
         vec![],
         store.clone(),
         ScriptedSummarizer {
@@ -1356,7 +1356,7 @@ async fn summarizer_failure_appends_nothing_and_zero_cadence_disables() {
 
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("sumoff".into());
-    let mut e = summarizing_engine(vec![], store.clone(), ScriptedSummarizer::default(), 0);
+    let e = summarizing_engine(vec![], store.clone(), ScriptedSummarizer::default(), 0);
     for turn in 1..=6 {
         e.run_turn(Incoming {
             session: sid.clone(),
@@ -1383,7 +1383,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         .await
         .unwrap();
     // Eight plain turns; the first mentions the budget.
-    let mut e = engine_with(vec![], vec![], store.clone());
+    let e = engine_with(vec![], vec![], store.clone());
     for turn in 1..=8 {
         let text = if turn == 1 {
             "our budget is 2000 crowns".to_string()
@@ -1398,7 +1398,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         .unwrap();
     }
     // Turn 9: the emitter recalls; the window (6) hides turns 1–2.
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "recall".into(),
@@ -1470,7 +1470,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
     }
 
     // No matches is a legitimate, grounded answer (abstention).
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "recall".into(),
@@ -1512,7 +1512,7 @@ async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
         remember_residual: nsengine::turn::RememberResidual::Never,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let sid = SessionId("never".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -1539,14 +1539,14 @@ async fn remember_fact_canonicalizes_key_spelling_variants() {
         args: serde_json::json!({"key": key, "value": "Brno"}),
     };
     let sid = SessionId("canon".into());
-    let mut e = engine_with(vec![remember("user.city")], vec![], store.clone());
+    let e = engine_with(vec![remember("user.city")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "I live in Brno".into(),
     })
     .await
     .unwrap();
-    let mut e = engine_with(vec![remember("User_City")], vec![], store.clone());
+    let e = engine_with(vec![remember("User_City")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "Brno, as I said".into(),
@@ -1577,7 +1577,7 @@ async fn forget_fact_soft_deletes_and_unknown_key_is_malformed() {
         args: serde_json::json!({"key": key}),
     };
     let sid = SessionId("forget".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![forget("user.nope"), forget("user.name")],
         vec![],
         store.clone(),
@@ -1609,7 +1609,7 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     // the same key, then a staged forget_all — all in one turn.
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("contra".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             Proposal {
                 rationale: "".into(),
@@ -1655,7 +1655,7 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     // store state, or replay from a fresh store would diverge) and is
     // staged like any irreversible action.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "forget_all".into(),
@@ -1696,7 +1696,7 @@ async fn second_forget_fact_miss_narrows_the_schema() {
         args: serde_json::json!({"key": key}),
     };
     let sid = SessionId("miss".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             forget("user.nope"),
             forget("user.nope"),
@@ -1744,7 +1744,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
     };
     // Turn 1: staged, not executed (seen live: "reset the memory" stored a
     // junk fact instead).
-    let mut e = engine_with(vec![forget_all()], vec![], store.clone());
+    let e = engine_with(vec![forget_all()], vec![], store.clone());
     let reply = e
         .run_turn(Incoming {
             session: sid.clone(),
@@ -1759,7 +1759,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
     );
     assert_eq!(store.facts("global", "").await.unwrap().len(), 2);
     // Turn 2: the user confirms; the purge runs and history is gone too.
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "confirm_pending".into(),
@@ -1796,7 +1796,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
 #[tokio::test]
 async fn remember_fact_without_value_is_malformed() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "bad".into(),
             action: "remember_fact".into(),
@@ -1828,7 +1828,7 @@ async fn remember_fact_trims_stray_punctuation_from_key() {
     // Seen live: a model that reliably emits ":user.name". Edge punctuation
     // is normalized away (like the trim normalizer); the identifier survives.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "remember".into(),
             action: "remember_fact".into(),
@@ -1877,7 +1877,7 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
     // yields no new information — the engine must refuse it, and the
     // narrowed schema must then remove the action entirely.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             echo_proposal("hi"),
             echo_proposal("hi"),
@@ -1920,7 +1920,7 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
 #[tokio::test]
 async fn same_action_with_different_args_is_not_a_repeat() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![],
         store.clone(),
@@ -1945,7 +1945,7 @@ async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
         args: serde_json::json!({"key": "user.name", "value": "Martin"}),
     };
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
+    let e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
     let sid = SessionId("rep3".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -1970,7 +1970,7 @@ async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
 async fn remember_fact_with_junk_key_is_malformed() {
     // Degenerate model outputs (seen live: key ", ") must not become facts.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: ", ".into(),
             action: "remember_fact".into(),
@@ -2054,7 +2054,7 @@ const RATE_LIMITED: &str =
 async fn fallback_reply_explains_provider_error() {
     // Seen live: a 429/402 from the provider surfaced as a bare "Sorry" and
     // the cause was only visible in the event log.
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitFailsWith(RATE_LIMITED)),
         Box::new(ScriptedReplier),
         EngineConfig::default(),
@@ -2110,7 +2110,7 @@ async fn a_terminal_provider_status_is_not_retried() {
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
     let sid = SessionId("terminal".into());
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(), // max_emit_retries = 3
         Box::new(|| Timestamp(42)),
@@ -2160,7 +2160,7 @@ async fn a_terminal_provider_status_is_not_retried() {
 #[tokio::test]
 async fn a_transient_provider_status_uses_the_retry_budget() {
     let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitProviderStatus(429, calls.clone())),
         Box::new(ScriptedReplier),
         EngineConfig::default(), // max_emit_retries = 3
@@ -2180,7 +2180,7 @@ async fn fallback_reply_explains_step_exhaustion() {
         .iter()
         .map(|t| echo_proposal(t))
         .collect();
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(ScriptedEmitter::new(proposals)),
         Box::new(ScriptedReplier),
         EngineConfig::default(), // max_iterations = 5
@@ -2211,7 +2211,7 @@ async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -2257,7 +2257,7 @@ async fn cant_help_template_receives_reason_var() {
             .collect(),
         ..Default::default()
     };
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitFailsWith(RATE_LIMITED)),
         Box::new(ScriptedReplier),
         cfg,
@@ -2292,7 +2292,7 @@ async fn registered_cant_help_template_replaces_fallback() {
             .collect(),
         ..Default::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("tpl1".into()),
@@ -2312,7 +2312,7 @@ async fn tool_args_failing_schema_are_rejected_as_malformed_not_called() {
         action: "echo".into(),
         args: serde_json::json!({"text": 42}),
     };
-    let mut e = engine_with(vec![bad, echo_proposal("ok")], vec![], store.clone());
+    let e = engine_with(vec![bad, echo_proposal("ok")], vec![], store.clone());
     let sid = SessionId("val".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2370,7 +2370,7 @@ async fn alias_action_rewrites_a_near_miss_name_but_proposed_event_keeps_the_raw
         action: "eko".into(),
         args: serde_json::json!({"text": "hi"}),
     };
-    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let e = engine_with_rules(vec![p], store.clone(), rules);
     let sid = SessionId("alias".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2402,7 +2402,7 @@ async fn normalize_arg_repairs_args_before_validation() {
         action: "echo".into(),
         args: serde_json::json!({"text": " \"hi\" "}),
     };
-    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let e = engine_with_rules(vec![p], store.clone(), rules);
     let sid = SessionId("norm".into());
     let reply = e
         .run_turn(Incoming {
@@ -2443,7 +2443,7 @@ async fn aliased_action_still_goes_through_guards() {
         learned: rules_handle(rules),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let sid = SessionId("alias-guard".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2483,7 +2483,7 @@ async fn guidance_reaches_the_emitter_scoped_to_legal_actions() {
         learned: rules_handle(rules),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     e.run_turn(Incoming {
         session: SessionId("g".into()),
         text: "go".into(),
@@ -2735,7 +2735,7 @@ async fn recall_reaches_earlier_sessions_of_the_same_scope() {
     // An earlier conversation, and the digest the consolidator would write
     // for it once it had a rolling summary.
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: old.clone(),
         text: "the deployment password is kept in the vault".into(),
@@ -2762,7 +2762,7 @@ async fn recall_reaches_earlier_sessions_of_the_same_scope() {
 
     // A new conversation, asking about it. The recall cue routes this Deep,
     // so the engine searches before proposing anything.
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: new.clone(),
         text: "what did i tell you earlier about the deployment password".into(),
@@ -2854,7 +2854,7 @@ fn routed_engine(
 async fn a_chat_turn_is_offered_no_tools() {
     let store = Arc::new(InMemoryStore::new());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: SessionId("chat".into()),
         text: "hello there, how are you".into(),
@@ -2884,7 +2884,7 @@ async fn a_tool_proposed_on_a_chat_turn_widens_the_tier_instead_of_being_refused
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("misroute".into());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(
+    let e = routed_engine(
         vec![echo_proposal("hi"), echo_proposal("hi")],
         store.clone(),
         legal.clone(),
@@ -2925,7 +2925,7 @@ async fn a_deep_turn_recalls_before_the_first_proposal() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("deep".into());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "what did i tell you earlier about the budget".into(),
@@ -2971,7 +2971,7 @@ async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, C
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
@@ -3158,7 +3158,7 @@ async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(WideTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
@@ -3284,7 +3284,7 @@ async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
@@ -3402,7 +3402,7 @@ async fn a_side_effect_is_persisted_before_the_reply_model_runs() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("durable".into());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = engine_watching_the_store(
+    let e = engine_watching_the_store(
         vec![Proposal {
             rationale: "durable".into(),
             action: "remember_fact".into(),
@@ -3450,8 +3450,7 @@ async fn a_pure_tool_result_is_not_flushed_early() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("pure".into());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e =
-        engine_watching_the_store(vec![echo_proposal("hi")], store.clone(), &sid, seen.clone());
+    let e = engine_watching_the_store(vec![echo_proposal("hi")], store.clone(), &sid, seen.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "say hi".into(),
@@ -3470,4 +3469,95 @@ async fn a_pure_tool_result_is_not_flushed_early() {
         .unwrap()
         .iter()
         .any(|ev| matches!(&ev.kind, EventKind::ToolReturned { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-10 (many conversations at once) T0.2: two sessions through one
+// channel keep separate, intact logs. Serial today — this is the regression
+// guard for Phase 2's dispatcher, which runs sessions on their own tasks.
+
+/// Channel double that carries a session per message (`ScriptedChannel` pins
+/// one session). Pops one `(session, text)` per recv, then closes.
+struct SessionsChannel(std::sync::Mutex<std::collections::VecDeque<(&'static str, &'static str)>>);
+#[async_trait::async_trait]
+impl Channel for SessionsChannel {
+    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        let next = self.0.lock().unwrap().pop_front();
+        match next {
+            Some((s, t)) => Ok(Incoming {
+                session: SessionId(s.into()),
+                text: t.into(),
+            }),
+            None => Err(ChannelError::Closed),
+        }
+    }
+    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn two_sessions_interleaved_through_one_channel_keep_separate_intact_logs() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [
+            ("a", "a one"),
+            ("b", "b one"),
+            ("a", "a two"),
+            ("b", "b two"),
+        ]
+        .into_iter()
+        .collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let mut e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after four messages")
+        .unwrap();
+
+    for (sid, expected, other) in [
+        ("a", ["a one", "a two"], "b "),
+        ("b", ["b one", "b two"], "a "),
+    ] {
+        let session = SessionId(sid.into());
+        let events = store.load(&session).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(2),
+            "session {sid} completed two turns"
+        );
+        let said: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::UserSaid { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said, expected,
+            "session {sid} holds its own messages, in order"
+        );
+        assert!(
+            !said.iter().any(|t| t.starts_with(other)),
+            "session {sid} holds nothing from the other session"
+        );
+        assert!(
+            EventLog::from_events(session, events)
+                .verify_chain()
+                .is_ok(),
+            "session {sid} chain verifies"
+        );
+    }
 }

@@ -492,7 +492,7 @@ mod tests {
         b.set_channel(Box::new(Closed));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),

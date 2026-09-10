@@ -326,7 +326,7 @@ pub async fn replay_with(
         reply_grounding_check: false,
         ..EngineConfig::default()
     };
-    let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
+    let engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
 
     // 3. Re-feed the user inputs.
     for text in d.user_inputs {
@@ -415,7 +415,7 @@ mod tests {
         for g in guards {
             b.add_guard(g);
         }
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(42)),
@@ -489,7 +489,7 @@ mod tests {
         b.set_channel(Box::new(ClosedChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),

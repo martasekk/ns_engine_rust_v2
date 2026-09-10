@@ -818,7 +818,7 @@ impl Harness {
             b.add_tool(Arc::new(EchoTool::new()));
             common
         };
-        let mut engine = Engine::with_clock(b.build().unwrap(), cfg, clock(self.ticks.clone()));
+        let engine = Engine::with_clock(b.build().unwrap(), cfg, clock(self.ticks.clone()));
         engine
             .run_turn(Incoming {
                 session: session.clone(),

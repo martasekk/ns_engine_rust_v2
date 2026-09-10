@@ -471,7 +471,7 @@ impl Engine {
     /// reply is sent). Returns whether a `Summarized` event was appended.
     /// A summarizer failure appends nothing; the next boundary retries with
     /// the larger range.
-    pub async fn maybe_summarize(&mut self, sid: &nscore::SessionId) -> Result<bool, EngineError> {
+    pub async fn maybe_summarize(&self, sid: &nscore::SessionId) -> Result<bool, EngineError> {
         let every = self.cfg.summary_every_turns as u32;
         if every == 0 {
             return Ok(false);
@@ -829,7 +829,7 @@ impl Engine {
         }
     }
 
-    pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
+    pub async fn run_turn(&self, incoming: Incoming) -> Result<String, EngineError> {
         let sid = incoming.session.clone();
         let scope = (self.cfg.scope_for)(&sid);
         let stored = self.parts.memory.load(&sid).await?;

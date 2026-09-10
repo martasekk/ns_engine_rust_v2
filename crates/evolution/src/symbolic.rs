@@ -240,7 +240,7 @@ mod tests {
         for g in guards {
             b.add_guard(g);
         }
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),
