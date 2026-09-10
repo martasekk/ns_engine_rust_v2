@@ -30,7 +30,8 @@ while keeping the model performing?* The answer, in one paragraph:
 Legend: **[DONE]** already in the engine · **[PARTIAL]** shape exists, a piece is missing ·
 **[MEASURE]** instrument or read a number before deciding · **[CANDIDATE]** worth a plan once
 its trigger fires · **[LATER]** designed-for, built later · **[NOT ADOPTED]** with the reason ·
-**[STANDS]** an earlier decision this sweep re-confirms.
+**[STANDS]** an earlier decision this sweep re-confirms · **[NOTED]** read once, no action ·
+**[NOT APPLICABLE]** needs training or weights an API harness cannot touch.
 
 ## Disposition against ns-engine (2026-09-11)
 
@@ -388,7 +389,75 @@ Re-affirmed from composition §5 and M7 §12: the bounded window, the fixed-fiel
 fold, no framework for children, no graph memory before its trigger. Nothing in the 2026
 literature moves any of these; Chroma and the codegen numbers strengthen them.
 
-## 7. Sources
+## 7. Novel memory architectures, mapped (addendum, same day)
+
+The question: *are there novel memory architectures worth applying?* Method: a web sweep over
+2025–2026 memory papers with every arXiv ID opened and title-matched, then a grep of `docs/`
+for each name and ID to separate "new to the field" from "new to this repo". Most of the field's
+list is already here: the 2026-09-07 catalogue files ReasoningBank, Agent Workflow Memory,
+Dynamic Cheatsheet, ACE and Reflexion under finding 09 (procedural memory, **[DONE]** via the
+M5 evolution pass); sleep-time compute is **[ADOPTED]** as the pass's driver B; Self-GC
+(2607.00692), bi-temporal invalidation (2501.13956, the Zep paper) and ghost-memory state labels
+are load-bearing in the M6 spec §14. What follows is what the sweep adds.
+
+The engine already has a CoALA-shaped store: working (window + trace), episodic (fixed-field
+summary, digests, typed observations still unbuilt), semantic (versioned scoped facts with four
+forgetting mechanisms), procedural (learned rules, notes, ledger, gated). Any "novel
+architecture" is judged as a delta against that, under three standing rules: no model-decided
+applies (M6 §13), a check becomes a gate only after a measured true-positive rate, and every
+model call is a request against fifty a day.
+
+### 7.1 Disposition
+
+| # | Architecture | What it adds over what exists | Calls | Disposition |
+|---|---|---|---|---|
+| N1 | **Memento** — case-based reasoning: a case bank of past trajectories with outcome labels, k nearest cases retrieved by similarity into the planner's prompt; frozen LLM, optional tiny learned selector (arXiv 2508.16153; 87.9% Pass@3 GAIA, +4.7–9.6 pts OOD) | **Absent from the repo.** The log *is* a case bank; digests carry outcome; bge-m3 is local. Retrieving the 2–3 nearest past episodes' action sequences into the emitter as "how this was done before" is the non-parametric variant. Desktop tasks repeat, which is where Evo-Memory (2511.20857) finds experience memory beats retrieval stores (gain ∝ task similarity, r≈0.72). | 0 per turn (local retrieval); tokens only | **[CANDIDATE]** — the cheap pre-step to compiled flows; same trigger as evolution §10 (10 sessions sharing a tool-call sequence ≥2), measured from the log at zero requests. Entrainment risk (`2026-09-04`): exemplars enter as reference with provenance, never as rules |
+| N2 | **ReasoningBank** — strategy items distilled from successes *and* failures, retrieved per task (2509.25140; +34% rel., −16% steps) | The pass mines **failure signatures only** (evolution §3.1) and the symbolic lane is prune/repair-only by construction (ClawTrace). A success lane feeding the *notes* lane, not the symbolic one, is the delta. MaTTS (3–5× rollouts) is out on this tier. | ~1 idle call per session; gate unchanged | **[CANDIDATE]** — small; the GRASP gate already decides whether a note survives |
+| N3 | **Dynamic Cheatsheet** — one self-curated persistent strategy sheet in every prompt, rewritten by the model (2504.07952; Game-of-24 10%→99%) | The notes lane in ungated form. "The model rewrites its own sheet and it goes straight into the next prompt" is exactly the claude-mem pattern M6 §13 rejects. The gated equivalent exists. | 1 per session | **[NOT ADOPTED]** as designed; **[DONE]** in gated form |
+| N4 | **Agent Workflow Memory** — induce reusable parameterised workflows from trajectories, inject as skills (2409.07429; +24.6% Mind2Web, +51.1% WebArena) | This is compiled flows / TraceCompiler, already **[LATER]** with a trigger (evolution §10). | 1 induction per session | **[STANDS]** — N1 is the cheaper step before it |
+| N5 | **Nemori** — episode boundaries by topic shift instead of fixed windows; distil semantic memory only where a next-episode *prediction* failed (2508.03341) | The summary runs every 4 turns and rebuilds every 3rd (M6 §5.1), a fixed cadence chosen against iterative-summarisation drift (2603.11768). A boundary detector need not be a model: cosine distance between consecutive turns on bge-m3 plus the existing `idle_after_secs` gap is a zero-request segmenter. The predict-calibrate half costs a request per episode and is dropped. | 0 (local boundary); summarizer calls become per-episode instead of per-4-turns | **[CANDIDATE]** — measure first, offline: how often does a 4-turn summary straddle a topic shift in the `cli` log? If rarely, nothing to gain |
+| N6 | **Decision-aware memory cards / CICL** — rank retrieval candidates by expected effect on the *next action*, not similarity; compress survivors to cards (2606.08151) | Facts selection is precision-aware (2605.11325) but similarity-ranked. The manifest records which facts were in context per call, and M8 grades turns, so a utility-per-fact signal is computable offline. The cross-encoder approximates the scorer. | 0 | **[CANDIDATE]** — lives inside M8 Phase 3's rerank; needs M8 Phase 2's gate first |
+| N7 | **Darwinian Memory** — GUI-agent memory items compete; only those with measured downstream usefulness survive, the rest are culled, no training (2601.22528; +18.0% success, +33.9% stability) | The engine's forgetting is decay-, access- and trust-based (M6 §6.2); usefulness-by-outcome is the survey's "learned forgetting" open problem, solvable *symbolically* here: manifest ∩ graded outcome → per-fact, per-note fitness, evaluated in the idle pass. **RMM**'s retrospective reflection (2503.08026; >10% LongMemEval) is the same signal from the other end: boost what the reply actually cited — and `reply_grounding_check` already computes what the reply drew on. | 0 | **[CANDIDATE]** — the one genuinely new *forgetting* mechanism; zero requests; blocked on M8 grading |
+| N8 | **Sleep-time compute, the anticipation half** — pre-materialise likely next context while idle (2504.13171; ~5× less test-time compute) | Consolidation half adopted. Anticipation spends idle requests from the same fifty on guesses; the 2026 study of 12 memory systems (2606.24775) finds **localised maintenance beats global reorganisation** on cost — which also argues for the current incremental-then-rebuild summary compromise over either extreme. | idle requests | **[NOT ADOPTED]** on this tier; **[LATER]** if the key moves to a paid band |
+| N9 | **Context folding / AgentFold** — branch a subtask, fold its trace to a summary (2510.11967, 2510.24699; ReAct parity at 10× smaller active context, gains from an RL-trained policy) | The scaffold is §4 of this doc (child session, digest back). The policy is trained; not applicable. | per child | covered by §4 |
+| N10 | **A-MEM** — Zettelkasten notes with LLM-generated links and rewrites of existing notes on every insert (2502.12110; 6× multi-hop) | One call per stored item plus evolution calls; graph-shaped links next to a discarded graph. | ≥1 per write | **[NOT ADOPTED]** — request cost |
+| N11 | **MemOS / MemoryOS / H-MEM** — OS frames, tiered paging, four-layer hierarchy with pointers (2507.03724, 2506.06326, 2507.22925) | Activation and parameter tiers unreachable via OpenRouter; summary depth 1 by decision (M6 §13). | — | **[STANDS]** |
+| N12 | **Mem0 / Zep-Graphiti** — extract → conflict-detect → update with scopes; bi-temporal edges (2504.19413, 2501.13956; Zep 63.8% vs Mem0 49.0% LongMemEval) | Versioned facts with validity intervals and scopes already are this. | — | **[DONE]** |
+| N13 | **ALMA** — a meta-agent searches memory designs as executable code (2602.07755) | Search is call-expensive; the *discovered* designs are portable. Worth reading the paper's winning schemas once. | — | **[NOTED]** |
+| N14 | Mem-α, AdaMEM, DeMem, MEM1, Memory-R1 — RL-trained managers; Titans, Cartridges, SEAL, EM-LLM — model-level | Training or weights. | — | **[NOT APPLICABLE]** |
+
+### 7.2 What the benchmarks say about the direction
+
+- MemoryAgentBench (2507.05257): no method masters retrieval, test-time learning, long-range
+  understanding *and* selective forgetting; forgetting is weakest everywhere. N7 targets the
+  weakest quadrant with zero requests.
+- Evo-Memory (2511.20857): on task streams, procedural memories (Cheatsheet, AWM) beat
+  retrieval stores (Mem0, MemOS, A-MEM); gain tracks task similarity. This engine's workload
+  is a task stream of repetitive desktop sequences. That favours N1/N2/N4 over any retrieval
+  upgrade, and it is the same conclusion the evolution pass was built on.
+- LongMemEval (2410.10813): temporal stores plus reflective re-ranking lead; the engine has
+  the temporal half, N7's citation loop is the reflective half.
+- "Always-On Agents" (2606.30306): the field over-invests in accumulation and under-invests
+  in relinquishing state. The engine's forgetting design is ahead of the field here; N7 is
+  the next step, not a reversal.
+
+### 7.3 Ranked, for this engine
+
+1. **N7 usefulness-fitness forgetting + citation boost** — zero requests, symbolic, closes the
+   benchmark's weakest quadrant; needs M8 Phase 2 grading to exist.
+2. **N1 case retrieval into the emitter** — zero requests, uses the vector lane M8 permitted,
+   matches the workload's repetitiveness; the trigger is already written in evolution §10.
+3. **N6 decision-aware reranking** — zero requests, upgrades M8 Phase 3 from similarity to
+   utility; same dependency as N7.
+4. **N2 success lane for notes** — one idle call per session; smallest change.
+5. **N5 topic-boundary summarisation** — zero-request segmenter; only if the offline count
+   shows the fixed cadence straddling topics.
+
+Nothing above changes the disposition table in §0 or the not-to-change list in §6. Every
+candidate is gated on the same instrument: the M8 evaluation lane. That lane, not any memory
+architecture, remains the critical path.
+
+## 8. Sources
 
 Repo: `docs/research/2026-09-02-memory-findings.md`, `2026-09-04-entrainment-findings.md`,
 `2026-09-07-context-budget-findings.md`, `2026-09-08-context-composition-findings.md`,
@@ -413,6 +482,19 @@ Context Engineering for AI Agents (manus.im/blog); Cognition, Don't Build Multi-
 
 OpenRouter: limits (openrouter.ai/docs/api-reference/limits), prompt caching
 (openrouter.ai/docs/features/prompt-caching).
+
+Memory architectures (§7), every ID opened and title-matched on 2026-09-11: Memento
+2508.16153 · ReasoningBank 2509.25140 · Dynamic Cheatsheet 2504.07952 · Agent Workflow Memory
+2409.07429 · Nemori 2508.03341 · decision-aware memory cards / CICL 2606.08151 · Darwinian
+Memory 2601.22528 · Reflective Memory Management 2503.08026 · sleep-time compute 2504.13171 ·
+Context-Folding 2510.11967 · AgentFold 2510.24699 · A-MEM 2502.12110 · MemOS 2507.03724 ·
+MemoryOS 2506.06326 · H-MEM 2507.22925 · Mem0 2504.19413 · Zep/Graphiti 2501.13956 · ALMA
+2602.07755 · Self-GC 2607.00692 · surveys 2603.07670, 2606.30306 · "Are We Ready For An
+Agent-Native Memory System?" 2606.24775 · benchmarks LoCoMo 2402.17753, LongMemEval
+2410.10813, MemoryAgentBench 2507.05257, Evo-Memory 2511.20857 · RL-trained (not applicable)
+Mem-α 2509.25911, AdaMEM 2606.05684, DeMem 2605.10870 · model-level (not applicable) Titans
+2501.00663, Cartridges 2506.06266, SEAL 2506.10943, EM-LLM 2407.09450. MIRAS and MemoryLLM/M+
+were not cited because their IDs could not be verified in the sweep.
 
 Footnote, Claude Code side (out of scope, recorded once): a Claude Code subagent receives
 CLAUDE.md, its delegation prompt (which this box's `graphify_gate.py` hook prefixes with the
