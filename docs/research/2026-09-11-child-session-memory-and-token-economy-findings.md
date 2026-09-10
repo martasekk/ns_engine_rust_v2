@@ -457,6 +457,71 @@ Nothing above changes the disposition table in §0 or the not-to-change list in 
 candidate is gated on the same instrument: the M8 evaluation lane. That lane, not any memory
 architecture, remains the critical path.
 
+### 7.4 Second sweep: GUI-agent, cognitive-architecture and dialogue lines
+
+A second pass aimed at three angles the first missed. The GUI-agent line is entirely absent
+from `docs/` (no hit for AppAgent, AutoDroid, UFO, Mobile-Agent, Agent S, Synapse, SkillWeaver,
+CRADLE, or any UI-transition memory); the dialogue line is present only as catalogue rows in
+`2026-09-07` §3. Verification: 23 IDs opened and title-matched, 12 title-matched from listings
+only, one ACM paper unverifiable; the sources paragraph marks which.
+
+| # | Architecture | What it adds | Calls | Disposition |
+|---|---|---|---|---|
+| S1 | **UI-transition memory** — the app as a state machine: nodes are UI states, edges are actions with their observed next state. AutoDroid's UTG (2308.15272; 71.3% completion), EAM's state graph with action-group mining and search-not-generation (2605.12294; +19.6% AndroidWorld, 6× fewer tokens), GraphPilot's validate-before-execute against stored transitions (2601.17418; "almost one LLM query" per task), UI-KOBE's node-neighbourhood as the candidate action set for a small on-device model (2605.29534), ActionEngine's program synthesis over the graph (2602.20502; **95% success at ~1 call per task vs 66%, 11.8× cheaper**) | Nothing like it exists. The verbatim log already records action → resulting `UiView`, so the graph can be **mined offline at zero requests** instead of crawled. Three symbolic uses, in order of safety: (a) the current node's known transitions *narrow* the emitter's legal set (never widen — M5 §2 holds); (b) a proposed action is checked against stored transitions, a check that becomes a gate only after its true-positive rate is measured; (c) a task matching a stored routine end-to-end replays as a compiled flow with one confirming call. (c) *is* TraceCompiler / compiled flows (evolution §10), given its missing substrate. **Prerequisite**: `UiView` carries no window or process identity (`crates/pointer/src/ui.rs:272-283`); a state key needs (process, window class, hash of the reduced control set). | 0 to mine; ~1 per task on replay | **[CANDIDATE]** — the largest requests-per-turn lever in either sweep; trigger unchanged from evolution §10 (10 sessions sharing a sequence ≥2), countable from the log today. The LLM-crawler variant is **[NOT ADOPTED]**: it spends requests and clicks a live desktop |
+| S2 | **Subgoal-chunked working memory** — HiAgent (2408.09559): once a subgoal closes, its observations are replaced by one summary line; **2× success, 3.8 fewer steps** on five long-horizon tasks | M7 Phase 1 clips trace lines; M7 §1 named "one more coarsening level" and never built it. Collapsing the this-turn trace per completed sub-sequence is that level. Zero requests if the boundary rides on the action call (a `done_with` field) or on a symbolic signal (a modal closed, a window changed). Fewer steps are fewer requests. | 0 | **[CANDIDATE]** — measure trace lines per turn after Phase 1 first; if the median is already ≤5, nothing to gain |
+| S3 | **Activation-scored retrieval, zero-call** — ACT-R base-level activation (recency × frequency decay) and spreading activation as ranking. SuperLocalMemory V3.3 (2604.04514): **70.4% LoCoMo with zero LLM calls on CPU**, Ebbinghaus forgetting tied to embedding compression. Hindsight (2512.12818): recall is retrieval-only (RRF + a local MiniLM cross-encoder), reflect is one opt-in call; 83.6% LongMemEval with a 20B model | `recall` ranks by BM25, M8 Phase 3 adds vector → cross-encoder. A recency-frequency prior on facts and turns is one column and one formula. Counter-evidence: vstash (2604.15484) found frequency+decay rescoring *and* cross-encoder reranking failed to beat adaptive RRF on BEIR — but BEIR is document retrieval, and M8 measured the cross-encoder helping here (paraphrase miss 33% → 25%). Hindsight's zero-call recall / one-call reflect split is exactly the engine's recall / gated-notes split. | 0 | **[MEASURE]** in the M8 suite, offline; mixed prior |
+| S4 | **Amortised relevance judgements** — EARM (2608.22767): past query × memory LLM scores fill a matrix, matrix completion predicts the rest; **+6.62% accuracy with only 17.5% of candidates ever scored by the model** | The engine's reranker is local and free, so no saving there. It applies to one thing: the paid `ClientEvaluator` M8 Phase 2 needs for *corrections* (entailment, not similarity). Score 17.5%, complete the rest. | −82% evaluator calls | **[CANDIDATE]** inside M8 T2.8's budget, if and when the evaluator ships |
+| S5 | **Versioned, append-only skill libraries** — Skill-Evo4GUI (2609.04869): +5.7 to +18.6 pp on OSWorld, and an honest instability finding: in-place skill edits broke their originating tasks. SkillWeaver (2504.07079): skills as code transfer +54.3% to weaker agents. Mobile-Agent-E (2501.11733): Tips + Shortcuts, +33.9 pp | The ledger, content-hash notes, and the GRASP gate with a regression budget are the defence Skill-Evo4GUI arrives at. The live `learned.toml` holds exactly one Tip. SkillWeaver's transfer result argues that compiled flows, being code, are model-agnostic even though notes are model-specific by design (evolution §10). | — | **[STANDS]** — validates the design; one note for the compiled-flows plan |
+| S6 | **Pre-storage reasoning** — PREMem (2509.10852): typed fragments (factual / experiential / subjective) with cross-session relations written at store time, so small models match large ones under a token budget. TiM (2311.08719): store conclusions, not history | M6 §5.2 typed observations, Phase 5, unbuilt. Same shape. | idle | **[STANDS]** → M6 Phase 5 |
+| S7 | **Decision-conflict forgetting** — DeMem (2605.10870): refine or split memory only where merging two states would change a *decision*; exact forgetting boundary, near-minimax regret | The principle behind N7: forget what never changed an action. Deciding "would change a decision" symbolically needs the manifest ∩ outcome join N7 proposes. | 0 | **[NOTED]** as N7's justification |
+| S8 | **Memory-cost-aware use** — ATMem (2606.31612) trains a reward from memory-on vs memory-off rollouts, learning *when memory is worth paying for* | RL, not applicable. The ablation itself is: `ns-app eval` with and without each memory block, offline, is the zero-request version and the number M8 should print per block. | 0 | **[NOTED]** → an M8 ablation arm |
+| S9 | Agent KB's disagreement gate on retrieved knowledge (2507.06229; +16 pp GAIA); Hindsight's four typed networks; SimpleMem's intent-planned retrieval scope (2601.02553; 30× fewer tokens) | Provenance + `TaintPolicy` + grounding check; facts / digests / observations / residuals; the M7 intent router. | — | **[DONE]** in different clothes |
+| S10 | SYNAPSE 2026 spreading-activation graph (2601.02744); ActMem causal graph (2603.00026); Global Workspace blackboard agents (2604.08206) | Graph memory, and a shared blackboard against the per-session scope decision (M6 §12.2, zero measured leakage in scoped designs). | — | **[NOT ADOPTED]** |
+| S11 | MementoGUI learned controller (2605.18652), Mem-W latent memory tokens (2605.09317; +30 pts), UFO2 knowledge substrate (2504.14603) | Trained controllers or vision-backbone tokens; UFO2's substrate is a per-app vector store of docs, demos and traces — the Windows-native precedent for S1's storage, now permitted by the vector trigger. | — | **[NOT APPLICABLE]** / UFO2 **[NOTED]** |
+| S12 | Soar chunking, classical TMS belief revision | No 2024–2026 agent paper adopts either with numbers. Versioned facts already are a TMS in the small. | — | nothing to take |
+
+### 7.5 Ranked additions from the second sweep
+
+1. **S1 UI-transition memory mined from the log**, used first to narrow the legal set, then
+   as a check, then as compiled-flow replay. It is the only mechanism in either sweep whose
+   measured effect is on *requests per task* rather than tokens or accuracy. Two prerequisites,
+   both cheap: window identity in `UiView`, and the sequence-sharing count from evolution §10.
+2. **S2 subgoal-collapsed trace** — the coarsening level M7 left open; zero requests; measure
+   trace length first.
+3. **S3 activation prior on recall** — one column, one formula, decided in the M8 suite.
+4. **S4 EARM for the paid evaluator** — only once the evaluator exists.
+
+Combined with §7.3, the whole candidate set still hangs on two instruments: the M8 lane for
+anything touching retrieval or forgetting, and one `ns-app budget` read of a real desktop
+session for anything touching requests. Neither has been run since the log was reset.
+
+### 7.6 Ranked for efficiency, intelligence and lowest context cost, desktop set aside
+
+The user's stated priority on 2026-09-11, after both sweeps: not the desktop line for now;
+the most efficiency and intelligence at the lowest context cost. Re-ranking both sweeps under
+that single criterion, with the measured number that earns each place and what it costs in
+model calls. Every item is generic; S1 (UI-transition memory) is parked.
+
+| Rank | Mechanism | Measured | Calls | Context cost |
+|---|---|---|---|---|
+| 1 | **Structured zero-call recall done right** — typed stores, local rerank, an activation prior (Hindsight 2512.12818, SuperLocalMemory 2604.04514, S3) | 83.6% LongMemEval with a 20B model vs 39% full-context; 70.4% LoCoMo with zero LLM calls | 0 | Falls: the prompt carries five ranked hits instead of history. Engine has the shape; M8 Phase 3 + one activation column completes it |
+| 2 | **Strategy memory from successes and failures, plus case exemplars** (ReasoningBank N2, Memento N1) | +34.2% relative effectiveness and −16% steps; +4.7–9.6 pts OOD | ~1 idle per session; 0 per turn | Small, bounded: ≤3 strategy lines and ≤2 exemplars per prompt, replacing guesswork iterations, which are the expensive kind of context |
+| 3 | **Usefulness-fitness forgetting with a citation boost** (N7: Darwinian 2601.22528, RMM 2503.08026, DeMem's principle S7) | +18.0% success, +33.9% stability; >10% LongMemEval | 0 | The only lever whose context cost *falls over time*: memory that never changed an outcome stops being loaded |
+| 4 | **Subgoal-collapsed working memory** (HiAgent S2) | 2× success, 3.8 fewer steps | 0 | In-turn trace shrinks to one line per closed subgoal; fewer steps are fewer requests |
+| 5 | **Failure-derived compression guidelines for the summarizer** (ACON 2510.00615, §3.4) | 26–54% peak-token reduction, >95% accuracy retained, up to +46% for small-LM agents | idle only, inside M8 | Summary block smaller and better-targeted; no new mechanism, a better prompt for one that exists |
+| 6 | **Engine-level context hygiene** (§5 R2–R3: read `tools_tokens`, slim schemas, obligations block, a breakpoint that can hit) | tool-token share unmeasured, estimated 13–20% of budget; obligations 5/10 → 10/10 | 0 | The floor everything else sits on; cheapest to do, and already specified |
+
+Parked under this criterion: S1 UI-transition memory (desktop-specific, requests-first);
+N8 idle anticipation (spends requests on guesses); N3 ungated cheatsheet (gains real, rule
+against model-decided prose in the prompt stands; the gated form is rank 2); S4 EARM (only
+matters once a paid evaluator exists). Decision aids: SimpleMem's 30× token figure (S9) comes
+from intent-planned retrieval scope, which is M7's router — already banked, not a new lever.
+
+The dependency is unchanged and worth saying once more: ranks 1, 3 and 5 are decided inside
+the M8 evaluation lane and cannot be measured without it. Rank 6 needs nothing. Rank 2 needs
+only the idle pass. Building M8 Phase 2 is therefore the efficiency lever, before any of the
+architectures above.
+
 ## 8. Sources
 
 Repo: `docs/research/2026-09-02-memory-findings.md`, `2026-09-04-entrainment-findings.md`,
@@ -495,6 +560,17 @@ Agent-Native Memory System?" 2606.24775 · benchmarks LoCoMo 2402.17753, LongMem
 Mem-α 2509.25911, AdaMEM 2606.05684, DeMem 2605.10870 · model-level (not applicable) Titans
 2501.00663, Cartridges 2506.06266, SEAL 2506.10943, EM-LLM 2407.09450. MIRAS and MemoryLLM/M+
 were not cited because their IDs could not be verified in the sweep.
+
+Second sweep (§7.4), opened and title-matched: EAM 2605.12294 · ActionEngine 2602.20502 ·
+UI-KOBE 2605.29534 · GraphPilot 2601.17418 · SYNAPSE 2601.02744 · ActMem 2603.00026 · Hindsight
+2512.12818 · DeMem 2605.10870 · Mem-W 2605.09317 · ATMem 2606.31612 · Global Workspace Agents
+2604.08206 · SimpleMem 2601.02553 · MementoGUI 2605.18652 · Skill-Evo4GUI 2609.04869 ·
+SuperLocalMemory V3.3 2604.04514 · EARM 2608.22767 · vstash 2604.15484 · Human-Inspired Memory
+2605.08538 · AutoDroid 2308.15272 · MemoryBank 2305.10250 · TiM 2311.08719 · ExpeL 2308.10144.
+Title-matched from listings only: Mobile-Agent-E 2501.11733 · Synapse 2306.07863 · UFO2
+2504.14603 · SkillWeaver 2504.07079 · Agent KB 2507.06229 · CRADLE 2403.03186 · Theanine
+2406.10996 · MemInsight 2503.21760 · HiAgent 2408.09559 · SeCom 2502.05589 · PREMem 2509.10852 ·
+O-Mem 2511.13593. Unverified: an ACT-R-inspired dialogue architecture (HAI 2025, ACM, 403).
 
 Footnote, Claude Code side (out of scope, recorded once): a Claude Code subagent receives
 CLAUDE.md, its delegation prompt (which this box's `graphify_gate.py` hook prefixes with the
