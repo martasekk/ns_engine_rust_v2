@@ -3960,3 +3960,150 @@ async fn one_slot_serializes_across_sessions() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-10 (many conversations at once) Phase 3: the leakage fixture
+// general-harness design §5.2b asked for — "two scopes, a fact stated in
+// one, and a recall in the other that must return nothing".
+
+/// Renders everything the reply model is shown — facts, summary, window,
+/// trace — so a test can assert on what did *not* reach it, not only on the
+/// trace `ScriptedReplier` echoes.
+struct ContextDump;
+#[async_trait::async_trait]
+impl Replier for ContextDump {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let mut out = String::new();
+        for f in &ctx.facts {
+            out.push_str(&render_fact(f));
+            out.push('\n');
+        }
+        if let Some(s) = &ctx.summary {
+            out.push_str(&render_summary(s));
+            out.push('\n');
+        }
+        out.push_str(&render_window(&ctx.window, ctx.window.len(), &ctx.caps));
+        out.push('\n');
+        out.push_str(&ctx.turn_trace);
+        Ok(out)
+    }
+}
+
+/// An engine whose `scope_for` maps each session to its own scope — what
+/// `ns-app serve` does (M6 §6.6: global facts are correct for a single-user
+/// CLI and a leak on a multi-user channel).
+fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
+    b.set_replier(Box::new(ContextDump));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            scope_for: Arc::new(|sid| sid.0.clone()),
+            // `ContextDump` copies its prompt by design; see `engine_with`.
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+fn recall_proposal(query: &str) -> Proposal {
+    Proposal {
+        rationale: "".into(),
+        action: "recall".into(),
+        args: serde_json::json!({"query": query}),
+    }
+}
+
+/// General-harness design §5.2b, the leakage fixture: two scopes, a fact
+/// stated in one, a recall in the other that must return nothing. Session
+/// `a` remembers `user.city = Brno`; session `b` recalls "city" and then
+/// takes a plain turn. The fact is stored under scope `a` alone, `b`'s
+/// recall comes back empty, and nothing `b`'s reply model was shown —
+/// pinned facts, summary, window, trace — carries the value. The same
+/// recall under `a`'s scope does find it, so the empty result is the
+/// scope's doing and not the query's.
+#[tokio::test]
+async fn a_fact_remembered_in_one_scope_is_invisible_from_another() {
+    let store = Arc::new(InMemoryStore::new());
+    let a = SessionId("a".into());
+    let b = SessionId("b".into());
+
+    let e = per_session_scope_engine(
+        vec![Proposal {
+            rationale: "durable".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": "user.city", "value": "Brno"}),
+        }],
+        store.clone(),
+    );
+    let reply_a = e
+        .run_turn(Incoming {
+            session: a.clone(),
+            text: "I live in Brno".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply_a.contains("Brno"),
+        "session a sees its own fact: {reply_a}"
+    );
+
+    let e = per_session_scope_engine(vec![recall_proposal("city")], store.clone());
+    let recall_reply = e
+        .run_turn(Incoming {
+            session: b.clone(),
+            text: "which city do I live in?".into(),
+        })
+        .await
+        .unwrap();
+    let plain_reply = e
+        .run_turn(Incoming {
+            session: b.clone(),
+            text: "are you sure?".into(),
+        })
+        .await
+        .unwrap();
+
+    // Stored under `a`'s scope, and nowhere else.
+    let in_a = store.facts("a", "").await.unwrap();
+    assert_eq!(in_a.len(), 1, "{in_a:?}");
+    assert_eq!(in_a[0].key, "user.city");
+    assert!(store.facts("b", "").await.unwrap().is_empty());
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+
+    // `b`'s recall found nothing ...
+    let events = store.load(&b).await.unwrap();
+    let returned = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.summary.clone()),
+            _ => None,
+        })
+        .expect("recall ran in session b");
+    assert_eq!(returned, "no matches");
+    // ... and nothing `b`'s reply model was shown carries the value.
+    assert!(!recall_reply.contains("Brno"), "{recall_reply}");
+    assert!(!plain_reply.contains("Brno"), "{plain_reply}");
+
+    // The same recall in `a`'s scope finds the fact: the fixture bites.
+    let e = per_session_scope_engine(vec![recall_proposal("city")], store.clone());
+    let reply_a = e
+        .run_turn(Incoming {
+            session: a.clone(),
+            text: "which city do I live in?".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply_a.contains("from memory, user.city is Brno"),
+        "{reply_a}"
+    );
+}

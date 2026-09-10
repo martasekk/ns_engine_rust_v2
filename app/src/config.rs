@@ -27,6 +27,10 @@ pub struct AppConfig {
     /// Absent means no pointer actions are registered.
     #[serde(default)]
     pub pointer: Option<PointerSection>,
+    /// [serve] — `ns-app serve`: where the TCP channel listens and which env
+    /// var holds its token.
+    #[serde(default)]
+    pub serve: ServeSection,
 }
 
 /// [models] — the local CPU model service, for the evaluation lane only
@@ -211,6 +215,62 @@ impl PointerSection {
         let (host, port) = self.addr.rsplit_once(':')?;
         let port: u16 = port.parse().ok()?;
         Some(format!("{host}:{}", port.checked_add(1)?))
+    }
+}
+
+/// [serve] — `ns-app serve`: the TCP channel (`nschannel_tcp`) that carries
+/// many conversations at once, one session per connection (multi-conversation
+/// plan Phase 3). The token never goes in the file, for the same reason the
+/// provider keys and the pointer's do not.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ServeSection {
+    /// `host:port` to listen on. Loopback unless `allow_remote`.
+    #[serde(default = "default_serve_listen")]
+    pub listen: String,
+    /// The env var holding the token every client presents in its first
+    /// line. Unset or blank means `serve` refuses to start.
+    #[serde(default = "default_serve_token_env")]
+    pub token_env: String,
+    /// Connections at once, machine-wide; the next one is closed at accept.
+    #[serde(default = "default_serve_max_connections")]
+    pub max_connections: usize,
+    /// Whether a non-loopback `listen` is meant. Off, a bind to one is
+    /// refused at startup: the channel has no auth beyond the token and no
+    /// TLS, so on the network it would be the whole conversation in clear.
+    #[serde(default)]
+    pub allow_remote: bool,
+}
+
+fn default_serve_listen() -> String {
+    "127.0.0.1:7375".into()
+}
+
+fn default_serve_token_env() -> String {
+    "NS_SERVE_TOKEN".into()
+}
+
+fn default_serve_max_connections() -> usize {
+    8
+}
+
+impl Default for ServeSection {
+    fn default() -> Self {
+        Self {
+            listen: default_serve_listen(),
+            token_env: default_serve_token_env(),
+            max_connections: default_serve_max_connections(),
+            allow_remote: false,
+        }
+    }
+}
+
+impl ServeSection {
+    /// The token, or `None` when the variable is unset or blank.
+    pub fn token(&self) -> Option<String> {
+        std::env::var(&self.token_env)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     }
 }
 
@@ -1341,6 +1401,48 @@ mod tests {
         assert!(cfg.evolution.pass_config(true, 90).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
+    }
+
+    /// `[serve]` defaults to loopback 7375, `NS_SERVE_TOKEN`, eight
+    /// connections and no remote bind; each field parses on its own, and
+    /// the token is read from the named variable, trimmed, blank meaning
+    /// unset.
+    #[test]
+    fn serve_section_defaults_and_parses() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.serve, ServeSection::default());
+        assert_eq!(cfg.serve.listen, "127.0.0.1:7375");
+        assert_eq!(cfg.serve.token_env, "NS_SERVE_TOKEN");
+        assert_eq!(cfg.serve.max_connections, 8);
+        assert!(!cfg.serve.allow_remote);
+
+        let cfg = AppConfig::parse(
+            "[serve]\nlisten = \"0.0.0.0:9000\"\ntoken_env = \"MY_TOKEN\"\n\
+             max_connections = 2\nallow_remote = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.serve.listen, "0.0.0.0:9000");
+        assert_eq!(cfg.serve.token_env, "MY_TOKEN");
+        assert_eq!(cfg.serve.max_connections, 2);
+        assert!(cfg.serve.allow_remote);
+
+        let cfg = AppConfig::parse("[serve]\nmax_connections = 3\n").unwrap();
+        assert_eq!(
+            cfg.serve.listen, "127.0.0.1:7375",
+            "the rest keep their defaults"
+        );
+        assert_eq!(cfg.serve.max_connections, 3);
+
+        // A variable no other test touches, so this cannot race one.
+        let cfg =
+            AppConfig::parse("[serve]\ntoken_env = \"NS_TEST_SERVE_TOKEN_2026_09_10\"\n").unwrap();
+        std::env::remove_var("NS_TEST_SERVE_TOKEN_2026_09_10");
+        assert_eq!(cfg.serve.token(), None);
+        std::env::set_var("NS_TEST_SERVE_TOKEN_2026_09_10", "  ");
+        assert_eq!(cfg.serve.token(), None, "blank is unset");
+        std::env::set_var("NS_TEST_SERVE_TOKEN_2026_09_10", " s3cret ");
+        assert_eq!(cfg.serve.token().as_deref(), Some("s3cret"));
+        std::env::remove_var("NS_TEST_SERVE_TOKEN_2026_09_10");
     }
 
     /// Absent is "no desktop"; present needs an address, and the token is an

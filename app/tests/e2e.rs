@@ -170,3 +170,67 @@ async fn two_overlapping_turns_on_one_session_lose_one_silently() {
         "the surviving log looks perfectly healthy"
     );
 }
+
+/// Multi-conversation plan Phase 3: `ns-app serve` is the chat assembly on a
+/// `TcpChannel`. A scripted engine on a loopback port answers one client
+/// through the dispatcher — the hello, one `{"text":…}`, one
+/// `{"session":…,"text":…}` back — and the turn is in the store under the
+/// client's session. The run does not end when the client leaves (a server
+/// outlives its clients by design), so it is aborted, not awaited.
+#[tokio::test]
+async fn serve_answers_a_tcp_client_through_the_dispatcher() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SqliteStore::open(&dir.path().join("serve.sqlite")).unwrap());
+    let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t0k".into(), 8, false)
+        .await
+        .unwrap();
+    let addr = channel.local_addr();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_shared_channel(channel);
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            // As `serve` configures it: each session its own fact scope.
+            scope_for: Arc::new(|sid| sid.0.clone()),
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let run = tokio::spawn(e.run());
+
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    w.write_all(b"{\"token\":\"t0k\",\"session\":\"s1\"}\n{\"text\":\"hi\"}\n")
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(r);
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("a reply in time")
+    .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["session"], "s1");
+    let text = reply["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("TRACE:"),
+        "the scripted replier answered: {text}"
+    );
+    drop(reader);
+    drop(w);
+
+    // The turn is in the store, under the client's session.
+    let events = store.load(&SessionId("s1".into())).await.unwrap();
+    assert_eq!(events.last().map(|e| e.turn), Some(1));
+    assert!(!run.is_finished(), "the server outlives its client");
+    run.abort();
+}

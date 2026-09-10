@@ -221,8 +221,35 @@ passed it.
 - *Summary owed across idle:* a session that goes quiet mid-summary drops it and
   recomputes at its next boundary rather than during the quiet period.
 
-**Residual, not fixed here.** `WithDesktop::recv` still `select!`s the inner
-channel's `recv` against the compose-box queue and drops the inner `read_line`
-whenever a desktop line wins — the mid-read cancellation the dispatcher now avoids
-one level up. Pre-existing; the file's own comment names the window. Fix is the
-same pinned-recv shape, inside `WithDesktop`.
+**Phase 3, as built.** `crates/channel-tcp` (`nschannel_tcp::TcpChannel::bind`,
+a `BindError` naming the empty token, the non-loopback address and the io error)
+and `ns-app serve`, which is the chat assembly with three branches: the channel,
+the fact scope (`scope_for = session id`), the banner. Decided beyond the plan:
+- *A takeover closes the displaced connection.* Replies going to the newest
+  claimant alone would leave the older client's lines answered on the other
+  socket; ending the older connection makes the takeover visible as EOF.
+- *Outbound is a bounded `try_send`* (64 deep). A peer that stops reading loses
+  replies to the log rather than stalling its session task and, through the
+  mailbox, the dispatcher. The inbound side blocks, never drops.
+- *The cap+1th connection gets nothing.* The pointer precedent sends a line
+  first; here a refused caller learns nothing, as with a bad token.
+- The engine-level leakage fixture renders facts, summary, window and trace on the
+  reply side, so it asserts on everything the model was shown, not only the trace.
+
+**Status, 2026-09-10.** Phases 0–3 built, green (34 test binaries), committed on
+`worktree-research-multi-conversation`. Phase 4 gated as written.
+
+**Residuals, not fixed here.**
+- `WithDesktop::recv` still `select!`s the inner channel's `recv` against the
+  compose-box queue and drops the inner `read_line` whenever a desktop line wins —
+  the mid-read cancellation the dispatcher now avoids one level up. Pre-existing;
+  the file's own comment names the window. Fix is the same pinned-recv shape,
+  inside `WithDesktop`.
+- The TCP hello has no time or length bound: a connection that sends nothing holds
+  a slot until it hangs up (the pointer agent has the same shape). Worth a hello
+  timeout before `allow_remote` is ever set.
+- `TcpChannel::bind` refuses a non-loopback address *after* binding it and
+  dropping the listener — a microsecond on the network. Resolving the address
+  first would close it; hostnames are why it is not done yet.
+- On the free tier, `worker_slots > 1` overlaps waiting, not requests (§2.9 of the
+  findings). No per-session fairness beyond arrival order; measure before adding.

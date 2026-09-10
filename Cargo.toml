@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/engine",
     "crates/channel-cli",
+    "crates/channel-tcp",
     "crates/memory-sqlite",
     "crates/llm",
     "crates/provenance",

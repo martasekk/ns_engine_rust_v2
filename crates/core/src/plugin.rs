@@ -97,10 +97,17 @@ impl HarnessBuilder {
 
     /// Takes the box every caller already builds; the parts hold it shared.
     pub fn set_channel(&mut self, c: Box<dyn Channel>) {
+        self.set_shared_channel(Arc::from(c));
+    }
+
+    /// The same slot, for a caller that already holds its channel shared —
+    /// `TcpChannel::bind` hands back an `Arc`, so the caller keeps a handle
+    /// (its `local_addr`) while the parts hold the channel.
+    pub fn set_shared_channel(&mut self, c: Arc<dyn Channel>) {
         if self.channel.is_some() {
             self.dup.push("channel");
         }
-        self.channel = Some(Arc::from(c));
+        self.channel = Some(c);
     }
 
     pub fn set_consolidator(&mut self, c: Box<dyn Consolidator>) {
