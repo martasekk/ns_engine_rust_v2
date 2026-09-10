@@ -294,6 +294,7 @@ mod tests {
     #[test]
     fn context_material_covers_every_rendered_block_and_the_persona() {
         let ctx = ReplyContext {
+            usage: None,
             persona: "You are Tomáš, a sales assistant.".into(),
             facts: vec![nscore::Fact {
                 key: "user.city".into(),
@@ -342,6 +343,7 @@ mod tests {
         .into();
         view.previous = Some((serde_json::json!("Martin"), nscore::Timestamp(1)));
         let ctx = ReplyContext {
+            usage: None,
             persona: String::new(),
             facts: vec![view],
             summary: None,

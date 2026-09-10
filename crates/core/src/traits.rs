@@ -70,6 +70,12 @@ pub struct EmitterContext {
     /// gain from showing a model its budget, and whether a 3B emitter acts
     /// on the line or merely reads it is what the task set is for.
     pub budget_line: Option<String>,
+    /// Where the provider client leaves what this call cost (M7 T0.1). The
+    /// engine hands every call the sink of the turn it belongs to and drains
+    /// it right after the call, so two turns in flight at once cannot mix
+    /// their records. `None` — every scripted double, every caller outside a
+    /// turn — leaves the client to the sink it was built with, or to none.
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +145,8 @@ pub struct ReplyContext {
     /// actually operationalizes — overlap against a gold answer, not overlap
     /// in the abstract. Rendered by the replier when set.
     pub do_not_repeat: Vec<String>,
+    /// The sink this call records into; see [`EmitterContext::usage`].
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,6 +168,8 @@ pub struct SummaryInput<'a> {
     pub records: &'a [crate::memory::TurnRecord],
     pub caps: &'a crate::memory::Caps,
     pub facts: &'a [crate::memory::FactView],
+    /// The sink this call records into; see [`EmitterContext::usage`].
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 /// The model's part of a summary; the engine adds range, trust and turn.

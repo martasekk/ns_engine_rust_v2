@@ -177,7 +177,6 @@ impl Shown {
 /// The regeneration falls back to the inert marker.
 struct Probe {
     shown: Arc<Mutex<Vec<Shown>>>,
-    sink: Arc<UsageSink>,
     first_draft: Option<&'static str>,
     drafts: AtomicU32,
 }
@@ -192,7 +191,9 @@ impl Replier for Probe {
     async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
         let n = self.drafts.fetch_add(1, Ordering::SeqCst);
         self.shown.lock().unwrap().push(Shown::capture(&ctx));
-        self.sink.record(spent("replier"));
+        if let Some(sink) = &ctx.usage {
+            sink.record(spent("replier"));
+        }
         match self.first_draft {
             Some(draft) if n == 0 => Ok(draft.into()),
             _ => Ok(INERT.into()),
@@ -205,14 +206,14 @@ impl Replier for Probe {
 ///
 /// It exists for one reason. The engine appends a `ModelCall` — the event
 /// carrying the [`ContextManifest`] of what that call was shown — once per
-/// `Usage` it drains from the sink, so a harness whose doubles leave nothing
-/// there records no manifests, and the four context columns would then have
-/// to be recomputed here from the log. A number a fixture computes for
-/// itself drifts from what the harness did, and then the set measures the
-/// test; the same argument [`Harness::counters`] is built on.
+/// `Usage` it drains from the sink it handed the call in its context, so a
+/// harness whose doubles leave nothing there records no manifests, and the
+/// four context columns would then have to be recomputed here from the log.
+/// A number a fixture computes for itself drifts from what the harness did,
+/// and then the set measures the test; the same argument
+/// [`Harness::counters`] is built on.
 struct MeteredEmitter {
     inner: Box<dyn Emitter>,
-    sink: Arc<UsageSink>,
 }
 
 #[async_trait::async_trait]
@@ -222,8 +223,11 @@ impl Emitter for MeteredEmitter {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
+        let sink = ctx.usage.clone();
         let proposed = self.inner.propose(ctx, legal).await;
-        self.sink.record(spent("emitter"));
+        if let Some(sink) = sink {
+            sink.record(spent("emitter"));
+        }
         proposed
     }
 }
@@ -680,9 +684,6 @@ struct Harness {
     traces: Arc<Mutex<Vec<Vec<String>>>>,
     sessions: Mutex<Vec<SessionId>>,
     ticks: Arc<AtomicU64>,
-    /// Where the doubles leave a `Usage` so the engine appends a `ModelCall`
-    /// with the manifest of what that call was shown (see [`MeteredEmitter`]).
-    usage: Arc<UsageSink>,
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
@@ -696,7 +697,6 @@ impl Harness {
             traces: Arc::new(Mutex::new(Vec::new())),
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
-            usage: Arc::new(UsageSink::new()),
             desktop: false,
         }
     }
@@ -764,13 +764,9 @@ impl Harness {
         }
         let before = self.shown.lock().unwrap().len();
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(MeteredEmitter {
-            inner: emitter,
-            sink: self.usage.clone(),
-        }));
+        b.set_emitter(Box::new(MeteredEmitter { inner: emitter }));
         b.set_replier(Box::new(Probe {
             shown: self.shown.clone(),
-            sink: self.usage.clone(),
             first_draft,
             drafts: AtomicU32::new(0),
         }));
@@ -785,7 +781,6 @@ impl Harness {
         // fixture grades.
         let common = EngineConfig {
             max_echo_ratio: 1.1,
-            usage: Some(self.usage.clone()),
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {

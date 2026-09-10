@@ -112,11 +112,6 @@ pub struct EngineConfig {
     /// a Flash-class model, and whether a 3B emitter acts on the line at all
     /// is exactly what the task set is for.
     pub show_budget_line: bool,
-    /// M7 T0.1: where the provider clients leave what each call cost. When
-    /// set, the engine appends one `ModelCall` per call, with the manifest
-    /// of what that call was shown. `None` — every scripted double, every
-    /// replay — measures nothing and writes nothing.
-    pub usage: Option<std::sync::Arc<nscore::UsageSink>>,
 }
 
 impl Default for EngineConfig {
@@ -154,7 +149,6 @@ impl Default for EngineConfig {
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
-            usage: None,
         }
     }
 }
@@ -510,11 +504,17 @@ impl Engine {
         } else {
             state.summary.as_ref()
         };
+        // This call's own sink (M7 T0.1; multi-conversation plan Phase 1):
+        // once more than one session is live the summary can run beside a
+        // turn, and a sink shared with that turn would hand this call's
+        // cost to whichever of the two drained first.
+        let usage = std::sync::Arc::new(nscore::UsageSink::new());
         let input = nscore::SummaryInput {
             previous,
             records: &records,
             caps: &self.cfg.caps,
             facts: &facts,
+            usage: Some(usage.clone()),
         };
         // The manifest for this call: the summarizer is shown the standing
         // facts and a range of verbatim records, and no tools or trace.
@@ -531,7 +531,7 @@ impl Engine {
         // turn came next; recording it says plainly that a request bought
         // no summary.
         let mut log = EventLog::from_events(sid.clone(), stored);
-        self.record_model_calls(&mut log, state.turn, &manifest);
+        self.record_model_calls(&usage, &mut log, state.turn, &manifest);
         let draft = match summarized {
             Ok(Some(d)) => d,
             Ok(None) => return self.persist_summary_events(sid, &log, n_loaded).await,
@@ -793,24 +793,27 @@ impl Engine {
         }
     }
 
-    /// Append one `ModelCall` for every provider call recorded since the
-    /// last drain (M7 T0.1).
+    /// Append one `ModelCall` for every provider call recorded in `sink`
+    /// since its last drain (M7 T0.1).
     ///
-    /// Called immediately after each of the engine's own model calls, so
-    /// what the sink returns is that call's and the manifest describes what
-    /// it was shown. The three call sites never overlap: the rolling summary
-    /// runs while the loop waits for the next message, never beside a turn.
+    /// Called immediately after each of the engine's own model calls, with
+    /// the sink that call's context carried — one per turn, one per summary
+    /// — so what the drain returns is that call's and the manifest describes
+    /// what it was shown, even while another session's turn is in flight
+    /// (multi-conversation plan Phase 1, findings §2.6). Nothing here reads
+    /// a process-wide sink: a client whose context carries none records into
+    /// its own, and that one belongs to the calls made outside a turn.
     ///
     /// Retries inside one call do not appear as separate events — they are
     /// counted in `Usage::attempts`, because the thing a reader wants to
     /// know is what one decision cost, requests included.
     fn record_model_calls(
         &self,
+        sink: &nscore::UsageSink,
         log: &mut EventLog,
         turn: u32,
         manifest: &nscore::ContextManifest,
     ) {
-        let Some(sink) = &self.cfg.usage else { return };
         for usage in sink.drain() {
             log.append(
                 turn,
@@ -835,6 +838,12 @@ impl Engine {
         let stored = self.parts.memory.load(&sid).await?;
         let n_loaded = stored.len();
         let mut log = EventLog::from_events(sid.clone(), stored);
+        // This turn's own sink for what its model calls cost (M7 T0.1). It
+        // travels in every context the turn builds and is drained right
+        // after each call, so a turn on another session running at the same
+        // time cannot land its records on this one's `ModelCall`s
+        // (multi-conversation plan Phase 1, findings §2.6).
+        let usage = std::sync::Arc::new(nscore::UsageSink::new());
 
         let turn = fold(log.events()).turn + 1;
         let now = &self.clock;
@@ -1006,6 +1015,7 @@ impl Engine {
                 rejections_this_turn: rejections_this_turn.clone(),
                 guidance: rules.guidance_for(&legal_names),
                 budget_line: None,
+                usage: Some(usage.clone()),
             };
 
             // c. propose
@@ -1033,7 +1043,7 @@ impl Engine {
             manifest.tier = self.cfg.router.is_some().then_some(tier);
             manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose(ctx, &legal).await;
-            self.record_model_calls(&mut log, turn, &manifest);
+            self.record_model_calls(&usage, &mut log, turn, &manifest);
             let mut proposal = match proposed {
                 Ok(p) => p,
                 Err(e) => {
@@ -2025,7 +2035,7 @@ impl Engine {
                 None => format!("[{id}] {vars}"),
             },
             ReplyPolicy::Generate => {
-                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn)
+                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn, &usage)
                     .await
             }
         };
@@ -2053,6 +2063,7 @@ impl Engine {
         rules: &nscore::LearnedRules,
         log: &mut EventLog,
         turn: u32,
+        usage: &std::sync::Arc<nscore::UsageSink>,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2095,6 +2106,7 @@ impl Engine {
                 guidance: guidance.clone(),
                 do_not_state,
                 do_not_repeat,
+                usage: Some(usage.clone()),
             };
         // The reply context is fitted too, and reported on the same
         // way. Its `turn_trace` is exempt: it is the material the
@@ -2111,7 +2123,7 @@ impl Engine {
         let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
         manifest.budget = Some(budget);
         let drafted = self.parts.replier.reply(budgeted).await;
-        self.record_model_calls(log, turn, &manifest);
+        self.record_model_calls(usage, log, turn, &manifest);
         match drafted {
             Ok(draft) if self.cfg.reply_grounding_check => {
                 // M6 §4.5. Two checks, one of which acts.
@@ -2166,7 +2178,7 @@ impl Engine {
                     // The regeneration is a second billed call, and
                     // the point of counting it is to know what the
                     // grounding check costs.
-                    self.record_model_calls(log, turn, &manifest);
+                    self.record_model_calls(usage, log, turn, &manifest);
                     regenerated.unwrap_or(draft)
                 }
             }

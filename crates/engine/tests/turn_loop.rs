@@ -2960,11 +2960,9 @@ async fn a_deep_turn_recalls_before_the_first_proposal() {
 async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, ContextManifest)> {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("budget".into());
-    let sink = Arc::new(UsageSink::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![]),
-        sink: sink.clone(),
     }));
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
@@ -2975,7 +2973,6 @@ async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, C
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
-            usage: Some(sink.clone()),
             prompt_budget_tokens: limit,
             budget_mode: mode,
             ..EngineConfig::default()
@@ -3226,12 +3223,11 @@ async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap
     )));
 }
 
-/// Stands in for a provider client: leaves a `Usage` in the same sink
-/// `OpenRouterClient` writes to, so the engine's half of the accounting can
-/// be tested without a network.
+/// Stands in for a provider client: leaves a `Usage` in the sink the engine
+/// handed the call — the one `OpenRouterClient` writes to — so the engine's
+/// half of the accounting can be tested without a network.
 struct MeteredEmitter {
     inner: ScriptedEmitter,
-    sink: Arc<UsageSink>,
 }
 
 #[async_trait::async_trait]
@@ -3241,8 +3237,12 @@ impl Emitter for MeteredEmitter {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
+        let sink = ctx
+            .usage
+            .clone()
+            .expect("the engine hands every call a sink");
         let proposed = self.inner.propose(ctx, legal).await;
-        self.sink.record(Usage {
+        sink.record(Usage {
             role: "emitter".into(),
             model: "test-model".into(),
             prompt_tokens: 900,
@@ -3272,12 +3272,10 @@ async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
         })
         .await
         .unwrap();
-    let sink = Arc::new(UsageSink::new());
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![echo_proposal("hi")]),
-        sink: sink.clone(),
     }));
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
@@ -3288,7 +3286,6 @@ async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
-            usage: Some(sink.clone()),
             ..EngineConfig::default()
         },
         Box::new(|| Timestamp(42)),
@@ -3560,4 +3557,150 @@ async fn two_sessions_interleaved_through_one_channel_keep_separate_intact_logs(
             "session {sid} chain verifies"
         );
     }
+}
+
+/// The session a call belongs to, read off the user text the engine put in
+/// the call's context (`"hello from a"` is session `"a"`).
+fn session_of(user_text: &str) -> String {
+    user_text
+        .strip_prefix("hello from ")
+        .unwrap_or_else(|| panic!("unexpected user text: {user_text:?}"))
+        .to_string()
+}
+
+fn usage_tagged(role: &str, session: &str) -> Usage {
+    Usage {
+        role: role.into(),
+        model: format!("model-for-{session}"),
+        prompt_tokens: 10,
+        completion_tokens: 1,
+        estimated: false,
+        attempts: 1,
+        latency_ms: 1,
+        tools_tokens: 0,
+    }
+}
+
+/// Records its cost into the sink its context carries, tagged with the
+/// session it was called for, and yields on both sides of the record: before
+/// it so the other session's call is in flight at the same time, and after
+/// it so the other session's record lands before this call returns — the
+/// moment a process-wide sink drained after the call would hand one
+/// session's cost to the other.
+struct SessionTaggedEmitter {
+    records: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for SessionTaggedEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        tokio::task::yield_now().await;
+        let sink = ctx
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink");
+        sink.record(usage_tagged("emitter", &session_of(&ctx.user_text)));
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Ok(Proposal {
+            rationale: "nothing to do".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+struct SessionTaggedReplier {
+    records: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Replier for SessionTaggedReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        tokio::task::yield_now().await;
+        let session = session_of(&ctx.user_text);
+        let sink = ctx
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink");
+        sink.record(usage_tagged("replier", &session));
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Ok(format!("hello back, {session}"))
+    }
+}
+
+/// Multi-conversation plan Phase 1 (findings §2.6): what a call cost travels
+/// with the call. Two turns on two sessions run at once, each role records
+/// into the sink its context carries and yields around the record, and every
+/// `ModelCall` still carries only its own session's usage — nothing lost to
+/// the other session, nothing counted twice.
+#[tokio::test]
+async fn usage_from_two_overlapping_turns_lands_on_their_own_model_calls() {
+    let store = Arc::new(InMemoryStore::new());
+    let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(SessionTaggedEmitter {
+        records: records.clone(),
+    }));
+    b.set_replier(Box::new(SessionTaggedReplier {
+        records: records.clone(),
+    }));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let message = |sid: &str| Incoming {
+        session: SessionId(sid.into()),
+        text: format!("hello from {sid}"),
+    };
+    let (reply_a, reply_b) = tokio::join!(e.run_turn(message("a")), e.run_turn(message("b")));
+    reply_a.unwrap();
+    reply_b.unwrap();
+
+    let mut landed = 0;
+    for (sid, other) in [("a", "b"), ("b", "a")] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        let calls: Vec<&Usage> = events
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::ModelCall { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        for role in ["emitter", "replier"] {
+            assert!(
+                calls.iter().any(|u| u.role == role),
+                "session {sid} has a ModelCall for its {role}"
+            );
+        }
+        for u in &calls {
+            assert_eq!(
+                u.model,
+                format!("model-for-{sid}"),
+                "session {sid}: its {} call carries another session's usage",
+                u.role
+            );
+            assert_ne!(u.model, format!("model-for-{other}"));
+        }
+        landed += calls.len();
+    }
+    assert_eq!(
+        landed,
+        records.load(std::sync::atomic::Ordering::SeqCst),
+        "every record landed exactly once: nothing lost, nothing duplicated"
+    );
 }

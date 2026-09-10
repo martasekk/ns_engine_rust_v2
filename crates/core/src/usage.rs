@@ -120,10 +120,12 @@ pub struct ContextManifest {
 /// would push an accounting concern into the contract the whole engine mocks
 /// against, for a number only the real client can produce.
 ///
-/// The engine drains after each of its own calls, and its three call sites
-/// never overlap — the rolling summary runs while the loop waits for the
-/// next message, never beside a turn — so what a drain returns belongs to
-/// the call that just finished.
+/// The engine gives each call its own sink through the call's context
+/// ([`crate::EmitterContext::usage`] and its siblings) and drains it right
+/// after the call, so what a drain returns belongs to that call even when
+/// another session's turn is in flight at the same time. A client built with
+/// a sink of its own records there only for a call whose context carries
+/// none — the evolution pass's probes, and anything else outside a turn.
 #[derive(Debug, Default)]
 pub struct UsageSink {
     calls: std::sync::Mutex<Vec<Usage>>,

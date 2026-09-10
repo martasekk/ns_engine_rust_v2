@@ -152,12 +152,16 @@ impl Replier for CloudReplier {
                 {"role": "user", "content": render_task(&ctx)},
             ],
         });
-        let body = self.client.chat(request).await.map_err(|e| match e {
-            ApiError::Transport(d) => ReplyError::Transport(d),
-            ApiError::Status { status, detail } => {
-                ReplyError::Transport(format!("status {status}: {detail}"))
-            }
-        })?;
+        let body = self
+            .client
+            .chat_into(request, ctx.usage.as_deref())
+            .await
+            .map_err(|e| match e {
+                ApiError::Transport(d) => ReplyError::Transport(d),
+                ApiError::Status { status, detail } => {
+                    ReplyError::Transport(format!("status {status}: {detail}"))
+                }
+            })?;
         let text: String = body["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
@@ -178,6 +182,7 @@ mod tests {
 
     fn ctx() -> ReplyContext {
         ReplyContext {
+            usage: None,
             persona: "You are Tomáš, a friendly sales assistant.".into(),
             facts: vec![Fact {
                 key: "user.name".into(),
@@ -216,6 +221,27 @@ mod tests {
     fn replier(mock: std::sync::Arc<MockTransport>) -> CloudReplier {
         let client = OpenRouterClient::new(mock, "k".into()).with_retry(1, 1);
         CloudReplier::new(client, "anthropic/claude-sonnet-5".into())
+    }
+
+    /// See the emitter's twin: the context's sink takes the call's cost,
+    /// the client's own stays empty.
+    #[tokio::test]
+    async fn the_calls_cost_lands_in_the_contexts_sink_not_the_clients() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Hello!"}}]
+        })]);
+        let own = std::sync::Arc::new(nscore::UsageSink::new());
+        let client =
+            OpenRouterClient::new(mock, "k".into()).with_usage_sink(own.clone(), "replier");
+        let r = CloudReplier::new(client, "m".into());
+        let turn = std::sync::Arc::new(nscore::UsageSink::new());
+        let mut ctx = ctx();
+        ctx.usage = Some(turn.clone());
+        r.reply(ctx).await.unwrap();
+        let recorded = turn.drain();
+        assert_eq!(recorded.len(), 1, "the turn's sink took the call");
+        assert_eq!(recorded[0].role, "replier");
+        assert!(own.drain().is_empty(), "the client's own sink was not used");
     }
 
     #[tokio::test]

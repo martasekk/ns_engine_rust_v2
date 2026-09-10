@@ -355,6 +355,7 @@ mod tests {
 
     fn ctx() -> EmitterContext {
         EmitterContext {
+            usage: None,
             facts: vec![
                 fact("user.name", "Martin"),
                 fact("user.city", "Brno"),

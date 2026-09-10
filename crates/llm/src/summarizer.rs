@@ -76,12 +76,16 @@ impl Summarizer for CloudSummarizer {
                 {"role": "user", "content": render_input(&input)},
             ],
         });
-        let body = self.client.chat(request).await.map_err(|e| match e {
-            ApiError::Transport(d) => SummarizeError::Transport(d),
-            ApiError::Status { status, detail } => {
-                SummarizeError::Transport(format!("status {status}: {detail}"))
-            }
-        })?;
+        let body = self
+            .client
+            .chat_into(request, input.usage.as_deref())
+            .await
+            .map_err(|e| match e {
+                ApiError::Transport(d) => SummarizeError::Transport(d),
+                ApiError::Status { status, detail } => {
+                    SummarizeError::Transport(format!("status {status}: {detail}"))
+                }
+            })?;
         let content = body["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -157,6 +161,7 @@ mod tests {
                 records: &recs,
                 caps: &Caps::default(),
                 facts: &facts,
+                usage: None,
             })
             .await
             .unwrap()
@@ -170,6 +175,35 @@ mod tests {
         assert!(at("Known facts (do not repeat):\n- user.name") < at("Previous summary:\n"));
         assert!(at("Previous summary:") < at("Turns to fold in:\n[t1] user: hi"));
         assert!(user.contains("[t2] user: what time is it"));
+    }
+
+    /// See the emitter's twin: the input's sink takes the call's cost, the
+    /// client's own stays empty.
+    #[tokio::test]
+    async fn the_calls_cost_lands_in_the_inputs_sink_not_the_clients() {
+        let mock = MockTransport::new(vec![Ok(reply(
+            "{\"topic\": \"Asking the time.\", \"established\": [], \"open\": []}",
+        ))]);
+        let own = std::sync::Arc::new(nscore::UsageSink::new());
+        let s = CloudSummarizer::new(
+            OpenRouterClient::new(mock, "k".into()).with_usage_sink(own.clone(), "summarizer"),
+            "m".into(),
+        );
+        let recs = records();
+        let call = std::sync::Arc::new(nscore::UsageSink::new());
+        s.summarize(nscore::SummaryInput {
+            previous: None,
+            records: &recs,
+            caps: &Caps::default(),
+            facts: &[],
+            usage: Some(call.clone()),
+        })
+        .await
+        .unwrap();
+        let recorded = call.drain();
+        assert_eq!(recorded.len(), 1, "the call's sink took the cost");
+        assert_eq!(recorded[0].role, "summarizer");
+        assert!(own.drain().is_empty(), "the client's own sink was not used");
     }
 
     #[tokio::test]
@@ -194,6 +228,7 @@ mod tests {
             records: &recs,
             caps: &caps,
             facts: &facts,
+            usage: None,
         };
         assert!(matches!(
             s.summarize(input()).await,

@@ -100,10 +100,14 @@ impl Emitter for CloudEmitter {
                 {"role": "user", "content": render_context(&ctx)},
             ],
         });
-        let body = self.client.chat(request).await.map_err(|e| match e {
-            ApiError::Transport(d) => EmitError::Transport(d),
-            ApiError::Status { status, detail } => EmitError::Provider { status, detail },
-        })?;
+        let body = self
+            .client
+            .chat_into(request, ctx.usage.as_deref())
+            .await
+            .map_err(|e| match e {
+                ApiError::Transport(d) => EmitError::Transport(d),
+                ApiError::Status { status, detail } => EmitError::Provider { status, detail },
+            })?;
 
         let message = &body["choices"][0]["message"];
         let tool_call = match message["tool_calls"]
@@ -216,6 +220,7 @@ mod tests {
 
     fn ctx() -> EmitterContext {
         EmitterContext {
+            usage: None,
             facts: vec![nscore::Fact {
                 key: "user.name".into(),
                 value: serde_json::json!("Martin"),
@@ -264,6 +269,29 @@ mod tests {
     fn emitter(mock: std::sync::Arc<MockTransport>) -> CloudEmitter {
         let client = OpenRouterClient::new(mock, "k".into()).with_retry(1, 1);
         CloudEmitter::new(client, "anthropic/claude-haiku-4.5".into())
+    }
+
+    /// The context's sink is the one the call records into, and the client's
+    /// own is left alone (multi-conversation plan Phase 1): that is how the
+    /// engine keeps two overlapping turns' costs on their own `ModelCall`s.
+    #[tokio::test]
+    async fn the_calls_cost_lands_in_the_contexts_sink_not_the_clients() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        let own = std::sync::Arc::new(nscore::UsageSink::new());
+        let client =
+            OpenRouterClient::new(mock, "k".into()).with_usage_sink(own.clone(), "emitter");
+        let e = CloudEmitter::new(client, "m".into());
+        let turn = std::sync::Arc::new(nscore::UsageSink::new());
+        let mut ctx = ctx();
+        ctx.usage = Some(turn.clone());
+        e.propose(ctx, &legal()).await.unwrap();
+        let recorded = turn.drain();
+        assert_eq!(recorded.len(), 1, "the turn's sink took the call");
+        assert_eq!(recorded[0].role, "emitter");
+        assert!(own.drain().is_empty(), "the client's own sink was not used");
     }
 
     #[tokio::test]

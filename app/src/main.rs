@@ -526,9 +526,9 @@ async fn main() {
     let rules = load_rules_or_exit(&cfg);
     let tools = build_tools(&cfg).await;
 
-    // M7 T0.1: one sink for the three roles. The engine drains it after each
-    // of its own calls, and those never overlap, so every record lands on
-    // the `ModelCall` of the call that produced it.
+    // M7 T0.1: the engine hands each of its own calls a sink of its own
+    // through the call's context, so this one is only the fallback for calls
+    // made outside a turn — and it is what names the role in every record.
     let usage = Arc::new(nscore::UsageSink::new());
 
     let mut b = HarnessBuilder::new();
@@ -644,7 +644,6 @@ async fn main() {
         prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
-        usage: Some(usage),
     };
     let mut engine = Engine::new(parts, engine_cfg);
     println!(
