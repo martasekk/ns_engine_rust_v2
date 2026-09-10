@@ -1,5 +1,6 @@
 pub use arc_swap;
 
+pub mod dispatch;
 pub mod echo;
 pub mod ground;
 pub mod guards;

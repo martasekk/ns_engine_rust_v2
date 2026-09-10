@@ -731,10 +731,22 @@ pub struct EngineSection {
     /// arming chord, and the badge's pie menu.
     #[serde(default = "default_confirm_irreversible")]
     pub confirm_irreversible: bool,
+    /// How many turns may run at once across all sessions (multi-conversation
+    /// plan Phase 2). Each session is still one turn at a time; this bounds
+    /// how many sessions are mid-turn. `1` is the CLI's serial behaviour. A
+    /// larger number overlaps the waiting of several conversations — it does
+    /// not add requests: the per-provider throttle and the daily allowance
+    /// stay global. Read through `worker_slots()`, which refuses 0.
+    #[serde(default = "default_worker_slots")]
+    pub worker_slots: usize,
 }
 
 fn default_confirm_irreversible() -> bool {
     true
+}
+
+fn default_worker_slots() -> usize {
+    1
 }
 
 impl Default for EngineSection {
@@ -743,6 +755,18 @@ impl Default for EngineSection {
             max_iterations: 5,
             max_emit_retries: 3,
             confirm_irreversible: default_confirm_irreversible(),
+            worker_slots: default_worker_slots(),
+        }
+    }
+}
+
+impl EngineSection {
+    /// Err names the bad value; config errors are fatal at startup. Zero
+    /// slots would park every turn forever.
+    pub fn worker_slots(&self) -> Result<usize, String> {
+        match self.worker_slots {
+            0 => Err("[engine] worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
         }
     }
 }
@@ -1268,6 +1292,27 @@ mod tests {
         );
         let cfg = AppConfig::parse("[memory]\nremember_residual = \"maybe\"\n").unwrap();
         assert!(cfg.memory.remember_residual().is_err());
+    }
+
+    /// `[engine] worker_slots` defaults to the CLI's one slot, takes a larger
+    /// number, and refuses 0 — which would park every turn forever — by name.
+    #[test]
+    fn engine_worker_slots_defaults_to_one_and_rejects_zero() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 1);
+        let cfg = AppConfig::parse("[engine]\nmax_iterations = 5\nmax_emit_retries = 3\n").unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 1);
+        let cfg = AppConfig::parse(
+            "[engine]\nmax_iterations = 5\nmax_emit_retries = 3\nworker_slots = 4\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 4);
+        let cfg = AppConfig::parse(
+            "[engine]\nmax_iterations = 5\nmax_emit_retries = 3\nworker_slots = 0\n",
+        )
+        .unwrap();
+        let err = cfg.engine.worker_slots().unwrap_err();
+        assert!(err.contains("[engine] worker_slots"), "{err}");
     }
 
     #[test]

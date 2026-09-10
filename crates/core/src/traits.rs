@@ -208,11 +208,15 @@ pub enum ChannelError {
     Io(String),
 }
 
+/// Both methods take `&self`: one `recv` is pending for the whole run while
+/// the session tasks `send` through the same handle, so an implementor keeps
+/// whatever it mutates behind its own lock or atomic (multi-conversation plan
+/// Phase 2, D2.1).
 #[async_trait]
 pub trait Channel: Send + Sync {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError>;
+    async fn recv(&self) -> Result<Incoming, ChannelError>;
     /// Callable WITHOUT a pending incoming turn (future proactive messages).
-    async fn send(&mut self, session: &SessionId, text: &str) -> Result<(), ChannelError>;
+    async fn send(&self, session: &SessionId, text: &str) -> Result<(), ChannelError>;
 }
 
 #[derive(Debug, thiserror::Error)]

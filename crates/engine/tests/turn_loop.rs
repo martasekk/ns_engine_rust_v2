@@ -7,10 +7,10 @@ use std::sync::Arc;
 struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         Err(ChannelError::Closed)
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -2518,26 +2518,34 @@ enum Step {
     Idle,
 }
 
-/// Channel double: pops one step per recv. `Idle` sleeps long enough for the
-/// engine's idle timeout to cancel the recv future (timeouts drop it).
+/// How long an `Idle` step keeps the recv quiet: several times the engine's
+/// idle timeout, so the quiet period is seen even if its first tick lands
+/// while the previous turn is still finishing.
+const IDLE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Channel double: one step per message. The dispatcher keeps its recv
+/// future across a timeout instead of dropping it, so `Idle` is a sleep
+/// *inside* the pending recv — long enough for the engine's idle timeout to
+/// fire — after which the same call goes on to the next step.
 struct ScriptedChannel(std::sync::Mutex<std::collections::VecDeque<Step>>);
 #[async_trait::async_trait]
 impl Channel for ScriptedChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        let next = self.0.lock().unwrap().pop_front();
-        match next {
-            Some(Step::Say(t)) => Ok(Incoming {
-                session: SessionId("idle".into()),
-                text: t.into(),
-            }),
-            Some(Step::Idle) => {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                Err(ChannelError::Closed)
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        loop {
+            let next = self.0.lock().unwrap().pop_front();
+            match next {
+                Some(Step::Say(t)) => {
+                    return Ok(Incoming {
+                        session: SessionId("idle".into()),
+                        text: t.into(),
+                    })
+                }
+                Some(Step::Idle) => tokio::time::sleep(IDLE_STEP).await,
+                None => return Err(ChannelError::Closed),
             }
-            None => Err(ChannelError::Closed),
         }
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -2604,7 +2612,7 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
         idle_after: Some(std::time::Duration::from_millis(20)),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(1)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(1)));
     e.run().await.unwrap();
     // pass after "one", pass after "two", and NOT a third time (no turn in between).
     assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2627,16 +2635,19 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
 /// announcement — so a loop that summarizes *before* recv deadlocks, and the
 /// test's timeout fails it. Nothing here can pass sequentially.
 struct HandshakeChannel {
-    received: usize,
+    received: std::sync::atomic::AtomicUsize,
     at_channel: Arc<tokio::sync::Notify>,
     summarized: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
 impl Channel for HandshakeChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        self.received += 1;
-        match self.received {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        let received = self
+            .received
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        match received {
             n @ (1 | 2) => Ok(Incoming {
                 session: SessionId("concurrent".into()),
                 text: format!("message {n}"),
@@ -2648,7 +2659,7 @@ impl Channel for HandshakeChannel {
             }
         }
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -2689,7 +2700,7 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(HandshakeChannel {
-        received: 0,
+        received: std::sync::atomic::AtomicUsize::new(0),
         at_channel: at_channel.clone(),
         summarized: summarized.clone(),
     }));
@@ -2705,7 +2716,7 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
         summary_every_turns: 1,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
 
     tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
         .await
@@ -3478,7 +3489,7 @@ async fn a_pure_tool_result_is_not_flushed_early() {
 struct SessionsChannel(std::sync::Mutex<std::collections::VecDeque<(&'static str, &'static str)>>);
 #[async_trait::async_trait]
 impl Channel for SessionsChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         let next = self.0.lock().unwrap().pop_front();
         match next {
             Some((s, t)) => Ok(Incoming {
@@ -3488,7 +3499,7 @@ impl Channel for SessionsChannel {
             None => Err(ChannelError::Closed),
         }
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -3511,7 +3522,7 @@ async fn two_sessions_interleaved_through_one_channel_keep_separate_intact_logs(
         .collect(),
     ))));
     b.set_consolidator(Box::new(NoopConsolidator));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
@@ -3703,4 +3714,249 @@ async fn usage_from_two_overlapping_turns_lands_on_their_own_model_calls() {
         records.load(std::sync::atomic::Ordering::SeqCst),
         "every record landed exactly once: nothing lost, nothing duplicated"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-conversation plan Phase 2: the dispatcher (`nsengine::dispatch`).
+// One turn at a time per session; `worker_slots` sessions at once.
+
+/// A `ScriptedEmitter` that yields to the scheduler before answering, so two
+/// turns started together both load the log before either appends to it —
+/// the same double as `app/tests/e2e.rs`.
+struct YieldingEmitter(ScriptedEmitter);
+#[async_trait::async_trait]
+impl Emitter for YieldingEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        tokio::task::yield_now().await;
+        self.0.propose(ctx, legal).await
+    }
+}
+
+/// A session's `UserSaid` lines in log order, each with its turn.
+fn user_said(events: &[Event]) -> Vec<(u32, &str)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::UserSaid { text } => Some((e.turn, text.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dispatcher_config(worker_slots: usize) -> EngineConfig {
+    EngineConfig {
+        worker_slots,
+        max_echo_ratio: 1.1,
+        ..EngineConfig::default()
+    }
+}
+
+/// The overlap hazard (`app/tests/e2e.rs`,
+/// `two_overlapping_turns_on_one_session_lose_one_silently`) inverted by the
+/// mailbox. Through `run_turn` directly, two messages for one session that
+/// overlap both number themselves turn 1 and one of them vanishes without an
+/// error. Through the dispatcher the same two messages — delivered back to
+/// back, answered by the same yielding emitter — go through the session's
+/// mailbox one after the other: the log holds turns 1 and 2, both
+/// `UserSaid`s in order, chain intact.
+#[tokio::test]
+async fn two_messages_for_one_session_through_the_dispatcher_become_two_turns() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(YieldingEmitter(ScriptedEmitter::new(vec![]))));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [("a", "first"), ("a", "second")].into_iter().collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(1),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after two messages")
+        .unwrap();
+
+    let sid = SessionId("a".into());
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(
+        user_said(&events),
+        vec![(1, "first"), (2, "second")],
+        "both messages became turns, in order"
+    );
+    assert_eq!(events.last().map(|e| e.turn), Some(2));
+    assert!(
+        EventLog::from_events(sid, events).verify_chain().is_ok(),
+        "the chain verifies"
+    );
+}
+
+/// Parks session `a`'s turn until released; answers session `b` at once.
+/// The session is read off the user text (`session_of`).
+struct ParkedEmitter {
+    release_a: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Emitter for ParkedEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        if session_of(&ctx.user_text) == "a" {
+            self.release_a.notified().await;
+        }
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// A `SessionsChannel` that also announces when the reply to one session
+/// has gone out — that session's turn is complete, reply and all.
+struct ReleasingChannel {
+    script: SessionsChannel,
+    on_sent: &'static str,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Channel for ReleasingChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        self.script.recv().await
+    }
+    async fn send(&self, s: &SessionId, t: &str) -> Result<(), ChannelError> {
+        self.script.send(s, t).await?;
+        if s.0 == self.on_sent {
+            self.release.notify_one();
+        }
+        Ok(())
+    }
+}
+
+/// Two sessions, two slots. Session `a`'s turn parks until session `b`'s
+/// reply has been sent, so the run completes only if `b`'s turn ran to the
+/// end while `a`'s was still in flight. With one slot `a` would hold it and
+/// `b` could never start; the timeout would fail the test.
+#[tokio::test]
+async fn two_sessions_run_concurrently_under_two_slots() {
+    let store = Arc::new(InMemoryStore::new());
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ParkedEmitter {
+        release_a: release_a.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(ReleasingChannel {
+        script: SessionsChannel(std::sync::Mutex::new(
+            [("a", "hello from a"), ("b", "hello from b")]
+                .into_iter()
+                .collect(),
+        )),
+        on_sent: "b",
+        release: release_a,
+    }));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(2),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("session b's turn must complete while session a's is parked")
+        .unwrap();
+
+    for sid in ["a", "b"] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(1),
+            "session {sid} completed its turn"
+        );
+    }
+}
+
+/// Counts the turns in flight through the emitter, and the most there ever
+/// were at once.
+struct InFlightEmitter {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    high_water: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl Emitter for InFlightEmitter {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.high_water.fetch_max(now, SeqCst);
+        // Every chance for the other session to start its turn beside this one.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// One slot — the default, the CLI's behaviour. Two sessions with a message
+/// each and an emitter that yields mid-turn: at no point are two turns in
+/// flight, and both sessions still complete.
+#[tokio::test]
+async fn one_slot_serializes_across_sessions() {
+    let store = Arc::new(InMemoryStore::new());
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(InFlightEmitter {
+        in_flight: in_flight.clone(),
+        high_water: high_water.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [("a", "hello from a"), ("b", "hello from b")]
+            .into_iter()
+            .collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(1),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after two messages")
+        .unwrap();
+
+    assert_eq!(
+        high_water.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "never two turns in flight under one slot"
+    );
+    assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for sid in ["a", "b"] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(1),
+            "session {sid} completed its turn"
+        );
+    }
 }

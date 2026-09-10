@@ -195,3 +195,34 @@ millisecond at twenty turns; `load` dominates and is itself sub-millisecond. Und
 N sessions the store mutex is held for ~0.6 ms per load, so contention would need
 hundreds of turns a second to matter, which no free tier allows. Continue-As-New
 (Phase 4) stays gated; the single WAL connection stays.
+
+**Phase 1, as built.** `EngineConfig.usage` had a reader the plan missed — the
+testkit harness fed it so its doubles produced `ModelCall`s. Those doubles now
+record into the context's sink and the field is gone. The attribution test yields
+on *both* sides of the record; a yield only before it would not have interleaved
+the two sessions' records on a current-thread runtime, so the old bug would have
+passed it.
+
+**Phase 2, as built.** Three things differ from D2.2 as written, each for a reason:
+- *Eviction is not "timeout → return; send fails → recreate".* A message can land
+  between the timeout firing and the receiver going away. The session task closes
+  its mailbox first, drains what already landed, and hands it back through its
+  result; mailboxes carry a generation so a stale stop report never evicts a fresh
+  one; the dispatcher reaps the stopping task before opening a new one and delivers
+  the leftovers ahead of the refused message. No loss, no reordering.
+- *The idle gate holds every slot for the length of the pass* (`try_acquire_many`),
+  which is the atomic form of "no turn in flight" and also keeps a turn from
+  starting beside the consolidator. `turns_since_pass` is counted while the slot is
+  still held, so the gate can never see every slot free and a turn uncounted.
+- *The CLI prompt moved.* The dispatcher restarts `recv` the moment a line arrives,
+  before the turn runs, so a prompt written at the top of `recv` would land ahead
+  of the reply. `recv` prompts only when nothing is showing and `send` writes the
+  reply and the next prompt together; the byte stream is unchanged.
+- *Summary owed across idle:* a session that goes quiet mid-summary drops it and
+  recomputes at its next boundary rather than during the quiet period.
+
+**Residual, not fixed here.** `WithDesktop::recv` still `select!`s the inner
+channel's `recv` against the compose-box queue and drops the inner `read_line`
+whenever a desktop line wins — the mid-read cancellation the dispatcher now avoids
+one level up. Pre-existing; the file's own comment names the window. Fix is the
+same pinned-recv shape, inside `WithDesktop`.

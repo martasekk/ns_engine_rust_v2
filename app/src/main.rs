@@ -521,6 +521,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let worker_slots = match cfg.engine.worker_slots() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
@@ -644,8 +651,9 @@ async fn main() {
         prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
+        worker_slots,
     };
-    let mut engine = Engine::new(parts, engine_cfg);
+    let engine = Engine::new(parts, engine_cfg);
     println!(
         "ns-harness — {}  |  {}",
         emitter_target.describe(),

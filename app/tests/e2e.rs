@@ -8,10 +8,10 @@ use std::sync::Arc;
 struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         Err(ChannelError::Closed)
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }

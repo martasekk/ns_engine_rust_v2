@@ -27,6 +27,7 @@
 //! away the poller stops and says so once; stdin keeps working. The desktop is
 //! an addition to the conversation, never a dependency of it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,19 +60,24 @@ impl Say for Arc<Mutex<Messages>> {
 }
 
 /// Wraps a channel so the desktop's compose box is a second way in.
+///
+/// `recv` and `send` take `&self` (multi-conversation plan Phase 2, D2.1):
+/// the engine keeps one `recv` pending while replies go out through the same
+/// handle. So the receiver sits behind a lock — one `recv` at a time, never
+/// contended — and the two routing facts are an atomic and a lock.
 pub struct WithDesktop<C> {
     inner: C,
-    rx: mpsc::Receiver<Message>,
+    rx: Mutex<mpsc::Receiver<Message>>,
     badge: Box<dyn Say>,
     /// Which way the last turn came in, and therefore where its reply goes.
     /// The engine answers the turn it was just handed, so this is exactly as
     /// long-lived as it needs to be.
-    last_from_desktop: bool,
+    last_from_desktop: AtomicBool,
     /// The session to put desktop lines on: whatever the wrapped channel last
     /// used, so this holds for any channel rather than only the CLI one. The
     /// initial value only matters if the owner types into the box before
     /// anything has come in the other way.
-    session: SessionId,
+    session: std::sync::Mutex<SessionId>,
 }
 
 impl<C: Channel> WithDesktop<C> {
@@ -112,56 +118,57 @@ impl<C: Channel> WithDesktop<C> {
         });
         WithDesktop {
             inner,
-            rx,
+            rx: Mutex::new(rx),
             badge: Box::new(client),
-            last_from_desktop: false,
-            session: SessionId("cli".into()),
+            last_from_desktop: AtomicBool::new(false),
+            session: std::sync::Mutex::new(SessionId("cli".into())),
         }
     }
 }
 
 #[async_trait]
-impl<C: Channel + Send> Channel for WithDesktop<C> {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+impl<C: Channel> Channel for WithDesktop<C> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         // On cancellation: the inner channel is a terminal read, and a
         // terminal delivers a whole line at once when Enter is pressed, so
         // there is no half-read line to lose while the owner is still typing.
         // The window in which a cancel could drop anything is between the line
         // arriving and the read completing.
+        let mut rx = self.rx.lock().await;
         tokio::select! {
-            typed = self.rx.recv() => match typed {
+            typed = rx.recv() => match typed {
                 Some(m) => {
-                    self.last_from_desktop = true;
+                    self.last_from_desktop.store(true, Ordering::SeqCst);
                     // The session is the inner channel's, deliberately: see
                     // the module header. The stamp is dropped here -- it is
                     // the owner's record in `outbox.jsonl`, not something the
                     // model needs in the turn.
-                    let session = self.session.clone();
+                    let session = self.session.lock().expect("session lock").clone();
                     println!("desk> {}", m.text);
                     Ok(Incoming { session, text: m.text })
                 }
                 // The poller is gone; the desktop is an addition, not a
                 // dependency, so fall back to the inner channel for good.
                 None => {
-                    self.last_from_desktop = false;
+                    self.last_from_desktop.store(false, Ordering::SeqCst);
                     self.inner.recv().await
                 }
             },
             from_inner = self.inner.recv() => {
-                self.last_from_desktop = false;
+                self.last_from_desktop.store(false, Ordering::SeqCst);
                 if let Ok(incoming) = &from_inner {
                     // Follow the wrapped channel rather than assuming its id,
                     // so a desktop line lands in whatever conversation this
                     // channel is actually running.
-                    self.session = incoming.session.clone();
+                    *self.session.lock().expect("session lock") = incoming.session.clone();
                 }
                 from_inner
             }
         }
     }
 
-    async fn send(&mut self, session: &SessionId, text: &str) -> Result<(), ChannelError> {
-        if !self.last_from_desktop {
+    async fn send(&self, session: &SessionId, text: &str) -> Result<(), ChannelError> {
+        if !self.last_from_desktop.load(Ordering::SeqCst) {
             return self.inner.send(session, text).await;
         }
         // Answer where the question was asked. The reply also goes to the
@@ -195,7 +202,7 @@ mod tests {
 
     #[async_trait]
     impl Channel for Scripted {
-        async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        async fn recv(&self) -> Result<Incoming, ChannelError> {
             let next = self.lines.lock().unwrap().pop();
             match next {
                 // Deliberately not "cli": the desktop line must pick this up
@@ -212,7 +219,7 @@ mod tests {
                 }
             }
         }
-        async fn send(&mut self, _s: &SessionId, text: &str) -> Result<(), ChannelError> {
+        async fn send(&self, _s: &SessionId, text: &str) -> Result<(), ChannelError> {
             self.sent.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -254,13 +261,13 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let ch = WithDesktop {
             inner,
-            rx,
+            rx: Mutex::new(rx),
             badge: Box::new(Badge {
                 said: to_badge.clone(),
                 refuse,
             }),
-            last_from_desktop: false,
-            session: SessionId("cli".into()),
+            last_from_desktop: AtomicBool::new(false),
+            session: std::sync::Mutex::new(SessionId("cli".into())),
         };
         (ch, tx, to_terminal, to_badge)
     }
@@ -276,7 +283,7 @@ mod tests {
     /// starting one of its own, which is the whole reason the box is useful.
     #[tokio::test]
     async fn a_desktop_line_arrives_on_the_inner_channels_session() {
-        let (mut ch, tx, _term, _badge) = channel(vec!["typed at the terminal"], false);
+        let (ch, tx, _term, _badge) = channel(vec!["typed at the terminal"], false);
 
         let first = ch.recv().await.unwrap();
         assert_eq!(first.text, "typed at the terminal");
@@ -302,7 +309,7 @@ mod tests {
     /// the owner is not looking.
     #[tokio::test]
     async fn a_reply_goes_back_the_way_the_turn_came_in() {
-        let (mut ch, tx, term, badge) = channel(vec!["from the terminal"], false);
+        let (ch, tx, term, badge) = channel(vec!["from the terminal"], false);
 
         let t = ch.recv().await.unwrap();
         ch.send(&t.session, "answer to the terminal").await.unwrap();
@@ -325,7 +332,7 @@ mod tests {
     /// lose that answer.
     #[tokio::test]
     async fn a_badge_that_refuses_does_not_fail_the_turn() {
-        let (mut ch, tx, _term, badge) = channel(vec![], true);
+        let (ch, tx, _term, badge) = channel(vec![], true);
         tx.send(typed("from the badge")).await.unwrap();
         let d = ch.recv().await.unwrap();
         assert!(ch.send(&d.session, "an answer").await.is_ok());
@@ -336,7 +343,7 @@ mod tests {
     /// it: when the poller gives up, the terminal keeps working.
     #[tokio::test]
     async fn a_dead_poller_leaves_the_terminal_working() {
-        let (mut ch, tx, _term, _badge) = channel(vec!["still here"], false);
+        let (ch, tx, _term, _badge) = channel(vec!["still here"], false);
         drop(tx);
         let t = ch.recv().await.unwrap();
         assert_eq!(t.text, "still here");

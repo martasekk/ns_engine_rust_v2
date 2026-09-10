@@ -7,9 +7,8 @@ use crate::trace::{
     DEFAULT_TOOL_RESULT_MAX_CHARS,
 };
 use nscore::{
-    Channel, ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming,
-    LegalActionSet, RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome,
-    Verdict,
+    ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming, LegalActionSet, RejectReason,
+    ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome, Verdict,
 };
 
 pub struct EngineConfig {
@@ -112,6 +111,18 @@ pub struct EngineConfig {
     /// a Flash-class model, and whether a 3B emitter acts on the line at all
     /// is exactly what the task set is for.
     pub show_budget_line: bool,
+    /// Multi-conversation plan Phase 2: how many turns may run at once
+    /// across all sessions (`dispatch::Dispatcher`). Every session is still
+    /// one turn at a time; this bounds how many *sessions* are mid-turn.
+    ///
+    /// `1` is the CLI's serial behaviour — one conversation, one turn, the
+    /// next message waits. A larger number buys overlap of *waiting* (the
+    /// user typing, tool latency, a desktop action in flight) under a
+    /// request budget that stays global: every model call still goes
+    /// through the one per-provider throttle and counts against the same
+    /// daily allowance, so N slots never mean N times the requests
+    /// (findings §2.9).
+    pub worker_slots: usize,
 }
 
 impl Default for EngineConfig {
@@ -149,6 +160,7 @@ impl Default for EngineConfig {
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
+            worker_slots: 1,
         }
     }
 }
@@ -396,6 +408,17 @@ impl Engine {
             clock,
             builtin_guards: guards,
         }
+    }
+
+    /// The wiring, for the dispatcher (`dispatch.rs`): it runs the
+    /// consolidator against the memory and hands the channel to the session
+    /// tasks. Crate-private so the roles stay the engine's to call.
+    pub(crate) fn parts(&self) -> &HarnessParts {
+        &self.parts
+    }
+
+    pub(crate) fn config(&self) -> &EngineConfig {
+        &self.cfg
     }
 
     /// Identity of a call within a turn: action plus its args as JSON
@@ -2201,122 +2224,19 @@ impl Engine {
         }
     }
 
-    /// Outer loop: recv → run_turn → send, until the channel closes. With
-    /// `idle_after` set, a quiet period runs the consolidator once (driver B,
-    /// spec M5 §5) — only when at least one turn ran since the last pass, and
-    /// never interleaved with a turn (same task).
-    ///
-    /// The rolling summary (M6 §5.1) runs *concurrently with the wait for the
-    /// next message*, not before it: it is sleep-time work, and a local
-    /// summarizer can take tens of seconds — long enough to hold up the
-    /// prompt if it sits on the critical path.
-    pub async fn run(&mut self) -> Result<(), EngineError> {
-        // The channel lives outside `self` for the loop's duration so the
-        // summary can borrow the engine while `recv` is still pending.
-        let mut channel = std::mem::replace(&mut self.parts.channel, Box::new(DetachedChannel));
-        let outcome = self.run_loop(&mut channel).await;
-        self.parts.channel = channel;
-        outcome
-    }
-
-    async fn run_loop(&mut self, channel: &mut Box<dyn Channel>) -> Result<(), EngineError> {
-        let mut turns_since_pass: u32 = 0;
-        // The session whose turn just ended: it may owe a rolling summary.
-        let mut summary_due: Option<nscore::SessionId> = None;
-        loop {
-            let due = summary_due.take();
-            let next = match &due {
-                None => next_message(&mut **channel, self.cfg.idle_after).await?,
-                Some(sid) => {
-                    // `recv` is polled first (biased), so the prompt appears
-                    // before the summary starts; the summary then runs while
-                    // the user reads the reply and types. If the user gets
-                    // there first the summary is dropped mid-flight — it is
-                    // recomputed from the store at the next boundary, and its
-                    // input range is capped by summary_input_max_chars, so an
-                    // abandoned summary cannot make the next one unbounded.
-                    let mut pending =
-                        std::pin::pin!(next_message(&mut **channel, self.cfg.idle_after));
-                    tokio::select! {
-                        biased;
-                        next = &mut pending => next?,
-                        summarized = self.maybe_summarize(sid) => {
-                            if let Err(e) = summarized {
-                                eprintln!("summary: {e}");
-                            }
-                            pending.await?
-                        }
-                    }
-                }
-            };
-            let incoming = match next {
-                Next::Closed => return Ok(()),
-                Next::Idle => {
-                    // Silence is not a message: the summary is still owed.
-                    summary_due = due;
-                    if turns_since_pass > 0 {
-                        if let Err(e) = self.parts.consolidator.run(&*self.parts.memory).await {
-                            eprintln!("evolution pass failed: {e}");
-                        }
-                        turns_since_pass = 0;
-                    }
-                    continue;
-                }
-                Next::Message(i) => i,
-            };
-            let session = incoming.session.clone();
-            let text = self.run_turn(incoming).await?;
-            turns_since_pass += 1;
-            channel
-                .send(&session, &text)
-                .await
-                .map_err(|e| EngineError::Channel(e.to_string()))?;
-            summary_due = Some(session);
-        }
-    }
-}
-
-/// What the wait for the next message produced.
-enum Next {
-    Message(Incoming),
-    /// `idle_after` elapsed with the channel quiet.
-    Idle,
-    Closed,
-}
-
-/// One wait on the channel, with the idle timeout folded in. A free function
-/// so it borrows only the channel, leaving the engine free for the summary.
-async fn next_message(
-    channel: &mut dyn Channel,
-    idle_after: Option<std::time::Duration>,
-) -> Result<Next, EngineError> {
-    let received = match idle_after {
-        Some(d) => tokio::time::timeout(d, channel.recv()).await,
-        None => Ok(channel.recv().await),
-    };
-    match received {
-        Ok(Ok(i)) => Ok(Next::Message(i)),
-        Ok(Err(ChannelError::Closed)) => Ok(Next::Closed),
-        Ok(Err(e)) => Err(EngineError::Channel(e.to_string())),
-        Err(_elapsed) => Ok(Next::Idle),
-    }
-}
-
-/// Stands in for the real channel while `run` holds it as a local. Never
-/// polled — `run` puts the real one back before returning.
-struct DetachedChannel;
-
-#[async_trait::async_trait]
-impl Channel for DetachedChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        Err(ChannelError::Closed)
-    }
-    async fn send(
-        &mut self,
-        _session: &nscore::SessionId,
-        _text: &str,
-    ) -> Result<(), ChannelError> {
-        Ok(())
+    /// Runs the engine on its channel until the channel closes: every
+    /// message goes to its session's mailbox, a session runs one turn at a
+    /// time, `worker_slots` sessions run at once, a quiet channel runs the
+    /// consolidator (driver B, spec M5 §5), and the rolling summary (M6
+    /// §5.1) runs while its session waits for the next message. The loop is
+    /// `dispatch::Dispatcher`; this builds it, so the CLI and the tests keep
+    /// the one call they had.
+    pub async fn run(self) -> Result<(), EngineError> {
+        let channel = self.parts.channel.clone();
+        let slots = self.cfg.worker_slots;
+        crate::dispatch::Dispatcher::new(std::sync::Arc::new(self), channel, slots)
+            .run()
+            .await
     }
 }
 
