@@ -69,6 +69,27 @@ provider = "openrouter"
 #   reasoning = "low"
 #   max_tokens = 1024
 #
+# OpenAI GPT-5.6 Luna is the cost-efficient default: it accepts `temperature`
+# (no safety net needed) and honours the reasoning block, at $0.20 / $1.20 per
+# MTok against Sonnet's $2 / $10. `reasoning = "low"` in all three roles is
+# what the M11 measurement ran; the emitter's job is one tool call, the
+# replier's is the prose, and 1024 is enough for the summarizer's four fields:
+#
+#   [llm.emitter]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 2048
+#
+#   [llm.replier]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 4096
+#
+#   [llm.summarizer]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 1024
+#
 # A local Qwen3 thinks by default and will spend the whole output budget on
 # it before the tool call; the emitter switches that off and keeps its
 # pinned temperature:

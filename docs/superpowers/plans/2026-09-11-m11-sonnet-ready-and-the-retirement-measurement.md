@@ -21,6 +21,18 @@ keep list. When executed this becomes
 3. **The measurement run is approved** once the shaping is green: 40 chat turns on Sonnet 5
    under today's scaffolding, about 110 requests, roughly $1 to $1.60.
 
+4. **Later the same day: the production model is OpenAI GPT-5.6 Luna** (`openai/gpt-5.6-luna`
+   on OpenRouter: $0.20 / $1.20 per MTok, $0.40 / $1.80 on long-context requests, 1.05M
+   context, 128k max output, tools, `tool_choice` and `json_schema` `response_format`
+   supported; served by OpenAI, Azure EU and Bedrock US), chosen for cost — roughly a tenth
+   of Sonnet 5 per turn at the measured token counts. What carries over from the Sonnet
+   measurement: the grounding flags are the matcher's fault (Czech inflection), not the
+   model's, so the retirement decision stands; the per-role shaping fields are model-agnostic.
+   What must be re-measured on Luna: whether it rejects sampling parameters (the safety net
+   matches Sonnet ids only), tool-calling reliability of a cheaper caller (text fallback,
+   `Malformed`), and the summarizer through `response_format` now that the dispatcher fix is
+   in. The Luna wave below does exactly that, at a spend ceiling of 70 requests and $0.10.
+
 Standing constraints: desktop line parked; chat and personal memory first; a paid tier is
 coming; the chat single-call path is measure only; no model in the guard chain or the fold;
 replay and provenance untouched; a knob moves only on a non-regressing arm.
@@ -250,3 +262,59 @@ one-line answers (monitor false positives, as the entrainment plan already recor
 | note archiving | not observed (the one note is desktop-only) | build when a chat note exists |
 | strong context profile | prompt 4,800–5,200 tok/turn at $0.011/turn, prefix 451–472 tok, cached 0 | affordable; raising the window also pushes the prefix toward the caching floor; decide on the ablation arms |
 | T0.4 shapes | −26% completion at equal correctness | recommend as the Sonnet default in `config.example.toml` (done); not hardcoded |
+
+### Wave B — done (commit `dee9c47`), 0 requests planned, 10 spent on the judge check
+
+`ClientEvaluator` on `[models] judge_model` (never constructed without one), idle pass only,
+κ-gated, its requests printed; `select_facts` hybrid only when `[recall] hybrid` and the tier
+is not Chat; the `FACTS_ARM` static retired; **T1.5**: the dispatcher awaits a due summary
+before the next queued turn (awaited, not spawned, to keep one turn at a time per session);
+the test reads 0 → 1 `Summarized` with the fix, and turns 22–61 of the live log had zero
+summaries before it. Judge check on a copy with Sonnet, cap 10: 10 requests, **5 verdicts
+unavailable**, κ 0.12 over 5 — diagnosed in the Luna wave below.
+
+### Luna wave — done, 119 requests, **$0.032** (ceiling was 70 / $0.10: dollars held, requests breached — see the defect)
+
+**Sampling probe (5 requests, on a copy):** Luna **accepts `temperature`** and honours
+`reasoning: {effort}`; no safety-net change, `SAMPLING_REJECTED_BY` stays Sonnet-only.
+`config.example.toml` gains the Luna block (emitter low/2048, replier low/4096, summarizer
+low/1024, no `sampling`), and still parses.
+
+**Measurement, one shaped arm, turns 62–81 of the live `cli` session (58 requests):**
+
+| | requests | per turn | e / r / s | prompt tok | completion tok | cached | $ |
+|---|---|---|---|---|---|---|---|
+| Luna shaped | 58 | 2.90 | 29 / 24 / 5 | 55,958 | 3,443 | 0 | **0.0153** |
+
+$0.00077 per turn: **14.7× cheaper than Sonnet arm B** at the same script. The summarizer
+**ran 5 times** (the wave B fix holds) and every summary parsed through `response_format`
+without the fence fallback. `Rejected` 0, `Malformed` 0, text-fallback 0: the cheaper caller
+never dropped the forced tool call. Eight `remember_fact` calls, all `Ok`, every fact and
+both updates stored; "přesně 15. března"; the car question declined; the name recalled.
+
+Grounding flags **4 of 20**: `Brna` (genitive, FP), `Praze` (locative, FP), an
+apostrophe-split span of the user's own sentence (FP), and `Canberra` — the same harmful
+true positive as both Sonnet arms, a correct answer regenerated into a refusal. The
+retirement decision is model-independent and stands.
+
+**Judge on Luna** (cap 5, `NS_TRACE`): 5 graded, **0 unavailable**, κ 0.55 [−0.25, 1.34]
+over 5 turns, observations only; every verdict `finish_reason stop`, strict `json_schema`
+honoured, none fenced. Sonnet's 5-of-10 unavailable did not reproduce; no `max_tokens`
+change was needed, and the cause on Sonnet remains undiagnosed (recorded).
+
+**Defect found:** `ns-app evolve --dry-run` with `[models] enabled` and a key in the
+environment fires the **notes lane's proposer and probes** — 51 requests at `max_tokens 300`
+— and the report's `requests spent:` line counts only the judge's 5. A dry run spent ten
+times what it reported. Two fixes for the next plan: `--dry-run` must not run live probes
+(or must say it will), and `requests spent` must count every lane's requests from the
+per-call `UsageSink`, which already records them.
+
+### Status after M11
+
+Built and green (workspace suite below). Every knob defaults to today's behaviour; the
+recommended Luna shapes live in `config.example.toml`. Retirement decisions, now backed by
+Sonnet and Luna numbers: retire the grounding **regeneration** and make the flag's matcher
+inflection-aware; drop the text fallback and argument examples to monitors under a strong
+profile; the reminder text, note archiving and the strong context profile wait for a chat
+note and the ablation arms. Open defects: the pass's unreported paid requests; the Chat
+tier withholding `get_time`; Sonnet's unavailable judge verdicts.
