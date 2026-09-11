@@ -293,3 +293,21 @@ pass only changed files to `rustfmt`; commit with `-c user.name=Martin -c user.e
   `usage.rs:15`; `tools_tokens` is the precedent for a new field. `MemorySection`
   `config.rs:279`, defaults as free fns, validated post-parse, mirrored into `TurnConfig`
   `turn.rs:49-52, 146-148`.
+
+## Results
+
+### P0 — done 2026-09-11 (commits `72048d9`, `d0bc08f`, `b40f8bd`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T0.1 | fixture `cached_tokens = 2048` → `Usage.cached_tokens == 2048`; absent → 0 | met; seven `Usage` literals updated (two in `turn_loop.rs` the plan had not listed) |
+| T0.2 | `ns-app budget` prints `cached`; estimated calls contribute 0 | met; footer `cached: X of Y prompt tokens on measured calls (Z%)` |
+| T0.3 | old manifests round-trip; `note_hashes.len() == guidance` | met; plus `facts_chars/summary_chars/window_chars`, `ablated`, and `EngineConfig.ablate` (blanks after fitting, budget report unchanged) |
+| T0.4 | per-ability table for full and ablated arms, exit 0 | met. **Without `facts`: 9/9 → 4/9** (information extraction, multi-session reasoning, temporal reasoning, knowledge updates, selective forgetting fail; abstention and the three desktop tasks hold). **`summary` and `guidance`: 9/9 → 9/9, not measurable** — the scripted suite carries no summary and no notes; fixtures that do are a follow-up before T5.2's arm or T3.3 can read anything |
+| T0.5 | a stable-prefix number per role | footer built and unit-tested (emitter median/max from block sizes, replier includes the real persona from config). On the recorded `cli` session it is not reached: that session predates `ModelCall` entirely and takes the reconstruction path. **First real reading comes from P2's smoke run.** |
+
+Deviations recorded: `app/src/main.rs` gained `ablate: None` (exhaustive `EngineConfig`
+literal) and the `--ablate` dispatch; `Harness::new()`/`desktop()` were replaced by
+`Harness::ablating(..)`/`desktop_ablating(..)` once nothing called the old ones. rustfmt
+collateral in `paraphrase.rs` was reverted; `turn.rs`, `config.rs`, `budget.rs` keep their
+pre-existing format diffs.
