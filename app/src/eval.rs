@@ -441,12 +441,62 @@ pub async fn run_paraphrase(activation: f32) -> i32 {
         Err(e) => eprintln!("paraphrase: the sqlite arm did not run ({e})"),
     }
 
+    // M8 T3.4 / M10 P3: the third arm, and the one the exit criterion is
+    // about. It is added **only when the service answers** — a hybrid arm
+    // against a dead service would be the bm25 arm again by design, and
+    // printing it as "hybrid" would be reporting a number for something that
+    // did not run. When it is absent the line below says so, which is what
+    // T3.4 means by "report the number as not measured".
+    //
+    // A separate database from the bm25 arm, so the two are not the same
+    // store measured twice with a knob moved: the vectors are written into
+    // this one by the same `backfill_embeddings` the idle pass calls.
+    let models = crate::config::ModelsSection {
+        enabled: true,
+        ..Default::default()
+    };
+    let recall = crate::config::RecallSection::default();
+    let mut hybrid_ran = false;
+    if crate::models::reachable(&models).await {
+        match nsmemory_sqlite::SqliteStore::open(&dir.path().join("paraphrase-hybrid.sqlite")) {
+            Ok(sqlite) => {
+                let sqlite = sqlite
+                    .with_activation(activation, half_life)
+                    .with_recall(crate::models::recall_tuning(&recall));
+                let sqlite = match crate::models::encoder(&models, &recall) {
+                    Some(enc) => sqlite.with_encoder(enc),
+                    None => sqlite,
+                };
+                let name = format!(
+                    "sqlite hybrid ({}, coarse {} → rerank)",
+                    recall.embed_model, recall.coarse_k
+                );
+                reports.push(paraphrase::measure(&sqlite, &name, k).await);
+                hybrid_ran = true;
+            }
+            Err(e) => eprintln!("paraphrase: the hybrid arm did not run ({e})"),
+        }
+    }
+
     print!("{}", paraphrase::render(&reports));
     println!(
         "  k = {k} (recall_top_k), activation_weight = {activation}, {} cases, \
-         no model calls and no requests spent.",
+         no requests spent.",
         paraphrase::corpus().len()
     );
+    if hybrid_ran {
+        println!(
+            "  the hybrid arm ran against nsmodels on {} — local CPU, no requests.",
+            models.base_url
+        );
+    } else {
+        println!(
+            "  hybrid arm: NOT MEASURED — no nsmodels service on {}. Start it with\n  \
+             `cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality \
+             --rerank`.",
+            models.base_url
+        );
+    }
     0
 }
 

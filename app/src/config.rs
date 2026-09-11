@@ -23,6 +23,10 @@ pub struct AppConfig {
     /// use. Absent, or `enabled = false`, means nothing reaches for it.
     #[serde(default)]
     pub models: ModelsSection,
+    /// [recall] — M8 §6 Phase 3. Everything here is inert without
+    /// `[models] enabled`, because the store gets no encoder without it.
+    #[serde(default)]
+    pub recall: RecallSection,
     /// [pointer] — a desktop to drive, through the ns-pointer agent on it.
     /// Absent means no pointer actions are registered.
     #[serde(default)]
@@ -116,6 +120,72 @@ impl Default for ModelsSection {
             evaluator_min_kappa: default_evaluator_min_kappa(),
         }
     }
+}
+
+/// [recall] — the hybrid retrieval path (M8 §6, M10 P3).
+///
+/// Every value here is measured rather than chosen, and the measurements are
+/// in M8 §6's table. The one thing to keep in mind while touching them is
+/// the finding that contradicts the intuition: with bge-m3 **wider is
+/// worse**. Coarse-10 → rerank missed 8% of paraphrases at 509 ms; k = 20,
+/// 30 and 48 all missed 17% at two to four times the cost. Every candidate
+/// past the tenth is another chance for the cross-encoder to promote a
+/// distractor.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct RecallSection {
+    /// Whether recall may take the hybrid path at all. Off by default, as
+    /// M8 §8 writes it, and never read outside the `Task`/`Deep` tier.
+    #[serde(default)]
+    pub hybrid: bool,
+    /// Candidates each arm contributes before rank fusion.
+    #[serde(default = "default_coarse_k")]
+    pub coarse_k: usize,
+    /// How long the whole hybrid path may take before it gives up and
+    /// returns the lexical list it already has (M8 T3.5).
+    ///
+    /// 800 ms against a 509 ms measured round trip: enough headroom for a
+    /// cold cache and a busy box, and short enough that the fallback is a
+    /// fallback rather than a formality. A recall that would hold a turn is
+    /// worth less than a worse recall that does not.
+    #[serde(default = "default_rerank_budget_ms")]
+    pub rerank_budget_ms: u64,
+    /// The embedder's name, recorded beside every stored vector so a model
+    /// change invalidates the index rather than mixing two geometries in it.
+    ///
+    /// `--model quality` is bge-m3, and M8 §6 is explicit that this is the
+    /// one to serve: the nsmodels default is chosen for throughput, and this
+    /// is a recall problem. Change this key *and* the flag together, or the
+    /// stored vectors will claim a model that did not write them.
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+}
+
+impl Default for RecallSection {
+    fn default() -> Self {
+        Self {
+            hybrid: false,
+            coarse_k: default_coarse_k(),
+            rerank_budget_ms: default_rerank_budget_ms(),
+            embed_model: default_embed_model(),
+        }
+    }
+}
+
+/// Ten, and the number has a table behind it. See [`RecallSection`].
+fn default_coarse_k() -> usize {
+    10
+}
+fn default_rerank_budget_ms() -> u64 {
+    800
+}
+fn default_embed_model() -> String {
+    "bge-m3".into()
+}
+fn default_embed_backfill_batch() -> usize {
+    64
+}
+fn default_embed_backfill_batches() -> usize {
+    16
 }
 
 /// 40, the same number `probe_budget_turns` uses. One idle pass, one budget
@@ -456,6 +526,15 @@ pub struct MemorySection {
     /// Hits per source the `recall` action returns (M6 §7).
     #[serde(default = "default_recall_top_k")]
     pub recall_top_k: usize,
+    /// M9 T5.3 / M10 T3.6: nearest earlier conversations the deep tier's
+    /// pre-emptive step may bring in as exemplars, as one `ToolReturned`.
+    ///
+    /// **0 until `--ablate` says otherwise.** That is the M9 rule for every
+    /// knob whose fixture does not exist yet, and "default" is not a
+    /// measurement. It also needs `[models] enabled`: without an encoder the
+    /// store has no digest vectors to be near.
+    #[serde(default)]
+    pub exemplars_max: usize,
 }
 
 fn default_recall_top_k() -> usize {
@@ -601,6 +680,7 @@ impl Default for MemorySection {
             summary_max_chars: default_summary_max_chars(),
             summary_input_max_chars: default_summary_input_max_chars(),
             recall_top_k: default_recall_top_k(),
+            exemplars_max: 0,
         }
     }
 }
@@ -1043,6 +1123,18 @@ pub struct EvolutionSection {
     /// band, which is what T2.7 will calibrate against, does not depend on it.
     #[serde(default = "default_reask_jaccard")]
     pub reask_jaccard: f32,
+    /// M8 T3.1: rows the embeddings backfill may embed per `/embed` call,
+    /// and how many calls one pass may make.
+    ///
+    /// Under `[evolution]` and not `[recall]` because this is a property of
+    /// the *pass* — how much of the idle window the backfill may take before
+    /// grading and consolidation need it. It is resumable, so a cap that
+    /// stops early costs a later pass rather than a re-run, and it never
+    /// runs in a turn.
+    #[serde(default = "default_embed_backfill_batch")]
+    pub embed_backfill_batch: usize,
+    #[serde(default = "default_embed_backfill_batches")]
+    pub embed_backfill_batches: usize,
 }
 
 /// 0.6: a reply more than half of which is one lifted run is a copy, not
@@ -1088,6 +1180,8 @@ impl Default for EvolutionSection {
             max_notes: default_max_notes(),
             regression_replay_cap: default_replay_cap(),
             reask_jaccard: default_reask_jaccard(),
+            embed_backfill_batch: default_embed_backfill_batch(),
+            embed_backfill_batches: default_embed_backfill_batches(),
         }
     }
 }
@@ -1128,6 +1222,8 @@ impl EvolutionSection {
             fitness_min_exposures: memory.fitness_min_exposures,
             fitness_demote: memory.fitness_demote,
             pinned_prefixes: memory.pinned_prefixes.clone(),
+            embed_backfill_batch: self.embed_backfill_batch,
+            embed_backfill_batches: self.embed_backfill_batches,
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -1281,6 +1377,39 @@ mod tests {
 
     /// A config that spells the endpoint out instead of naming the preset
     /// still gets that provider's rate limit and prompt-cache behaviour.
+    /// M8 T3.5 / M10 P3: `[recall]` parses, and every default is today's
+    /// behaviour — hybrid off, exemplars off, coarse 10, 800 ms.
+    #[test]
+    fn the_recall_section_defaults_to_todays_behaviour_and_parses() {
+        let bare = AppConfig::parse("").unwrap();
+        assert!(!bare.recall.hybrid);
+        assert_eq!(bare.recall.coarse_k, 10);
+        assert_eq!(bare.recall.rerank_budget_ms, 800);
+        assert_eq!(bare.recall.embed_model, "bge-m3");
+        assert_eq!(bare.memory.exemplars_max, 0);
+        assert_eq!(bare.evolution.embed_backfill_batch, 64);
+
+        let set = AppConfig::parse(
+            "[recall]\n\
+             hybrid = true\n\
+             coarse_k = 20\n\
+             rerank_budget_ms = 1500\n\
+             [memory]\n\
+             exemplars_max = 2\n\
+             [evolution]\n\
+             embed_backfill_batch = 8\n",
+        )
+        .unwrap();
+        assert!(set.recall.hybrid);
+        assert_eq!(set.recall.coarse_k, 20);
+        assert_eq!(set.recall.rerank_budget_ms, 1500);
+        assert_eq!(set.memory.exemplars_max, 2);
+        let pc = set
+            .evolution
+            .pass_config(true, &set.memory, &set.models);
+        assert_eq!(pc.embed_backfill_batch, 8);
+    }
+
     #[test]
     fn min_interval_and_prompt_cache_follow_the_resolved_base_url() {
         let emitter = |toml: &str| {

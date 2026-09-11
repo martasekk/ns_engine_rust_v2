@@ -667,8 +667,10 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "ns-core",
+ "ns-memory-sqlite",
  "ns-provenance",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -682,6 +684,7 @@ dependencies = [
  "ns-core",
  "ns-engine",
  "ns-llm",
+ "ns-memory-sqlite",
  "reqwest",
  "serde",
  "serde_json",

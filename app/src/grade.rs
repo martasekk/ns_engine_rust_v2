@@ -292,6 +292,7 @@ pub async fn run_cmd(
             timeout_ms,
             reask_cosine,
             relevance_cut,
+            ..Default::default()
         },
         SymbolicEvaluator::default(),
     );

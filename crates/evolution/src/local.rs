@@ -63,6 +63,16 @@ pub struct LocalConfig {
     pub reask_cosine: f32,
     /// Cross-encoder score below which the reply is not about the question.
     pub relevance_cut: f32,
+    /// Which embedder the service was started with, recorded beside every
+    /// vector the recall backfill stores (M8 T3.1).
+    ///
+    /// It is a name this side writes down, not one the service reports:
+    /// nsmodels answers `/health` with which *roles* are loaded, not with
+    /// which weights, and the only thing the store needs is a key that
+    /// changes when the geometry changes. `--model quality` is bge-m3, and
+    /// M8 §6 is explicit that this is the one to run — the nsmodels default
+    /// is chosen for throughput and this is a recall problem.
+    pub embed_model: String,
 }
 
 impl Default for LocalConfig {
@@ -72,6 +82,7 @@ impl Default for LocalConfig {
             timeout_ms: 2000,
             reask_cosine: 0.90,
             relevance_cut: 0.0,
+            embed_model: "bge-m3".into(),
         }
     }
 }
@@ -317,6 +328,93 @@ impl LocalEvaluator {
             .map(|s| s as f32)
             .ok_or_else(|| GradeError::Invalid("no score in /rerank reply".into()))
     }
+}
+
+/// M8 T3.1/T3.2: the same client, lent to the store.
+///
+/// The recall path needs `/embed` and `/rerank` over loopback, which is
+/// exactly what this already is — the retry table, the refusal
+/// classification that survives a Czech Windows, and the "two unreachable
+/// calls and the lane is out" rule included. A second client beside it would
+/// be a second copy of all three, and the one that drifted would be the one
+/// the hot path used.
+///
+/// The trait lives in `ns-core` so `ns-memory-sqlite` can be handed this
+/// without growing an HTTP stack; `app/` does the handing.
+#[async_trait::async_trait]
+impl nscore::TextEncoder for LocalEvaluator {
+    fn model(&self) -> &str {
+        &self.cfg.embed_model
+    }
+
+    async fn embed(
+        &self,
+        texts: &[String],
+        kind: &str,
+    ) -> Result<Vec<Vec<f32>>, nscore::StoreError> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let v = self
+            .call("/embed", serde_json::json!({"texts": texts, "kind": kind}))
+            .await
+            .map_err(encoder_err)?;
+        let rows = v
+            .get("vectors")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| nscore::StoreError::Io("no vectors in /embed reply".into()))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_f64())
+                            .map(|x| x as f32)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, nscore::StoreError> {
+        if docs.is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        let v = self
+            .call(
+                "/rerank",
+                serde_json::json!({"query": query, "docs": docs, "k": k}),
+            )
+            .await
+            .map_err(encoder_err)?;
+        let ranked = v
+            .get("ranked")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| nscore::StoreError::Io("no ranked list in /rerank reply".into()))?;
+        Ok(ranked
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get("index")?.as_u64()? as usize,
+                    r.get("score")?.as_f64()? as f32,
+                ))
+            })
+            .collect())
+    }
+}
+
+/// A grading failure told as a store failure. The store's caller does not
+/// act on the difference — every one of these ends in the lexical list — but
+/// the text survives into the message a report prints.
+fn encoder_err(e: GradeError) -> nscore::StoreError {
+    nscore::StoreError::Io(e.to_string())
 }
 
 /// The two scores a grade is made of, before any cut is applied.

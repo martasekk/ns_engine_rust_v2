@@ -347,6 +347,7 @@ fn build_pass(
                     timeout_ms: cfg.models.timeout_ms,
                     reask_cosine: cfg.models.reask_cosine,
                     relevance_cut: cfg.models.relevance_cut,
+                    embed_model: cfg.recall.embed_model.clone(),
                 },
                 // The local scorer keeps the structural half of the symbolic
                 // checks rather than re-deriving it: I6 is two logged facts
@@ -553,8 +554,11 @@ async fn main() {
         let tools = build_tools(&cfg, schema_profile).await;
         let emitter = role_or_exit(&cfg, Role::Emitter);
         let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
-        let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store");
+        // M8 T3.1: `evolve` is the idle pass run by hand, and the embeddings
+        // backfill is one of its steps — so this store needs the encoder the
+        // running harness's does, or `ns-app evolve` would be the one place
+        // the backfill never happens.
+        let store = models::store(&cfg);
         match pass.run_report(&store).await {
             Ok(report) => println!("{report}"),
             Err(e) => {
@@ -663,18 +667,7 @@ async fn main() {
         )
         .with_prompt_cache(replier_target.prompt_cache),
     ));
-    b.set_memory(Arc::new(
-        nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store")
-            // M9 T3.1/T3.2. The composition root is where the `[memory]`
-            // knobs meet the store; `EngineConfig` carries the same two
-            // numbers for anything that reads the config as one object.
-            // Both default to today's ranking.
-            .with_activation(
-                cfg.memory.activation_weight,
-                cfg.memory.activation_half_life_days,
-            ),
-    ));
+    b.set_memory(Arc::new(models::store(&cfg)));
     // Says whether the local model service is answering, when one is asked
     // for. Before the channel so the line lands with the other startup
     // reports rather than in the middle of the first turn.
@@ -799,6 +792,12 @@ async fn main() {
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
         worker_slots,
+        // M8 T3.2/T3.3 and M10 T3.6. Both off by default, and both inert
+        // without `[models] enabled` — the store gets no encoder, so the
+        // hybrid path *is* the lexical path and there are no digest vectors
+        // to be near.
+        recall_hybrid: cfg.recall.hybrid,
+        exemplars_max: cfg.memory.exemplars_max,
     };
     let engine = Engine::new(parts, engine_cfg);
     println!(

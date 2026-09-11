@@ -93,11 +93,7 @@ pub fn corpus() -> &'static [RecallCase] {
             id: "en/time-format",
             lang: "en",
             said: "I prefer 24-hour times, never am and pm",
-            distractors: &[
-                "set an alarm for later",
-                "the meeting moved",
-                "thanks",
-            ],
+            distractors: &["set an alarm for later", "the meeting moved", "thanks"],
             verbatim: "what times do I prefer",
             paraphrase: "how should you write clock values for me",
         },
@@ -249,6 +245,14 @@ pub struct Report {
     pub retriever: String,
     pub verbatim: Arm,
     pub paraphrase: Arm,
+    /// Whether this arm had vectors to search — i.e. whether the backfill
+    /// wrote any (M10 P3).
+    ///
+    /// It changes what the closing verdict may say. M6 §12.8's sentence is
+    /// "stay lexical *unless* the miss rate clears 20%", and reading that
+    /// back at an arm which is not lexical would report the phase's success
+    /// as a reason not to have built it.
+    pub vectors: bool,
 }
 
 impl Report {
@@ -272,7 +276,11 @@ pub fn pool() -> Vec<String> {
     let mut out = Vec::new();
     for case in corpus() {
         let (before, after) = case.distractors.split_at(case.distractors.len() / 2);
-        for text in before.iter().chain(std::iter::once(&case.said)).chain(after) {
+        for text in before
+            .iter()
+            .chain(std::iter::once(&case.said))
+            .chain(after)
+        {
             out.push((*text).to_string());
         }
     }
@@ -328,7 +336,24 @@ pub async fn measure(store: &dyn MemoryStore, retriever: &str, k: usize) -> Repo
             retriever: format!("{retriever} — NOT MEASURED: {e}"),
             verbatim,
             paraphrase,
+            vectors: false,
         };
+    }
+
+    // M8 T3.1: the vectors the hybrid arm reads have to exist before it is
+    // measured, and they are written exactly where the idle pass writes
+    // them — through `backfill_embeddings`, in bounded batches, before the
+    // first query. A store without an encoder returns 0 on the first call
+    // and this loop costs one method call.
+    //
+    // The bound is here rather than trusted: an arm that hung on a service
+    // would look like a slow test rather than a misconfiguration.
+    let mut vectors = false;
+    for _ in 0..64 {
+        match store.backfill_embeddings(64).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => vectors = true,
+        }
     }
 
     for case in corpus() {
@@ -337,8 +362,12 @@ pub async fn measure(store: &dyn MemoryStore, retriever: &str, k: usize) -> Repo
             (&mut paraphrase, case.paraphrase),
         ] {
             arm.total += 1;
+            // `search_turns_hybrid`, whose default *is* `search_turns_in`,
+            // which for one session is `search_turns`: the in-memory and
+            // bm25 arms measure exactly what they measured before this
+            // existed, and the third arm measures the path that ships.
             let found = store
-                .search_turns(&sid, query, k)
+                .search_turns_hybrid(std::slice::from_ref(&sid), query, k)
                 .await
                 .unwrap_or_default()
                 .iter()
@@ -355,6 +384,7 @@ pub async fn measure(store: &dyn MemoryStore, retriever: &str, k: usize) -> Repo
         retriever: retriever.to_string(),
         verbatim,
         paraphrase,
+        vectors,
     }
 }
 
@@ -366,13 +396,13 @@ pub fn render(reports: &[Report]) -> String {
         "\n  paraphrased recall (M6 §12.8 trigger: miss rate > 20% on the paraphrase arm)\n\n",
     );
     out.push_str(&format!(
-        "  {:<26} {:>10} {:>8} {:>10} {:>8}\n",
+        "  {:<44} {:>10} {:>8} {:>10} {:>8}\n",
         "retriever", "verbatim", "miss", "paraphrase", "miss"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(66)));
+    out.push_str(&format!("  {}\n", "-".repeat(84)));
     for r in reports {
         out.push_str(&format!(
-            "  {:<26} {:>6}/{:<3} {:>7.0}% {:>6}/{:<3} {:>7.0}%\n",
+            "  {:<44} {:>6}/{:<3} {:>7.0}% {:>6}/{:<3} {:>7.0}%\n",
             r.retriever,
             r.verbatim.hits,
             r.verbatim.total,
@@ -397,6 +427,14 @@ pub fn render(reports: &[Report]) -> String {
         if r.trigger_fired() {
             out.push_str(&format!(
                 "  {}: TRIGGER FIRED — {:.0}% > 20%. M6 §12.8 permits embeddings here.\n",
+                r.retriever,
+                r.paraphrase.miss_rate() * 100.0
+            ));
+        } else if r.vectors {
+            // Not a §12.8 verdict: this arm is what §12.8 permitted. The
+            // sentence it has to answer is M8 §6's exit line instead.
+            out.push_str(&format!(
+                "  {}: {:.0}% ≤ 20% — M8 §6's exit criterion met on this arm.\n",
                 r.retriever,
                 r.paraphrase.miss_rate() * 100.0
             ));
@@ -486,14 +524,16 @@ mod tests {
             misses: vec!["a".into(), "b".into(), "c".into()],
         };
         assert!((arm.miss_rate() - 0.25).abs() < 1e-9);
-        assert!(Arm {
-            arm: "verbatim",
-            hits: 0,
-            total: 0,
-            misses: vec![],
-        }
-        .miss_rate()
+        assert!(
+            Arm {
+                arm: "verbatim",
+                hits: 0,
+                total: 0,
+                misses: vec![],
+            }
+            .miss_rate()
             .abs()
-            < 1e-9);
+                < 1e-9
+        );
     }
 }

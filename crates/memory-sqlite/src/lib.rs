@@ -16,6 +16,80 @@ pub struct SqliteStore {
     /// ranking, and a builder leaves every `open()` call site and both
     /// conformance suites untouched.
     activation: nscore::Activation,
+    /// M8 T3.1/T3.2: the embedder and cross-encoder the hybrid path uses.
+    ///
+    /// `None` — the default, and every store opened by a test that has not
+    /// asked for one — is today's behaviour exactly: no vector is ever
+    /// written, `search_turns_hybrid` is `search_turns_in`, and nothing here
+    /// touches the network.
+    encoder: Option<std::sync::Arc<dyn nscore::TextEncoder>>,
+    recall: Recall,
+}
+
+/// The two knobs M8 T3.5 names, carried on the store because the store is
+/// what spends them.
+#[derive(Debug, Clone, Copy)]
+pub struct Recall {
+    /// Candidates each arm contributes before fusion.
+    ///
+    /// Default 10, and the number is measured rather than chosen: with
+    /// bge-m3 **wider is worse** — 8% paraphrase miss at k=10 against 17% at
+    /// 20, 30 and 48, at two to four times the latency (M8 §6). Every
+    /// candidate past the tenth is another chance for the cross-encoder to
+    /// promote a distractor.
+    pub coarse_k: usize,
+    /// How long the whole hybrid path may take before it gives up and
+    /// returns the lexical list it already has. A recall that would hold a
+    /// turn is worth less than a worse recall that does not.
+    pub rerank_budget_ms: u64,
+}
+
+impl Default for Recall {
+    fn default() -> Self {
+        Self {
+            coarse_k: 10,
+            rerank_budget_ms: 800,
+        }
+    }
+}
+
+/// Little-endian f32s. A vector is opaque to SQLite and is read back only
+/// beside the `dim` and `model` that were written with it.
+fn vector_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn blob_vector(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// What a digest is embedded as: the same three fields its FTS index covers,
+/// and nothing else. Not the JSON — an index over a blob also matches on
+/// field names, and a vector over one would put two digests near each other
+/// for sharing a schema.
+fn digest_text(topic: &str, established_json: &str, open_json: &str) -> String {
+    let list = |j: &str| {
+        serde_json::from_str::<Vec<String>>(j)
+            .unwrap_or_default()
+            .join("; ")
+    };
+    format!(
+        "{topic}. {} {}",
+        list(established_json),
+        list(open_json)
+    )
+    .trim()
+    .to_string()
+}
+
+fn turn_text(kind_json: &str) -> Option<(&'static str, String)> {
+    match serde_json::from_str::<nscore::EventKind>(kind_json).ok()? {
+        nscore::EventKind::UserSaid { text } => Some(("user", text)),
+        nscore::EventKind::Replied { text } => Some(("bot", text)),
+        _ => None,
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> StoreError {
@@ -132,10 +206,57 @@ impl SqliteStore {
         Self::migrate_facts(&conn)?;
         Self::ensure_events_fts(&conn)?;
         Self::ensure_session_digests(&conn)?;
+        Self::ensure_embeddings(&conn)?;
         Ok(Self {
             activation: nscore::Activation::default(),
+            encoder: None,
+            recall: Recall::default(),
             conn: Mutex::new(conn),
         })
+    }
+
+    /// M8 T3.1/T3.2: run the hybrid path with this encoder. Without one the
+    /// store behaves exactly as it did before Phase 3 existed.
+    pub fn with_encoder(mut self, encoder: std::sync::Arc<dyn nscore::TextEncoder>) -> Self {
+        self.encoder = Some(encoder);
+        self
+    }
+
+    /// M8 T3.5: `[recall] coarse_k` and `[recall] rerank_budget_ms`.
+    pub fn with_recall(mut self, recall: Recall) -> Self {
+        self.recall = recall;
+        self
+    }
+
+    /// M8 T3.1: one vector per embeddable row per model.
+    ///
+    /// `model` is part of the primary key rather than a column beside it.
+    /// That is the whole invalidation rule in one line of DDL: a change of
+    /// embedder produces rows that do not collide with the old ones, the
+    /// backfill sees every row as unembedded *for the new model*, and a
+    /// query embedded by bge-m3 is never compared against a vector e5-small
+    /// wrote. Two geometries in one index is the failure that presents as a
+    /// retriever quietly getting worse, with nothing in the log to say so.
+    ///
+    /// `kind` distinguishes an event rowid from a digest rowid, which are
+    /// two different tables' counters and would otherwise collide. Digests
+    /// are keyed the same way because M10 T3.6 embeds them at write time in
+    /// the pass and reads them back by cosine.
+    fn ensure_embeddings(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS embeddings (
+                 kind   TEXT    NOT NULL,
+                 owner  TEXT    NOT NULL,
+                 row_id INTEGER NOT NULL,
+                 model  TEXT    NOT NULL,
+                 dim    INTEGER NOT NULL,
+                 vector BLOB    NOT NULL,
+                 PRIMARY KEY (kind, row_id, model)
+             );
+             CREATE INDEX IF NOT EXISTS embeddings_owner
+                 ON embeddings(kind, model, owner);",
+        )
+        .map_err(io_err)
     }
 
     /// M9 T3.1/T3.2: rank with the activation prior at this weight.
@@ -341,6 +462,187 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    /// bm25's candidate rowids for `query`, best first — the same index and
+    /// the same filter `search_turns_in` reads, without the rescoring and
+    /// without building a `TurnHit`.
+    ///
+    /// Separate from `search_turns_in` on purpose: fusion needs a *key*, and
+    /// a `TurnHit` has none — two lines of the same session can carry the
+    /// same text. The rowid is the key both arms already agree on.
+    async fn lexical_rows(
+        &self,
+        sessions: &[SessionId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>, StoreError> {
+        let Some(expr) = fts_query(query) else {
+            return Ok(vec![]);
+        };
+        let placeholders = (2..2 + sessions.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit_param = sessions.len() + 2;
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT e.rowid, bm25(events_fts) AS score
+                 FROM events_fts JOIN events e ON e.rowid = events_fts.rowid
+                 WHERE events_fts MATCH ?1 AND e.session_id IN ({placeholders})
+                   AND (e.kind_json LIKE '{{\"type\":\"UserSaid\"%'
+                        OR e.kind_json LIKE '{{\"type\":\"Replied\"%')
+                 ORDER BY score, e.turn DESC LIMIT ?{limit_param}"
+            ))
+            .map_err(io_err)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() + 2);
+        params.push(expr.into());
+        params.extend(sessions.iter().map(|s| s.0.clone().into()));
+        params.push((limit as i64).into());
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0))
+            .map_err(io_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(io_err)
+    }
+
+    /// Every stored turn vector for these sessions and this model, with the
+    /// line it belongs to.
+    ///
+    /// A full scan of the sessions' vectors rather than an ANN index, and
+    /// deliberately so: `recall_sessions` is 3, a session is hundreds of
+    /// lines, and a dot product over a thousand 1024-dim vectors is under a
+    /// millisecond — an index here would be a dependency bought to make the
+    /// cheap half of a 509 ms round trip cheaper. When a scope grows to where
+    /// this shows up beside `/rerank`, that is the measurement that justifies
+    /// one.
+    #[allow(clippy::type_complexity)]
+    async fn turn_vectors(
+        &self,
+        sessions: &[SessionId],
+        model: &str,
+    ) -> Result<Vec<(i64, SessionId, u32, &'static str, String, Vec<f32>)>, StoreError> {
+        if sessions.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = (2..2 + sessions.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT e.rowid, e.session_id, e.turn, e.kind_json, em.vector
+                 FROM embeddings em JOIN events e ON e.rowid = em.row_id
+                 WHERE em.kind = 'turn' AND em.model = ?1
+                   AND e.session_id IN ({placeholders})"
+            ))
+            .map_err(io_err)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() + 1);
+        params.push(model.to_string().into());
+        params.extend(sessions.iter().map(|s| s.0.clone().into()));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(io_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (rowid, session_id, turn, kind_json, blob) = row.map_err(io_err)?;
+            if let Some((speaker, text)) = turn_text(&kind_json) {
+                out.push((
+                    rowid,
+                    SessionId(session_id),
+                    turn,
+                    speaker,
+                    text,
+                    blob_vector(&blob),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The hybrid arm (M8 T3.2). `Ok(None)` means "nothing to add" — no
+    /// vectors for this model — and every failure, the latency budget
+    /// included, is an `Err` the caller turns back into the lexical list.
+    async fn hybrid_hits(
+        &self,
+        enc: &dyn nscore::TextEncoder,
+        sessions: &[SessionId],
+        query: &str,
+        k: usize,
+    ) -> Result<Option<Vec<nscore::TurnHit>>, StoreError> {
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
+        let over = |msg: &str| StoreError::Io(format!("recall over budget: {msg}"));
+
+        let stored = self.turn_vectors(sessions, enc.model()).await?;
+        if stored.is_empty() {
+            return Ok(None);
+        }
+        let coarse = self.recall.coarse_k.max(k);
+        let lexical = self.lexical_rows(sessions, query, coarse).await?;
+
+        let q = enc.embed(&[query.to_string()], "query").await?;
+        if started.elapsed() > budget {
+            return Err(over("embed"));
+        }
+        let q = q.into_iter().next().unwrap_or_default();
+
+        let mut scored: Vec<(i64, f32)> = stored
+            .iter()
+            .filter_map(|(rowid, _, _, _, _, v)| nscore::cosine(&q, v).map(|c| (*rowid, c)))
+            .collect();
+        // A dimension mismatch on every row is a model change the primary key
+        // should have prevented; treat it as "no vector arm" rather than as a
+        // ranking over nothing.
+        if scored.is_empty() {
+            return Ok(None);
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let vector: Vec<i64> = scored.iter().take(coarse).map(|(r, _)| *r).collect();
+
+        // Rank, never score (M8 §6): bm25 and a cosine live on unrelated
+        // scales, and the cosine's own range is too compressed to threshold.
+        let fused: Vec<i64> = nscore::rrf_fuse(&[lexical, vector])
+            .into_iter()
+            .take(coarse)
+            .collect();
+        let by_row: std::collections::HashMap<i64, &(i64, SessionId, u32, &'static str, String, Vec<f32>)> =
+            stored.iter().map(|r| (r.0, r)).collect();
+        let rows: Vec<&(i64, SessionId, u32, &'static str, String, Vec<f32>)> =
+            fused.iter().filter_map(|r| by_row.get(r).copied()).collect();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let docs: Vec<String> = rows.iter().map(|r| r.4.clone()).collect();
+        let ranked = enc.rerank(query, &docs, k).await?;
+        if started.elapsed() > budget {
+            return Err(over("rerank"));
+        }
+        Ok(Some(
+            ranked
+                .into_iter()
+                .take(k)
+                .filter_map(|(i, score)| {
+                    rows.get(i).map(|r| nscore::TurnHit {
+                        session: r.1.clone(),
+                        turn: r.2,
+                        speaker: r.3,
+                        text: r.4.clone(),
+                        score: score as f64,
+                    })
+                })
+                .collect(),
+        ))
+    }
 }
 
 /// FTS5 MATCH expression: each 3+ char token quoted, OR-joined. None when
@@ -517,6 +819,203 @@ impl MemoryStore for SqliteStore {
         Ok(out)
     }
 
+    /// M8 T3.2. The lexical list is computed **first and kept**, and every
+    /// path that is not a complete hybrid success returns it untouched: no
+    /// encoder, no stored vectors, a service that will not answer, a
+    /// dimension change, or a round trip that ran past
+    /// `[recall] rerank_budget_ms`. Same order, same count — the fallback is
+    /// not a degraded hybrid, it is today's result.
+    async fn search_turns_hybrid(
+        &self,
+        sessions: &[SessionId],
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::TurnHit>, StoreError> {
+        let lexical = self.search_turns_in(sessions, query, k).await?;
+        let Some(enc) = self.encoder.clone() else {
+            return Ok(lexical);
+        };
+        if k == 0 || sessions.is_empty() {
+            return Ok(lexical);
+        }
+        match self.hybrid_hits(enc.as_ref(), sessions, query, k).await {
+            Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
+            // Both the "nothing stored" and the "service said no" branches
+            // land here, and both mean the same thing to a caller: the
+            // lexical answer is the answer.
+            _ => Ok(lexical),
+        }
+    }
+
+    /// M8 T3.1: embed the next `limit` rows that have no vector for the
+    /// current model, turns and digests both, and say how many were done.
+    ///
+    /// One batch, one `/embed` call. Resumable by construction — the "not
+    /// embedded yet" set is a `LEFT JOIN … IS NULL` against
+    /// `(kind, row_id, model)`, so a second run over the same log selects
+    /// nothing and returns 0 without dialling the service at all.
+    async fn backfill_embeddings(&self, limit: usize) -> Result<usize, StoreError> {
+        let Some(enc) = self.encoder.clone() else {
+            return Ok(0);
+        };
+        if limit == 0 {
+            return Ok(0);
+        }
+        let model = enc.model().to_string();
+        // (kind, owner, row_id, text)
+        let mut pending: Vec<(&'static str, String, i64, String)> = Vec::new();
+        {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.rowid, e.session_id, e.kind_json FROM events e
+                     LEFT JOIN embeddings em
+                       ON em.kind = 'turn' AND em.row_id = e.rowid AND em.model = ?1
+                     WHERE em.row_id IS NULL
+                       AND (e.kind_json LIKE '{\"type\":\"UserSaid\"%'
+                            OR e.kind_json LIKE '{\"type\":\"Replied\"%')
+                     ORDER BY e.rowid LIMIT ?2",
+                )
+                .map_err(io_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![model, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(io_err)?;
+            for row in rows {
+                let (rowid, session_id, kind_json) = row.map_err(io_err)?;
+                if let Some((_, text)) = turn_text(&kind_json) {
+                    pending.push(("turn", session_id, rowid, text));
+                }
+            }
+            let room = limit.saturating_sub(pending.len());
+            if room > 0 {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT d.rowid, d.session_id, d.topic, d.established_json, d.open_json
+                         FROM session_digests d
+                         LEFT JOIN embeddings em
+                           ON em.kind = 'digest' AND em.row_id = d.rowid AND em.model = ?1
+                         WHERE em.row_id IS NULL ORDER BY d.rowid LIMIT ?2",
+                    )
+                    .map_err(io_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![model, room as i64], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(io_err)?;
+                for row in rows {
+                    let (rowid, session_id, topic, established, open) = row.map_err(io_err)?;
+                    pending.push(("digest", session_id, rowid, digest_text(&topic, &established, &open)));
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // The guard is dropped above: an embedding is a network round trip,
+        // and holding the connection across it would make every other reader
+        // of this store wait on the service.
+        let texts: Vec<String> = pending.iter().map(|p| p.3.clone()).collect();
+        let vectors = enc.embed(&texts, "passage").await?;
+        if vectors.len() != pending.len() {
+            return Err(StoreError::Io(format!(
+                "/embed returned {} vectors for {} texts",
+                vectors.len(),
+                pending.len()
+            )));
+        }
+        let conn = self.conn.lock().await;
+        let mut done = 0usize;
+        for ((kind, owner, row_id, _), v) in pending.iter().zip(vectors) {
+            if v.is_empty() {
+                continue;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (kind, owner, row_id, model, dim, vector)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![kind, owner, row_id, model, v.len() as i64, vector_blob(&v)],
+            )
+            .map_err(io_err)?;
+            done += 1;
+        }
+        Ok(done)
+    }
+
+    /// M10 T3.6: the digests of `scope` nearest `query` by cosine over the
+    /// vectors the backfill wrote for them. Empty without an encoder or
+    /// without stored digest vectors — an exemplars step that did not happen.
+    async fn nearest_digests(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<nscore::SessionDigest>, StoreError> {
+        let Some(enc) = self.encoder.clone() else {
+            return Ok(vec![]);
+        };
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let mut stored: Vec<(i64, Vec<f32>)> = Vec::new();
+        {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT d.rowid, em.vector FROM embeddings em
+                     JOIN session_digests d ON d.rowid = em.row_id
+                     WHERE em.kind = 'digest' AND em.model = ?1 AND d.scope = ?2",
+                )
+                .map_err(io_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![enc.model(), scope], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(io_err)?;
+            for row in rows {
+                let (rowid, blob) = row.map_err(io_err)?;
+                stored.push((rowid, blob_vector(&blob)));
+            }
+        }
+        if stored.is_empty() {
+            return Ok(vec![]);
+        }
+        let q = enc.embed(&[query.to_string()], "query").await?;
+        let q = q.into_iter().next().unwrap_or_default();
+        let mut scored: Vec<(i64, f32)> = stored
+            .iter()
+            .filter_map(|(rowid, v)| nscore::cosine(&q, v).map(|c| (*rowid, c)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let conn = self.conn.lock().await;
+        let mut out = Vec::new();
+        for (rowid, _) in scored.into_iter().take(k) {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {DIGEST_COLUMNS} FROM session_digests d WHERE d.rowid = ?1"
+                ))
+                .map_err(io_err)?;
+            if let Some(d) = stmt
+                .query_row([rowid], row_to_digest)
+                .optional()
+                .map_err(io_err)?
+            {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
     async fn put_session_digest(&self, digest: &nscore::SessionDigest) -> Result<(), StoreError> {
         let established = serde_json::to_string(&digest.summary.established).map_err(io_err)?;
         let open = serde_json::to_string(&digest.summary.open).map_err(io_err)?;
@@ -549,6 +1048,15 @@ impl MemoryStore for SqliteStore {
                 digest.last_turn,
                 digest.at.0,
             ],
+        )
+        .map_err(io_err)?;
+        // M10 T3.6: a re-digested session is a new text, so its vector is
+        // stale. Dropping it is what puts the row back into the backfill's
+        // "not embedded yet" set — the same reason the update trigger above
+        // deletes from the FTS index rather than leaving the old topic in it.
+        conn.execute(
+            "DELETE FROM embeddings WHERE kind = 'digest' AND owner = ?1",
+            [&digest.session.0],
         )
         .map_err(io_err)?;
         Ok(())
@@ -1498,5 +2006,323 @@ mod tests {
             .map(|s| s.0)
             .collect();
         assert_eq!(names, vec!["new", "mid", "old"]);
+    }
+
+    // ----- M8 Phase 3: the hybrid arm -------------------------------------
+
+    /// A scripted stand-in for bge-m3 over loopback.
+    ///
+    /// Not a mock of HTTP — the transport is `nsevolution::LocalEvaluator`'s
+    /// and is tested there. What this has to reproduce is the only property
+    /// the store depends on: two texts that mean the same thing are close
+    /// even when they share no token. Each concept is a synonym set, the
+    /// vector is the L2-normalised count over the sets, and the "reranker" is
+    /// the same cosine — which is exactly the bi-encoder/cross-encoder
+    /// relationship in miniature and keeps the test honest about ordering
+    /// rather than about a model.
+    struct ScriptedEncoder {
+        model: String,
+        embeds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        delay_ms: u64,
+        /// When set, every call fails the way an unreachable service does.
+        down: bool,
+    }
+
+    const CONCEPTS: &[&[&str]] = &[
+        &["budget", "money", "spend", "crowns", "cost"],
+        &["name", "who", "martin", "called"],
+        &["deadline", "friday", "due", "when"],
+    ];
+
+    impl ScriptedEncoder {
+        fn new(model: &str) -> Self {
+            Self {
+                model: model.into(),
+                embeds: Default::default(),
+                delay_ms: 0,
+                down: false,
+            }
+        }
+        fn vector(text: &str) -> Vec<f32> {
+            let tokens = nscore::query_tokens(text);
+            let mut v: Vec<f32> = CONCEPTS
+                .iter()
+                .map(|set| {
+                    tokens
+                        .iter()
+                        .filter(|t| set.iter().any(|w| t.starts_with(w)))
+                        .count() as f32
+                })
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            v
+        }
+    }
+
+    #[async_trait]
+    impl nscore::TextEncoder for ScriptedEncoder {
+        fn model(&self) -> &str {
+            &self.model
+        }
+        async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+            if self.down {
+                return Err(StoreError::Io("connection refused".into()));
+            }
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            self.embeds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        }
+        async fn rerank(
+            &self,
+            query: &str,
+            docs: &[String],
+            k: usize,
+        ) -> Result<Vec<(usize, f32)>, StoreError> {
+            if self.down {
+                return Err(StoreError::Io("connection refused".into()));
+            }
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            let q = Self::vector(query);
+            let mut scored: Vec<(usize, f32)> = docs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (i, nscore::cosine(&q, &Self::vector(d)).unwrap_or(0.0)))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+            Ok(scored)
+        }
+    }
+
+    fn corpus_store(enc: Option<std::sync::Arc<dyn nscore::TextEncoder>>) -> (tempfile::TempDir, SqliteStore, SessionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(&dir.path().join("t.sqlite")).unwrap();
+        if let Some(e) = enc {
+            store = store.with_encoder(e);
+        }
+        (dir, store, SessionId("s".into()))
+    }
+
+    async fn fill(store: &SqliteStore, sid: &SessionId) {
+        let mut log = EventLog::new(sid.clone());
+        for (i, text) in [
+            "our budget for the whole campaign is 2000 crowns",
+            "can you open the browser",
+            "the printer is out of paper",
+            "my name is Martin and I work at a print shop",
+        ]
+        .iter()
+        .enumerate()
+        {
+            log.append(
+                i as u32 + 1,
+                Timestamp(i as u64 + 1),
+                EventKind::UserSaid {
+                    text: (*text).into(),
+                },
+            );
+        }
+        store.append(sid, log.events()).await.unwrap();
+    }
+
+    /// T3.1's exit criterion: the backfill is resumable, so a second run
+    /// over the same log embeds nothing and dials nothing.
+    #[tokio::test]
+    async fn backfilling_twice_embeds_nothing_the_second_time() {
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let calls = enc.embeds.clone();
+        let (_d, store, sid) = corpus_store(Some(enc));
+        fill(&store, &sid).await;
+
+        assert_eq!(store.backfill_embeddings(100).await.unwrap(), 4);
+        let after_first = calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(store.backfill_embeddings(100).await.unwrap(), 0);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            after_first,
+            "a resumed backfill with nothing to do must not call /embed at all"
+        );
+    }
+
+    /// The backfill is bounded, and a bound that is not respected is a turn's
+    /// worth of latency in an idle pass.
+    #[tokio::test]
+    async fn the_backfill_runs_in_bounded_batches() {
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let (_d, store, sid) = corpus_store(Some(enc));
+        fill(&store, &sid).await;
+        assert_eq!(store.backfill_embeddings(2).await.unwrap(), 2);
+        assert_eq!(store.backfill_embeddings(2).await.unwrap(), 2);
+        assert_eq!(store.backfill_embeddings(2).await.unwrap(), 0);
+    }
+
+    /// T3.1: a stored vector records its model, so a model change
+    /// invalidates rather than mixes two geometries in one index.
+    #[tokio::test]
+    async fn a_model_change_invalidates_rather_than_mixing() {
+        let (dir, store, sid) = corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new(
+            "bge-m3",
+        ))));
+        fill(&store, &sid).await;
+        assert_eq!(store.backfill_embeddings(100).await.unwrap(), 4);
+        drop(store);
+
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(std::sync::Arc::new(ScriptedEncoder::new("e5-small")));
+        // Every row is unembedded *for the new model*: nothing is reused and
+        // nothing is compared across the two.
+        assert_eq!(store.backfill_embeddings(100).await.unwrap(), 4);
+        assert_eq!(store.backfill_embeddings(100).await.unwrap(), 0);
+    }
+
+    /// T3.2's exit criterion, stated the way the plan states it: with no
+    /// vectors and no encoder the hybrid result is *exactly* today's bm25
+    /// list — same order, same count — not a degraded hybrid.
+    #[tokio::test]
+    async fn without_an_encoder_the_hybrid_search_is_exactly_the_bm25_list() {
+        let (_d, store, sid) = corpus_store(None);
+        fill(&store, &sid).await;
+        let q = "what is our budget for the campaign";
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(hybrid, lexical);
+    }
+
+    /// The same criterion with the service *down* rather than absent, and
+    /// with vectors already stored: the failure must not cost a line.
+    #[tokio::test]
+    async fn with_the_service_down_the_hybrid_search_is_exactly_the_bm25_list() {
+        let (dir, store, sid) = corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new(
+            "bge-m3",
+        ))));
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        let q = "what is our budget for the campaign";
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        drop(store);
+
+        let mut down = ScriptedEncoder::new("bge-m3");
+        down.down = true;
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(std::sync::Arc::new(down));
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(hybrid, lexical);
+    }
+
+    /// What the phase is for: a question with no token in common with the
+    /// line it is asking about. bm25 cannot return it; the fused arm does.
+    #[tokio::test]
+    async fn the_vector_arm_finds_a_paraphrase_bm25_cannot() {
+        let (_d, store, sid) = corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new(
+            "bge-m3",
+        ))));
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        let q = "how much money are we allowed to spend";
+        let target = "our budget for the whole campaign is 2000 crowns";
+
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        assert!(
+            !lexical.iter().any(|h| h.text == target),
+            "bm25 was expected to miss this, and the arm is pointless if it does not: {lexical:?}"
+        );
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(hybrid.first().map(|h| h.text.as_str()), Some(target));
+    }
+
+    /// T3.5: a recall that would exceed `rerank_budget_ms` falls back to
+    /// lexical rather than holding the turn.
+    #[tokio::test]
+    async fn a_recall_over_the_rerank_budget_falls_back_to_lexical() {
+        let (dir, store, sid) = corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new(
+            "bge-m3",
+        ))));
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        let q = "what is our budget for the campaign";
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        drop(store);
+
+        let mut slow = ScriptedEncoder::new("bge-m3");
+        slow.delay_ms = 60;
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(std::sync::Arc::new(slow))
+            .with_recall(Recall {
+                coarse_k: 10,
+                rerank_budget_ms: 1,
+            });
+        let started = std::time::Instant::now();
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(hybrid, lexical, "over budget must return today's list");
+        // The budget bounds the wait too: one slow round trip, not two.
+        assert!(started.elapsed().as_millis() < 200, "{:?}", started.elapsed());
+    }
+
+    /// T3.6's substrate: digests are embedded by the same backfill and read
+    /// back by cosine, and without vectors the step simply does not happen.
+    #[tokio::test]
+    async fn nearest_digests_ranks_by_cosine_and_is_empty_without_vectors() {
+        let digest = |sid: &str, topic: &str| nscore::SessionDigest {
+            session: SessionId(sid.into()),
+            scope: "global".into(),
+            summary: nscore::SessionSummary {
+                topic: topic.into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::User,
+                through_turn: 2,
+                rebuilt_from: 1,
+            },
+            last_turn: 2,
+            at: Timestamp(1),
+        };
+        let (_d, store, _sid) = corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new(
+            "bge-m3",
+        ))));
+        store
+            .put_session_digest(&digest("a", "what the campaign budget is"))
+            .await
+            .unwrap();
+        store
+            .put_session_digest(&digest("b", "the deadline on friday"))
+            .await
+            .unwrap();
+
+        assert!(
+            store.nearest_digests("global", "how much can we spend", 2).await.unwrap().is_empty(),
+            "no vectors stored yet: the exemplars step did not happen"
+        );
+        store.backfill_embeddings(100).await.unwrap();
+        let near = store
+            .nearest_digests("global", "how much can we spend", 1)
+            .await
+            .unwrap();
+        assert_eq!(near.len(), 1);
+        assert_eq!(near[0].session, SessionId("a".into()));
     }
 }

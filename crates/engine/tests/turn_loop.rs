@@ -4996,3 +4996,312 @@ async fn the_marker_survives_folding() {
         "the verbatim call keeps the marker: {last}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M10 P3 / M8 Phase 3: the tier rule, and exemplars as a tool return.
+// ---------------------------------------------------------------------------
+
+/// Counts what the turn dials. This *is* the recorded transport: the store
+/// reaches the service through exactly this trait, so a turn that calls
+/// `/embed` increments it and a turn that does not cannot.
+struct CountingEncoder {
+    embeds: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+const EXEMPLAR_CONCEPTS: &[&[&str]] = &[
+    &["invoice", "faktury", "billing", "invoices", "print"],
+    &["holiday", "vacation", "leave", "july"],
+];
+
+impl CountingEncoder {
+    fn vector(text: &str) -> Vec<f32> {
+        let tokens = nscore::query_tokens(text);
+        let mut v: Vec<f32> = EXEMPLAR_CONCEPTS
+            .iter()
+            .map(|set| {
+                tokens
+                    .iter()
+                    .filter(|t| set.iter().any(|w| t.starts_with(w)))
+                    .count() as f32
+            })
+            .collect();
+        // A non-zero last component keeps a text with no concept word from
+        // being the zero vector, which has no direction to compare.
+        v.push(0.25);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+        v
+    }
+}
+
+#[async_trait::async_trait]
+impl TextEncoder for CountingEncoder {
+    fn model(&self) -> &str {
+        "bge-m3"
+    }
+    async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+        self.embeds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(texts.iter().map(|t| Self::vector(t)).collect())
+    }
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, StoreError> {
+        let q = Self::vector(query);
+        let mut scored: Vec<(usize, f32)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, nscore::cosine(&q, &Self::vector(d)).unwrap_or(0.0)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored)
+    }
+}
+
+struct FixedRouter(Tier);
+impl nsengine::router::Router for FixedRouter {
+    fn route(&self, _input: &nsengine::router::RouteInput<'_>) -> nsengine::router::Route {
+        nsengine::router::Route {
+            tier: self.0,
+            cues: vec!["fixed".into()],
+            tools: None,
+        }
+    }
+}
+
+fn hybrid_engine(
+    store: Arc<nsmemory_sqlite::SqliteStore>,
+    tier: Tier,
+    cfg: EngineConfig,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal("ok")])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            router: Some(Arc::new(FixedRouter(tier))),
+            ..cfg
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+fn hybrid_store(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<nsmemory_sqlite::SqliteStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let embeds: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let store = nsmemory_sqlite::SqliteStore::open(&dir.path().join("h.sqlite"))
+        .unwrap()
+        .with_encoder(Arc::new(CountingEncoder {
+            embeds: embeds.clone(),
+        }));
+    (Arc::new(store), embeds)
+}
+
+/// M8 T3.1: the backfill lives in the idle pass, so a turn — on the shipped
+/// default, with an encoder wired up — calls `/embed` exactly zero times.
+#[tokio::test]
+async fn a_turn_never_calls_embed_on_the_shipped_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, embeds) = hybrid_store(&dir);
+    let e = hybrid_engine(store.clone(), Tier::Deep, EngineConfig::default());
+    e.run_turn(Incoming {
+        session: SessionId("s".into()),
+        text: "what did I say about the invoices".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "recall_hybrid is off by default and a turn never backfills"
+    );
+}
+
+/// M8 T3.3: the hybrid path is reachable only from `Task`/`Deep`. A `Chat`
+/// turn issues no `/embed` call even with the knob on and the vectors there.
+#[tokio::test]
+async fn a_chat_tier_turn_issues_no_embed_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, embeds) = hybrid_store(&dir);
+    let sid = SessionId("s".into());
+    let mut log = EventLog::new(sid.clone());
+    for t in 1..=8u32 {
+        log.append(
+            t,
+            Timestamp(t as u64),
+            EventKind::UserSaid {
+                text: format!("turn {t}: the invoice window is titled Faktury"),
+            },
+        );
+    }
+    store.append(&sid, log.events()).await.unwrap();
+    store.backfill_embeddings(100).await.unwrap();
+    let after_backfill = embeds.load(std::sync::atomic::Ordering::Relaxed);
+
+    let on = || EngineConfig {
+        recall_hybrid: true,
+        ..EngineConfig::default()
+    };
+    let chat = hybrid_engine(store.clone(), Tier::Chat, on());
+    chat.run_turn(Incoming {
+        session: sid.clone(),
+        text: "where do I find billing documents".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed),
+        after_backfill,
+        "a Chat turn's recall stays lexical"
+    );
+
+    // And the same message on the deep tier does dial it — otherwise the
+    // assertion above would pass on a knob that never works anywhere.
+    let deep = hybrid_engine(store, Tier::Deep, on());
+    deep.run_turn(Incoming {
+        session: sid,
+        text: "where do I find billing documents".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed) > after_backfill,
+        "the deep tier is where the hybrid path lives"
+    );
+}
+
+async fn digest_of(store: &nsmemory_sqlite::SqliteStore, session: &str, topic: &str) {
+    store
+        .put_session_digest(&SessionDigest {
+            session: SessionId(session.into()),
+            scope: "global".into(),
+            summary: SessionSummary {
+                topic: topic.into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::External,
+                through_turn: 4,
+                rebuilt_from: 1,
+            },
+            last_turn: 4,
+            at: Timestamp(7),
+        })
+        .await
+        .unwrap();
+}
+
+/// M10 T3.6. The exemplars arrive as one `ToolReturned` against one
+/// `ToolCalled`, carrying the digests' lowest trust — not as an extra block
+/// of prompt text with no call to point at and no trust to carry.
+#[tokio::test]
+async fn exemplars_enter_as_a_tool_returned_not_as_a_context_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds) = hybrid_store(&dir);
+    digest_of(&store, "older-a", "printing the invoices for Faktury").await;
+    digest_of(&store, "older-b", "the holiday plan for July").await;
+    store.backfill_embeddings(100).await.unwrap();
+
+    let sid = SessionId("now".into());
+    let e = hybrid_engine(
+        store.clone(),
+        Tier::Deep,
+        EngineConfig {
+            exemplars_max: 1,
+            ..EngineConfig::default()
+        },
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "print the invoices again".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let call = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. } if action == "exemplars"))
+        .expect("the exemplars step ran as a call");
+    let returned = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolReturned { call: c, outcome } if *c == call.id => Some(outcome),
+            _ => None,
+        })
+        .expect("and returned against that call");
+    let ToolOutcome::Ok { output } = returned else {
+        panic!("exemplars failed: {returned:?}");
+    };
+    assert!(
+        output.summary.contains("printing the invoices"),
+        "the nearest digest, by meaning: {}",
+        output.summary
+    );
+    assert!(
+        !output.summary.contains("holiday"),
+        "exemplars_max = 1 means one: {}",
+        output.summary
+    );
+    // The laundering rule: folded text carries the weakest trust it is made
+    // of, and these digests are External.
+    assert_eq!(output.trust, Trust::External);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. }
+                if action == "exemplars"))
+            .count(),
+        1,
+        "one call, one return — not one per digest"
+    );
+}
+
+/// The other half of the tier rule: exemplars are a deep-tier step, so a
+/// `Chat` turn retrieves none however the knob is set.
+#[tokio::test]
+async fn a_chat_tier_turn_retrieves_no_exemplars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds) = hybrid_store(&dir);
+    digest_of(&store, "older-a", "printing the invoices for Faktury").await;
+    store.backfill_embeddings(100).await.unwrap();
+
+    let sid = SessionId("now".into());
+    let e = hybrid_engine(
+        store.clone(),
+        Tier::Chat,
+        EngineConfig {
+            exemplars_max: 3,
+            ..EngineConfig::default()
+        },
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "print the invoices again".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. }
+                if action == "exemplars")),
+        "no exemplars step on the chat tier"
+    );
+}

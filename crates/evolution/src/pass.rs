@@ -66,6 +66,21 @@ pub struct PassConfig {
     /// pinned_prefixes`). Threaded through the pass the way `fact_stale_days`
     /// is: the knob belongs to memory, and the pass is where it is applied.
     pub pinned_prefixes: Vec<String>,
+    /// M8 T3.1: rows the embeddings backfill may embed in one batch, and how
+    /// many batches one pass may run.
+    ///
+    /// Two numbers rather than one total because they bound different
+    /// things. The batch is one `/embed` round trip and therefore one
+    /// memory spike on a CPU encoder; the cap is how long the *pass* may
+    /// spend on it before the idle window is needed for something else. The
+    /// backfill is resumable, so a cap that stops early costs nothing but a
+    /// later pass finishing the job.
+    ///
+    /// This never runs in a turn. It is a step of `run_report`, which runs
+    /// while the harness is waiting for the next message — the guard M8
+    /// names for the risk "the embeddings backfill runs in a turn".
+    pub embed_backfill_batch: usize,
+    pub embed_backfill_batches: usize,
 }
 
 impl Default for PassConfig {
@@ -84,6 +99,8 @@ impl Default for PassConfig {
             fitness_min_exposures: 8,
             fitness_demote: false,
             pinned_prefixes: vec!["user.".into()],
+            embed_backfill_batch: 64,
+            embed_backfill_batches: 16,
         }
     }
 }
@@ -208,6 +225,15 @@ pub struct Report {
     /// at once — which is what makes the rate comparable between runs, and
     /// what makes it the instrument M10's prompt-side loop fix is graded on.
     pub rejections: nscore::RejectionTally,
+    /// Rows the embeddings backfill embedded this run (M8 T3.1). 0 on a
+    /// store with no encoder, and 0 on a second pass over the same log —
+    /// that second 0 is the resumability property, reported rather than
+    /// asserted.
+    pub embedded: usize,
+    /// Set when the backfill stopped on `embed_backfill_batches` with rows
+    /// still unembedded, so a reader knows the next pass has work rather
+    /// than that the log is fully indexed.
+    pub embed_backfill_incomplete: bool,
 }
 
 impl std::fmt::Display for Report {
@@ -256,6 +282,16 @@ impl std::fmt::Display for Report {
             )?,
             None => writeln!(f)?,
         }
+        writeln!(
+            f,
+            "embeddings backfilled: {}{}",
+            self.embedded,
+            if self.embed_backfill_incomplete {
+                " (batch cap reached — the next pass continues)"
+            } else {
+                ""
+            }
+        )?;
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
         // M9 T4.5: the numbers this phase exists to make readable without
@@ -635,6 +671,48 @@ impl EvolutionPass {
         // chain is extended, never rewritten.
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
+
+        // 4b°. The embeddings backfill (M8 T3.1).
+        //
+        // Here and nowhere else. The recall path reads vectors; something has
+        // to write them, and the only two places that could are a turn and
+        // this pass. A turn is ruled out by M8's own risk line — an
+        // embedding is a network round trip per batch, and a turn that waited
+        // on one would pay a recall cost at the moment it has none to spare.
+        //
+        // After grading rather than before it: grading is what the idle
+        // window is *for*, and a backfill of a long log would otherwise spend
+        // the window and leave the grades for next time. Bounded, resumable,
+        // and silent on a store with no encoder — `backfill_embeddings`
+        // returns 0 without dialling anything.
+        //
+        // A dry run writes nothing anywhere else and writes nothing here.
+        if !self.cfg.dry_run {
+            let batch = self.cfg.embed_backfill_batch;
+            // A full last batch is how "there may be more" presents itself
+            // without a second query: the store selects `limit` rows and
+            // stops. Reported as *may have more*, which is the honest claim.
+            let mut last_was_full = false;
+            for _ in 0..self.cfg.embed_backfill_batches {
+                match store.backfill_embeddings(batch).await {
+                    Ok(0) => {
+                        last_was_full = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        report.embedded += n;
+                        last_was_full = n == batch;
+                    }
+                    // The service being down is not a failed pass. Every
+                    // other lane here degrades the same way.
+                    Err(_) => {
+                        last_was_full = false;
+                        break;
+                    }
+                }
+            }
+            report.embed_backfill_incomplete = last_was_full;
+        }
 
         // 4b′. Calibration (M8 T2.7, M10 T5.3), before anything downstream
         // asks whose verdict to believe. It has to run here and not at
@@ -1113,6 +1191,87 @@ mod tests {
         assert!(!dir.path().join("learned.toml").exists());
         assert!(!dir.path().join("ledger.json").exists());
         assert_eq!(rules.load().alias("eko"), None);
+    }
+
+    /// A constant-vector encoder. The pass does not care what a vector
+    /// *means* — the ranking is tested where the ranking lives — only that
+    /// something was written and that a second run writes nothing.
+    struct FlatEncoder(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl nscore::TextEncoder for FlatEncoder {
+        fn model(&self) -> &str {
+            "bge-m3"
+        }
+        async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(texts
+                .iter()
+                .map(|t| vec![t.len() as f32 / 100.0, 1.0])
+                .collect())
+        }
+        async fn rerank(
+            &self,
+            _q: &str,
+            docs: &[String],
+            k: usize,
+        ) -> Result<Vec<(usize, f32)>, StoreError> {
+            Ok((0..docs.len().min(k)).map(|i| (i, 1.0)).collect())
+        }
+    }
+
+    /// M8 T3.1: the backfill is a step of the idle pass, it is resumable,
+    /// and a dry run — which writes nothing anywhere else — writes no
+    /// vectors either.
+    #[tokio::test]
+    async fn the_idle_pass_backfills_embeddings_once_and_then_has_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = Arc::new(FlatEncoder(Default::default()));
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let store = nsmemory_sqlite::SqliteStore::open(&sqlite_dir.path().join("p.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        let sid = SessionId("s".into());
+        let mut l = EventLog::new(sid.clone());
+        l.append(1, Timestamp(1), EventKind::UserSaid { text: "hi".into() });
+        l.append(
+            1,
+            Timestamp(2),
+            EventKind::Replied {
+                text: "hello".into(),
+            },
+        );
+        store.append(&sid, l.events()).await.unwrap();
+
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let dry = pass(dir.path(), rules.clone(), true)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(
+            dry.embedded, 0,
+            "a dry run writes nothing, vectors included"
+        );
+        assert_eq!(enc.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let first = pass(dir.path(), rules.clone(), false)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(first.embedded, 2);
+        assert!(!first.embed_backfill_incomplete);
+        let dialled = enc.0.load(std::sync::atomic::Ordering::Relaxed);
+
+        let second = pass(dir.path(), rules, false)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(second.embedded, 0, "resumable: the second pass has nothing");
+        assert_eq!(
+            enc.0.load(std::sync::atomic::Ordering::Relaxed),
+            dialled,
+            "and it does not dial the service to discover that"
+        );
     }
 
     #[tokio::test]

@@ -167,6 +167,33 @@ pub struct EngineConfig {
     /// daily allowance, so N slots never mean N times the requests
     /// (findings §2.9).
     pub worker_slots: usize,
+    /// M8 T3.2/T3.3: whether recall may take the hybrid path — bm25 ∪ vector
+    /// candidates, fused by rank, reranked — instead of staying lexical.
+    ///
+    /// Off by default, as M8 §8 writes it, and the store is the second gate:
+    /// without an encoder and without stored vectors `search_turns_hybrid`
+    /// *is* `search_turns_in`, so turning this on against a store that has
+    /// neither changes nothing at all.
+    ///
+    /// **Never reached from `Chat`.** A conversational turn's recall stays
+    /// lexical however this is set, which is the tier rule stated once here
+    /// and asserted by `a_chat_tier_turn_issues_no_embed_call`. The reason is
+    /// the one M8 §6 gives for the whole phase: coarse-vector-to-rerank costs
+    /// a round trip of about half a second, and a tier whose budget is half
+    /// the ceiling is not where that is spent.
+    pub recall_hybrid: bool,
+    /// M9 T5.3 / M10 T3.6: how many nearest earlier conversations the deep
+    /// tier's pre-emptive step may bring in as exemplars. **0 — off — until
+    /// `--ablate` decides otherwise**, which is the M9 rule for every knob
+    /// whose fixture does not exist yet.
+    ///
+    /// An exemplar enters as a `ToolReturned`, never as a context block.
+    /// That is not presentation: a context block has no provenance, no
+    /// trust and no call to point at, and a digest built from External tool
+    /// output stays External (M6 §5.1, the laundering rule). As a tool
+    /// return it carries the digests' *lowest* trust, it is in the
+    /// provenance index, and it replays.
+    pub exemplars_max: usize,
 }
 
 impl Default for EngineConfig {
@@ -213,6 +240,8 @@ impl Default for EngineConfig {
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
             worker_slots: 1,
+            recall_hybrid: false,
+            exemplars_max: 0,
         }
     }
 }
@@ -432,6 +461,31 @@ fn recall_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
                  shown.",
             )
             .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        }),
+        side_effect: nscore::SideEffect::Pure,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// Engine-owned, engine-*run* action: the nearest earlier conversations
+/// (M9 T5.3, M10 T3.6).
+///
+/// It has a spec because every call in the log has one — `classify` reads it
+/// for provenance and a replay resolves the call through it — but it is
+/// never put in a legal set and never offered to the emitter. The deep tier
+/// runs it for the same reason it runs `recall` itself: an emitter iteration
+/// spent asking for context is a request that bought no progress.
+pub const EXEMPLARS: &str = "exemplars";
+
+fn exemplars_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: EXEMPLARS.into(),
+        description: "Earlier conversations most like this one, by meaning.".into(),
         args_schema: serde_json::json!({
             "type": "object",
             "properties": { "query": { "type": "string" } },
@@ -799,20 +853,37 @@ impl Engine {
     /// the `Deep` tier running it pre-emptively (M7 Phase 3). Two copies
     /// would drift, and the one that drifted would be the one a model reached
     /// for after the other had already failed it.
+    ///
+    /// M8 T3.3: `tier` is here and not inferred because the hybrid arm is
+    /// tier-gated, and both callers know their tier. `Chat` recall stays
+    /// lexical — a conversational turn never dials a model — and the
+    /// `recall` action is reachable from `Chat`, so the gate cannot live at
+    /// the pre-emptive call site alone.
     async fn recall_outcome(
         &self,
         sid: &nscore::SessionId,
         scope: &str,
         query: &str,
         turn: u32,
+        tier: nscore::Tier,
     ) -> ToolOutcome {
         let k = self.cfg.recall_top_k;
+        let hybrid = self.cfg.recall_hybrid && tier != nscore::Tier::Chat;
         // Turns already visible in the window (and this one) add nothing.
         let visible_from = turn.saturating_sub(self.cfg.window_turns as u32);
         let mut lines: Vec<String> = Vec::new();
         let mut trusts: Vec<nscore::Trust> = Vec::new();
         let mut failure: Option<String> = None;
-        match self.parts.memory.search_turns(sid, query, k * 3).await {
+        let this_session = std::slice::from_ref(sid);
+        let within = if hybrid {
+            self.parts
+                .memory
+                .search_turns_hybrid(this_session, query, k * 3)
+                .await
+        } else {
+            self.parts.memory.search_turns(sid, query, k * 3).await
+        };
+        match within {
             Ok(hits) => {
                 for h in hits.into_iter().filter(|h| h.turn < visible_from).take(k) {
                     trusts.push(if h.speaker == "user" {
@@ -844,7 +915,15 @@ impl Engine {
                         .take(self.cfg.recall_sessions)
                         .collect();
                     if !earlier.is_empty() {
-                        match self.parts.memory.search_turns_in(&earlier, query, k).await {
+                        let across = if hybrid {
+                            self.parts
+                                .memory
+                                .search_turns_hybrid(&earlier, query, k)
+                                .await
+                        } else {
+                            self.parts.memory.search_turns_in(&earlier, query, k).await
+                        };
+                        match across {
                             Ok(hits) => {
                                 for h in hits.into_iter().take(k) {
                                     trusts.push(if h.speaker == "user" {
@@ -919,6 +998,74 @@ impl Engine {
                     artifact: None,
                     trust: nscore::min_trust(&trusts),
                 },
+            },
+        }
+    }
+
+    /// The exemplars step (M9 T5.3, M10 T3.6): at most `exemplars_max`
+    /// digests of this scope nearest the message by cosine, as **one**
+    /// `ToolReturned` carrying their lowest trust.
+    ///
+    /// One return and not one per digest: they are a single answer to a
+    /// single question, and N returns would be N entries in the trace
+    /// competing with the turn's real tool results for the verbatim lines
+    /// `trace_verbatim_lines` allows.
+    ///
+    /// Lowest trust, not each digest's own: they arrive folded into one
+    /// text, a reader cannot tell which sentence came from which
+    /// conversation, and trust that cannot be attributed has to be the
+    /// weakest of what it is made of (M6 §5.1).
+    ///
+    /// The current session is excluded — a conversation is not an exemplar
+    /// of itself — and so is a store with no digest vectors, which returns
+    /// an empty list and therefore "no similar conversations".
+    async fn exemplars_outcome(
+        &self,
+        sid: &nscore::SessionId,
+        scope: &str,
+        query: &str,
+    ) -> ToolOutcome {
+        let digests = match self
+            .parts
+            .memory
+            .nearest_digests(scope, query, self.cfg.exemplars_max + 1)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return ToolOutcome::Err {
+                    kind: "store".into(),
+                    detail: e.to_string(),
+                }
+            }
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut trusts: Vec<nscore::Trust> = Vec::new();
+        for d in digests
+            .into_iter()
+            .filter(|d| &d.session != sid)
+            .take(self.cfg.exemplars_max)
+        {
+            trusts.push(d.summary.trust);
+            lines.push(format!(
+                "a similar earlier conversation (through t{}) was about: {}",
+                d.last_turn, d.summary.topic
+            ));
+        }
+        if lines.is_empty() {
+            return ToolOutcome::Ok {
+                output: nscore::ToolOutput {
+                    summary: "no similar conversations".into(),
+                    artifact: None,
+                    trust: nscore::Trust::System,
+                },
+            };
+        }
+        ToolOutcome::Ok {
+            output: nscore::ToolOutput {
+                summary: lines.join("; "),
+                artifact: None,
+                trust: nscore::min_trust(&trusts),
             },
         }
     }
@@ -1022,7 +1169,7 @@ impl Engine {
                 )
                 .id;
             let outcome = self
-                .recall_outcome(&sid, &scope, &incoming.text, turn)
+                .recall_outcome(&sid, &scope, &incoming.text, turn, tier)
                 .await;
             log.append(
                 turn,
@@ -1032,6 +1179,46 @@ impl Engine {
                     outcome,
                 },
             );
+
+            // M10 T3.6: exemplars — the nearest earlier *conversations*,
+            // by cosine over their digests' stored vectors.
+            //
+            // A second call rather than more lines inside the recall return,
+            // because it answers a different question: recall finds the line
+            // that says the thing, an exemplar is a whole conversation shaped
+            // like this one. Keeping them apart is also what lets `--ablate`
+            // decide the default later — a knob folded into another step's
+            // output cannot be turned off and measured.
+            //
+            // Off at `exemplars_max = 0`, which is every deployment today,
+            // and the store returns nothing without an encoder, so this is
+            // two comparisons on the ordinary path.
+            if self.cfg.exemplars_max > 0 {
+                let args = serde_json::json!({ "query": incoming.text });
+                let spec = exemplars_spec();
+                let classified = classify(log.events(), &args, &spec, turn);
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: EXEMPLARS.into(),
+                            args: classified,
+                        },
+                    )
+                    .id;
+                let outcome = self
+                    .exemplars_outcome(&sid, &scope, &incoming.text)
+                    .await;
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+            }
         }
 
         // M10 T1.4: applicability, asked once per turn rather than per
@@ -1846,7 +2033,7 @@ impl Engine {
                     )
                     .id;
                 calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = self.recall_outcome(&sid, &scope, &query, turn).await;
+                let outcome = self.recall_outcome(&sid, &scope, &query, turn, tier).await;
                 log.append(
                     turn,
                     now(),
