@@ -781,6 +781,17 @@ pub(crate) struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
+    /// M10 T1.4: the verbatim window this fixture runs with, when it needs a
+    /// narrower one than the default six.
+    ///
+    /// Applicability pruning makes `recall` legal only once there is
+    /// something out of sight — a turn older than the window, or an earlier
+    /// session. The `abstention` fixture asks its question on turn 2 of a
+    /// fresh store, so under the default window there is nothing out of sight
+    /// and `recall` is (correctly) not offered. A one-turn window puts turn 1
+    /// out of sight and restores the ability's own shape: the search runs,
+    /// finds nothing, and the reply has to decline.
+    window_turns: Option<usize>,
     /// M10 T5.1: the learned rules this fixture hands the engine, which is
     /// where the guidance block comes from. Empty on the ten abilities, so
     /// their rows are the numbers they have always been.
@@ -844,6 +855,7 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
+            window_turns: None,
             learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
             summaries: false,
             persona: String::new(),
@@ -966,6 +978,9 @@ impl Harness {
             // configuration sees the weight the arm is actually running at.
             activation_weight: self.run.activation_weight,
             activation_half_life_days: ACTIVATION_HALF_LIFE,
+            window_turns: self
+                .window_turns
+                .unwrap_or(EngineConfig::default().window_turns),
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {
@@ -1810,7 +1825,16 @@ async fn abstention(run: Run) -> Ability {
     const INVENTED: &str = "Ostrava";
     const INVENTING_DRAFT: &str = "You live in Ostrava.";
 
-    let h = Harness::for_run(run);
+    // One turn of verbatim window rather than six (M10 T1.4): the question
+    // is asked on turn 2, and `recall` is offered only once a turn has left
+    // the window. What the ability grades is unchanged — the search still
+    // runs, still finds nothing, and the reply still has to decline — but
+    // now turn 1 is genuinely out of sight, which is the situation a model
+    // reaches for `recall` in.
+    let h = Harness {
+        window_turns: Some(1),
+        ..Harness::for_run(run)
+    };
     let sid = SessionId("eval-abstention".into());
     h.turn(
         &sid,

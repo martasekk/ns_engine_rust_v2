@@ -1653,9 +1653,12 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
         .iter()
         .any(|e| matches!(e.kind, EventKind::PendingConfirmation { .. })));
 
-    // Nothing stored: forget_all is still legal (legality never depends on
-    // store state, or replay from a fresh store would diverge) and is
-    // staged like any irreversible action.
+    // Nothing stored: `forget_all` is not legal either, and for a different
+    // reason — M10 T1.4 leaves it out of the set while the scope holds no
+    // facts, because a purge of nothing is an iteration spent finding that
+    // out. The replay hazard the old rule was guarding against is handled
+    // where it arises: `replay_session` sets `prune_inapplicable: false`, so
+    // a replay never narrows a set the recording had wider.
     let store = Arc::new(InMemoryStore::new());
     let e = engine_with(
         vec![Proposal {
@@ -1674,8 +1677,14 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     .await
     .unwrap();
     let events = store.load(&sid2).await.unwrap();
-    assert!(rejection_reasons(&events).is_empty());
-    assert!(events
+    let reasons = rejection_reasons(&events);
+    assert!(
+        reasons
+            .iter()
+            .all(|r| matches!(r, RejectReason::IllegalAction { .. })),
+        "a purge of an empty scope should not even be offered: {reasons:?}"
+    );
+    assert!(!events
         .iter()
         .any(|e| matches!(e.kind, EventKind::PendingConfirmation { .. })));
 }
@@ -4009,6 +4018,10 @@ fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>)
             scope_for: Arc::new(|sid| sid.0.clone()),
             // `ContextDump` copies its prompt by design; see `engine_with`.
             max_echo_ratio: 1.1,
+            // What this fixture is about is scope, not applicability: with no
+            // verbatim window there is nothing in sight, so M10 T1.4 keeps
+            // `recall` legal from turn 1 and the scripted recall can run.
+            window_turns: 0,
             ..EngineConfig::default()
         },
         Box::new(|| Timestamp(42)),
@@ -4529,4 +4542,155 @@ async fn a_reply_quoting_a_fact_value_records_that_fact_as_cited() {
     // list is never written — absence is how the join reads "nothing cited".
     let cited = run("Sure.").await;
     assert!(cited.is_empty(), "{cited:?}");
+}
+
+// ---- M10 T1.4: applicability pruning of the synthetic tools -------------
+//
+// Every tool in the schema costs ~60 tokens of envelope before a word of
+// description. On the recorded 21-turn log `forget_fact` and `forget_all`
+// rode every single call while the store held zero facts (~216 tokens a
+// turn), and `recall` rode turn 1, where there is nothing out of sight to
+// recall. Neither could have succeeded; both were a way for a small model to
+// spend an iteration finding that out.
+
+/// An engine with no router and no registered tools, whose emitter records
+/// the legal set it is shown and then declines to act. The turn ends on the
+/// fallback, which is the point: what is under test is the array, not the
+/// outcome.
+fn probe_engine(
+    store: Arc<InMemoryStore>,
+    legal: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    cfg: EngineConfig,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(RoutingProbe {
+        inner: ScriptedEmitter::new(vec![]),
+        legal,
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)))
+}
+
+fn probe_cfg() -> EngineConfig {
+    EngineConfig {
+        max_echo_ratio: 1.1,
+        reply_grounding_check: false,
+        ..EngineConfig::default()
+    }
+}
+
+async fn offered(
+    store: Arc<InMemoryStore>,
+    cfg: EngineConfig,
+    sid: &str,
+    text: &str,
+) -> Vec<String> {
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let e = probe_engine(store, legal.clone(), cfg);
+    let _ = e
+        .run_turn(Incoming {
+            session: SessionId(sid.into()),
+            text: text.into(),
+        })
+        .await;
+    let seen = legal.lock().expect("legal").clone();
+    seen.into_iter().next().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn forget_tools_are_absent_while_the_scope_holds_no_facts() {
+    let store = Arc::new(InMemoryStore::new());
+    let names = offered(store.clone(), probe_cfg(), "s", "hello").await;
+    assert!(
+        !names.contains(&"forget_fact".to_string()) && !names.contains(&"forget_all".to_string()),
+        "a store with nothing in it was still offered the forget tools: {names:?}"
+    );
+
+    // And they come back the moment there is something to forget: the rule
+    // is applicability, not removal.
+    store
+        .put_fact(Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            confidence: 0.9,
+            uses: 1,
+            last_validated: Timestamp(1),
+            prov: Provenance::Residual,
+            valid_from: Timestamp(1),
+            ..Default::default()
+        })
+        .await
+        .expect("put_fact");
+    let names = offered(store, probe_cfg(), "s", "hello again").await;
+    assert!(
+        names.contains(&"forget_fact".to_string()) && names.contains(&"forget_all".to_string()),
+        "the forget tools stayed away with a fact in the store: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn recall_is_absent_on_the_first_turn_of_a_fresh_store() {
+    let store = Arc::new(InMemoryStore::new());
+    let names = offered(store, probe_cfg(), "fresh", "hello").await;
+    assert!(
+        !names.contains(&"recall".to_string()),
+        "turn 1 of a fresh store was offered recall, which has nothing to search: {names:?}"
+    );
+
+    // The plan's exit criterion: on turn 1 of an empty store the emitter sees
+    // only the tools it can act with (`respond_directly` is appended by the
+    // schema compiler, not by the legal set).
+    assert_eq!(
+        names,
+        vec!["ask_clarification".to_string(), "remember_fact".to_string()],
+        "turn 1 of an empty store sends more than it can use"
+    );
+}
+
+/// The risk the plan names: pruning `recall` on turn 1 must not hide
+/// cross-session recall. It does not — an earlier digested conversation in
+/// the same scope is exactly the case that keeps it.
+#[tokio::test]
+async fn recall_is_offered_on_turn_one_when_an_earlier_session_exists() {
+    let store = Arc::new(InMemoryStore::new());
+    let earlier = SessionId("older".into());
+    store
+        .put_session_digest(&SessionDigest {
+            session: earlier.clone(),
+            scope: "global".into(),
+            summary: SessionSummary {
+                through_turn: 1,
+                topic: "what the cat is called".into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::User,
+                rebuilt_from: 1,
+            },
+            last_turn: 1,
+            at: Timestamp(1),
+        })
+        .await
+        .expect("digest");
+
+    let cfg = EngineConfig {
+        recall_sessions: 3,
+        ..probe_cfg()
+    };
+    let names = offered(store.clone(), cfg, "new", "what was the cat called").await;
+    assert!(
+        names.contains(&"recall".to_string()),
+        "turn 1 with an earlier digested session must still offer recall: {names:?}"
+    );
+
+    // With cross-session recall switched off there is nothing out of sight
+    // again, and the tool goes back to costing nothing.
+    let cfg = EngineConfig {
+        recall_sessions: 0,
+        ..probe_cfg()
+    };
+    let names = offered(store, cfg, "new2", "what was the cat called").await;
+    assert!(!names.contains(&"recall".to_string()), "{names:?}");
 }

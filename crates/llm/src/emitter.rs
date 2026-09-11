@@ -3,11 +3,26 @@ use crate::schema::build_tools;
 use async_trait::async_trait;
 use nscore::{EmitError, Emitter, EmitterContext, LegalActionSet, Proposal};
 
-const SYSTEM: &str = "You translate the user's latest message into exactly one action call \
-from the provided tools. Choose respond_directly when no tool applies. Never invent argument \
-values the user did not supply. The context lists actions already performed this turn with \
-their results; never repeat a completed action — when those results answer the user, choose \
-respond_directly.";
+/// The instruction every tool's `_rationale` property used to carry (M10
+/// T1.1). Sent once, in the system prompt, instead of once per tool: on the
+/// recorded turn-21 array the per-tool copy was 106 chars × 7 tools and a
+/// quarter of every call's tool tokens (findings §8.1). The schema keeps only
+/// a short label ([`crate::schema::RATIONALE_HINT`]); this is the sentence
+/// that says what to put there.
+pub const RATIONALE_INSTRUCTION: &str = "Every tool takes `_rationale` first: one sentence \
+saying why this action, grounded in the user's words.";
+
+const SYSTEM_PREAMBLE: &str = "You translate the user's latest message into exactly one action \
+call from the provided tools. Choose respond_directly when no tool applies. Never invent \
+argument values the user did not supply. The context lists actions already performed this turn \
+with their results; never repeat a completed action — when those results answer the user, \
+choose respond_directly. ";
+
+/// Assembled rather than written out so the rationale instruction has exactly
+/// one home in the workspace and the test can assert it appears once.
+fn system_prompt() -> String {
+    format!("{SYSTEM_PREAMBLE}{RATIONALE_INSTRUCTION}")
+}
 
 pub struct CloudEmitter {
     client: OpenRouterClient,
@@ -106,7 +121,7 @@ impl Emitter for CloudEmitter {
             "tool_choice": "required",
             "tools": build_tools(legal),
             "messages": [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": system_prompt()},
                 {"role": "user", "content": render_context(&ctx)},
             ],
         });
@@ -207,6 +222,34 @@ impl Emitter for CloudEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M10 T1.1. The instruction moved out of every tool and into the one
+    /// message that is sent once — so it has to actually be there, and it has
+    /// to be there exactly once, or the cut traded a repeated instruction for
+    /// a missing one.
+    #[test]
+    fn the_system_prompt_carries_the_rationale_instruction_once() {
+        let prompt = system_prompt();
+        assert_eq!(
+            prompt.matches(RATIONALE_INSTRUCTION).count(),
+            1,
+            "the rationale instruction is not in the system prompt exactly once: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("_rationale"),
+            "the instruction must name the field the schema injects"
+        );
+        assert_eq!(
+            prompt.matches("_rationale").count(),
+            1,
+            "one mention, not a restatement per paragraph"
+        );
+        // And the schema is now the short label, not this sentence.
+        assert!(
+            !crate::schema::RATIONALE_HINT.contains("grounded"),
+            "the per-tool property is still carrying the instruction"
+        );
+    }
     use crate::client::OpenRouterClient;
     use crate::transport::{HttpResponse, MockTransport, TransportError};
     use nscore::{ActionSpec, EmitterContext, LegalActionSet, SideEffect};

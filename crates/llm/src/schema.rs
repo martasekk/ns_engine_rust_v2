@@ -28,10 +28,21 @@ pub const RESPOND_DIRECTLY: &str = "respond_directly";
 /// silently.
 pub const RATIONALE: &str = "_rationale";
 
+/// What the `_rationale` property says about itself, per tool.
+///
+/// M10 T1.1: this text was repeated verbatim in every tool of every array —
+/// 106 chars each, a measured **25% of all tool tokens** on the recorded
+/// turn-21 call (findings §8.1). It is one instruction, and one instruction
+/// belongs in the system prompt, which is sent once; see
+/// [`crate::emitter::RATIONALE_INSTRUCTION`], which carries the sentence this
+/// used to repeat. What stays here is the label a reader of the schema alone
+/// needs to know what the field is for, and nothing more.
+pub const RATIONALE_HINT: &str = "why, in one clause";
+
 fn rationale_prop() -> serde_json::Value {
     serde_json::json!({
         "type": "string",
-        "description": "One sentence: why this action, grounded in the user's words"
+        "description": RATIONALE_HINT
     })
 }
 
@@ -299,6 +310,30 @@ mod tests {
             respond_directly_tokens(),
             nscore::estimate_tokens(arr[1].to_string().len())
         );
+    }
+
+    /// M10 T1.1. The property is not "the constant is short" but "no tool
+    /// pays more than one clause for it", which is what a per-tool multiplier
+    /// means: the recorded turn-21 array carried 106 chars × 7 tools of the
+    /// same sentence, a quarter of every tool token on the call. Measured on
+    /// the compiled tool, so a description sneaking back in via `json!`
+    /// fails here and not in a review.
+    #[test]
+    fn the_rationale_property_costs_under_forty_chars_per_tool() {
+        let legal = legal();
+        for tool in [tool_schema(&legal.actions[0]), respond_directly_tool()] {
+            let name = tool["function"]["name"].as_str().unwrap().to_string();
+            let desc = tool["function"]["parameters"]["properties"][RATIONALE]["description"]
+                .as_str()
+                .expect("the rationale property describes itself");
+            assert!(
+                desc.chars().count() <= 40,
+                "`{name}` pays {} chars of rationale boilerplate: {desc:?} — the instruction \
+                 belongs in the emitter's system prompt, once",
+                desc.chars().count()
+            );
+        }
+        assert!(RATIONALE_HINT.chars().count() <= 40);
     }
 
     #[test]

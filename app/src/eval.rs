@@ -24,7 +24,6 @@
 use nstestkit::eval::{render_table, run_all_for, Ability, Run};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Beside `learned.toml` and `learned-ledger.json` in the working directory,
 /// which is where every other file this binary owns already lives.
@@ -352,13 +351,11 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             other => return Err(format!("{USAGE} (got {other:?})")),
         }
     }
-    // M10 T5.2. `main.rs` calls `run(&parsed.ledger)` with no weight, and
-    // `main.rs` belongs to another task of this milestone, so the flag
-    // reaches the default mode through this cell instead of through a
-    // parameter. [`run_at`] is the real entry point and takes the weight;
-    // the day `main.rs` passes `parsed.activation` to it, the cell and
-    // [`run`] go away together.
-    ACTIVATION.store(activation.to_bits(), Ordering::SeqCst);
+    // M10 T5.2. The weight used to reach the default mode through a static
+    // cell, because `main.rs` called `run(&parsed.ledger)` with no weight and
+    // `main.rs` belonged to another task. It now calls `run_at(&ledger,
+    // parsed.activation)`, so the cell and its `run` wrapper are gone and the
+    // flag travels as a parameter like every other argument here.
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
@@ -366,10 +363,6 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         activation,
     })
 }
-
-/// `--activation <w>` for the default mode, as bits of an `f32`. See
-/// [`parse_args`].
-static ACTIVATION: AtomicU32 = AtomicU32::new(0);
 
 /// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
 /// T0.4).
@@ -518,17 +511,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Runs the set, prints the table and the ledger diff, returns the process
-/// exit code: 0 when every ability passed, 1 otherwise.
-pub async fn run(ledger_path: &Path) -> i32 {
-    run_at(
-        ledger_path,
-        f32::from_bits(ACTIVATION.load(Ordering::SeqCst)),
-    )
-    .await
-}
-
-/// The same, at one `[memory] activation_weight` (M9 T3.3, M10 T5.2).
+/// Runs the set at one `[memory] activation_weight` (M9 T3.3, M10 T5.2),
+/// prints the table and the ledger diff, and returns the process exit code:
+/// 0 when every ability passed, 1 otherwise.
 ///
 /// The ability set **and** the tie-heavy recall corpus, because the ability
 /// set alone is what M9 T3.3 already tried: *"suites insensitive … identical

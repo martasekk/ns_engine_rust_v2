@@ -10,6 +10,58 @@ pub enum SideEffect {
     Irreversible,
 }
 
+/// Which text a component writes into the [`ActionSpec`]s it hands the
+/// emitter (M10 T1.3).
+///
+/// Not a transform over a finished spec: the short form of a description is
+/// written by whoever wrote the long one, in the same place, because a
+/// mechanical first-sentence cut would silently drop the one clause a tool
+/// needs (`pointer_type`'s `key` against its `text`) and nothing would
+/// notice. The rule both profiles obey is the conservative one the field
+/// measured (TsCG, arXiv 2605.26165): imperative, one sentence, no restating
+/// of parameter names — and **every parameter that changes capability stays
+/// in both profiles**, because a removed parameter is a removed capability
+/// the model cannot ask for. Only descriptions shrink, and only enums the
+/// recorded log never exercised collapse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaProfile {
+    /// Today's descriptions, unchanged. The default until the live rates of
+    /// M10 T1.6 say `Slim` holds.
+    #[default]
+    Full,
+    /// One imperative sentence per tool.
+    Slim,
+}
+
+impl SchemaProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchemaProfile::Full => "full",
+            SchemaProfile::Slim => "slim",
+        }
+    }
+
+    /// Config spelling → profile. `Err` carries the message a config error
+    /// should print.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "full" => Ok(SchemaProfile::Full),
+            "slim" => Ok(SchemaProfile::Slim),
+            other => Err(format!(
+                "schema_profile {other:?} is unknown — known profiles: full, slim"
+            )),
+        }
+    }
+
+    /// Pick between the two spellings of one piece of text.
+    pub fn pick<T>(self, full: T, slim: T) -> T {
+        match self {
+            SchemaProfile::Full => full,
+            SchemaProfile::Slim => slim,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResidualRule {
     Allowed,

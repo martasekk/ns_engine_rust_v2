@@ -202,6 +202,30 @@ run a non-dry evolution pass on `ns-run/ns.sqlite`, copy it first.
   they remove text and applicability mismatches, and the snapshot test is their record.
 - After the branch lands: `graphify <root> --update`; update findings §8.5 with the numbers.
 
+## Decisions taken during execution (2026-09-11, user)
+
+Asked and answered while wave 3 ran; they bind the waves that follow.
+
+1. **Chat path: measure only.** Plain chat turns keep the emitter-first shape for now. A
+   counter lands in `ns-app budget` (with P4): *chat-tier turns whose only proposal was
+   `respond_directly`: N of M*. The single-call path is decided later, with that number.
+2. **A paid tier is coming soon.** Tokens and cache hits count again. Consequences, applied
+   before wave 4: (a) P2's adaptive depth selects the tool set **once per turn**, not per
+   iteration, so the `tools` array is byte-stable across a turn's iterations and the prefix
+   can cache — "remove, don't mask" stays correct *between* turns, "stable within a turn" is
+   the new rule; escalation (T2.2) still widens the set, and that is the one legitimate
+   mid-turn cache miss; (b) M9 T2.3 is reopened for the emitter: on turn 21 the tool array
+   (731) plus facts+summary+window (538) already clears the 1,024 floor, so an emitter
+   breakpoint after the window block is applicable once the array is stable — it goes into
+   P4 behind `[llm] prompt_cache_emitter` (default off) and is verified by `cached_tokens`
+   on the first paid-tier session, never by code review; (c) the replier prefix (225
+   tokens) stays under the floor; no change.
+3. **Priority after M10: chat and personal memory.** The desktop line stays parked; the tool
+   array work continues because the chat floor is where its cost lives.
+4. **Delivery: one draft PR to `main`** carrying `worktree-m9-memory` and
+   `worktree-m10-tool-array`, with both plans' Results as the description, opened when M10's
+   last wave lands.
+
 ## Results
 
-*(empty until execution)*
+*(filled per wave)*

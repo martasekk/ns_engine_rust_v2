@@ -328,6 +328,9 @@ pub async fn replay_with(
     let cfg = EngineConfig {
         learned: Arc::new(arc_swap::ArcSwap::new(opts.learned)),
         reply_grounding_check: false,
+        // M10 T1.4: a replay runs against a fresh store, so applicability
+        // pruning would narrow a set the recording had wider. Never narrow.
+        prune_inapplicable: false,
         ..EngineConfig::default()
     };
     let engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));

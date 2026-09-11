@@ -716,6 +716,13 @@ pub struct LlmConfig {
     /// Send Anthropic cache breakpoints. Unset: the provider's own value.
     #[serde(default)]
     pub prompt_cache: Option<bool>,
+    /// M10 T1.3: `"full"` (the default) or `"slim"` — which spelling of
+    /// every tool description rides on each emitter call. `slim` is the
+    /// same tool set with shorter text; it never removes a parameter.
+    /// Default stays `full` until the live Malformed/IllegalAction rates of
+    /// M10 T1.6 say `slim` holds.
+    #[serde(default)]
+    pub schema_profile: Option<String>,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -740,6 +747,15 @@ fn is_loopback(url: &str) -> bool {
 }
 
 impl LlmConfig {
+    /// `[llm] schema_profile`, resolved. Err carries the message a startup
+    /// error should print; unset is [`nscore::SchemaProfile::Full`].
+    pub fn schema_profile(&self) -> Result<nscore::SchemaProfile, String> {
+        match self.schema_profile.as_deref() {
+            None => Ok(nscore::SchemaProfile::Full),
+            Some(s) => nscore::SchemaProfile::parse(s).map_err(|e| format!("[llm] {e}")),
+        }
+    }
+
     fn section(&self, role: Role) -> &RoleSection {
         match role {
             Role::Emitter => &self.emitter,
@@ -1155,6 +1171,32 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
+    }
+
+    /// M10 T1.3. The knob defaults to today's behaviour, the way every knob
+    /// in this plan does, and an unknown spelling is a startup error rather
+    /// than a silent fall back to `full` — a deployment that asked for `slim`
+    /// and got `full` would read its own token numbers wrong.
+    #[test]
+    fn schema_profile_defaults_to_full_and_rejects_an_unknown_name() {
+        assert_eq!(
+            AppConfig::parse("").unwrap().llm.schema_profile().unwrap(),
+            nscore::SchemaProfile::Full
+        );
+        assert_eq!(
+            AppConfig::parse("[llm]\nschema_profile = \"slim\"")
+                .unwrap()
+                .llm
+                .schema_profile()
+                .unwrap(),
+            nscore::SchemaProfile::Slim
+        );
+        let err = AppConfig::parse("[llm]\nschema_profile = \"tiny\"")
+            .unwrap()
+            .llm
+            .schema_profile()
+            .unwrap_err();
+        assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
     }
 
     #[test]

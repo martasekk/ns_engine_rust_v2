@@ -18,9 +18,9 @@ type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
 /// daemon and reads the http component config, and `budget` reads a log on a
 /// box where neither has to be up. A name the snapshot does not hold prints
 /// `n/a` rather than a guess.
-fn budget_specs() -> Vec<nscore::ActionSpec> {
-    let mut specs = nsengine::turn::synthetic_specs();
-    specs.extend(nscomponents_std::pointer_tool::specs());
+pub(crate) fn budget_specs(profile: nscore::SchemaProfile) -> Vec<nscore::ActionSpec> {
+    let mut specs = nsengine::turn::synthetic_specs(profile);
+    specs.extend(nscomponents_std::pointer_tool::specs(profile));
     specs.push(
         nscomponents_std::time_tool::GetTimeTool::new()
             .spec()
@@ -29,7 +29,7 @@ fn budget_specs() -> Vec<nscore::ActionSpec> {
     specs
 }
 
-async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
+async fn build_tools(cfg: &AppConfig, profile: nscore::SchemaProfile) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> =
         vec![Arc::new(nscomponents_std::time_tool::GetTimeTool::new())];
     let tool_transport = Arc::new(nscomponents_std::transport::ReqwestToolTransport::new());
@@ -51,7 +51,7 @@ async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
             );
             std::process::exit(1);
         };
-        match connect_pointer(&target.addr, &token).await {
+        match connect_pointer(&target.addr, &token, profile).await {
             Ok(more) => tools.extend(more),
             Err(e) => eprintln!("pointer: {e}\npointer: the desktop actions are not registered."),
         }
@@ -94,7 +94,11 @@ async fn desktop_messages(cfg: &AppConfig) -> Option<nspointer::messages::Messag
 /// `initialize` to carry it, and a session that starts not armed or with no
 /// local brake is something the person at this end should know before the
 /// emitter's first click.
-async fn connect_pointer(addr: &str, token: &str) -> Result<Vec<Arc<dyn Tool>>, String> {
+async fn connect_pointer(
+    addr: &str,
+    token: &str,
+    profile: nscore::SchemaProfile,
+) -> Result<Vec<Arc<dyn Tool>>, String> {
     use nspointer::client::RemotePointer;
     let dial = tokio::net::TcpStream::connect(addr);
     let stream = tokio::time::timeout(std::time::Duration::from_secs(5), dial)
@@ -120,7 +124,7 @@ async fn connect_pointer(addr: &str, token: &str) -> Result<Vec<Arc<dyn Tool>>, 
         );
     }
     let shared: Arc<dyn nspointer::Pointer> = Arc::new(pointer);
-    let tools = nscomponents_std::pointer_tool::tools(shared)
+    let tools = nscomponents_std::pointer_tool::tools(shared, profile)
         .await
         .map_err(|e| format!("could not read the screen layout from {addr}: {e}"))?;
     eprintln!("pointer: {} desktop actions on {addr}", tools.len());
@@ -401,6 +405,15 @@ async fn main() {
     cfg.llm
         .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
     let cfg = cfg;
+    // M10 T1.3: resolved once, here, because every subcommand that prices or
+    // sends a tool array has to price or send the same one.
+    let schema_profile = match cfg.llm.schema_profile() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     let args: Vec<String> = std::env::args().collect();
 
     // `ns-app providers`: which backends exist, which keys are present, and
@@ -468,7 +481,7 @@ async fn main() {
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
                 cfg.persona.text.len(),
-                &budget_specs(),
+                &budget_specs(schema_profile),
             )
         );
         return;
@@ -494,7 +507,7 @@ async fn main() {
         if let Some(block) = parsed.ablate {
             std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
-        std::process::exit(eval::run(&parsed.ledger).await);
+        std::process::exit(eval::run_at(&parsed.ledger, parsed.activation).await);
     }
 
     // `ns-app grade [--local] [--split dev|held|all]`: what an evaluator is
@@ -531,7 +544,7 @@ async fn main() {
             }
         };
         let rules = load_rules_or_exit(&cfg);
-        let tools = build_tools(&cfg).await;
+        let tools = build_tools(&cfg, schema_profile).await;
         let emitter = role_or_exit(&cfg, Role::Emitter);
         let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
         let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
@@ -617,7 +630,7 @@ async fn main() {
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
-    let tools = build_tools(&cfg).await;
+    let tools = build_tools(&cfg, schema_profile).await;
 
     // M7 T0.1: the engine hands each of its own calls a sink of its own
     // through the call's context, so this one is only the fallback for calls
@@ -764,6 +777,8 @@ async fn main() {
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
         tool_result_max_chars: cfg.memory.tool_result_max_chars,
         recall_sessions: cfg.memory.recall_sessions,
+        schema_profile,
+        prune_inapplicable: true,
         router: cfg
             .router
             .enabled
@@ -968,12 +983,12 @@ mod tests {
             let _ = serve_listener(agent, listener).await;
         });
 
-        let tools = connect_pointer(&addr, "t0k").await.unwrap();
+        let tools = connect_pointer(&addr, "t0k", nscore::SchemaProfile::Full).await.unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
         assert_eq!(names.len(), 10, "{names:?}");
         assert!(names.contains(&"pointer_click") && names.contains(&"pointer_ui_read"));
 
-        let err = match connect_pointer(&addr, "wrong").await {
+        let err = match connect_pointer(&addr, "wrong", nscore::SchemaProfile::Full).await {
             Err(e) => e,
             Ok(_) => panic!("a wrong token must be refused"),
         };

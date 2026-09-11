@@ -124,6 +124,21 @@ pub struct EngineConfig {
     /// beyond this one. 0 keeps recall inside the current conversation, as
     /// it was before digests existed.
     pub recall_sessions: usize,
+    /// M10 T1.3: which spelling of every tool description the emitter is
+    /// shown. `Full` — the default — is today's text unchanged.
+    pub schema_profile: nscore::SchemaProfile,
+    /// M10 T1.4: whether the synthetic tools that cannot apply are left out
+    /// of the legal set. On by default, and **off under replay**.
+    ///
+    /// Applicability is the one thing in the legal set that is read from the
+    /// store rather than from this turn's own events, and replay runs against
+    /// a fresh double: a session that had two facts when it was recorded has
+    /// none when it is replayed, so `forget_all` would be narrowed away and a
+    /// recorded proposal would come back `IllegalAction`. Replay must never
+    /// *narrow* the set — offering a superset can only turn a rejection back
+    /// into the recorded outcome — so it turns the pruning off and compares
+    /// what the run actually did.
+    pub prune_inapplicable: bool,
     /// M7 Phase 3: decides each turn's tier before the first model call.
     /// `None` — every scripted double and every replay — routes nothing and
     /// behaves exactly as the engine did before the router existed.
@@ -191,6 +206,8 @@ impl Default for EngineConfig {
             trace_verbatim_lines: 5,
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
+            schema_profile: nscore::SchemaProfile::Full,
+            prune_inapplicable: true,
             router: None,
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
@@ -272,26 +289,30 @@ fn explain_error(detail: &str) -> String {
 /// because the price is the schema, not the label. Nothing here is a
 /// statement about which of them were *legal* on any given call — that is
 /// what the manifest's `tool_names` records.
-pub fn synthetic_specs() -> Vec<nscore::ActionSpec> {
+pub fn synthetic_specs(profile: nscore::SchemaProfile) -> Vec<nscore::ActionSpec> {
     vec![
-        ask_clarification_spec(),
-        confirm_pending_spec(),
-        remember_fact_spec(),
-        forget_fact_spec(),
-        forget_all_spec(),
-        recall_spec(),
-        inspect_result_spec(),
+        ask_clarification_spec(profile),
+        confirm_pending_spec(profile),
+        remember_fact_spec(profile),
+        forget_fact_spec(profile),
+        forget_all_spec(profile),
+        recall_spec(profile),
+        inspect_result_spec(profile),
     ]
 }
 
 /// Engine-owned synthetic action: ask the user one question (spec §5.1).
 pub const ASK_CLARIFICATION: &str = "ask_clarification";
 
-fn ask_clarification_spec() -> nscore::ActionSpec {
+fn ask_clarification_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: ASK_CLARIFICATION.into(),
-        description: "Ask the user one short question to resolve missing or ungrounded \
-                      information required by the next action."
+        description: profile
+            .pick(
+                "Ask the user one short question to resolve missing or ungrounded \
+                 information required by the next action.",
+                "Ask the user one short question the next action needs answered.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -307,10 +328,15 @@ fn ask_clarification_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: the user just confirmed the staged action.
 pub const CONFIRM_PENDING: &str = "confirm_pending";
 
-fn confirm_pending_spec() -> nscore::ActionSpec {
+fn confirm_pending_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: CONFIRM_PENDING.into(),
-        description: "The user has just confirmed the pending action; execute it.".into(),
+        description: profile
+            .pick(
+                "The user has just confirmed the pending action; execute it.",
+                "Execute the pending action the user just confirmed.",
+            )
+            .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Pure,
         residual_policy: Default::default(),
@@ -321,11 +347,15 @@ fn confirm_pending_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: store one durable fact.
 pub const REMEMBER_FACT: &str = "remember_fact";
 
-fn remember_fact_spec() -> nscore::ActionSpec {
+fn remember_fact_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: REMEMBER_FACT.into(),
-        description: "Store one durable fact about the user or task as key/value \
-                      (dotted keys, e.g. user.name)."
+        description: profile
+            .pick(
+                "Store one durable fact about the user or task as key/value \
+                 (dotted keys, e.g. user.name).",
+                "Store one durable fact under a dotted key, e.g. user.name.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -344,11 +374,15 @@ fn remember_fact_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: soft-delete one fact (M6 §6.2).
 pub const FORGET_FACT: &str = "forget_fact";
 
-fn forget_fact_spec() -> nscore::ActionSpec {
+fn forget_fact_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_FACT.into(),
-        description: "Delete one stored fact by its key (e.g. user.name). Only when the user \
-                      explicitly asks to forget or remove something stored."
+        description: profile
+            .pick(
+                "Delete one stored fact by its key (e.g. user.name). Only when the user \
+                 explicitly asks to forget or remove something stored.",
+                "Delete one stored fact by key, only when the user asks to forget it.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -365,11 +399,16 @@ fn forget_fact_spec() -> nscore::ActionSpec {
 /// (M6 §6.2). Irreversible: staged behind the confirmation flow.
 pub const FORGET_ALL: &str = "forget_all";
 
-fn forget_all_spec() -> nscore::ActionSpec {
+fn forget_all_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_ALL.into(),
-        description: "Erase everything stored about the user; asks for confirmation first. Only \
-                      when the user explicitly asks to reset or wipe the memory."
+        description: profile
+            .pick(
+                "Erase everything stored about the user; asks for confirmation first. Only \
+                 when the user explicitly asks to reset or wipe the memory.",
+                "Erase every stored fact, only when the user asks to wipe the memory; \
+                 confirmation is asked first.",
+            )
             .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Irreversible,
@@ -381,12 +420,17 @@ fn forget_all_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: search memory beyond the context (M6 §7).
 pub const RECALL: &str = "recall";
 
-fn recall_spec() -> nscore::ActionSpec {
+fn recall_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: RECALL.into(),
-        description: "Search earlier turns of this conversation and stored facts for words the \
-                      user is asking about. Use when the answer is not in the recent turns \
-                      or facts shown."
+        description: profile
+            .pick(
+                "Search earlier turns of this conversation and stored facts for words the \
+                 user is asking about. Use when the answer is not in the recent turns \
+                 or facts shown.",
+                "Search earlier turns and stored facts when the answer is not in what is \
+                 shown.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -403,13 +447,18 @@ fn recall_spec() -> nscore::ActionSpec {
 /// (M7 T1.2).
 pub const INSPECT_RESULT: &str = "inspect_result";
 
-fn inspect_result_spec() -> nscore::ActionSpec {
+fn inspect_result_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: INSPECT_RESULT.into(),
-        description: "Read more of a tool result that was shown clipped. `id` is the handle in \
-                      the trace, like r42. With `query`, returns the part of the result around \
-                      the first match; without one, the next part. For a desktop, prefer \
-                      pointer_ui_find, which searches the live screen instead."
+        description: profile
+            .pick(
+                "Read more of a tool result that was shown clipped. `id` is the handle in \
+                 the trace, like r42. With `query`, returns the part of the result around \
+                 the first match; without one, the next part. For a desktop, prefer \
+                 pointer_ui_find, which searches the live screen instead.",
+                "Read more of a clipped tool result by its trace handle, like r42; with a \
+                 query, the part around the first match.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -947,7 +996,7 @@ impl Engine {
         // enters the provenance index, carries its own trust, and replays.
         if tier == nscore::Tier::Deep {
             let args = serde_json::json!({ "query": incoming.text });
-            let spec = recall_spec();
+            let spec = recall_spec(self.cfg.schema_profile);
             let classified = classify(log.events(), &args, &spec, turn);
             let call_id = log
                 .append(
@@ -971,6 +1020,42 @@ impl Engine {
                 },
             );
         }
+
+        // M10 T1.4: applicability, asked once per turn rather than per
+        // iteration. A tool in the schema that cannot do anything is tokens
+        // spent on a choice that can only fail — `forget_fact` and
+        // `forget_all` were sent on all 21 recorded turns while the store
+        // held zero facts (~216 tokens a turn), and `recall` was sent on
+        // turn 1 (findings §8.1).
+        //
+        // This is store state deciding legality, which the narrowing below
+        // deliberately avoids for *this turn's own* events. The difference
+        // is that these two questions are answered before the loop and held
+        // fixed across it, so an iteration cannot see the set change under
+        // it; and both fail **open** — a store that errors keeps the tool.
+        let scope_holds_facts = !self.cfg.prune_inapplicable
+            || self
+                .parts
+                .memory
+                .facts(&scope, "")
+                .await
+                .map(|f| !f.is_empty())
+                .unwrap_or(true);
+        // Recall is worth its schema when there is something out of sight:
+        // turns older than the verbatim window, or an earlier conversation
+        // in the same scope.
+        let recall_applies = !self.cfg.prune_inapplicable || turn > self.cfg.window_turns as u32 || {
+            self.cfg.recall_sessions > 0
+                && match self
+                    .parts
+                    .memory
+                    .session_digests(&scope, self.cfg.recall_sessions + 1)
+                    .await
+                {
+                    Ok(digests) => digests.into_iter().any(|d| d.session != sid),
+                    Err(_) => true,
+                }
+        };
 
         let mut rejections_this_turn: Vec<String> = Vec::new();
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
@@ -998,7 +1083,7 @@ impl Engine {
                 // occurred and nothing grounds the arg — the only way forward
                 // is to ask (respond_directly stays available at schema level).
                 LegalActionSet {
-                    actions: vec![ask_clarification_spec()],
+                    actions: vec![ask_clarification_spec(self.cfg.schema_profile)],
                 }
             } else {
                 // Narrowed schema (spec §2): actions rejected this turn are
@@ -1018,12 +1103,12 @@ impl Engine {
                 } else {
                     Vec::new()
                 };
-                actions.push(ask_clarification_spec());
+                actions.push(ask_clarification_spec(self.cfg.schema_profile));
                 if !denied_this_turn.contains(REMEMBER_FACT) {
-                    actions.push(remember_fact_spec());
+                    actions.push(remember_fact_spec(self.cfg.schema_profile));
                 }
-                if !denied_this_turn.contains(RECALL) {
-                    actions.push(recall_spec());
+                if !denied_this_turn.contains(RECALL) && recall_applies {
+                    actions.push(recall_spec(self.cfg.schema_profile));
                 }
                 // Offered only while there is something to inspect. An
                 // action in the schema that can only fail is a way for a
@@ -1031,7 +1116,7 @@ impl Engine {
                 if !denied_this_turn.contains(INSPECT_RESULT)
                     && !clipped_results(log.events(), turn, self.cfg.tool_result_max_chars).is_empty()
                 {
-                    actions.push(inspect_result_spec());
+                    actions.push(inspect_result_spec(self.cfg.schema_profile));
                 }
                 // Forgetting is legal only while it can mean something: not
                 // after a fact was written this turn (seen live: "my name is
@@ -1043,16 +1128,16 @@ impl Engine {
                     .iter()
                     .any(|k| k.starts_with(&format!("{REMEMBER_FACT}\u{0}")));
                 let forgot = calls_this_turn.iter().any(|k| k.starts_with("forget_"));
-                if !wrote_fact && !forgot {
+                if !wrote_fact && !forgot && scope_holds_facts {
                     if !denied_this_turn.contains(FORGET_FACT) {
-                        actions.push(forget_fact_spec());
+                        actions.push(forget_fact_spec(self.cfg.schema_profile));
                     }
                     if !denied_this_turn.contains(FORGET_ALL) {
-                        actions.push(forget_all_spec());
+                        actions.push(forget_all_spec(self.cfg.schema_profile));
                     }
                 }
                 if active_pending.is_some() {
-                    actions.push(confirm_pending_spec());
+                    actions.push(confirm_pending_spec(self.cfg.schema_profile));
                 }
                 LegalActionSet { actions }
             };
@@ -1380,7 +1465,7 @@ impl Engine {
                     rejections_this_turn.push("ask_clarification missing question".into());
                     continue;
                 };
-                let ask_spec = ask_clarification_spec();
+                let ask_spec = ask_clarification_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &ask_spec, turn);
                 let classified = ClassifiedProposal {
                     proposal: proposal.clone(),
@@ -1492,7 +1577,7 @@ impl Engine {
                         .push(format!("remember_fact rejected malformed key {key:?}"));
                     continue;
                 }
-                let fact_spec = remember_fact_spec();
+                let fact_spec = remember_fact_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &fact_spec, turn);
                 let prov = classified_args
                     .iter()
@@ -1672,7 +1757,7 @@ impl Engine {
                     rejections_this_turn.push("recall missing query".into());
                     continue;
                 };
-                let spec = recall_spec();
+                let spec = recall_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
@@ -1737,7 +1822,7 @@ impl Engine {
                     denied_this_turn.insert(INSPECT_RESULT.to_string());
                     continue;
                 };
-                let spec = inspect_result_spec();
+                let spec = inspect_result_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let page = inspect_page(log.events(), turn, id);
                 let call_id = log
@@ -1850,7 +1935,7 @@ impl Engine {
                     }
                     continue;
                 }
-                let spec = forget_fact_spec();
+                let spec = forget_fact_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
@@ -2497,15 +2582,10 @@ mod tests {
     /// half of the legal set the engine owns itself is the unchecked half.
     #[test]
     fn every_builtin_spec_keeps_the_rationale_first() {
-        for spec in [
-            ask_clarification_spec(),
-            confirm_pending_spec(),
-            remember_fact_spec(),
-            forget_fact_spec(),
-            forget_all_spec(),
-            recall_spec(),
-            inspect_result_spec(),
-        ] {
+        for spec in [nscore::SchemaProfile::Full, nscore::SchemaProfile::Slim]
+            .into_iter()
+            .flat_map(synthetic_specs)
+        {
             let name = spec.name.clone();
             spec.check_arg_names()
                 .unwrap_or_else(|e| panic!("builtin `{name}` breaks think-then-commit: {e}"));
