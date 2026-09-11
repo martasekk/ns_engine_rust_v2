@@ -327,9 +327,27 @@ pub struct Args {
     /// `[memory] summary_guidelines` empty vs three hand-written lines
     /// (M9 T5.2, read by M10 T5.4). Same shape, same reason.
     pub guidelines: bool,
+    /// `--paraphrase --facts`: run the paraphrased-recall arm over the
+    /// **facts** corpus instead of the turns corpus (M11 T1.1).
+    ///
+    /// A modifier on `--paraphrase` rather than a fourth mode, because it is
+    /// the same measurement — a miss rate over a paraphrase arm with a
+    /// verbatim control — asked of the other retriever. `search_facts` is
+    /// `lexical_rank`, not bm25, and the turns number says nothing about it.
+    pub facts: bool,
 }
 
-const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase] \
+/// Where `--facts` reaches [`run_paraphrase`] from.
+///
+/// The M10 T5.2 note above records this pattern and its retirement: a flag
+/// whose call site in `main.rs` belongs to another task travels through a
+/// cell until that task lands, and then becomes a parameter like every other
+/// argument. `main.rs` is M11 P0's file while this is written, so the one
+/// follow-up line is `run_paraphrase(parsed.activation, parsed.facts)` and
+/// this cell goes with it.
+static FACTS_ARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase [--facts]] \
      [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive] \
      [--obligations] [--guidelines]";
 
@@ -341,10 +359,12 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut depth = nscore::Depth::Full;
     let mut obligations = false;
     let mut guidelines = false;
+    let mut facts = false;
     let mut rest = args.iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--facts" => facts = true,
             "--obligations" => obligations = true,
             "--guidelines" => guidelines = true,
             "--depth" => {
@@ -383,6 +403,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     // `main.rs` belonged to another task. It now calls `run_at(&ledger,
     // parsed.activation)`, so the cell and its `run` wrapper are gone and the
     // flag travels as a parameter like every other argument here.
+    if facts && !paraphrase {
+        return Err(format!("{USAGE} (--facts is a modifier on --paraphrase)"));
+    }
+    FACTS_ARM.store(facts, std::sync::atomic::Ordering::Relaxed);
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
@@ -391,6 +415,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         depth,
         obligations,
         guidelines,
+        facts,
     })
 }
 
@@ -455,6 +480,9 @@ pub async fn run_ablate(block: nscore::Ablate, activation: f32) -> i32 {
 pub async fn run_paraphrase(activation: f32) -> i32 {
     use nstestkit::paraphrase;
 
+    if FACTS_ARM.load(std::sync::atomic::Ordering::Relaxed) {
+        return run_paraphrase_facts(activation).await;
+    }
     let k = nsengine::turn::EngineConfig::default().recall_top_k;
     // M9 T3.3: the same half-life the shipped config defaults to, so a
     // sweep over `--activation` measures the knob and not a second one.
@@ -533,6 +561,99 @@ pub async fn run_paraphrase(activation: f32) -> i32 {
     } else {
         println!(
             "  hybrid arm: NOT MEASURED — no nsmodels service on {}. Start it with\n  \
+             `cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality \
+             --rerank`.",
+            models.base_url
+        );
+    }
+    0
+}
+
+/// `ns-app eval --paraphrase --facts` — the same measurement over the facts
+/// corpus (M11 T1.1).
+///
+/// Two arms, and the comparison is the whole point: `search_facts` under
+/// `lexical_rank` against `search_facts_hybrid` with the encoder. The exit
+/// criterion is "the hybrid paraphrase miss rate is below the lexical one
+/// with the verbatim arm at 0% on both", so both numbers have to be printed
+/// side by side and read off one table.
+///
+/// The hybrid arm is added **only when the service answers**, for the turns
+/// arm's reason: with nsmodels down `search_facts_hybrid` *is* `search_facts`
+/// by design, and printing that as "hybrid" would be reporting a number for
+/// something that did not run.
+async fn run_paraphrase_facts(activation: f32) -> i32 {
+    use nstestkit::paraphrase;
+
+    let k = nsengine::turn::EngineConfig::default().recall_top_k;
+    let half_life = nsengine::turn::EngineConfig::default().activation_half_life_days;
+    let mut reports = Vec::new();
+
+    // A throwaway database, never `ns.sqlite`: this arm *writes facts*, and a
+    // measurement that left twelve of them in the live store would be editing
+    // the memory every other number here is read from.
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("paraphrase --facts: no temp dir ({e})");
+            return 2;
+        }
+    };
+    match nsmemory_sqlite::SqliteStore::open(&dir.path().join("facts-lexical.sqlite")) {
+        Ok(sqlite) => {
+            let sqlite = sqlite.with_activation(activation, half_life);
+            reports
+                .push(paraphrase::measure_facts(&sqlite, "facts lexical (lexical_rank)", k).await);
+        }
+        Err(e) => eprintln!("paraphrase --facts: the lexical arm did not run ({e})"),
+    }
+
+    let models = crate::config::ModelsSection {
+        enabled: true,
+        ..Default::default()
+    };
+    let recall = crate::config::RecallSection::default();
+    let mut hybrid_ran = false;
+    if crate::models::reachable(&models).await {
+        match nsmemory_sqlite::SqliteStore::open(&dir.path().join("facts-hybrid.sqlite")) {
+            Ok(sqlite) => {
+                let sqlite = sqlite
+                    .with_activation(activation, half_life)
+                    .with_recall(crate::models::recall_tuning(&recall));
+                let sqlite = match crate::models::encoder(&models, &recall) {
+                    Some(enc) => sqlite.with_encoder(enc),
+                    None => sqlite,
+                };
+                let name = format!(
+                    "facts hybrid ({}, coarse {} → rerank)",
+                    recall.embed_model, recall.coarse_k
+                );
+                reports.push(paraphrase::measure_facts(&sqlite, &name, k).await);
+                hybrid_ran = true;
+            }
+            Err(e) => eprintln!("paraphrase --facts: the hybrid arm did not run ({e})"),
+        }
+    }
+
+    print!("{}", paraphrase::render(&reports));
+    println!(
+        "  k = {k} (recall_top_k), activation_weight = {activation}, {} facts in one \
+         scope, no requests spent.",
+        paraphrase::fact_corpus().len()
+    );
+    println!(
+        "  the corpus is built so every paraphrase shares zero tokens with its fact, \
+         which is\n  the lexical floor `lexical_rank` cannot climb: it drops a fact with \
+         no query token\n  in it before it ranks anything."
+    );
+    if hybrid_ran {
+        println!(
+            "  the hybrid facts arm ran against nsmodels on {} — local CPU, no requests.",
+            models.base_url
+        );
+    } else {
+        println!(
+            "  hybrid facts arm: NOT MEASURED — no nsmodels service on {}. Start it with\n  \
              `cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality \
              --rerank`.",
             models.base_url

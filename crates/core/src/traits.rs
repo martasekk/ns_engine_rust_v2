@@ -477,6 +477,29 @@ pub trait MemoryStore: Send + Sync {
         query: &str,
         k: usize,
     ) -> Result<Vec<Fact>, StoreError>;
+    /// The hybrid facts path (M11 T1.1): `lexical_rank` candidates ∪ cosine
+    /// candidates, fused by rank, reranked by a cross-encoder, top `k`.
+    ///
+    /// A default that *is* `search_facts`, for [`Self::search_turns_hybrid`]'s
+    /// reasons exactly: the four implementors need no change, and the
+    /// contract is stated once — **with no encoder, no stored fact vectors,
+    /// or a service that does not answer, this returns exactly what
+    /// `search_facts` returns, same order, same count.** The hybrid arm is
+    /// only ever an addition on top of a list that already exists.
+    ///
+    /// Its own method rather than a knob inside `search_facts` because
+    /// `search_facts` is on every turn's context path and the hybrid arm is
+    /// not: the caller decides, from what it knows about the tier and the
+    /// config, and a store cannot be made to dial a model by a caller that
+    /// did not ask for it.
+    async fn search_facts_hybrid(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        self.search_facts(scope, query, k).await
+    }
     /// Every scope holding at least one fact row.
     async fn scopes(&self) -> Result<Vec<String>, StoreError>;
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError>;

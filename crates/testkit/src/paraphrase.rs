@@ -196,6 +196,151 @@ pub fn corpus() -> &'static [RecallCase] {
     ]
 }
 
+/// One fact to find, and the two ways of asking for it (M11 T1.1).
+///
+/// A separate corpus from [`RecallCase`] because a fact is not a turn. The
+/// turn corpus is a pool of lines in one session and is searched by
+/// `search_turns`; a fact is a `(key, value)` in a scope, searched by
+/// `search_facts`, whose lexical arm is `nscore::lexical_rank` — a *token
+/// count over `key + " " + value`*, not bm25. Measuring the facts path on the
+/// turns corpus would report a number for the wrong retriever, which is the
+/// mistake this module's header already warns about once.
+pub struct FactCase {
+    pub id: &'static str,
+    pub lang: &'static str,
+    pub key: &'static str,
+    pub value: &'static str,
+    /// Asked in the words the fact is written in — the control, and the arm
+    /// the exit criterion requires at 0% miss on both retrievers.
+    pub verbatim: &'static str,
+    /// The same question with none of those words. `lexical_rank` drops a
+    /// fact with no query token in it *before* ranking, so every one of these
+    /// is a guaranteed lexical miss: the corpus is built so the lexical arm
+    /// cannot score by accident.
+    pub paraphrase: &'static str,
+}
+
+/// Twelve facts, six Czech and six English, in the shapes this engine's
+/// `remember_fact` actually writes: budgets, names, preferences, desktop
+/// coordinates, standing refusals and deadlines.
+///
+/// Small for [`corpus`]'s reason, and adversarial for it too: the Czech half
+/// carries the inflection that costs a lexical index the overlap it never
+/// meant to lose (2605.24556, the Czech lexical ceiling), which is the whole
+/// argument for a second arm here.
+pub fn fact_corpus() -> &'static [FactCase] {
+    &[
+        FactCase {
+            id: "en/budget",
+            lang: "en",
+            key: "campaign.budget",
+            value: "2000 crowns for the whole campaign",
+            verbatim: "what is the campaign budget",
+            paraphrase: "how much money may we spend",
+        },
+        FactCase {
+            id: "en/name",
+            lang: "en",
+            key: "user.name",
+            value: "Martin, works at a print shop",
+            verbatim: "what is my name",
+            paraphrase: "who am I, remind me",
+        },
+        FactCase {
+            id: "en/clock",
+            lang: "en",
+            key: "user.clock.format",
+            value: "24-hour clock, never am or pm",
+            verbatim: "what clock format do I use",
+            paraphrase: "in which style should hours be shown",
+        },
+        FactCase {
+            id: "en/desktop",
+            lang: "en",
+            key: "invoice.window",
+            value: "the one titled Faktury on the second screen",
+            verbatim: "which invoice window",
+            paraphrase: "where do I find billing documents",
+        },
+        FactCase {
+            id: "en/refusal",
+            lang: "en",
+            key: "client.rule",
+            value: "never send anything to clients without showing me first",
+            verbatim: "what is the client rule",
+            paraphrase: "what am I not allowed to do alone",
+        },
+        FactCase {
+            id: "en/deadline",
+            lang: "en",
+            key: "fair.deadline",
+            value: "everything finished before the twelfth",
+            verbatim: "when is the fair deadline",
+            paraphrase: "by which date must all of it be ready",
+        },
+        FactCase {
+            id: "cs/budget",
+            lang: "cs",
+            key: "rozpocet.kampan",
+            value: "2000 korun na celou kampaň",
+            verbatim: "kolik korun máme na kampaň",
+            paraphrase: "kolik peněz smíme utratit",
+        },
+        FactCase {
+            id: "cs/name",
+            lang: "cs",
+            key: "jmeno.uzivatele",
+            value: "Martin, dělá v tiskárně",
+            verbatim: "kdo je Martin a kde dělá",
+            paraphrase: "kdo jsem, připomeň mi to",
+        },
+        FactCase {
+            id: "cs/orders",
+            lang: "cs",
+            key: "objednavky.prehled",
+            value: "otevírá se zeleným tlačítkem vlevo dole",
+            verbatim: "čím se otevírá přehled vlevo dole",
+            paraphrase: "kde najdu seznam toho, co si lidé koupili",
+        },
+        FactCase {
+            id: "cs/refusal",
+            lang: "cs",
+            key: "klienti.pravidlo",
+            value: "nikdy nic neposílej klientům bez ukázání",
+            verbatim: "komu nikdy nic neposílej bez ukázání",
+            paraphrase: "co nesmíš udělat sám",
+        },
+        FactCase {
+            id: "cs/deadline",
+            lang: "cs",
+            key: "veletrh.termin",
+            value: "všechno hotové před dvanáctým",
+            verbatim: "kdy má být všechno hotové",
+            paraphrase: "dokdy nejpozději to mám stihnout",
+        },
+        FactCase {
+            id: "cs/preference",
+            lang: "cs",
+            key: "preference.hodin",
+            value: "piš mi časy ve dvacetičtyřhodinovém formátu",
+            verbatim: "v jakém formátu psát časy",
+            paraphrase: "v jaké podobě zapisovat hodiny",
+        },
+    ]
+}
+
+/// What both arms of the facts search read: `key + " " + value`, the key's
+/// separators opened out.
+///
+/// Duplicated from `nsmemory_sqlite`'s private `fact_text` on purpose — the
+/// testkit must not depend on the sqlite crate to state what it measures, and
+/// this copy is what the corpus test below checks its own overlap against. If
+/// the two ever disagree, the overlap test is measuring a haystack the store
+/// does not have, and that is a failure worth a broken build.
+pub fn fact_text(key: &str, value: &str) -> String {
+    format!("{} {}", key.replace(['.', '_', '-'], " "), value)
+}
+
 /// The share of a query's matchable tokens that also appear in the line it is
 /// meant to find.
 ///
@@ -388,6 +533,111 @@ pub async fn measure(store: &dyn MemoryStore, retriever: &str, k: usize) -> Repo
     }
 }
 
+/// Run the facts corpus through one store (M11 T1.1).
+///
+/// **One scope, every fact.** Twelve facts in `paraphrase-facts`, so a hit
+/// means the retriever picked the target out of twelve and not out of one —
+/// [`measure`]'s reason for one session, for the same failure mode.
+///
+/// Seeded through `put_fact` rather than by handing `lexical_rank` a slice:
+/// the question is whether the *store* finds it, and the store is where the
+/// write-time vector, the supersession rule and the hybrid fusion live.
+/// Everything goes through `search_facts_hybrid`, whose default *is*
+/// `search_facts` — so a store with no encoder measures exactly today's
+/// `lexical_rank`, which is what makes the two arms comparable.
+pub async fn measure_facts(store: &dyn MemoryStore, retriever: &str, k: usize) -> Report {
+    const SCOPE: &str = "paraphrase-facts";
+    let mut verbatim = Arm {
+        arm: "verbatim",
+        hits: 0,
+        total: 0,
+        misses: Vec::new(),
+    };
+    let mut paraphrase = Arm {
+        arm: "paraphrase",
+        hits: 0,
+        total: 0,
+        misses: Vec::new(),
+    };
+
+    for (i, case) in fact_corpus().iter().enumerate() {
+        let at = Timestamp(i as u64 + 1);
+        if let Err(e) = store
+            .put_fact(nscore::Fact {
+                key: case.key.into(),
+                value: serde_json::Value::String(case.value.into()),
+                confidence: 1.0,
+                uses: 0,
+                last_validated: at,
+                prov: nscore::Provenance::Constant,
+                scope: SCOPE.into(),
+                trust: nscore::Trust::User,
+                valid_from: at,
+                ..Default::default()
+            })
+            .await
+        {
+            return Report {
+                retriever: format!("{retriever} — NOT MEASURED: {e}"),
+                verbatim,
+                paraphrase,
+                vectors: false,
+            };
+        }
+    }
+
+    // The pass's own step, in the pass's own shape: bounded batches until it
+    // returns 0. `put_fact` has already embedded each fact on a store with an
+    // encoder, so this normally writes nothing and is here as the repair path
+    // it is in production — a fact written while the service was down.
+    let mut vectors = false;
+    for _ in 0..64 {
+        match store.backfill_embeddings(64).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => vectors = true,
+        }
+    }
+
+    for case in fact_corpus() {
+        for (arm, query) in [
+            (&mut verbatim, case.verbatim),
+            (&mut paraphrase, case.paraphrase),
+        ] {
+            arm.total += 1;
+            let hybrid = store
+                .search_facts_hybrid(SCOPE, query, k)
+                .await
+                .unwrap_or_default();
+            // "Did this arm have a vector index at all" answered by what the
+            // arm did rather than by what it was configured with: a store
+            // whose hybrid list never differs from its lexical list *is* the
+            // lexical arm, whatever was handed to it, and the closing verdict
+            // must not call it anything else.
+            if !vectors {
+                let lexical = store
+                    .search_facts(SCOPE, query, k)
+                    .await
+                    .unwrap_or_default();
+                if lexical != hybrid {
+                    vectors = true;
+                }
+            }
+            if hybrid.iter().any(|f| f.key == case.key) {
+                arm.hits += 1;
+            } else {
+                arm.misses.push(case.id.to_string());
+            }
+        }
+    }
+
+    Report {
+        retriever: retriever.to_string(),
+        verbatim,
+        paraphrase,
+        vectors,
+    }
+}
+
 /// The arm as a person has to read it to make the §12.8 decision: both
 /// retrievers, both arms, and what the number means stated rather than left
 /// to be looked up.
@@ -513,6 +763,71 @@ mod tests {
             Vec::<String>::new(),
             "the control arm missed"
         );
+    }
+
+    /// The facts corpus's honesty check, and a stronger one than the turns
+    /// corpus needs: `lexical_rank` drops a fact with **no** query token in
+    /// it, so a paraphrase that shares even one token is a candidate and the
+    /// lexical arm could score on it. Zero overlap is the requirement, and
+    /// the verbatim control still has to be a control.
+    #[test]
+    fn every_fact_paraphrase_shares_nothing_with_the_fact() {
+        for case in fact_corpus() {
+            let text = fact_text(case.key, case.value);
+            let p = overlap(case.paraphrase, &text);
+            assert!(
+                p == 0.0,
+                "{}: paraphrase shares {:.0}% of its tokens with `{}` — lexical_rank \
+                 would rank it, so the arm would not be measuring a paraphrase",
+                case.id,
+                p * 100.0,
+                text
+            );
+            let v = overlap(case.verbatim, &text);
+            assert!(
+                v >= 0.40,
+                "{}: verbatim query shares only {:.0}% — it is not the control it claims \
+                 to be",
+                case.id,
+                v * 100.0
+            );
+        }
+    }
+
+    /// Both languages, distinct keys, and nothing pinned-looking: the three
+    /// things that would quietly make the number easier.
+    #[test]
+    fn the_fact_corpus_is_shaped_the_way_the_measurement_needs() {
+        let cs = fact_corpus().iter().filter(|c| c.lang == "cs").count();
+        let en = fact_corpus().iter().filter(|c| c.lang == "en").count();
+        assert!(cs >= 5 && en >= 5, "cs={cs} en={en}");
+        assert!(fact_corpus().len() >= 12, "twelve facts is the floor");
+        let mut keys: Vec<&str> = fact_corpus().iter().map(|c| c.key).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "two cases share a key: {keys:?}");
+    }
+
+    /// The lexical floor, stated as a test rather than trusted: on a store
+    /// with no encoder the paraphrase arm misses **every** case and the
+    /// verbatim arm misses none. That pair is what the hybrid arm is measured
+    /// against, and if the floor ever moves the comparison has moved with it.
+    #[tokio::test]
+    async fn the_facts_lexical_arm_is_a_floor_of_zero_and_a_control_of_twelve() {
+        let store = InMemoryStore::new();
+        let report = measure_facts(&store, "in-memory (lexical_rank)", 5).await;
+        assert_eq!(
+            report.verbatim.misses,
+            Vec::<String>::new(),
+            "the control arm missed"
+        );
+        assert_eq!(
+            report.paraphrase.hits, 0,
+            "a lexical arm that finds a paraphrase means the corpus leaks tokens: {:?}",
+            report.paraphrase
+        );
+        assert!(!report.vectors, "no encoder, so no vector arm");
     }
 
     #[test]

@@ -84,6 +84,25 @@ fn digest_text(topic: &str, established_json: &str, open_json: &str) -> String {
     .to_string()
 }
 
+/// What a fact is embedded as (M11 T1.1): `key + " " + value`, with the key's
+/// separators opened out.
+///
+/// The same text `lexical_rank` builds its haystack from, deliberately: the
+/// two arms of a hybrid search have to be searching the same thing, or the
+/// fusion is comparing a ranking over one document with a ranking over
+/// another. The dots and underscores come out because `user.prefs.lang` is
+/// one token to an embedder and three words to a person, and the person's
+/// reading is the one a paraphrase is written in.
+fn fact_text(key: &str, value: &serde_json::Value) -> String {
+    let value = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    format!("{} {}", key.replace(['.', '_', '-'], " "), value)
+        .trim()
+        .to_string()
+}
+
 fn turn_text(kind_json: &str) -> Option<(&'static str, String)> {
     match serde_json::from_str::<nscore::EventKind>(kind_json).ok()? {
         nscore::EventKind::UserSaid { text } => Some(("user", text)),
@@ -568,6 +587,131 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// Every stored fact vector for this scope and this model, with the fact
+    /// it belongs to (M11 T1.1).
+    ///
+    /// Joined back to `facts` by rowid and filtered to the live versions, so
+    /// a superseded value whose vector is still in the table cannot be
+    /// retrieved: the embeddings table is a cache over the current facts, not
+    /// a second history of them. The full scan is `turn_vectors`' bargain for
+    /// the same reason — a scope holds tens of facts, and a dot product over
+    /// tens of 1024-dim vectors is noise beside the `/rerank` round trip.
+    async fn fact_vectors(
+        &self,
+        scope: &str,
+        model: &str,
+    ) -> Result<Vec<(Fact, Vec<f32>)>, StoreError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {FACT_COLUMNS}, em.vector
+                 FROM embeddings em JOIN facts f ON f.rowid = em.row_id
+                 WHERE em.kind = 'fact' AND em.model = ?1 AND em.owner = ?2
+                   AND f.scope = ?2 AND f.state IN ('current', 'cold')"
+            ))
+            .map_err(io_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![model, scope], |r| {
+                Ok((row_to_fact(r)?, r.get::<_, Vec<u8>>(14)?))
+            })
+            .map_err(io_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (fact, blob) = row.map_err(io_err)?;
+            out.push((fact, blob_vector(&blob)));
+        }
+        Ok(out)
+    }
+
+    /// The hybrid facts arm (M11 T1.1), shaped exactly like [`Self::hybrid_hits`]:
+    /// `lexical_rank` candidates ∪ cosine candidates, fused by rank with
+    /// `rrf_fuse`, reranked by the cross-encoder over the union, truncated to
+    /// `k`. `Ok(None)` is "nothing to add"; every failure is an `Err` the
+    /// caller turns back into the lexical list.
+    ///
+    /// The fusion key is `(key, valid_from)` rather than the rowid, because
+    /// that is the pair the *facts* table calls a version and the pair
+    /// `lexical_rank` can produce without a second query. The rowid is still
+    /// what the embeddings table is keyed by — it has to be, the PK is
+    /// `(kind, row_id, model)` and only a rowid is unique across scopes.
+    async fn hybrid_fact_hits(
+        &self,
+        enc: &dyn nscore::TextEncoder,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Option<Vec<Fact>>, StoreError> {
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
+        let over = |msg: &str| StoreError::Io(format!("fact recall over budget: {msg}"));
+
+        let stored = self.fact_vectors(scope, enc.model()).await?;
+        if stored.is_empty() {
+            return Ok(None);
+        }
+        let coarse = self.recall.coarse_k.max(k);
+        let current = self.facts(scope, "").await?;
+        let key_of = |f: &Fact| (f.key.clone(), f.valid_from.0);
+        let lexical: Vec<(String, u64)> = nscore::lexical_rank(
+            &current,
+            query,
+            coarse,
+            nscore::Activation {
+                now: Timestamp(nscore::now_ms()),
+                ..self.activation
+            },
+        )
+        .iter()
+        .map(key_of)
+        .collect();
+
+        let q = enc.embed(&[query.to_string()], "query").await?;
+        if started.elapsed() > budget {
+            return Err(over("embed"));
+        }
+        let q = q.into_iter().next().unwrap_or_default();
+
+        let mut scored: Vec<((String, u64), f32)> = stored
+            .iter()
+            .filter_map(|(f, v)| nscore::cosine(&q, v).map(|c| (key_of(f), c)))
+            .collect();
+        // A dimension mismatch on every row is a model change the primary key
+        // should have prevented; no vector arm rather than a ranking over
+        // nothing.
+        if scored.is_empty() {
+            return Ok(None);
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let vector: Vec<(String, u64)> =
+            scored.into_iter().take(coarse).map(|(id, _)| id).collect();
+
+        // Rank, never score (M8 §6). A token count and a cosine live on
+        // unrelated scales; the fusion only ever reads positions.
+        let fused: Vec<(String, u64)> = nscore::rrf_fuse(&[lexical, vector])
+            .into_iter()
+            .take(coarse)
+            .collect();
+        let by_id: std::collections::HashMap<(String, u64), &Fact> =
+            stored.iter().map(|(f, _)| (key_of(f), f)).collect();
+        let rows: Vec<&Fact> = fused.iter().filter_map(|id| by_id.get(id).copied()).collect();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let docs: Vec<String> = rows.iter().map(|f| fact_text(&f.key, &f.value)).collect();
+        let ranked = enc.rerank(query, &docs, k).await?;
+        if started.elapsed() > budget {
+            return Err(over("rerank"));
+        }
+        Ok(Some(
+            ranked
+                .into_iter()
+                .take(k)
+                .filter_map(|(i, _)| rows.get(i).map(|f| (*f).clone()))
+                .collect(),
+        ))
+    }
+
     /// The hybrid arm (M8 T3.2). `Ok(None)` means "nothing to add" — no
     /// vectors for this model — and every failure, the latency budget
     /// included, is an `Err` the caller turns back into the lexical list.
@@ -642,6 +786,136 @@ impl SqliteStore {
                 })
                 .collect(),
         ))
+    }
+}
+
+/// The fact write path's two halves (M11 T1.1), in their own inherent block
+/// because a trait impl takes only the trait's own methods.
+impl SqliteStore {
+    /// The SQL half of `put_fact`, split out so the connection guard is
+    /// dropped before anything dials a network.
+    ///
+    /// The split is the point: `put_fact` is now "write, then embed", and the
+    /// embed must not be able to hold the lock or fail the write.
+    async fn write_fact(&self, fact: &Fact) -> Result<(), StoreError> {
+        let conn = self.conn.lock().await;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(io_err)?;
+        let value_json = serde_json::to_string(&fact.value).map_err(io_err)?;
+        let prov_json = serde_json::to_string(&fact.prov).map_err(io_err)?;
+        if exists.is_some() {
+            conn.execute(
+                "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
+                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12,
+                     exposures = ?13, credits = ?14
+                 WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                rusqlite::params![
+                    fact.scope,
+                    fact.key,
+                    fact.valid_from.0,
+                    fact.valid_to.map(|t| t.0),
+                    fact.state.as_str(),
+                    value_json,
+                    fact.confidence as f64,
+                    fact.uses,
+                    fact.last_validated.0,
+                    prov_json,
+                    trust_str(fact.trust),
+                    fact.last_used.0,
+                    fact.exposures,
+                    fact.credits,
+                ],
+            )
+            .map_err(io_err)?;
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE facts SET state = 'superseded', valid_to = ?3
+             WHERE scope = ?1 AND key = ?2 AND state IN ('current', 'cold')",
+            rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
+        )
+        .map_err(io_err)?;
+        conn.execute(
+            &format!(
+                "INSERT INTO facts ({FACT_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            ),
+            rusqlite::params![
+                fact.scope,
+                fact.key,
+                fact.valid_from.0,
+                fact.valid_to.map(|t| t.0),
+                fact.state.as_str(),
+                value_json,
+                fact.confidence as f64,
+                fact.uses,
+                fact.last_validated.0,
+                prov_json,
+                trust_str(fact.trust),
+                fact.last_used.0,
+                fact.exposures,
+                fact.credits,
+            ],
+        )
+        .map_err(io_err)?;
+        Ok(())
+    }
+
+    /// M11 T1.1: one vector for the fact just written, best effort.
+    ///
+    /// Write time *and* the pass's backfill, not one or the other. The
+    /// backfill alone would leave a fact stated this turn invisible to the
+    /// vector arm until the next idle pass — the window in which a user is
+    /// most likely to ask about it again — and write time alone would lose
+    /// every fact written while the service was down. Together, the backfill
+    /// is the repair path for whatever this drops, which is why dropping is
+    /// allowed: a `?` here would let an unreachable embedder fail a memory
+    /// write.
+    ///
+    /// Only a live version is embedded. A superseded or forgotten row is a
+    /// value the engine has stopped believing, and a vector for it would be a
+    /// retriever able to return what `facts()` will not.
+    async fn embed_fact(&self, fact: &Fact) {
+        let Some(enc) = self.encoder.clone() else {
+            return;
+        };
+        if !matches!(fact.state, FactState::Current | FactState::Cold) {
+            return;
+        }
+        let model = enc.model().to_string();
+        let row_id: Option<i64> = {
+            let conn = self.conn.lock().await;
+            conn.query_row(
+                "SELECT rowid FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        };
+        let Some(row_id) = row_id else {
+            return;
+        };
+        let text = fact_text(&fact.key, &fact.value);
+        let Ok(vectors) = enc.embed(&[text], "passage").await else {
+            return;
+        };
+        let Some(v) = vectors.into_iter().next().filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO embeddings (kind, owner, row_id, model, dim, vector)
+             VALUES ('fact', ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![fact.scope, row_id, model, v.len() as i64, vector_blob(&v)],
+        );
     }
 }
 
@@ -919,6 +1193,42 @@ impl MemoryStore for SqliteStore {
                     pending.push(("digest", session_id, rowid, digest_text(&topic, &established, &open)));
                 }
             }
+            // M11 T1.1: the same three lines for facts. `owner` is the scope
+            // and `row_id` the facts rowid — the composite key
+            // `(scope, key, valid_from)` cannot serve, because the embeddings
+            // PK is `(kind, row_id, model)` and takes one integer. The rowid
+            // is also what supersession already moves: a new version is a new
+            // row and so a new, unembedded `row_id`, and the old row's vector
+            // stops being reachable the moment `fact_vectors` filters on
+            // `state IN ('current', 'cold')`.
+            let room = limit.saturating_sub(pending.len());
+            if room > 0 {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT f.rowid, f.scope, f.key, f.value_json FROM facts f
+                         LEFT JOIN embeddings em
+                           ON em.kind = 'fact' AND em.row_id = f.rowid AND em.model = ?1
+                         WHERE em.row_id IS NULL AND f.state IN ('current', 'cold')
+                         ORDER BY f.rowid LIMIT ?2",
+                    )
+                    .map_err(io_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![model, room as i64], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(io_err)?;
+                for row in rows {
+                    let (rowid, scope, key, value_json) = row.map_err(io_err)?;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&value_json).unwrap_or(serde_json::Value::Null);
+                    pending.push(("fact", scope, rowid, fact_text(&key, &value)));
+                }
+            }
         }
         if pending.is_empty() {
             return Ok(0);
@@ -1138,72 +1448,15 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError> {
-        let conn = self.conn.lock().await;
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
-                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(io_err)?;
-        let value_json = serde_json::to_string(&fact.value).map_err(io_err)?;
-        let prov_json = serde_json::to_string(&fact.prov).map_err(io_err)?;
-        if exists.is_some() {
-            conn.execute(
-                "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
-                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12,
-                     exposures = ?13, credits = ?14
-                 WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
-                rusqlite::params![
-                    fact.scope,
-                    fact.key,
-                    fact.valid_from.0,
-                    fact.valid_to.map(|t| t.0),
-                    fact.state.as_str(),
-                    value_json,
-                    fact.confidence as f64,
-                    fact.uses,
-                    fact.last_validated.0,
-                    prov_json,
-                    trust_str(fact.trust),
-                    fact.last_used.0,
-                    fact.exposures,
-                    fact.credits,
-                ],
-            )
-            .map_err(io_err)?;
-            return Ok(());
-        }
-        conn.execute(
-            "UPDATE facts SET state = 'superseded', valid_to = ?3
-             WHERE scope = ?1 AND key = ?2 AND state IN ('current', 'cold')",
-            rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
-        )
-        .map_err(io_err)?;
-        conn.execute(
-            &format!(
-                "INSERT INTO facts ({FACT_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
-            ),
-            rusqlite::params![
-                fact.scope,
-                fact.key,
-                fact.valid_from.0,
-                fact.valid_to.map(|t| t.0),
-                fact.state.as_str(),
-                value_json,
-                fact.confidence as f64,
-                fact.uses,
-                fact.last_validated.0,
-                prov_json,
-                trust_str(fact.trust),
-                fact.last_used.0,
-                fact.exposures,
-                fact.credits,
-            ],
-        )
-        .map_err(io_err)?;
+        self.write_fact(&fact).await?;
+        // M11 T1.1: the write-time vector, best effort and after the lock is
+        // gone. A fact write that failed because the embedder was unreachable
+        // would be a memory lost to a retrieval optimisation, so this can
+        // only ever add a row — never fail the write, never hold the
+        // connection across the round trip. The pass's backfill is what
+        // catches whatever this misses, which is what makes it safe to be
+        // best effort.
+        self.embed_fact(&fact).await;
         Ok(())
     }
 
@@ -1262,6 +1515,31 @@ impl MemoryStore for SqliteStore {
                 ..self.activation
             },
         ))
+    }
+
+    /// M11 T1.1, and `search_turns_hybrid`'s shape line for line: the lexical
+    /// list is computed **first and kept**, and every path that is not a
+    /// complete hybrid success returns it untouched — no encoder, no stored
+    /// fact vectors, a service that will not answer, a dimension change, or a
+    /// round trip past `[recall] rerank_budget_ms`. Same order, same count:
+    /// the fallback is not a degraded hybrid, it is today's result.
+    async fn search_facts_hybrid(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        let lexical = self.search_facts(scope, query, k).await?;
+        let Some(enc) = self.encoder.clone() else {
+            return Ok(lexical);
+        };
+        if k == 0 {
+            return Ok(lexical);
+        }
+        match self.hybrid_fact_hits(enc.as_ref(), scope, query, k).await {
+            Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
+            _ => Ok(lexical),
+        }
     }
 
     async fn scopes(&self) -> Result<Vec<String>, StoreError> {
@@ -2324,5 +2602,155 @@ mod tests {
             .unwrap();
         assert_eq!(near.len(), 1);
         assert_eq!(near[0].session, SessionId("a".into()));
+    }
+
+    // ----- M11 T1.1: the hybrid facts arm ---------------------------------
+
+    fn a_fact(key: &str, value: &str, at: u64) -> Fact {
+        Fact {
+            key: key.into(),
+            value: serde_json::json!(value),
+            confidence: 1.0,
+            uses: 0,
+            last_validated: Timestamp(at),
+            prov: nscore::Provenance::Constant,
+            valid_from: Timestamp(at),
+            ..Default::default()
+        }
+    }
+
+    /// The facts the two arms are measured over: one the paraphrase is aimed
+    /// at, and two that share the concept space so a hit means the retriever
+    /// chose rather than returned.
+    async fn seed_facts(store: &SqliteStore) {
+        for (i, (key, value)) in [
+            ("campaign.budget", "2000 crowns for the whole campaign"),
+            ("user.name", "Martin, works at a print shop"),
+            ("fair.deadline", "everything finished before friday"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .put_fact(a_fact(key, value, i as u64 + 1))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// M11 T1.1's safety line, in its strongest form: vectors *are* in the
+    /// table, and the service is the thing that is gone. The hybrid list has
+    /// to be the lexical list — same order, same count — not a ranking over
+    /// whatever half of the path completed.
+    #[tokio::test]
+    async fn hybrid_search_facts_equals_lexical_with_the_service_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.sqlite");
+
+        // With no encoder at all, first: the four implementors' case.
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            seed_facts(&store).await;
+            for q in ["campaign budget", "martin", "deadline friday", "nothing"] {
+                assert_eq!(
+                    store.search_facts_hybrid("global", q, 5).await.unwrap(),
+                    store.search_facts("global", q, 5).await.unwrap(),
+                    "no encoder must be today's list for {q:?}"
+                );
+            }
+        }
+        // Then with the vectors written and the service refusing: the same
+        // store file, a second encoder that is down.
+        {
+            let up = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+            let store = SqliteStore::open(&path).unwrap().with_encoder(up);
+            assert!(
+                store.backfill_embeddings(100).await.unwrap() >= 3,
+                "the three facts have to be embedded for this to test anything"
+            );
+        }
+        let down = std::sync::Arc::new(ScriptedEncoder {
+            down: true,
+            ..ScriptedEncoder::new("bge-m3")
+        });
+        let store = SqliteStore::open(&path).unwrap().with_encoder(down);
+        for q in ["campaign budget", "martin", "deadline friday", "nothing"] {
+            let lexical = store.search_facts("global", q, 5).await.unwrap();
+            let hybrid = store.search_facts_hybrid("global", q, 5).await.unwrap();
+            assert_eq!(hybrid, lexical, "service down must be today's list for {q:?}");
+        }
+    }
+
+    /// The reason the arm exists: a question asked in words the fact does not
+    /// contain. `lexical_rank` drops it — no token in common is no candidate
+    /// at all — and the cosine arm puts it back.
+    #[tokio::test]
+    async fn a_paraphrased_fact_query_hits_under_hybrid_and_misses_lexically() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc);
+        seed_facts(&store).await;
+
+        let q = "how much money";
+        let lexical = store.search_facts("global", q, 5).await.unwrap();
+        assert!(
+            !lexical.iter().any(|f| f.key == "campaign.budget"),
+            "the corpus is wrong if lexical already finds it: {lexical:?}"
+        );
+        let hybrid = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(
+            hybrid.first().map(|f| f.key.as_str()),
+            Some("campaign.budget"),
+            "the paraphrase has to land on the fact it is about: {hybrid:?}"
+        );
+
+        // And the verbatim query is not regressed by the second arm.
+        let verbatim = store
+            .search_facts_hybrid("global", "campaign budget", 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            verbatim.first().map(|f| f.key.as_str()),
+            Some("campaign.budget")
+        );
+    }
+
+    /// Write time, not only the pass: the vector is there before any backfill
+    /// has run, and the backfill then has nothing left to do for it.
+    #[tokio::test]
+    async fn put_fact_writes_the_vector_and_the_backfill_is_idempotent_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc);
+        seed_facts(&store).await;
+        assert_eq!(
+            store.backfill_embeddings(100).await.unwrap(),
+            0,
+            "put_fact embedded them; the backfill must find nothing"
+        );
+        assert_eq!(
+            store
+                .fact_vectors("global", "bge-m3")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // A superseded version stops being retrievable: the new row is a new
+        // rowid, and the old one is filtered out by state.
+        store
+            .put_fact(a_fact("campaign.budget", "4000 crowns instead", 9))
+            .await
+            .unwrap();
+        let live = store.fact_vectors("global", "bge-m3").await.unwrap();
+        assert_eq!(live.len(), 3, "one version per key stays reachable: {live:?}");
+        assert!(live
+            .iter()
+            .any(|(f, _)| f.key == "campaign.budget" && f.valid_from == Timestamp(9)));
     }
 }
