@@ -30,6 +30,15 @@ pub struct PassConfig {
     pub regression_replay_cap: usize,
     /// Report only: no file writes, no hot swap, no facts.
     pub dry_run: bool,
+    /// M12 T0.1: may a dry run spend requests?
+    ///
+    /// `false` by default, which is the thing M11 got wrong: a dry run that
+    /// wrote nothing still dialled the judge, the proposer and the probes,
+    /// and the free tier's daily fifty went on a pass whose whole point was
+    /// that it changed nothing. Only `--spend` buys them back, and it buys
+    /// nothing else: a spending dry run still writes no file, no fact and
+    /// no ledger entry.
+    pub spend: bool,
     /// M6 §6.2: a live fact neither validated nor used this long goes cold.
     pub fact_stale_days: u64,
     /// M7 Phase 4: the scope session digests are written under. One value
@@ -91,6 +100,7 @@ impl Default for PassConfig {
             max_notes: 20,
             regression_replay_cap: 200,
             dry_run: false,
+            spend: false,
             fact_stale_days: 90,
             digest_scope: "global".into(),
             evaluate: EvaluateConfig::default(),
@@ -125,6 +135,11 @@ const KAPPA_REFERENCE: &str = "symbolic";
 /// positives below which the estimate is resting on a handful of turns.
 const KAPPA_MIN_N: u32 = 96;
 const KAPPA_MIN_POSITIVES: u32 = 10;
+
+/// The lanes that cost provider requests, in the order the pass runs them
+/// (M12 T0.3). A fixed order rather than the map's, so two runs print the
+/// same sentence and `judge, proposer, probes` reads as the sequence it is.
+const LANES: [&str; 3] = ["judge", "proposer", "probes"];
 
 /// How one evaluator agreed with the reference, over the turns both graded.
 ///
@@ -205,6 +220,19 @@ pub struct Report {
     /// Grade attempts the scorer could not answer. Not a failure of a turn
     /// and not counted against anything — the service was down.
     pub grades_unavailable: usize,
+    /// The same number split by [`crate::evaluate::GradeError::reason`]
+    /// (M12 T0.4). "The service was down" and "the verdict was cut off at
+    /// max_tokens" are one count and two different jobs, and only the
+    /// second is fixed by a number in the config.
+    pub grades_unavailable_by_reason: BTreeMap<String, u32>,
+    /// M12 T0.1: paid lanes this run stayed out of, in the order they would
+    /// have run. Empty on a pass that entered every lane it had.
+    pub skipped_lanes: Vec<String>,
+    /// M12 T0.3: provider requests each paid lane spent this pass, read off
+    /// that lane's own usage sink. The notes lane is where M11's dry run
+    /// actually spent its fifty requests, and `evaluator_requests` could
+    /// not see it — only the judge reports itself.
+    pub lane_requests: BTreeMap<String, u32>,
     /// M10 T5.3: one entry per evaluator beside the symbolic baseline.
     pub agreement: Vec<EvaluatorAgreement>,
     /// M11 T1.3: requests each evaluator spent this pass, for the ones that
@@ -272,13 +300,51 @@ impl std::fmt::Display for Report {
             "graded turns: {} newly graded, {} read back from the log, {} unavailable",
             self.graded_turns, self.grades_reused, self.grades_unavailable
         )?;
+        write!(f, "grades unavailable: {}", self.grades_unavailable)?;
+        if self.grades_unavailable_by_reason.is_empty() {
+            writeln!(f)?;
+        } else {
+            let by: Vec<String> = self
+                .grades_unavailable_by_reason
+                .iter()
+                .map(|(reason, n)| format!("{reason} {n}"))
+                .collect();
+            writeln!(f, " ({})", by.join(", "))?;
+        }
         for a in &self.agreement {
             writeln!(f, "{a}")?;
         }
+        if !self.skipped_lanes.is_empty() {
+            writeln!(f, "skipped (dry run): {}", self.skipped_lanes.join(", "))?;
+        }
         // Printed next to κ deliberately: for a paid judge the two numbers
         // are one sentence — what the agreement cost.
-        for (id, n) in &self.evaluator_requests {
-            writeln!(f, "requests spent: {id} {n}")?;
+        //
+        // The per-lane line supersedes `evaluator_requests` wherever there
+        // are sinks: the judge would otherwise be printed twice, once under
+        // its evaluator id and once as a lane.
+        if self.lane_requests.is_empty() {
+            for (id, n) in &self.evaluator_requests {
+                writeln!(f, "requests spent: {id} {n}")?;
+            }
+        } else {
+            let mut lanes: Vec<(&str, u32)> = Vec::new();
+            for lane in LANES {
+                if let Some(n) = self.lane_requests.get(lane) {
+                    lanes.push((lane, *n));
+                }
+            }
+            for (lane, n) in &self.lane_requests {
+                if !LANES.contains(&lane.as_str()) {
+                    lanes.push((lane, *n));
+                }
+            }
+            let total: u32 = lanes.iter().map(|(_, n)| n).sum();
+            let line: Vec<String> = lanes
+                .iter()
+                .map(|(lane, n)| format!("{lane} {n}"))
+                .collect();
+            writeln!(f, "requests spent: {}, total {total}", line.join(", "))?;
         }
         write!(
             f,
@@ -347,6 +413,10 @@ pub struct EvolutionPass {
     /// they cost nothing and they are what every other scorer is calibrated
     /// against — and `with_evaluator` adds the ones that do cost something.
     evaluators: Vec<Arc<dyn Evaluator>>,
+    /// One usage sink per paid lane (M12 T0.3), named by [`LANES`]. Empty
+    /// when nothing paid is attached — a pass with no key, or every double
+    /// in this file.
+    lane_sinks: Vec<(String, Arc<nscore::UsageSink>)>,
     learned_path: PathBuf,
     ledger_path: PathBuf,
     cfg: PassConfig,
@@ -400,6 +470,7 @@ impl EvolutionPass {
             probe: None,
             proposer: None,
             evaluators: vec![symbolic],
+            lane_sinks: Vec::new(),
             learned_path,
             ledger_path,
             cfg,
@@ -421,6 +492,21 @@ impl EvolutionPass {
         self.probe = Some(probe);
         self.proposer = Some(proposer);
         self
+    }
+    /// Attach the usage sinks the paid lanes' clients record into (M12
+    /// T0.3). Each is drained at the end of `run_report` into
+    /// [`Report::lane_requests`], so the numbers belong to that run.
+    pub fn with_lane_sinks(mut self, sinks: Vec<(String, Arc<nscore::UsageSink>)>) -> Self {
+        self.lane_sinks = sinks;
+        self
+    }
+    /// May this run enter a lane that costs requests (M12 T0.1)?
+    ///
+    /// The one gate. A dry run is free unless `spend` says otherwise, and
+    /// asking it here rather than at each client means a lane cannot be
+    /// added later and quietly miss the check.
+    fn may_spend(&self) -> bool {
+        !self.cfg.dry_run || self.cfg.spend
     }
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = clock;
@@ -464,12 +550,24 @@ impl EvolutionPass {
                 .then(a.cmp(b))
         });
 
+        // M12 T0.1: a free dry run never asks a paid scorer, so the skip is
+        // here and not inside the loop — an evaluator that is not going to
+        // be asked must not count as a reused grade either.
+        let asked: Vec<&Arc<dyn Evaluator>> = self
+            .evaluators
+            .iter()
+            .filter(|ev| self.may_spend() || !ev.paid())
+            .collect();
+        if asked.len() != self.evaluators.len() {
+            report.skipped_lanes.push("judge".into());
+        }
+
         let mut budget = self.cfg.evaluate.budget_turns;
         let mut fresh: BTreeMap<usize, Vec<nscore::EventKind>> = BTreeMap::new();
         for (si, ti) in queue {
             let t = &per_session[si][ti];
             let mut wanted: Vec<&Arc<dyn Evaluator>> = Vec::new();
-            for ev in &self.evaluators {
+            for ev in asked.iter().copied() {
                 if graded_by(&sessions[si].1, fresh.get(&si), t.turn, &ev.id()) {
                     report.grades_reused += 1;
                 } else {
@@ -499,8 +597,17 @@ impl EvolutionPass {
                     }
                     // The service was down or answered with nonsense. Neither
                     // is a fact about the turn, so nothing is written and the
-                    // turn stays ungraded for the next pass to try.
-                    Err(_) => report.grades_unavailable += 1,
+                    // turn stays ungraded for the next pass to try — but
+                    // *why* it could not answer is kept (M12 T0.4), because
+                    // a cut-off verdict and a dead service need different
+                    // fixes and used to be one number.
+                    Err(e) => {
+                        report.grades_unavailable += 1;
+                        *report
+                            .grades_unavailable_by_reason
+                            .entry(e.reason().to_string())
+                            .or_default() += 1;
+                    }
                 }
             }
             if any {
@@ -896,7 +1003,20 @@ impl EvolutionPass {
         .await?;
 
         // 7. Notes lane (only with a live probe and a proposer).
-        if let (Some(probe), Some(proposer)) = (&self.probe, &self.proposer) {
+        //
+        // M12 T0.1: and only when this run may spend. Both halves of the
+        // lane dial a provider — one request per proposal, two probe runs
+        // per candidate — and M11's dry run spent fifty-one of them here
+        // while reporting five.
+        if !self.may_spend() && self.probe.is_some() && self.proposer.is_some() {
+            report.skipped_lanes.push("notes proposer".into());
+            report.skipped_lanes.push("probes".into());
+        }
+        let lane = self
+            .may_spend()
+            .then_some((&self.probe, &self.proposer))
+            .unwrap_or((&None, &None));
+        if let (Some(probe), Some(proposer)) = lane {
             let mut budget = self.cfg.probe_budget_turns;
             let clean: Vec<&Recorded> = sessions
                 .iter()
@@ -1024,6 +1144,15 @@ impl EvolutionPass {
                 report.written = true;
             }
             ledger.save_atomic(&self.ledger_path)?;
+        }
+
+        // 9. What each paid lane spent (M12 T0.3). Drained rather than read:
+        //    `UsageSink` hands its records over once, which is exactly the
+        //    per-run scoping this number wants — the idle driver runs this
+        //    pass again on the same sinks.
+        for (lane, sink) in &self.lane_sinks {
+            let calls = sink.drain().len() as u32;
+            *report.lane_requests.entry(lane.clone()).or_default() += calls;
         }
         Ok(report)
     }
@@ -2026,5 +2155,147 @@ mod tests {
             "{recorded:?}"
         );
         assert!(recorded.iter().any(|j| j.contains(r#""by":"symbolic""#)));
+    }
+
+    // -----------------------------------------------------------------
+    // M12 P0 — a dry run spends nothing, and every paid lane is counted
+    // -----------------------------------------------------------------
+
+    /// A paid scorer that records every call it was asked to make.
+    struct CountingJudge(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Evaluator for CountingJudge {
+        fn id(&self) -> String {
+            "client:double".into()
+        }
+        fn paid(&self) -> bool {
+            true
+        }
+        async fn grade(
+            &self,
+            _view: &crate::evaluate::TurnView<'_>,
+        ) -> Result<crate::evaluate::TurnGrade, crate::evaluate::GradeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::evaluate::TurnGrade {
+                issue: crate::evaluate::Issue::None,
+                answers_user: 2,
+                grounded: true,
+                scorer: "client:double".into(),
+            })
+        }
+    }
+
+    struct CountingProposer(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl NoteProposer for CountingProposer {
+        async fn propose(
+            &self,
+            _t: &str,
+            _e: &[Note],
+            _ask: &crate::notes::Ask,
+        ) -> Result<Option<Note>, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(Note::new("global", "Use echo to repeat text.", 0.0)))
+        }
+    }
+
+    struct CountingProbe(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl ProbeRunner for CountingProbe {
+        async fn run(
+            &self,
+            _r: &[Event],
+            _rules: Arc<LearnedRules>,
+        ) -> Result<Vec<TurnOutcome>, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![TurnOutcome::Ok])
+        }
+    }
+
+    /// M12 T0.1: `--dry-run` without `--spend` enters no lane that costs a
+    /// request — not the judge, not the proposer, not the probes — and says
+    /// which lanes it stayed out of.
+    #[tokio::test]
+    async fn a_dry_run_enters_no_paid_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        record_into(
+            store.clone(),
+            "fb",
+            vec![typo(), typo(), typo(), typo(), typo()],
+        )
+        .await;
+        let graded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proposed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let p = pass(dir.path(), rules, true)
+            .with_evaluator(Arc::new(CountingJudge(graded.clone())))
+            .with_notes(
+                Box::new(CountingProbe(probed.clone())),
+                Box::new(CountingProposer(proposed.clone())),
+            );
+        let report = p.run_report(&*store).await.unwrap();
+        let seq = std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(graded.load(seq), 0, "the judge was asked: {report}");
+        assert_eq!(proposed.load(seq), 0, "the proposer was asked: {report}");
+        assert_eq!(probed.load(seq), 0, "the probes ran: {report}");
+        assert_eq!(report.probe_turns_used, 0, "{report}");
+        let printed = report.to_string();
+        assert!(
+            printed.contains("skipped (dry run): judge, notes proposer, probes"),
+            "{printed}"
+        );
+    }
+
+    fn lane_usage(role: &str) -> nscore::Usage {
+        nscore::Usage {
+            role: role.into(),
+            model: "m".into(),
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            estimated: true,
+            attempts: 1,
+            latency_ms: 5,
+            tools_tokens: 0,
+            cached_tokens: 0,
+        }
+    }
+
+    /// M12 T0.3: the report says what each paid lane spent, not only what
+    /// the judge did — the notes lane is where the requests actually went.
+    #[tokio::test]
+    async fn every_paid_lane_reports_its_own_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        record_into(store.clone(), "a", vec![good()]).await;
+        let judge = Arc::new(nscore::UsageSink::new());
+        let proposer = Arc::new(nscore::UsageSink::new());
+        let probes = Arc::new(nscore::UsageSink::new());
+        for _ in 0..2 {
+            judge.record(lane_usage("judge"));
+        }
+        proposer.record(lane_usage("notes-proposer"));
+        for _ in 0..3 {
+            probes.record(lane_usage("probe"));
+        }
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let report = pass(dir.path(), rules, true)
+            .with_lane_sinks(vec![
+                ("judge".to_string(), judge.clone()),
+                ("proposer".to_string(), proposer.clone()),
+                ("probes".to_string(), probes.clone()),
+            ])
+            .run_report(&*store)
+            .await
+            .unwrap();
+        assert_eq!(report.lane_requests.get("judge"), Some(&2), "{report}");
+        assert_eq!(report.lane_requests.get("proposer"), Some(&1), "{report}");
+        assert_eq!(report.lane_requests.get("probes"), Some(&3), "{report}");
+        let printed = report.to_string();
+        assert!(
+            printed.contains("requests spent: judge 2, proposer 1, probes 3, total 6"),
+            "{printed}"
+        );
     }
 }

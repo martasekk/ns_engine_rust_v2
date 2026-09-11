@@ -1296,6 +1296,9 @@ impl EvolutionSection {
             max_notes: self.max_notes,
             regression_replay_cap: self.regression_replay_cap,
             dry_run,
+            // M12 T0.2: `--spend` is a flag of the run, not a config knob —
+            // `build_pass` sets it from the command line.
+            spend: false,
             fact_stale_days,
             // The CLI maps every session to one scope (M6 §15), so digests
             // are written under it. A multi-user channel replaces this with

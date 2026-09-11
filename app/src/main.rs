@@ -131,13 +131,27 @@ async fn connect_pointer(
     Ok(tools)
 }
 
-/// `ns-app evolve [--dry-run]` → Ok(dry_run)
-fn parse_evolve_args(args: &[String]) -> Result<bool, String> {
-    match args {
-        [] => Ok(false),
-        [flag] if flag == "--dry-run" => Ok(true),
-        other => Err(format!("usage: ns-app evolve [--dry-run] (got {other:?})")),
+/// `ns-app evolve [--dry-run] [--spend]` → Ok((dry_run, spend))
+///
+/// M12 T0.2: `--dry-run` alone now spends nothing — no judge, no note
+/// proposer, no probes — and `--spend` is the only way to buy those lanes
+/// back out of one. Without `--dry-run` the pass spends anyway, so
+/// `--spend` there is accepted and says nothing new.
+fn parse_evolve_args(args: &[String]) -> Result<(bool, bool), String> {
+    let usage = || format!("usage: ns-app evolve [--dry-run] [--spend] (got {args:?})");
+    let (mut dry_run, mut spend) = (false, false);
+    for arg in args {
+        let flag = match arg.as_str() {
+            "--dry-run" => &mut dry_run,
+            "--spend" => &mut spend,
+            _ => return Err(usage()),
+        };
+        if *flag {
+            return Err(usage());
+        }
+        *flag = true;
     }
+    Ok((dry_run, spend))
 }
 
 /// One throttle per endpoint: roles sharing a base URL share the pacing,
@@ -342,9 +356,12 @@ fn build_pass(
     tools: &[Arc<dyn Tool>],
     emitter: &RoleTarget,
     dry_run: bool,
+    spend: bool,
 ) -> nsevolution::pass::EvolutionPass {
     let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
-    let pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
+    let mut pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
+    // M12 T0.2: the flag the pass consults before it enters a paid lane.
+    pass_cfg.spend = spend;
     let evaluate_cfg = pass_cfg.evaluate.clone();
     let mut pass = nsevolution::pass::EvolutionPass::new(
         rules,
@@ -395,6 +412,14 @@ fn build_pass(
         Some(key) => {
             let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
             let model = emitter.model.clone();
+            // M12 T0.3: one sink per paid lane. The judge counts its own
+            // grades, but nothing counted the notes lane, which is where a
+            // pass actually spends — so each lane's client records into a
+            // sink of its own and the report sums them per run.
+            let judge_sink = Arc::new(nscore::UsageSink::new());
+            let proposer_sink = Arc::new(nscore::UsageSink::new());
+            let probe_sink = Arc::new(nscore::UsageSink::new());
+            let mut lane_sinks: Vec<(String, Arc<nscore::UsageSink>)> = Vec::new();
             // M11 T1.3: the paid judge, and only when `[models] judge_model`
             // names one. `for_model` is the gate — `None` in, `None` out —
             // so an unset id cannot reach a request, and `pass` is handed
@@ -405,7 +430,8 @@ fn build_pass(
             let mut pass = pass;
             if let Some(judge) = nsevolution::client_eval::ClientEvaluator::for_model(
                 cfg.models.judge_model.as_deref(),
-                client_for(emitter, transport.clone(), &key),
+                client_for(emitter, transport.clone(), &key)
+                    .with_usage_sink(judge_sink.clone(), "judge"),
                 |c| nsevolution::client_eval::JudgeConfig {
                     // Sonnet 5's shape, and harmless on anything else: no
                     // sampling key at all, one short reasoning block, a
@@ -426,14 +452,20 @@ fn build_pass(
                     cfg.models.evaluator_min_kappa
                 );
                 pass = pass.with_evaluator(std::sync::Arc::new(judge));
+                lane_sinks.push(("judge".into(), judge_sink));
             }
             // The probe builds a fresh emitter per run, on the same target.
+            // Each of those clients records into the one probe sink, so a
+            // lane that builds a client per probed session is still one
+            // number in the report.
             let factory_target = emitter.clone();
             let factory_transport = transport.clone();
             let factory_key = key.clone();
             let factory_model = model.clone();
+            let factory_sink = probe_sink.clone();
             let emitter_factory: nsevolution::notes::EmitterFactory = Arc::new(move || {
-                let c = client_for(&factory_target, factory_transport.clone(), &factory_key);
+                let c = client_for(&factory_target, factory_transport.clone(), &factory_key)
+                    .with_usage_sink(factory_sink.clone(), "probe");
                 Box::new(nsllm::emitter::CloudEmitter::new(c, factory_model.clone()))
                     as Box<dyn nscore::Emitter>
             });
@@ -443,10 +475,14 @@ fn build_pass(
                 persona: cfg.persona.text.clone(),
             };
             let proposer = nsevolution::notes::ClientNoteProposer {
-                client: client_for(emitter, transport, &key),
+                client: client_for(emitter, transport, &key)
+                    .with_usage_sink(proposer_sink.clone(), "notes-proposer"),
                 model,
             };
+            lane_sinks.push(("proposer".into(), proposer_sink));
+            lane_sinks.push(("probes".into(), probe_sink));
             pass.with_notes(Box::new(probe), Box::new(proposer))
+                .with_lane_sinks(lane_sinks)
         }
     }
 }
@@ -609,17 +645,23 @@ async fn main() {
     // `ns-app evolve [--dry-run]`: driver A (spec M5 §5). The symbolic lane
     // needs no key; without one the notes lane is skipped with a warning.
     if args.get(1).map(String::as_str) == Some("evolve") {
-        let dry_run = match parse_evolve_args(&args[2..]) {
-            Ok(d) => d,
+        let (dry_run, spend) = match parse_evolve_args(&args[2..]) {
+            Ok(flags) => flags,
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
         };
+        if dry_run && !spend {
+            eprintln!(
+                "dry run: the judge, the note proposer and the probes are skipped \
+                 (add --spend to buy them)."
+            );
+        }
         let rules = load_rules_or_exit(&cfg);
         let tools = build_tools(&cfg, schema_profile).await;
         let emitter = role_or_exit(&cfg, Role::Emitter);
-        let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
+        let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run, spend);
         // M8 T3.1: `evolve` is the idle pass run by hand, and the embeddings
         // backfill is one of its steps — so this store needs the encoder the
         // running harness's does, or `ns-app evolve` would be the one place
@@ -799,12 +841,15 @@ async fn main() {
     }
     if cfg.evolution.enabled {
         // Driver B: the idle timer runs this pass during quiet periods.
+        // Driver B is not a dry run, so it spends by the same rule it
+        // always did: `spend` only ever gates a dry run.
         b.set_consolidator(Box::new(build_pass(
             &cfg,
             rules.clone(),
             &tools,
             &emitter_target,
             false,
+            true,
         )));
     } else {
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -1038,11 +1083,20 @@ mod tests {
         assert!(out.contains("is unknown"), "{out}");
     }
 
+    /// M12 T0.2: `--dry-run` is free by default, and `--spend` is the only
+    /// way to buy requests out of one.
     #[test]
-    fn evolve_args_accept_only_dry_run() {
-        assert_eq!(parse_evolve_args(&[]), Ok(false));
-        assert_eq!(parse_evolve_args(&["--dry-run".to_string()]), Ok(true));
-        assert!(parse_evolve_args(&["--wat".to_string()]).is_err());
+    fn evolve_args_accept_dry_run_and_spend() {
+        let arg = |flags: &[&str]| {
+            parse_evolve_args(&flags.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(arg(&[]), Ok((false, false)));
+        assert_eq!(arg(&["--dry-run"]), Ok((true, false)));
+        assert_eq!(arg(&["--spend"]), Ok((false, true)));
+        assert_eq!(arg(&["--dry-run", "--spend"]), Ok((true, true)));
+        assert_eq!(arg(&["--spend", "--dry-run"]), Ok((true, true)));
+        assert!(arg(&["--wat"]).is_err());
+        assert!(arg(&["--dry-run", "--dry-run"]).is_err());
     }
 
     /// The whole client hop, against an agent that records and touches
