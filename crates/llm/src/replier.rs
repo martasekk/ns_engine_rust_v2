@@ -2,24 +2,39 @@ use crate::client::{ApiError, OpenRouterClient};
 use async_trait::async_trait;
 use nscore::{Replier, ReplyContext, ReplyError};
 
+/// 4096, not 1024: models with reasoning enabled by default (e.g. Claude
+/// Sonnet 5) spend output tokens on reasoning before content; a tight cap
+/// yields finish_reason "length" with null content.
+pub const MAX_TOKENS: u32 = 4096;
+
+/// The request shape this replier has always sent: no sampling param at all,
+/// no reasoning block, 4096 output tokens (M11 T0.2).
+pub fn default_shape() -> crate::provider::RequestShape {
+    crate::provider::RequestShape::unsampled(MAX_TOKENS)
+}
+
 pub struct CloudReplier {
     client: OpenRouterClient,
     model: String,
-    max_tokens: u32,
+    shape: crate::provider::RequestShape,
     prompt_cache: bool,
 }
 
 impl CloudReplier {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
-        // 4096, not 1024: models with reasoning enabled by default (e.g.
-        // Claude Sonnet 5) spend output tokens on reasoning before content;
-        // a tight cap yields finish_reason "length" with null content.
         Self {
             client,
             model,
-            max_tokens: 4096,
+            shape: default_shape(),
             prompt_cache: true,
         }
+    }
+
+    /// `[llm.replier]`'s shaping fields, already resolved against the model
+    /// id (M11 T0.2). Unset everywhere is [`default_shape`].
+    pub fn with_shape(mut self, shape: crate::provider::RequestShape) -> Self {
+        self.shape = shape;
+        self
     }
 
     /// Whether to mark the persona block with an Anthropic `cache_control`
@@ -74,6 +89,23 @@ fn render_reference(ctx: &ReplyContext) -> String {
     s
 }
 
+/// M11 T1.2. The sentence added when every reference block is empty.
+///
+/// An empty `<reference>` is not the same as a reference that happens to say
+/// nothing relevant, and a model that is shown nothing tends to fill the gap
+/// from its own weights (2606.06055). Saying so is cheap — one sentence, and
+/// only on the turns that have nothing to draw on.
+pub const MEMORY_SILENCE: &str = "Nothing in memory bears on this; say so rather than guessing.";
+
+/// Whether this turn has any reference material at all: no facts, no
+/// summary, and no `recall` in the trace, which is the one action that goes
+/// looking for material the context did not carry.
+fn memory_is_silent(ctx: &ReplyContext) -> bool {
+    ctx.facts.is_empty()
+        && ctx.summary.is_none()
+        && !ctx.turn_trace.lines().any(|l| l.contains("recall"))
+}
+
 /// The task: the user's message, what this turn did, and the instruction.
 /// Everything here is live; nothing here is cacheable.
 fn render_task(ctx: &ReplyContext) -> String {
@@ -114,6 +146,14 @@ fn render_task(ctx: &ReplyContext) -> String {
             ctx.do_not_repeat.join(" / ")
         ));
     }
+    // M11 T1.2: said once, next to the instruction, not inside the empty
+    // <reference> — an empty block is the absence of a claim, and this is a
+    // claim about that absence.
+    if memory_is_silent(ctx) {
+        s.push('\n');
+        s.push_str(MEMORY_SILENCE);
+        s.push('\n');
+    }
     // The old closing line asked the model to "state only outcomes and values
     // that appear above", which read literally is a request for a copy — and
     // got one. Answering comes first now; grounding is the constraint on the
@@ -152,14 +192,16 @@ impl Replier for CloudReplier {
         } else {
             serde_json::Value::String(format!("{persona}\n\n{reference}"))
         };
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
             "messages": [
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": render_task(&ctx)},
             ],
         });
+        // Sampling stays absent unless a config puts it back; the shape is
+        // also where `reasoning` and a per-role `max_tokens` enter.
+        self.shape.apply(&mut request);
         let body = self
             .client
             .chat_into(request, ctx.usage.as_deref())
@@ -279,6 +321,10 @@ mod tests {
             req.get("temperature").is_none(),
             "sampling params are rejected on sonnet-5"
         );
+        // M11 T0.2: the default shape is today's request — 4096 tokens and
+        // no `reasoning` block until a config asks for one.
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none(), "{req}");
         assert_eq!(req["messages"][0]["role"], "system");
         assert_eq!(
             req["messages"][0]["content"][0]["text"],
@@ -400,6 +446,80 @@ mod tests {
             reqs[0]["messages"][0]["content"][0]["text"],
             "You are a helpful assistant."
         );
+    }
+
+    /// M11 T0.2. `reasoning` is a block, not a `reasoning_effort` string —
+    /// OpenRouter takes `{"effort": …}` and Sonnet 5 takes no budget at all.
+    #[tokio::test]
+    async fn effort_rides_as_a_reasoning_block() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })]);
+        let client = OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1);
+        let (shape, _) = crate::provider::RoleShaping {
+            reasoning: Some("medium".into()),
+            max_tokens: Some(4096),
+            ..Default::default()
+        }
+        .resolve(
+            "replier",
+            "anthropic/claude-sonnet-5",
+            crate::replier::default_shape(),
+        );
+        CloudReplier::new(client, "anthropic/claude-sonnet-5".into())
+            .with_shape(shape)
+            .reply(ctx())
+            .await
+            .unwrap();
+        let reqs = mock.requests.lock().unwrap();
+        let req = &reqs[0];
+        assert_eq!(req["reasoning"], serde_json::json!({"effort": "medium"}));
+        assert!(req.get("reasoning_effort").is_none(), "{req}");
+        assert!(req.get("temperature").is_none(), "{req}");
+        assert!(req.get("thinking").is_none(), "no manual budget: {req}");
+        assert_eq!(req["max_tokens"], 4096);
+    }
+
+    /// M11 T1.2. The line is about an absence, so it may only appear when
+    /// there is one: no facts, no summary, and nothing recalled this turn.
+    /// The answerable arm is the other half of this guard.
+    #[tokio::test]
+    async fn the_silence_line_appears_only_when_every_reference_block_is_empty() {
+        async fn task_of(c: ReplyContext) -> String {
+            let mock = MockTransport::ok(vec![serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })]);
+            replier(mock.clone()).reply(c).await.unwrap();
+            let reqs = mock.requests.lock().unwrap();
+            reqs[0]["messages"][1]["content"].as_str().unwrap().into()
+        }
+        // The shipped context carries a fact and a summary: no line.
+        assert!(!task_of(ctx()).await.contains(MEMORY_SILENCE));
+
+        let silent = || {
+            let mut c = ctx();
+            c.facts = vec![];
+            c.summary = None;
+            c.turn_trace = "Proposed(respond_directly)".into();
+            c
+        };
+        let t = task_of(silent()).await;
+        assert_eq!(t.matches(MEMORY_SILENCE).count(), 1, "{t}");
+        // and it sits with the instruction, after what the turn did.
+        assert!(t.find("<did>").unwrap() < t.find(MEMORY_SILENCE).unwrap());
+
+        // Any one block that is not empty takes it away again.
+        let mut c = silent();
+        c.facts = ctx().facts;
+        assert!(!task_of(c).await.contains(MEMORY_SILENCE));
+        let mut c = silent();
+        c.summary = ctx().summary;
+        assert!(!task_of(c).await.contains(MEMORY_SILENCE));
+        // A recall that fired is material even when it came back empty:
+        // the model was shown the search, not nothing.
+        let mut c = silent();
+        c.turn_trace = "Proposed(recall)\nToolReturned(ok: recall: no matches)".into();
+        assert!(!task_of(c).await.contains(MEMORY_SILENCE));
     }
 
     #[tokio::test]

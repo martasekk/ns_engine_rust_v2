@@ -84,6 +84,7 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
                 action: Some(proposal.action.clone()),
                 rejection: false,
                 foldable: false,
+                done: false,
                 line: format!("Proposed({})", proposal.action),
             }),
             EventKind::Rejected { reason, .. } => Some(TraceEntry {
@@ -91,6 +92,7 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
                 action: None,
                 rejection: true,
                 foldable: false,
+                done: false,
                 line: match reason {
                     RejectReason::Malformed { detail } => format!("Rejected(malformed: {detail})"),
                     // Named as an endpoint problem, because this line is fed back
@@ -110,12 +112,19 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
             }),
             EventKind::ToolReturned { outcome, call } => {
                 let action = action_of.get(&call.0).cloned();
+                // M10 T4.1. The call ran; the repeat gate will refuse an
+                // identical one. `inspect_result` is the exception the gate
+                // itself makes — the same call is how the next page is asked
+                // for — and marking it `done` would be a false statement in
+                // the one place the model is being asked to trust the trace.
+                let done = action.as_deref() != Some(INSPECT_RESULT);
                 Some(match outcome {
                     ToolOutcome::Ok { output } => TraceEntry {
                         handle: Some(e.id),
                         action,
                         rejection: false,
                         foldable: true,
+                        done,
                         line: format!("ToolReturned(ok: {})", output.summary),
                     },
                     ToolOutcome::Err { kind, detail } => TraceEntry {
@@ -123,6 +132,7 @@ fn trace_entries(events: &[nscore::Event], turn: u32) -> Vec<TraceEntry> {
                         action,
                         rejection: false,
                         foldable: true,
+                        done,
                         line: format!("ToolReturned(err {kind}: {detail})"),
                     },
                 })
@@ -148,8 +158,28 @@ struct TraceEntry {
     /// `Proposed` lines are dropped by the fold instead, since the outcome
     /// line beneath them already names the action.
     foldable: bool,
+    /// M10 T4.1: this line is a call that *ran*. The rendered line carries
+    /// [`DONE_MARKER`] and the fold's descriptor carries its short form, so
+    /// the statement survives the fold rather than being a property only of
+    /// the last few verbatim lines.
+    done: bool,
     line: String,
 }
+
+/// What an executed call is marked with in "This turn so far" (M10 T4.1).
+///
+/// The prompt already said "never repeat a completed action" and the
+/// recorded sessions repeated one 6 times in 81 proposals anyway. A sentence
+/// in the system prompt is read once, at the top, about calls in general;
+/// this rides on the line itself, next to the call it is about, and says
+/// what will happen rather than what is preferred — the repeat gate is real,
+/// and a model that re-proposes spends a request to be told so.
+pub const DONE_MARKER: &str = " [done; an identical call is denied]";
+
+/// Its short form, for the fold's counted line. `pointer_move ×3 ok done`
+/// is the same fact in three characters, and the fold's whole job is to say
+/// the turn's earlier steps in one line.
+const DONE_SHORT: &str = " done";
 
 /// `pointer_move ×3 ok` — how one folded outcome is counted.
 fn fold_descriptor(entry: &TraceEntry, max_chars: usize) -> String {
@@ -159,12 +189,13 @@ fn fold_descriptor(entry: &TraceEntry, max_chars: usize) -> String {
     } else {
         "ok"
     };
+    let done = if entry.done { DONE_SHORT } else { "" };
     match entry
         .handle
         .filter(|_| entry.line.chars().count() > max_chars)
     {
-        Some(id) => format!("{action} {outcome} ({}, clipped)", result_handle(id)),
-        None => format!("{action} {outcome}"),
+        Some(id) => format!("{action} {outcome}{done} ({}, clipped)", result_handle(id)),
+        None => format!("{action} {outcome}{done}"),
     }
 }
 
@@ -242,6 +273,9 @@ fn fold_older_steps(
         action: None,
         rejection: false,
         foldable: false,
+        // The fold's own line is not a call; the calls it counts carry
+        // `DONE_SHORT` inside their descriptors.
+        done: false,
         line,
     }];
     out.extend(kept);
@@ -383,7 +417,17 @@ pub fn trace_for_prompt(
         .into_iter()
         .map(|entry| {
             dropped += entry.line.chars().count().saturating_sub(max_chars);
-            clip_trace_line(&entry.line, max_chars, entry.handle)
+            let line = clip_trace_line(&entry.line, max_chars, entry.handle);
+            // M10 T4.1, after the clip rather than before it: a marker
+            // appended to the raw line would be the first thing a long
+            // `pointer_ui_read` result cut off, and a marker that is present
+            // exactly when the result is short is not a rule the model can
+            // learn.
+            if entry.done {
+                format!("{line}{DONE_MARKER}")
+            } else {
+                line
+            }
         })
         .collect();
     (lines, dropped)
@@ -459,8 +503,9 @@ pub(crate) fn window_range(window: &[nscore::TurnRecord]) -> Option<(u32, u32)> 
 /// What the emitter was shown, in keys (M7 T0.1). Built from the context
 /// immediately before it is moved into the call, so the two cannot drift.
 pub(crate) fn emitter_manifest(
+    scope: &str,
     ctx: &nscore::EmitterContext,
-    tools: usize,
+    tool_names: Vec<String>,
     clipped_chars: usize,
     note_hashes: Vec<String>,
 ) -> nscore::ContextManifest {
@@ -471,7 +516,10 @@ pub(crate) fn emitter_manifest(
         trace_lines: ctx.trace_so_far.len(),
         trace_chars: ctx.trace_so_far.iter().map(|l| l.chars().count()).sum(),
         clipped_chars,
-        tools,
+        // Count and list filled from one legal set, the invariant
+        // `tool_names.len() == tools` states (M10 T0.1).
+        tools: tool_names.len(),
+        tool_names,
         guidance: ctx.guidance.len(),
         note_hashes,
         obligations: ctx.obligations.len(),
@@ -484,6 +532,9 @@ pub(crate) fn emitter_manifest(
         ablated: None,
         tier: None,
         route_cues: Vec::new(),
+        // The session's fact scope, so the fitness join can credit these
+        // keys per `(scope, key)` rather than by key alone (M9 follow-up 7).
+        scope: Some(scope.to_string()),
         // Filled in by the caller, which is the only place that knows what
         // the budget did to this context.
         budget: None,
@@ -493,6 +544,7 @@ pub(crate) fn emitter_manifest(
 /// What the replier was shown. `tools` is zero: the reply model is given no
 /// action schema at all, which is half of why it is the cheaper of the two.
 pub(crate) fn reply_manifest(
+    scope: &str,
     ctx: &nscore::ReplyContext,
     clipped_chars: usize,
     note_hashes: Vec<String>,
@@ -505,6 +557,7 @@ pub(crate) fn reply_manifest(
         trace_chars: ctx.turn_trace.chars().count(),
         clipped_chars,
         tools: 0,
+        tool_names: Vec::new(),
         guidance: ctx.guidance.len(),
         note_hashes,
         obligations: ctx.obligations.len(),
@@ -514,6 +567,7 @@ pub(crate) fn reply_manifest(
         ablated: None,
         tier: None,
         route_cues: Vec::new(),
+        scope: Some(scope.to_string()),
         budget: None,
     }
 }
@@ -521,6 +575,106 @@ pub(crate) fn reply_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log with one executed call of `action` in turn 1, and one
+    /// `inspect_result` over its result if `paged`.
+    fn ran(action: &str, summary: &str, paged: bool) -> Vec<nscore::Event> {
+        let mut log = nscore::EventLog::new(nscore::SessionId("t".into()));
+        let call = log
+            .append(
+                1,
+                nscore::Timestamp(1),
+                EventKind::ToolCalled {
+                    action: action.into(),
+                    args: Default::default(),
+                },
+            )
+            .id;
+        log.append(
+            1,
+            nscore::Timestamp(2),
+            EventKind::ToolReturned {
+                call,
+                outcome: ToolOutcome::Ok {
+                    output: nscore::ToolOutput {
+                        summary: summary.into(),
+                        artifact: None,
+                        trust: nscore::Trust::System,
+                    },
+                },
+            },
+        );
+        if paged {
+            let insp = log
+                .append(
+                    1,
+                    nscore::Timestamp(3),
+                    EventKind::ToolCalled {
+                        action: INSPECT_RESULT.into(),
+                        args: Default::default(),
+                    },
+                )
+                .id;
+            log.append(
+                1,
+                nscore::Timestamp(4),
+                EventKind::ToolReturned {
+                    call: insp,
+                    outcome: ToolOutcome::Ok {
+                        output: nscore::ToolOutput {
+                            summary: "page 2".into(),
+                            artifact: None,
+                            trust: nscore::Trust::System,
+                        },
+                    },
+                },
+            );
+        }
+        log.events().to_vec()
+    }
+
+    /// M10 T4.1. "Never repeat a completed action" was already in the system
+    /// prompt, and the recorded sessions repeated one six times in eighty-one
+    /// proposals. This says the same thing beside the call it is about, and
+    /// says what happens rather than what is preferred.
+    #[test]
+    fn an_executed_call_carries_the_done_marker() {
+        let (lines, _) = trace_for_prompt(&ran("pointer_click", "clicked Save", false), 1, 0, 1200);
+        let outcome = lines
+            .iter()
+            .find(|l| l.starts_with("ToolReturned"))
+            .expect("the call ran");
+        assert!(outcome.ends_with(DONE_MARKER), "{outcome}");
+        assert!(outcome.contains("clicked Save"), "{outcome}");
+        // The proposal line above it is not a call that ran.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("Proposed") && l.contains("done")),
+            "{lines:?}"
+        );
+
+        // The marker lands after the clip, not before it: a long result must
+        // not lose the one line that says it will not be run again.
+        let long = "node ".repeat(500);
+        let (clipped, _) = trace_for_prompt(&ran("pointer_ui_read", &long, false), 1, 0, 100);
+        let outcome = clipped
+            .iter()
+            .find(|l| l.starts_with("ToolReturned"))
+            .expect("the read ran");
+        assert!(outcome.contains("inspect_result to see more"), "{outcome}");
+        assert!(outcome.ends_with(DONE_MARKER), "{outcome}");
+
+        // `inspect_result` is the repeat gate's own exception — the same call
+        // is how the next page is asked for — so marking it done would be a
+        // false statement in the one place the trace is asking to be trusted.
+        let (paged, _) = trace_for_prompt(&ran("pointer_click", "clicked Save", true), 1, 0, 1200);
+        assert_eq!(
+            paged.iter().filter(|l| l.contains(DONE_MARKER)).count(),
+            1,
+            "only the real call is marked: {paged:?}"
+        );
+    }
 
     /// A result that fits is passed through untouched: most of them do, and a
     /// trace full of "[0 more characters]" would be noise.
@@ -572,6 +726,7 @@ mod tests {
             action: Some(action.into()),
             rejection: false,
             foldable: true,
+            done: action != INSPECT_RESULT,
             line: format!("ToolReturned(ok: {text})"),
         }
     }
@@ -582,6 +737,7 @@ mod tests {
             action: Some(action.into()),
             rejection: false,
             foldable: false,
+            done: false,
             line: format!("Proposed({action})"),
         }
     }
@@ -592,6 +748,7 @@ mod tests {
             action: None,
             rejection: true,
             foldable: false,
+            done: false,
             line: format!("Rejected({text})"),
         }
     }
@@ -640,7 +797,9 @@ mod tests {
             "the fold leads: {lines:?}"
         );
         assert!(
-            lines[0].contains("pointer_move ok ×3"),
+            // `done` is M10 T4.1's short form, carried by the descriptor so
+            // the marker survives the fold.
+            lines[0].contains("pointer_move ok done ×3"),
             "equal steps are counted, not repeated: {}",
             lines[0]
         );
@@ -667,7 +826,7 @@ mod tests {
         let entries = vec![big, outcome("a", 1, "x"), outcome("b", 2, "y")];
         let lines = folded(entries, 2);
         assert!(
-            lines[0].contains("pointer_ui_read ok (r42, clipped)"),
+            lines[0].contains("pointer_ui_read ok done (r42, clipped)"),
             "{}",
             lines[0]
         );
@@ -818,7 +977,14 @@ mod tests {
         ];
         let window = vec![record(1, "ahoj", "hello"), record(2, "who am I", "Martin")];
         let ctx = emitter_ctx(facts.clone(), Some(summary.clone()), window.clone());
-        let m = emitter_manifest(&ctx, 3, 0, vec![]);
+        let m = emitter_manifest(
+            "global",
+            &ctx,
+            vec!["echo".into(), "recall".into(), "respond".into()],
+            0,
+            vec![],
+        );
+        assert_eq!(m.tools, 3, "the count is the list's length");
         assert_eq!(m.facts_chars, nscore::facts_chars(&facts));
         assert_eq!(m.summary_chars, nscore::summary_chars(Some(&summary)));
         assert_eq!(
@@ -830,7 +996,13 @@ mod tests {
         // An empty context is three zeros, not three defaults that happen to
         // look like one: nothing was sent, so nothing is charged to the
         // prefix.
-        let empty = emitter_manifest(&emitter_ctx(vec![], None, vec![]), 0, 0, vec![]);
+        let empty = emitter_manifest(
+            "global",
+            &emitter_ctx(vec![], None, vec![]),
+            vec![],
+            0,
+            vec![],
+        );
         assert_eq!(
             (empty.facts_chars, empty.summary_chars, empty.window_chars),
             (0, 0, 0)
@@ -845,7 +1017,7 @@ mod tests {
         let mut ctx = emitter_ctx(vec![], None, vec![]);
         ctx.guidance = vec!["prefer echo".into(), "never wipe".into()];
         let hashes = vec!["sha256:a".to_string(), "sha256:b".to_string()];
-        let m = emitter_manifest(&ctx, 0, 0, hashes.clone());
+        let m = emitter_manifest("global", &ctx, vec![], 0, hashes.clone());
         assert_eq!(m.guidance, 2);
         assert_eq!(m.note_hashes, hashes);
     }

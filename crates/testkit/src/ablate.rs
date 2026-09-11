@@ -16,6 +16,7 @@
 //! red exit code would make the measurement something to avoid taking.
 
 use crate::eval::{run_all_for, Ability, Run};
+use crate::fixtures::{self, Fixture};
 use nscore::Ablate;
 
 /// One arm's result over the whole ability set.
@@ -64,6 +65,15 @@ pub struct Report {
     pub block: Ablate,
     pub full: Vec<Ability>,
     pub ablated: Vec<Ability>,
+    /// M10 T5.1: the same two arms over the scripted sessions, which is the
+    /// half of this report that can see `summary` and `guidance` at all.
+    ///
+    /// M9 §Results T0.4 read 9/9 → 9/9 for both blocks and could not say
+    /// whether that was a block doing nothing or a suite carrying nothing.
+    /// These rows carry a summary and two rendered notes each and print both
+    /// counts, so the next reader is never left with that question.
+    pub full_fixtures: Vec<Fixture>,
+    pub ablated_fixtures: Vec<Fixture>,
 }
 
 impl Report {
@@ -93,6 +103,34 @@ impl Report {
     /// zero when blanking it changed nothing.
     pub fn delta(&self) -> i64 {
         self.ablated_arm().passed as i64 - self.full_arm().passed as i64
+    }
+
+    /// The same number over the scripted sessions' answerable arm (M10 T5.1).
+    pub fn fixture_delta(&self) -> i64 {
+        let passed = |rows: &[Fixture]| rows.iter().filter(|r| r.passed).count() as i64;
+        passed(&self.ablated_fixtures) - passed(&self.full_fixtures)
+    }
+
+    /// And over the abstention arm, kept separate for 2606.09376's reason:
+    /// folded into one rate, a block that made the harness decline more would
+    /// look like a block that made it answer better.
+    pub fn abstention_delta(&self) -> i64 {
+        let declined = |rows: &[Fixture]| rows.iter().filter(|r| r.declined).count() as i64;
+        declined(&self.ablated_fixtures) - declined(&self.full_fixtures)
+    }
+
+    /// Whether the suite could have seen this block at all: the sessions the
+    /// **full** arm ran carried one.
+    ///
+    /// This is the question M9 could not answer. A zero delta with this true
+    /// is a measured zero; a zero delta with it false is blindness.
+    pub fn fixtures_carry_the_block(&self) -> bool {
+        match self.block {
+            Ablate::Summary => self.full_fixtures.iter().all(|r| r.summary_shown > 0),
+            Ablate::Guidance => self.full_fixtures.iter().all(|r| r.notes_shown >= 2),
+            // `facts` was never blind: M9 measured 9/9 → 4/9 with it.
+            Ablate::Facts => !self.full_fixtures.is_empty(),
+        }
     }
 }
 
@@ -126,13 +164,20 @@ pub async fn measure(block: Ablate, activation_weight: f32) -> Report {
     let arm = |ablate| Run {
         ablate,
         activation_weight,
+        ..Run::default()
     };
     let full = run_all_for(arm(None)).await;
     let ablated = run_all_for(arm(Some(block))).await;
+    // M10 T5.1, in the same two arms and the same order, so the fixture
+    // section of the table is read the way the ability section is.
+    let full_fixtures = fixtures::run_all_for(arm(None)).await;
+    let ablated_fixtures = fixtures::run_all_for(arm(Some(block))).await;
     Report {
         block,
         full,
         ablated,
+        full_fixtures,
+        ablated_fixtures,
     }
 }
 
@@ -189,6 +234,85 @@ pub fn render(r: &Report) -> String {
     }
     for a in r.ablated.iter().filter(|a| !a.passed) {
         out.push_str(&format!("  {} FAILED: {}\n", a.ability, a.detail));
+    }
+    out.push_str(&render_fixtures(r));
+    out
+}
+
+/// The scripted-session half of the same report (M10 T5.1).
+///
+/// Counts rather than rows: thirty fixtures times two arms is not a table
+/// anybody reads, and the two numbers that matter are the delta and whether
+/// the full arm carried the block at all.
+pub fn render_fixtures(r: &Report) -> String {
+    let block = block_name(r.block);
+    let (full, ablated) = (&r.full_fixtures, &r.ablated_fixtures);
+    if full.is_empty() {
+        return String::new();
+    }
+    let passed = |rows: &[Fixture]| rows.iter().filter(|x| x.passed).count();
+    let declined = |rows: &[Fixture]| rows.iter().filter(|x| x.declined).count();
+    let summaries: usize = full.iter().filter(|x| x.summary_chars > 0).count();
+    let notes: usize = full.iter().filter(|x| x.notes_held >= 2).count();
+    let mut out = format!(
+        "\n  M10 T5.1 — the same block over {} scripted sessions from hand-authored seeds\n\n\
+         \x20 answerable   {}/{} → {}/{} ({:+})\n\
+         \x20 abstention   {}/{} → {}/{} ({:+})\n\
+         \x20 carried      {summaries}/{} sessions hold a summary in the log, \
+         {notes}/{} hand the engine two reply notes\n",
+        full.len(),
+        passed(full),
+        full.len(),
+        passed(ablated),
+        ablated.len(),
+        r.fixture_delta(),
+        declined(full),
+        full.len(),
+        declined(ablated),
+        ablated.len(),
+        r.abstention_delta(),
+        full.len(),
+        full.len(),
+    );
+    // M10 T5.4 arm 1: the per-ability rows, so a total that did not move can
+    // be told from six abilities that each moved and cancelled.
+    out.push('\n');
+    out.push_str(&fixtures::render_arms(
+        "full",
+        full,
+        &format!("no {block}"),
+        ablated,
+    ));
+    if r.fixture_delta() == 0 {
+        out.push_str(&format!(
+            "  a zero delta here is {}: the full arm's sessions {} carry `{block}`.\n",
+            if r.fixtures_carry_the_block() {
+                "a measurement"
+            } else {
+                "BLINDNESS, not a finding"
+            },
+            if r.fixtures_carry_the_block() {
+                "do"
+            } else {
+                "do NOT"
+            },
+        ));
+    } else {
+        let mut lost: Vec<&str> = full
+            .iter()
+            .zip(ablated)
+            .filter(|(f, a)| f.passed && !a.passed)
+            .map(|(f, _)| f.id)
+            .collect();
+        lost.truncate(6);
+        out.push_str(&format!(
+            "  lost without `{block}` (first {}): {}\n",
+            lost.len(),
+            lost.join(", ")
+        ));
+        if let Some(one) = ablated.iter().find(|a| !a.passed) {
+            out.push_str(&format!("  {} FAILED: {}\n", one.id, one.detail));
+        }
     }
     out
 }
@@ -260,6 +384,10 @@ mod tests {
             inspections: 0,
             budget_drops: 0,
             escalations: 0,
+            target_action: "remember_fact",
+            target_proposed: passed,
+            legal_size: 8,
+            bits: crate::eval::bits_over_random(passed, 8),
             detail: if passed {
                 String::new()
             } else {
@@ -273,6 +401,8 @@ mod tests {
                 row("information extraction", false),
                 row("abstention", true),
             ],
+            full_fixtures: vec![],
+            ablated_fixtures: vec![],
         };
         let t = render(&r);
         assert!(
@@ -301,6 +431,42 @@ mod tests {
         );
         assert_eq!(r.delta(), -1);
         assert_eq!(r.lost(), vec!["information extraction"]);
+    }
+
+    /// **The finding M9 could not take** (M10 T5.1, and P5's exit criterion).
+    ///
+    /// M9 §Results T0.4: *"`summary` and `guidance`: 9/9 → 9/9, not
+    /// measurable — the scripted suite carries no summary and no notes."*
+    /// Both halves are asserted here, because either alone would let the
+    /// blindness back: the full arm's sessions have to **carry** the block,
+    /// and blanking it has to **cost** them.
+    #[tokio::test]
+    async fn the_summary_ablation_arm_is_no_longer_blind() {
+        for block in [Ablate::Summary, Ablate::Guidance] {
+            let r = measure(block, 0.0).await;
+            let table = render(&r);
+            assert!(
+                r.fixtures_carry_the_block(),
+                "the full arm does not carry `{}` — this is M9's blindness again:\n{table}",
+                block_name(block)
+            );
+            assert_eq!(
+                r.full_fixtures.iter().filter(|f| f.passed).count(),
+                r.full_fixtures.len(),
+                "the full arm must be green or the delta means nothing:\n{table}"
+            );
+            assert!(
+                r.fixture_delta() < 0,
+                "blanking `{}` cost the scripted sessions nothing:\n{table}",
+                block_name(block)
+            );
+            // Abstention is graded on its own arm, and neither block is what
+            // makes a reply decline: a delta there would mean the blanking
+            // reached the grounding interceptor, which is not its business.
+            assert_eq!(r.abstention_delta(), 0, "{table}");
+            assert!(table.contains("M10 T5.1 —"), "{table}");
+            assert!(table.contains("answerable"), "{table}");
+        }
     }
 
     #[test]

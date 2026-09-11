@@ -6,7 +6,7 @@
 //! ability regresses, which is what keeps a regression from reaching the gate
 //! in the first place.
 //!
-//! Nine abilities: the six memory ones from M6 §11 Phase 7, and three desktop
+//! Ten abilities: the six memory ones from M6 §11 Phase 7, and four desktop
 //! tasks over a control tree of the recorded size, which are what exercise
 //! M7's own phases — the clip and its handle, the fold, and the router.
 
@@ -23,8 +23,8 @@ async fn the_memory_and_desktop_abilities_pass_against_a_fixed_model() {
     println!("{table}");
     assert_eq!(
         rows.len(),
-        9,
-        "six memory abilities and three desktop:\n{table}"
+        10,
+        "six memory abilities and four desktop:\n{table}"
     );
     assert!(
         rows.iter().all(|r| r.passed),

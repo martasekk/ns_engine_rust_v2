@@ -28,10 +28,21 @@ pub const RESPOND_DIRECTLY: &str = "respond_directly";
 /// silently.
 pub const RATIONALE: &str = "_rationale";
 
+/// What the `_rationale` property says about itself, per tool.
+///
+/// M10 T1.1: this text was repeated verbatim in every tool of every array —
+/// 106 chars each, a measured **25% of all tool tokens** on the recorded
+/// turn-21 call (findings §8.1). It is one instruction, and one instruction
+/// belongs in the system prompt, which is sent once; see
+/// [`crate::emitter::RATIONALE_INSTRUCTION`], which carries the sentence this
+/// used to repeat. What stays here is the label a reader of the schema alone
+/// needs to know what the field is for, and nothing more.
+pub const RATIONALE_HINT: &str = "why, in one clause";
+
 fn rationale_prop() -> serde_json::Value {
     serde_json::json!({
         "type": "string",
-        "description": "One sentence: why this action, grounded in the user's words"
+        "description": RATIONALE_HINT
     })
 }
 
@@ -49,34 +60,42 @@ fn rationale_only() -> serde_json::Value {
 /// string property of every tool, plus the always-legal `respond_directly`
 /// tool. The emitter physically cannot propose an illegal action.
 pub fn build_tools(legal: &LegalActionSet) -> serde_json::Value {
-    let mut tools: Vec<serde_json::Value> = legal
-        .actions
-        .iter()
-        .map(|spec| {
-            let mut schema = spec.args_schema.clone();
-            let obj = schema.as_object_mut().expect("args_schema is an object");
-            obj.entry("type").or_insert(serde_json::json!("object"));
-            obj.entry("properties").or_insert(serde_json::json!({}));
-            obj["properties"][RATIONALE] = rationale_prop();
-            let mut required = vec![serde_json::json!(RATIONALE)];
-            if let Some(existing) = obj.get("required").and_then(|r| r.as_array()) {
-                required.extend(existing.iter().cloned());
-            }
-            obj.insert("required".into(), serde_json::Value::Array(required));
-            obj.insert("additionalProperties".into(), serde_json::json!(false));
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": spec.name,
-                    "description": spec.description,
-                    "strict": true,
-                    "parameters": schema,
-                }
-            })
-        })
-        .collect();
+    let mut tools: Vec<serde_json::Value> = legal.actions.iter().map(tool_schema).collect();
+    tools.push(respond_directly_tool());
+    serde_json::Value::Array(tools)
+}
 
-    tools.push(serde_json::json!({
+/// One spec compiled to the one element `build_tools` would put in the
+/// array. Split out of `build_tools` (M10 T0.1) so a report can price a
+/// single tool with the same bytes the request paid for: an apportionment
+/// that re-derived the envelope would drift from the array the moment the
+/// compiler changed, which is the change M10 P1 is about to make.
+pub fn tool_schema(spec: &nscore::ActionSpec) -> serde_json::Value {
+    let mut schema = spec.args_schema.clone();
+    let obj = schema.as_object_mut().expect("args_schema is an object");
+    obj.entry("type").or_insert(serde_json::json!("object"));
+    obj.entry("properties").or_insert(serde_json::json!({}));
+    obj["properties"][RATIONALE] = rationale_prop();
+    let mut required = vec![serde_json::json!(RATIONALE)];
+    if let Some(existing) = obj.get("required").and_then(|r| r.as_array()) {
+        required.extend(existing.iter().cloned());
+    }
+    obj.insert("required".into(), serde_json::Value::Array(required));
+    obj.insert("additionalProperties".into(), serde_json::json!(false));
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "strict": true,
+            "parameters": schema,
+        }
+    })
+}
+
+/// The tool every call carries whether or not anything is legal.
+pub fn respond_directly_tool() -> serde_json::Value {
+    serde_json::json!({
         "type": "function",
         "function": {
             "name": RESPOND_DIRECTLY,
@@ -89,9 +108,27 @@ pub fn build_tools(legal: &LegalActionSet) -> serde_json::Value {
                 "additionalProperties": false
             }
         }
-    }));
+    })
+}
 
-    serde_json::Value::Array(tools)
+/// What one tool costs of the request, in the same chars/4 the client
+/// measures the whole array with (`client.rs`, `nscore::estimate_tokens`).
+///
+/// The per-tool envelope and the injected `_rationale` property are part of
+/// this number, because they are part of the tool's bytes — on the recorded
+/// desktop array the envelope alone is ~70 tokens per tool and the rationale
+/// boilerplate is 25% of the total, and a per-tool table that hid either
+/// would point P1 at the wrong text. What is *not* in it is the array's own
+/// two brackets and its `n - 1` commas; summing these over a call therefore
+/// lands within a token or so of the call's `tools_tokens`, and that gap is
+/// the floor in `estimate_tokens` plus those separators.
+pub fn schema_tokens(spec: &nscore::ActionSpec) -> u32 {
+    nscore::estimate_tokens(tool_schema(spec).to_string().len())
+}
+
+/// `schema_tokens` for the always-appended tool, which has no spec.
+pub fn respond_directly_tokens() -> u32 {
+    nscore::estimate_tokens(respond_directly_tool().to_string().len())
 }
 
 #[cfg(test)]
@@ -245,6 +282,58 @@ mod tests {
                 spec.args_schema
             );
         }
+    }
+
+    /// The pin `ns-app budget`'s per-tool table rests on: a tool priced
+    /// alone is byte-identical to the same tool inside the array, so the
+    /// table's rows are the request's own bytes and not a model of them.
+    #[test]
+    fn a_tool_priced_alone_is_the_same_bytes_as_in_the_array() {
+        let legal = legal();
+        let arr = build_tools(&legal);
+        let arr = arr.as_array().unwrap();
+        assert_eq!(
+            tool_schema(&legal.actions[0]).to_string(),
+            arr[0].to_string()
+        );
+        assert_eq!(respond_directly_tool().to_string(), arr[1].to_string());
+        // And the sum of the parts is the whole, within the separators the
+        // array adds: two brackets and one comma per gap.
+        let parts: usize = arr.iter().map(|t| t.to_string().len()).sum();
+        let whole = serde_json::Value::Array(arr.to_vec()).to_string().len();
+        assert_eq!(whole, parts + 2 + (arr.len() - 1));
+        assert_eq!(
+            schema_tokens(&legal.actions[0]),
+            nscore::estimate_tokens(arr[0].to_string().len())
+        );
+        assert_eq!(
+            respond_directly_tokens(),
+            nscore::estimate_tokens(arr[1].to_string().len())
+        );
+    }
+
+    /// M10 T1.1. The property is not "the constant is short" but "no tool
+    /// pays more than one clause for it", which is what a per-tool multiplier
+    /// means: the recorded turn-21 array carried 106 chars × 7 tools of the
+    /// same sentence, a quarter of every tool token on the call. Measured on
+    /// the compiled tool, so a description sneaking back in via `json!`
+    /// fails here and not in a review.
+    #[test]
+    fn the_rationale_property_costs_under_forty_chars_per_tool() {
+        let legal = legal();
+        for tool in [tool_schema(&legal.actions[0]), respond_directly_tool()] {
+            let name = tool["function"]["name"].as_str().unwrap().to_string();
+            let desc = tool["function"]["parameters"]["properties"][RATIONALE]["description"]
+                .as_str()
+                .expect("the rationale property describes itself");
+            assert!(
+                desc.chars().count() <= 40,
+                "`{name}` pays {} chars of rationale boilerplate: {desc:?} — the instruction \
+                 belongs in the emitter's system prompt, once",
+                desc.chars().count()
+            );
+        }
+        assert!(RATIONALE_HINT.chars().count() <= 40);
     }
 
     #[test]

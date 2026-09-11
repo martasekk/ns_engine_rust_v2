@@ -518,9 +518,87 @@ pub fn render_summary(s: &SessionSummary) -> String {
     out
 }
 
+/// M8 §6 T3.2: the RRF constant this repo fuses with.
+///
+/// Not the customary 60. That constant is tuned for lists of hundreds of
+/// candidates, where a rank-60 document still deserves weight; here the lists
+/// are `coarse_k` long — ten by default — and 60 would flatten every rank
+/// difference the two arms disagree about into noise. The M8 retrieval sweep
+/// fixed the band at `k ∈ [1, 10]`; 5 sits in the middle of it.
+pub const RRF_K: f64 = 5.0;
+
+/// Fuse ranked lists **by rank, never by score** (M8 §6).
+///
+/// Every list contributes `1 / (RRF_K + rank)` to each key it ranks, rank
+/// counted from 1. Rank and not score because of nsmodels' own measurement: a
+/// bi-encoder's cosine range is compressed enough — a true match at 0.898
+/// against 0.862 for an unrelated Czech sentence — that a threshold across
+/// arms is meaningless, and bm25's scale is unrelated to a cosine's, so
+/// normalising the two is a guess wearing arithmetic.
+///
+/// Ties break on first appearance, so fusing one list returns that list
+/// unchanged — the property the "service down" fallback rests on.
+pub fn rrf_fuse<K: Clone + Eq + std::hash::Hash>(lists: &[Vec<K>]) -> Vec<K> {
+    let mut score: std::collections::HashMap<K, f64> = Default::default();
+    let mut order: Vec<K> = Vec::new();
+    for list in lists {
+        for (i, key) in list.iter().enumerate() {
+            if !score.contains_key(key) {
+                order.push(key.clone());
+            }
+            *score.entry(key.clone()).or_insert(0.0) += 1.0 / (RRF_K + (i as f64 + 1.0));
+        }
+    }
+    let mut out = order;
+    out.sort_by(|a, b| {
+        score[b]
+            .partial_cmp(&score[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// Cosine between two vectors nsmodels has already normalised, i.e. their dot
+/// product. `None` when the lengths disagree — which is what a model change
+/// looks like from here, and is why a stored vector records the model that
+/// produced it (M8 T3.1).
+pub fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(a.iter().zip(b).map(|(x, y)| x * y).sum())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M8 §6: fusing one list must be that list, or the "service down"
+    /// fallback is not a fallback.
+    #[test]
+    fn fusing_one_list_returns_it_unchanged() {
+        let one = vec!["a", "b", "c"];
+        assert_eq!(rrf_fuse(&[one.clone()]), one);
+        assert!(rrf_fuse::<&str>(&[]).is_empty());
+    }
+
+    /// Rank, not score: the key both arms rank beats the key one arm puts
+    /// first, because two agreements outweigh one confident opinion at k = 5.
+    #[test]
+    fn rrf_ranks_agreement_above_either_arms_own_first() {
+        let lexical = vec!["x", "shared"];
+        let vector = vec!["y", "shared"];
+        let fused = rrf_fuse(&[lexical, vector]);
+        assert_eq!(fused[0], "shared", "fused = {fused:?}");
+    }
+
+    #[test]
+    fn cosine_is_a_dot_product_and_refuses_a_dimension_change() {
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0]), Some(1.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), Some(0.0));
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), None);
+        assert_eq!(cosine(&[], &[]), None);
+    }
 
     fn rec(turn: u32, user: &str, did: &[&str], reply: &str) -> TurnRecord {
         TurnRecord {

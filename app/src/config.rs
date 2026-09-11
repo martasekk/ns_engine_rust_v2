@@ -23,6 +23,10 @@ pub struct AppConfig {
     /// use. Absent, or `enabled = false`, means nothing reaches for it.
     #[serde(default)]
     pub models: ModelsSection,
+    /// [recall] — M8 §6 Phase 3. Everything here is inert without
+    /// `[models] enabled`, because the store gets no encoder without it.
+    #[serde(default)]
+    pub recall: RecallSection,
     /// [pointer] — a desktop to drive, through the ns-pointer agent on it.
     /// Absent means no pointer actions are registered.
     #[serde(default)]
@@ -90,6 +94,36 @@ pub struct ModelsSection {
     /// for new turns only — a second pass over the same log grades nothing.
     #[serde(default = "default_evaluate_budget_turns")]
     pub evaluate_budget_turns: u32,
+    /// Cohen's κ an evaluator must reach against the symbolic proxies before
+    /// the notes gate will act on its grades (M8 T2.7, M10 T5.3).
+    ///
+    /// Under it the scorer still runs and every grade it produces is still
+    /// recorded — it contributes observations and no candidates, which is
+    /// exactly what a paid judge below threshold gets. 0.4 is the bottom of
+    /// Landis–Koch's "moderate" band, and it is a floor rather than a
+    /// target: the lane's own held-out numbers (M8 §Results: symbolic 0.501,
+    /// local 0.628, local-vs-symbolic 0.466) sit above it, so a scorer that
+    /// falls under it has moved.
+    #[serde(default = "default_evaluator_min_kappa")]
+    pub evaluator_min_kappa: f64,
+    /// The paid offline judge (M11 T1.3): a model id for
+    /// `nsevolution::client_eval::ClientEvaluator`, or unset.
+    ///
+    /// **Unset is not a disabled feature, it is the absence of one.** With no
+    /// id here `ClientEvaluator::for_model` returns `None` and nothing is
+    /// constructed, so the idle pass spends exactly the requests it spent
+    /// before — zero. Set it and one request is spent per newly-graded turn,
+    /// capped by `evaluate_budget_turns` and paid once per turn ever, because
+    /// a graded turn is remembered by its `Graded` event.
+    ///
+    /// It is under `[models]` beside `evaluate_budget_turns` and
+    /// `evaluator_min_kappa` rather than under `[llm]` with the roles,
+    /// because it is not a role: it never runs in a turn, never enters the
+    /// guard chain, and its output is κ-gated like every other evaluator's.
+    /// The endpoint and key it dials are the emitter's, so naming a judge
+    /// needs no second provider block.
+    #[serde(default)]
+    pub judge_model: Option<String>,
 }
 
 impl Default for ModelsSection {
@@ -101,14 +135,88 @@ impl Default for ModelsSection {
             reask_cosine: default_reask_cosine(),
             relevance_cut: default_relevance_cut(),
             evaluate_budget_turns: default_evaluate_budget_turns(),
+            evaluator_min_kappa: default_evaluator_min_kappa(),
+            judge_model: None,
         }
     }
+}
+
+/// [recall] — the hybrid retrieval path (M8 §6, M10 P3).
+///
+/// Every value here is measured rather than chosen, and the measurements are
+/// in M8 §6's table. The one thing to keep in mind while touching them is
+/// the finding that contradicts the intuition: with bge-m3 **wider is
+/// worse**. Coarse-10 → rerank missed 8% of paraphrases at 509 ms; k = 20,
+/// 30 and 48 all missed 17% at two to four times the cost. Every candidate
+/// past the tenth is another chance for the cross-encoder to promote a
+/// distractor.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct RecallSection {
+    /// Whether recall may take the hybrid path at all. Off by default, as
+    /// M8 §8 writes it, and never read outside the `Task`/`Deep` tier.
+    #[serde(default)]
+    pub hybrid: bool,
+    /// Candidates each arm contributes before rank fusion.
+    #[serde(default = "default_coarse_k")]
+    pub coarse_k: usize,
+    /// How long the whole hybrid path may take before it gives up and
+    /// returns the lexical list it already has (M8 T3.5).
+    ///
+    /// 800 ms against a 509 ms measured round trip: enough headroom for a
+    /// cold cache and a busy box, and short enough that the fallback is a
+    /// fallback rather than a formality. A recall that would hold a turn is
+    /// worth less than a worse recall that does not.
+    #[serde(default = "default_rerank_budget_ms")]
+    pub rerank_budget_ms: u64,
+    /// The embedder's name, recorded beside every stored vector so a model
+    /// change invalidates the index rather than mixing two geometries in it.
+    ///
+    /// `--model quality` is bge-m3, and M8 §6 is explicit that this is the
+    /// one to serve: the nsmodels default is chosen for throughput, and this
+    /// is a recall problem. Change this key *and* the flag together, or the
+    /// stored vectors will claim a model that did not write them.
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+}
+
+impl Default for RecallSection {
+    fn default() -> Self {
+        Self {
+            hybrid: false,
+            coarse_k: default_coarse_k(),
+            rerank_budget_ms: default_rerank_budget_ms(),
+            embed_model: default_embed_model(),
+        }
+    }
+}
+
+/// Ten, and the number has a table behind it. See [`RecallSection`].
+fn default_coarse_k() -> usize {
+    10
+}
+fn default_rerank_budget_ms() -> u64 {
+    800
+}
+fn default_embed_model() -> String {
+    "bge-m3".into()
+}
+fn default_embed_backfill_batch() -> usize {
+    64
+}
+fn default_embed_backfill_batches() -> usize {
+    16
 }
 
 /// 40, the same number `probe_budget_turns` uses. One idle pass, one budget
 /// of the same order: the two lanes compete for the same wait.
 fn default_evaluate_budget_turns() -> u32 {
     40
+}
+
+/// The bottom of Landis–Koch's "moderate" band. See
+/// [`ModelsSection::evaluator_min_kappa`].
+fn default_evaluator_min_kappa() -> f64 {
+    0.4
 }
 
 fn default_models_base_url() -> String {
@@ -151,6 +259,16 @@ pub struct RouterSection {
     /// Words that mean something is to be done, so the tools must be legal.
     #[serde(default)]
     pub task_cues: Vec<String>,
+    /// M10 T2.1/T2.3: `"full"` (the default) or `"adaptive"`. `full` sends
+    /// every registered tool the tier allows, exactly as before this knob
+    /// existed; `adaptive` sends the tool groups the message's own cues name
+    /// and lets an `IllegalAction` widen the set for the rest of the turn.
+    ///
+    /// Default stays `full` until the live escalation rate holds under 5 per
+    /// 100 proposals (`ns-app budget`'s `rejections by reason`), whatever
+    /// the eval numbers say.
+    #[serde(default)]
+    pub depth: Option<String>,
 }
 
 impl Default for RouterSection {
@@ -159,6 +277,7 @@ impl Default for RouterSection {
             enabled: true,
             recall_cues: Vec::new(),
             task_cues: Vec::new(),
+            depth: None,
         }
     }
 }
@@ -175,7 +294,20 @@ impl RouterSection {
         if !self.task_cues.is_empty() {
             r.task_cues = self.task_cues.clone();
         }
+        // Resolved and reported at startup by `depth()`, which is what the
+        // composition root calls first; an unreadable value never gets this
+        // far, and if it somehow did, the default is today's behaviour.
+        r.depth = self.depth().unwrap_or_default();
         r
+    }
+
+    /// `[router] depth`, resolved. Err carries the message a startup error
+    /// should print, the same shape `[llm] schema_profile` uses.
+    pub fn depth(&self) -> Result<nscore::Depth, String> {
+        match self.depth.as_deref() {
+            None => Ok(nscore::Depth::Full),
+            Some(s) => nscore::Depth::parse(s).map_err(|e| format!("[router] {e}")),
+        }
     }
 }
 
@@ -413,6 +545,15 @@ pub struct MemorySection {
     /// Hits per source the `recall` action returns (M6 §7).
     #[serde(default = "default_recall_top_k")]
     pub recall_top_k: usize,
+    /// M9 T5.3 / M10 T3.6: nearest earlier conversations the deep tier's
+    /// pre-emptive step may bring in as exemplars, as one `ToolReturned`.
+    ///
+    /// **0 until `--ablate` says otherwise.** That is the M9 rule for every
+    /// knob whose fixture does not exist yet, and "default" is not a
+    /// measurement. It also needs `[models] enabled`: without an encoder the
+    /// store has no digest vectors to be near.
+    #[serde(default)]
+    pub exemplars_max: usize,
 }
 
 fn default_recall_top_k() -> usize {
@@ -454,8 +595,10 @@ fn default_relevant_max() -> usize {
 }
 
 /// Off. The prior ships inert and a measurement turns it on (M9 T3.1).
+// 0.5 since M10 T5.4: the tie corpus separates at 0.5 and the verbatim arms do not move
+// (plan §Results); 0 restores the pre-M9 order byte for byte.
 fn default_activation_weight() -> f32 {
-    0.0
+    0.5
 }
 
 fn default_activation_half_life_days() -> f32 {
@@ -558,6 +701,7 @@ impl Default for MemorySection {
             summary_max_chars: default_summary_max_chars(),
             summary_input_max_chars: default_summary_input_max_chars(),
             recall_top_k: default_recall_top_k(),
+            exemplars_max: 0,
         }
     }
 }
@@ -674,6 +818,28 @@ pub struct RoleSection {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// M11 T0.1. How much the model may think before it answers:
+    /// `"low"`, `"medium"` or `"high"`, sent as OpenRouter's
+    /// `reasoning: {"effort": …}`. Unset sends no reasoning block, which is
+    /// the provider's own default and the request this role has always sent.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Output-token cap for this role. Unset is the role's constant (emitter
+    /// and replier 4096, summarizer 400) — a floor chosen so a reasoning
+    /// model does not spend the whole budget before the content starts.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// `"default"` (the role's own `temperature`) or `"none"` (no sampling
+    /// param at all). Claude Sonnet 5 rejects the *presence* of
+    /// `temperature`, so `none` omits the key rather than changing its
+    /// value; a Sonnet model id defaults this to `none` on its own.
+    #[serde(default)]
+    pub sampling: Option<String>,
+    /// `thinking = false` sends `reasoning: {"enabled": false}`, for models
+    /// that reason by default where this role wants a tool call, not a
+    /// monologue. Unset sends nothing.
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -697,6 +863,25 @@ pub struct LlmConfig {
     /// Send Anthropic cache breakpoints. Unset: the provider's own value.
     #[serde(default)]
     pub prompt_cache: Option<bool>,
+    /// M10 P4 (decision 2b): give the *emitter* a breakpoint too, after its
+    /// window block. Default **false**, and false is the request the emitter
+    /// has always sent, byte for byte.
+    ///
+    /// Separate from `prompt_cache` because the two are gated on different
+    /// facts. `prompt_cache` says whether breakpoints survive the hop to the
+    /// provider — a property of the endpoint. This says whether an emitter
+    /// prefix is worth one, which needs the tool array to be stable inside a
+    /// turn (M10 P2's rule) and the prefix to clear the provider's
+    /// 1,024-token floor. It has no effect unless `prompt_cache` is on.
+    #[serde(default)]
+    pub prompt_cache_emitter: bool,
+    /// M10 T1.3: `"full"` (the default) or `"slim"` — which spelling of
+    /// every tool description rides on each emitter call. `slim` is the
+    /// same tool set with shorter text; it never removes a parameter.
+    /// Default stays `full` until the live Malformed/IllegalAction rates of
+    /// M10 T1.6 say `slim` holds.
+    #[serde(default)]
+    pub schema_profile: Option<String>,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -721,6 +906,15 @@ fn is_loopback(url: &str) -> bool {
 }
 
 impl LlmConfig {
+    /// `[llm] schema_profile`, resolved. Err carries the message a startup
+    /// error should print; unset is [`nscore::SchemaProfile::Full`].
+    pub fn schema_profile(&self) -> Result<nscore::SchemaProfile, String> {
+        match self.schema_profile.as_deref() {
+            None => Ok(nscore::SchemaProfile::Full),
+            Some(s) => nscore::SchemaProfile::parse(s).map_err(|e| format!("[llm] {e}")),
+        }
+    }
+
     fn section(&self, role: Role) -> &RoleSection {
         match role {
             Role::Emitter => &self.emitter,
@@ -757,6 +951,13 @@ impl LlmConfig {
                     s.model = None;
                     s.base_url = None;
                     s.api_key_env = None;
+                    // M11 T0.1: a shape is chosen for a model — an effort
+                    // level or a sampling opt-out belongs to the backend
+                    // being left behind, exactly as its model id does.
+                    s.reasoning = None;
+                    s.max_tokens = None;
+                    s.sampling = None;
+                    s.thinking = None;
                 }
             }
         }
@@ -860,6 +1061,48 @@ impl LlmConfig {
             prompt_cache,
             local,
         })
+    }
+
+    /// One role's four shaping fields, parsed (M11 T0.1). Err carries the
+    /// message a startup error prints, naming the section and the bad value
+    /// the way `schema_profile` and `budget_mode` do — a typo here would
+    /// otherwise look exactly like a model that ignores the knob.
+    pub fn shaping(&self, role: Role) -> Result<nsllm::provider::RoleShaping, String> {
+        let s = self.section(role);
+        let where_ = role.as_str();
+        let sampling = match &s.sampling {
+            None => None,
+            Some(v) => {
+                Some(nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
+            }
+        };
+        let reasoning = match &s.reasoning {
+            None => None,
+            Some(v) => {
+                Some(nsllm::provider::parse_effort(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
+            }
+        };
+        Ok(nsllm::provider::RoleShaping {
+            reasoning,
+            max_tokens: s.max_tokens,
+            sampling,
+            thinking: s.thinking,
+        })
+    }
+
+    /// The request shape one role sends: its own default folded through the
+    /// config and the Sonnet safety net (M11 T0.2/T0.3). The second half of
+    /// the pair is the startup line to print when the net fired.
+    ///
+    /// One function so `main.rs` cannot resolve a role's model down one path
+    /// and its shape down another.
+    pub fn shape(
+        &self,
+        role: Role,
+        model: &str,
+        base: nsllm::provider::RequestShape,
+    ) -> Result<(nsllm::provider::RequestShape, Option<String>), String> {
+        Ok(self.shaping(role)?.resolve(role.as_str(), model, base))
     }
 
     /// Emitter, replier, summarizer — the order the banner prints them in.
@@ -972,6 +1215,18 @@ pub struct EvolutionSection {
     /// band, which is what T2.7 will calibrate against, does not depend on it.
     #[serde(default = "default_reask_jaccard")]
     pub reask_jaccard: f32,
+    /// M8 T3.1: rows the embeddings backfill may embed per `/embed` call,
+    /// and how many calls one pass may make.
+    ///
+    /// Under `[evolution]` and not `[recall]` because this is a property of
+    /// the *pass* — how much of the idle window the backfill may take before
+    /// grading and consolidation need it. It is resumable, so a cap that
+    /// stops early costs a later pass rather than a re-run, and it never
+    /// runs in a turn.
+    #[serde(default = "default_embed_backfill_batch")]
+    pub embed_backfill_batch: usize,
+    #[serde(default = "default_embed_backfill_batches")]
+    pub embed_backfill_batches: usize,
 }
 
 /// 0.6: a reply more than half of which is one lifted run is a copy, not
@@ -1017,6 +1272,8 @@ impl Default for EvolutionSection {
             max_notes: default_max_notes(),
             regression_replay_cap: default_replay_cap(),
             reask_jaccard: default_reask_jaccard(),
+            embed_backfill_batch: default_embed_backfill_batch(),
+            embed_backfill_batches: default_embed_backfill_batches(),
         }
     }
 }
@@ -1030,7 +1287,7 @@ impl EvolutionSection {
         &self,
         dry_run: bool,
         memory: &MemorySection,
-        evaluate_budget_turns: u32,
+        models: &ModelsSection,
     ) -> nsevolution::pass::PassConfig {
         let fact_stale_days = memory.fact_stale_days;
         nsevolution::pass::PassConfig {
@@ -1046,16 +1303,19 @@ impl EvolutionSection {
             digest_scope: "global".into(),
             evaluate: nsevolution::evaluate::EvaluateConfig {
                 reask_jaccard: self.reask_jaccard,
-                budget_turns: evaluate_budget_turns,
+                budget_turns: models.evaluate_budget_turns,
                 ..Default::default()
             },
             // The symbolic checks are the baseline every other evaluator is
             // calibrated against (T2.7), so they are what the gate believes
             // until a κ threshold says otherwise.
             authoritative_evaluator: "symbolic".into(),
+            evaluator_min_kappa: models.evaluator_min_kappa,
             fitness_min_exposures: memory.fitness_min_exposures,
             fitness_demote: memory.fitness_demote,
             pinned_prefixes: memory.pinned_prefixes.clone(),
+            embed_backfill_batch: self.embed_backfill_batch,
+            embed_backfill_batches: self.embed_backfill_batches,
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -1137,6 +1397,62 @@ mod tests {
         assert_eq!(cfg.http_components[0].name, "check_stock");
     }
 
+    /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an
+    /// unknown depth is a startup error rather than a silent `full` — a
+    /// deployment that asked for `adaptive` and got `full` would read its
+    /// own escalation rate as a success.
+    #[test]
+    fn depth_and_the_emitter_cache_knob_default_to_todays_behaviour() {
+        let plain = AppConfig::parse("").unwrap();
+        assert_eq!(plain.router.depth().unwrap(), nscore::Depth::Full);
+        assert_eq!(plain.router.router().depth, nscore::Depth::Full);
+        assert!(!plain.llm.prompt_cache_emitter);
+
+        let on = AppConfig::parse(
+            "[router]\ndepth = \"adaptive\"\n[llm]\nprompt_cache_emitter = true\n",
+        )
+        .unwrap();
+        assert_eq!(on.router.depth().unwrap(), nscore::Depth::Adaptive);
+        assert_eq!(on.router.router().depth, nscore::Depth::Adaptive);
+        assert!(on.llm.prompt_cache_emitter);
+        // The cue lists are untouched by the depth knob.
+        assert!(!on.router.router().task_cues.is_empty());
+
+        let err = AppConfig::parse("[router]\ndepth = \"shallow\"")
+            .unwrap()
+            .router
+            .depth()
+            .unwrap_err();
+        assert!(err.starts_with("[router] "), "{err}");
+        assert!(err.contains("full, adaptive"), "{err}");
+    }
+
+    /// M10 T1.3. The knob defaults to today's behaviour, the way every knob
+    /// in this plan does, and an unknown spelling is a startup error rather
+    /// than a silent fall back to `full` — a deployment that asked for `slim`
+    /// and got `full` would read its own token numbers wrong.
+    #[test]
+    fn schema_profile_defaults_to_full_and_rejects_an_unknown_name() {
+        assert_eq!(
+            AppConfig::parse("").unwrap().llm.schema_profile().unwrap(),
+            nscore::SchemaProfile::Full
+        );
+        assert_eq!(
+            AppConfig::parse("[llm]\nschema_profile = \"slim\"")
+                .unwrap()
+                .llm
+                .schema_profile()
+                .unwrap(),
+            nscore::SchemaProfile::Slim
+        );
+        let err = AppConfig::parse("[llm]\nschema_profile = \"tiny\"")
+            .unwrap()
+            .llm
+            .schema_profile()
+            .unwrap_err();
+        assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
+    }
+
     #[test]
     fn api_key_env_defaults_to_openrouter_and_is_configurable() {
         let d = AppConfig::parse("").unwrap();
@@ -1153,6 +1469,39 @@ mod tests {
 
     /// A config that spells the endpoint out instead of naming the preset
     /// still gets that provider's rate limit and prompt-cache behaviour.
+    /// M8 T3.5 / M10 P3: `[recall]` parses, and every default is today's
+    /// behaviour — hybrid off, exemplars off, coarse 10, 800 ms.
+    #[test]
+    fn the_recall_section_defaults_to_todays_behaviour_and_parses() {
+        let bare = AppConfig::parse("").unwrap();
+        assert!(!bare.recall.hybrid);
+        assert_eq!(bare.recall.coarse_k, 10);
+        assert_eq!(bare.recall.rerank_budget_ms, 800);
+        assert_eq!(bare.recall.embed_model, "bge-m3");
+        assert_eq!(bare.memory.exemplars_max, 0);
+        assert_eq!(bare.evolution.embed_backfill_batch, 64);
+
+        let set = AppConfig::parse(
+            "[recall]\n\
+             hybrid = true\n\
+             coarse_k = 20\n\
+             rerank_budget_ms = 1500\n\
+             [memory]\n\
+             exemplars_max = 2\n\
+             [evolution]\n\
+             embed_backfill_batch = 8\n",
+        )
+        .unwrap();
+        assert!(set.recall.hybrid);
+        assert_eq!(set.recall.coarse_k, 20);
+        assert_eq!(set.recall.rerank_budget_ms, 1500);
+        assert_eq!(set.memory.exemplars_max, 2);
+        let pc = set
+            .evolution
+            .pass_config(true, &set.memory, &set.models);
+        assert_eq!(pc.embed_backfill_batch, 8);
+    }
+
     #[test]
     fn min_interval_and_prompt_cache_follow_the_resolved_base_url() {
         let emitter = |toml: &str| {
@@ -1359,6 +1708,81 @@ mod tests {
         }
     }
 
+    /// M11 T0.1, the exit criterion: a bare `[llm.emitter]` produces today's
+    /// request. All four fields default to None, and None folded onto a
+    /// role's default shape is that shape.
+    #[test]
+    fn role_shaping_fields_default_to_none() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"openrouter\"\n[llm.emitter]\n").unwrap();
+        for role in [Role::Emitter, Role::Replier, Role::Summarizer] {
+            let shaping = cfg.llm.shaping(role).expect("an empty section parses");
+            assert_eq!(shaping, nsllm::provider::RoleShaping::default(), "{role:?}");
+        }
+        let base = nsllm::provider::RequestShape::pinned(4096);
+        let (shape, note) = cfg
+            .llm
+            .shape(Role::Emitter, "google/gemini-3.8-flash", base.clone())
+            .unwrap();
+        assert_eq!(shape, base);
+        assert!(note.is_none());
+        let mut req = serde_json::json!({"model": "google/gemini-3.8-flash"});
+        shape.apply(&mut req);
+        assert_eq!(req["temperature"], 0);
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none(), "{req}");
+
+        // Set, they arrive as written.
+        let cfg = AppConfig::parse(
+            "[llm.emitter]\nreasoning = \"low\"\nmax_tokens = 2048\n\
+             sampling = \"none\"\nthinking = false\n",
+        )
+        .unwrap();
+        let shaping = cfg.llm.shaping(Role::Emitter).unwrap();
+        assert_eq!(shaping.reasoning.as_deref(), Some("low"));
+        assert_eq!(shaping.max_tokens, Some(2048));
+        assert_eq!(shaping.sampling, Some(nsllm::provider::Sampling::None));
+        assert_eq!(shaping.thinking, Some(false));
+        // and only for the role that set them.
+        assert_eq!(
+            cfg.llm.shaping(Role::Replier).unwrap(),
+            nsllm::provider::RoleShaping::default()
+        );
+    }
+
+    /// A typo is a startup error naming the section, like every other knob
+    /// in this file — not a silently dropped shape.
+    #[test]
+    fn unknown_shaping_values_are_rejected_at_parse() {
+        let cfg = AppConfig::parse("[llm.replier]\nreasoning = \"maximum\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Replier).unwrap_err();
+        assert!(err.starts_with("[llm.replier]"), "{err}");
+        assert!(err.contains("maximum") && err.contains("\"medium\""), "{err}");
+
+        let cfg = AppConfig::parse("[llm.summarizer]\nsampling = \"off\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
+        assert!(err.starts_with("[llm.summarizer]"), "{err}");
+        assert!(err.contains("off") && err.contains("\"none\""), "{err}");
+    }
+
+    /// T0.3 as the operator meets it: a config that only names Sonnet gets
+    /// a request without `temperature`, and one line saying so.
+    #[test]
+    fn a_config_naming_sonnet_resolves_to_a_sampling_free_shape() {
+        let cfg = AppConfig::parse(
+            "[llm]\nprovider = \"openrouter\"\n\
+             [llm.emitter]\nmodel = \"anthropic/claude-sonnet-5\"\n",
+        )
+        .unwrap();
+        let target = cfg.llm.role(Role::Emitter).unwrap();
+        let (shape, note) = cfg
+            .llm
+            .shape(Role::Emitter, &target.model, nsllm::emitter::default_shape())
+            .unwrap();
+        assert!(shape.temperature.is_none());
+        let line = note.expect("the coercion is announced");
+        assert!(line.contains("anthropic/claude-sonnet-5") && line.contains("emitter"));
+    }
+
     #[test]
     fn bad_toml_is_a_readable_error() {
         assert!(AppConfig::parse("[llm").is_err());
@@ -1460,12 +1884,31 @@ mod tests {
     fn evaluate_budget_turns_parses_and_reaches_the_pass() {
         let cfg = AppConfig::parse("[models]\nevaluate_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.models.evaluate_budget_turns, 7);
-        let pc = cfg
-            .evolution
-            .pass_config(true, &cfg.memory, cfg.models.evaluate_budget_turns);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
         assert_eq!(pc.evaluate.budget_turns, 7);
         // And the gate's default belief is the symbolic baseline.
         assert_eq!(pc.authoritative_evaluator, "symbolic");
+    }
+
+    /// M10 T5.3. The κ threshold is a key with a default, and it reaches the
+    /// pass — the two halves of "honoured" that a config test can settle.
+    #[test]
+    fn evaluator_min_kappa_defaults_to_four_tenths_and_reaches_the_pass() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!((cfg.models.evaluator_min_kappa - 0.4).abs() < 1e-12);
+        assert!(
+            (cfg.evolution
+                .pass_config(true, &cfg.memory, &cfg.models)
+                .evaluator_min_kappa
+                - 0.4)
+                .abs()
+                < 1e-12
+        );
+
+        let cfg = AppConfig::parse("[models]\nevaluator_min_kappa = 0.62\n").unwrap();
+        assert!((cfg.models.evaluator_min_kappa - 0.62).abs() < 1e-12);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
+        assert!((pc.evaluator_min_kappa - 0.62).abs() < 1e-12);
     }
 
     /// M9 T4.4. The two fitness knobs sit beside `fact_stale_days` in
@@ -1477,7 +1920,7 @@ mod tests {
         let cfg = AppConfig::parse("").unwrap();
         assert_eq!(cfg.memory.fitness_min_exposures, 8);
         assert!(!cfg.memory.fitness_demote, "reports before it demotes");
-        let pc = cfg.evolution.pass_config(true, &cfg.memory, 40);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
         assert_eq!(pc.fitness_min_exposures, 8);
         assert!(!pc.fitness_demote);
         assert_eq!(pc.pinned_prefixes, vec!["user.".to_string()]);
@@ -1487,7 +1930,7 @@ mod tests {
             "[memory]\nfitness_min_exposures = 3\nfitness_demote = true\npinned_prefixes = [\"me.\"]\n",
         )
         .unwrap();
-        let pc = cfg.evolution.pass_config(false, &cfg.memory, 40);
+        let pc = cfg.evolution.pass_config(false, &cfg.memory, &cfg.models);
         assert_eq!(pc.fitness_min_exposures, 3);
         assert!(pc.fitness_demote);
         assert_eq!(pc.pinned_prefixes, vec!["me.".to_string()]);
@@ -1515,7 +1958,7 @@ mod tests {
         assert_eq!(tuned.memory.guidance_max, 3);
         // M9 T3.1: the activation prior ships inert. A config that never
         // heard of it must rank exactly as it did before M9.
-        assert_eq!(cfg.memory.activation_weight, 0.0);
+        assert_eq!(cfg.memory.activation_weight, 0.5);
         assert_eq!(cfg.memory.activation_half_life_days, 7.0);
         let prior = AppConfig::parse(
             "[memory]\nactivation_weight = 0.5\nactivation_half_life_days = 14.0\n",
@@ -1588,11 +2031,15 @@ mod tests {
         assert_eq!(cfg.evolution.idle_after(), None);
         assert_eq!(
             cfg.evolution
-                .pass_config(true, &cfg.memory, 40)
+                .pass_config(true, &cfg.memory, &cfg.models)
                 .probe_budget_turns,
             7
         );
-        assert!(cfg.evolution.pass_config(true, &cfg.memory, 40).dry_run);
+        assert!(
+            cfg.evolution
+                .pass_config(true, &cfg.memory, &cfg.models)
+                .dry_run
+        );
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
     }

@@ -1653,9 +1653,12 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
         .iter()
         .any(|e| matches!(e.kind, EventKind::PendingConfirmation { .. })));
 
-    // Nothing stored: forget_all is still legal (legality never depends on
-    // store state, or replay from a fresh store would diverge) and is
-    // staged like any irreversible action.
+    // Nothing stored: `forget_all` is not legal either, and for a different
+    // reason — M10 T1.4 leaves it out of the set while the scope holds no
+    // facts, because a purge of nothing is an iteration spent finding that
+    // out. The replay hazard the old rule was guarding against is handled
+    // where it arises: `replay_session` sets `prune_inapplicable: false`, so
+    // a replay never narrows a set the recording had wider.
     let store = Arc::new(InMemoryStore::new());
     let e = engine_with(
         vec![Proposal {
@@ -1674,8 +1677,14 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     .await
     .unwrap();
     let events = store.load(&sid2).await.unwrap();
-    assert!(rejection_reasons(&events).is_empty());
-    assert!(events
+    let reasons = rejection_reasons(&events);
+    assert!(
+        reasons
+            .iter()
+            .all(|r| matches!(r, RejectReason::IllegalAction { .. })),
+        "a purge of an empty scope should not even be offered: {reasons:?}"
+    );
+    assert!(!events
         .iter()
         .any(|e| matches!(e.kind, EventKind::PendingConfirmation { .. })));
 }
@@ -4009,6 +4018,10 @@ fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>)
             scope_for: Arc::new(|sid| sid.0.clone()),
             // `ContextDump` copies its prompt by design; see `engine_with`.
             max_echo_ratio: 1.1,
+            // What this fixture is about is scope, not applicability: with no
+            // verbatim window there is nothing in sight, so M10 T1.4 keeps
+            // `recall` legal from turn 1 and the scripted recall can run.
+            window_turns: 0,
             ..EngineConfig::default()
         },
         Box::new(|| Timestamp(42)),
@@ -4529,4 +4542,1167 @@ async fn a_reply_quoting_a_fact_value_records_that_fact_as_cited() {
     // list is never written — absence is how the join reads "nothing cited".
     let cited = run("Sure.").await;
     assert!(cited.is_empty(), "{cited:?}");
+}
+
+// ---- M10 T1.4: applicability pruning of the synthetic tools -------------
+//
+// Every tool in the schema costs ~60 tokens of envelope before a word of
+// description. On the recorded 21-turn log `forget_fact` and `forget_all`
+// rode every single call while the store held zero facts (~216 tokens a
+// turn), and `recall` rode turn 1, where there is nothing out of sight to
+// recall. Neither could have succeeded; both were a way for a small model to
+// spend an iteration finding that out.
+
+/// An engine with no router and no registered tools, whose emitter records
+/// the legal set it is shown and then declines to act. The turn ends on the
+/// fallback, which is the point: what is under test is the array, not the
+/// outcome.
+fn probe_engine(
+    store: Arc<InMemoryStore>,
+    legal: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    cfg: EngineConfig,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(RoutingProbe {
+        inner: ScriptedEmitter::new(vec![]),
+        legal,
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)))
+}
+
+fn probe_cfg() -> EngineConfig {
+    EngineConfig {
+        max_echo_ratio: 1.1,
+        reply_grounding_check: false,
+        ..EngineConfig::default()
+    }
+}
+
+async fn offered(
+    store: Arc<InMemoryStore>,
+    cfg: EngineConfig,
+    sid: &str,
+    text: &str,
+) -> Vec<String> {
+    let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let e = probe_engine(store, legal.clone(), cfg);
+    let _ = e
+        .run_turn(Incoming {
+            session: SessionId(sid.into()),
+            text: text.into(),
+        })
+        .await;
+    let seen = legal.lock().expect("legal").clone();
+    seen.into_iter().next().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn forget_tools_are_absent_while_the_scope_holds_no_facts() {
+    let store = Arc::new(InMemoryStore::new());
+    let names = offered(store.clone(), probe_cfg(), "s", "hello").await;
+    assert!(
+        !names.contains(&"forget_fact".to_string()) && !names.contains(&"forget_all".to_string()),
+        "a store with nothing in it was still offered the forget tools: {names:?}"
+    );
+
+    // And they come back the moment there is something to forget: the rule
+    // is applicability, not removal.
+    store
+        .put_fact(Fact {
+            key: "user.name".into(),
+            value: serde_json::json!("Martin"),
+            confidence: 0.9,
+            uses: 1,
+            last_validated: Timestamp(1),
+            prov: Provenance::Residual,
+            valid_from: Timestamp(1),
+            ..Default::default()
+        })
+        .await
+        .expect("put_fact");
+    let names = offered(store, probe_cfg(), "s", "hello again").await;
+    assert!(
+        names.contains(&"forget_fact".to_string()) && names.contains(&"forget_all".to_string()),
+        "the forget tools stayed away with a fact in the store: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn recall_is_absent_on_the_first_turn_of_a_fresh_store() {
+    let store = Arc::new(InMemoryStore::new());
+    let names = offered(store, probe_cfg(), "fresh", "hello").await;
+    assert!(
+        !names.contains(&"recall".to_string()),
+        "turn 1 of a fresh store was offered recall, which has nothing to search: {names:?}"
+    );
+
+    // The plan's exit criterion: on turn 1 of an empty store the emitter sees
+    // only the tools it can act with (`respond_directly` is appended by the
+    // schema compiler, not by the legal set).
+    assert_eq!(
+        names,
+        vec!["ask_clarification".to_string(), "remember_fact".to_string()],
+        "turn 1 of an empty store sends more than it can use"
+    );
+}
+
+/// The risk the plan names: pruning `recall` on turn 1 must not hide
+/// cross-session recall. It does not — an earlier digested conversation in
+/// the same scope is exactly the case that keeps it.
+#[tokio::test]
+async fn recall_is_offered_on_turn_one_when_an_earlier_session_exists() {
+    let store = Arc::new(InMemoryStore::new());
+    let earlier = SessionId("older".into());
+    store
+        .put_session_digest(&SessionDigest {
+            session: earlier.clone(),
+            scope: "global".into(),
+            summary: SessionSummary {
+                through_turn: 1,
+                topic: "what the cat is called".into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::User,
+                rebuilt_from: 1,
+            },
+            last_turn: 1,
+            at: Timestamp(1),
+        })
+        .await
+        .expect("digest");
+
+    let cfg = EngineConfig {
+        recall_sessions: 3,
+        ..probe_cfg()
+    };
+    let names = offered(store.clone(), cfg, "new", "what was the cat called").await;
+    assert!(
+        names.contains(&"recall".to_string()),
+        "turn 1 with an earlier digested session must still offer recall: {names:?}"
+    );
+
+    // With cross-session recall switched off there is nothing out of sight
+    // again, and the tool goes back to costing nothing.
+    let cfg = EngineConfig {
+        recall_sessions: 0,
+        ..probe_cfg()
+    };
+    let names = offered(store, cfg, "new2", "what was the cat called").await;
+    assert!(!names.contains(&"recall".to_string()), "{names:?}");
+}
+
+// ---------------------------------------------------------------------------
+// M10 P2/P4 — adaptive depth, the stable array, the done marker.
+// ---------------------------------------------------------------------------
+
+/// A pointer-shaped tool double. Only the *name* matters here: the cue table
+/// maps words to tool names, so a fixture that used `echo` would be testing
+/// the fallback and nothing else.
+struct NamedTool(ActionSpec);
+impl NamedTool {
+    fn new(name: &str) -> Self {
+        NamedTool(ActionSpec {
+            name: name.into(),
+            description: format!("{name}, for the depth fixtures"),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"q": {"type": "string"}}
+            }),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        })
+    }
+}
+#[async_trait::async_trait]
+impl Tool for NamedTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.0
+    }
+    async fn call(&self, a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            summary: format!(
+                "{} ran with {}",
+                self.0.name,
+                a.get("q").and_then(|v| v.as_str()).unwrap_or("-")
+            ),
+            artifact: None,
+            trust: Trust::System,
+        })
+    }
+}
+
+fn pointer_proposal(action: &str, q: &str) -> Proposal {
+    Proposal {
+        rationale: "the user asked".into(),
+        action: action.into(),
+        args: serde_json::json!({"q": q}),
+    }
+}
+
+/// Records the `tools` array *as bytes* — the serialized specs, not their
+/// names. Names being equal is not the claim P2 makes; the claim is that a
+/// provider cache sees the same prefix, and that is a claim about bytes.
+struct ArrayProbe {
+    inner: ScriptedEmitter,
+    arrays: Arc<std::sync::Mutex<Vec<String>>>,
+    traces: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for ArrayProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.arrays
+            .lock()
+            .expect("arrays")
+            .push(serde_json::to_string(&legal.actions).expect("specs serialize"));
+        self.traces
+            .lock()
+            .expect("traces")
+            .push(ctx.trace_so_far.clone());
+        // A scripted emitter records no cost, and no cost means no
+        // `ModelCall` and therefore no manifest — which is the thing T2.2
+        // says has to grow. One nominal record per call is enough to put the
+        // manifest in the log.
+        if let Some(sink) = ctx.usage.as_deref() {
+            sink.record(Usage {
+                role: "emitter".into(),
+                model: "probe".into(),
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                estimated: true,
+                attempts: 1,
+                latency_ms: 0,
+                tools_tokens: 1,
+                cached_tokens: 0,
+            });
+        }
+        self.inner.propose(ctx, legal).await
+    }
+}
+
+struct DepthRun {
+    arrays: Vec<String>,
+    traces: Vec<Vec<String>>,
+    events: Vec<Event>,
+}
+
+/// A desktop-shaped harness at one depth, with the scripted proposals given.
+async fn depth_run(depth: nscore::Depth, text: &str, proposals: Vec<Proposal>) -> DepthRun {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId(format!("depth-{}", depth.as_str()));
+    let arrays = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let traces = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ArrayProbe {
+        inner: ScriptedEmitter::new(proposals),
+        arrays: Arc::clone(&arrays),
+        traces: Arc::clone(&traces),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    for name in [
+        "pointer_ui_read",
+        "pointer_ui_find",
+        "pointer_click",
+        "pointer_scroll",
+    ] {
+        b.add_tool(Arc::new(NamedTool::new(name)));
+    }
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            reply_grounding_check: false,
+            max_iterations: 8,
+            trace_verbatim_lines: 1,
+            router: Some(Arc::new(nsengine::router::KeywordRouter {
+                depth,
+                ..nsengine::router::KeywordRouter::default()
+            })),
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: text.into(),
+    })
+    .await
+    .unwrap();
+    // Taken before the await: a `MutexGuard` held across one is not `Send`.
+    let taken_arrays = arrays.lock().expect("arrays").clone();
+    let taken_traces = traces.lock().expect("traces").clone();
+    DepthRun {
+        arrays: taken_arrays,
+        traces: taken_traces,
+        events: store.load(&sid).await.unwrap(),
+    }
+}
+
+fn manifest_tool_names(events: &[Event]) -> Vec<Vec<String>> {
+    events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } if usage.role == "emitter" => {
+                Some(manifest.tool_names.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// M10 P2, decision 2(a). The tool array is the biggest single block of an
+/// emitter prompt and the one a prefix cache would hold; a set recomputed
+/// per iteration would move it for nothing, since nothing between two
+/// iterations of one turn changes what the *message* asked for.
+///
+/// Bytes, not names: the claim is about what a provider hashes.
+#[tokio::test]
+async fn the_tools_array_is_byte_stable_across_a_turns_iterations() {
+    for depth in [nscore::Depth::Adaptive, nscore::Depth::Full] {
+        let run = depth_run(
+            depth,
+            "klikni na Save v panelu",
+            vec![
+                pointer_proposal("pointer_ui_read", "save"),
+                pointer_proposal("pointer_click", "save"),
+            ],
+        )
+        .await;
+        assert!(
+            run.arrays.len() >= 3,
+            "{depth:?}: two tool calls and a settle, got {}",
+            run.arrays.len()
+        );
+        let first = &run.arrays[0];
+        for (i, a) in run.arrays.iter().enumerate() {
+            assert_eq!(a, first, "{depth:?}: iteration {i} sent a different array");
+        }
+        // And what the manifest recorded is the array that rode.
+        let recorded = manifest_tool_names(&run.events);
+        let head = recorded.first().cloned().unwrap_or_default();
+        for names in &recorded {
+            assert_eq!(names, &head, "{depth:?}: the manifest moved too");
+        }
+    }
+
+    // Adaptive actually narrowed — otherwise the stability above would be
+    // the stability of the full set and would prove nothing about P2.
+    let adaptive = depth_run(
+        nscore::Depth::Adaptive,
+        "klikni na Save v panelu",
+        vec![pointer_proposal("pointer_click", "save")],
+    )
+    .await;
+    let names = manifest_tool_names(&adaptive.events)
+        .into_iter()
+        .next()
+        .expect("an emitter call");
+    assert!(names.contains(&"pointer_click".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"pointer_scroll".to_string()),
+        "the click cue does not ask for the scroll tool: {names:?}"
+    );
+}
+
+/// M10 T2.2. The cue table is a guess about the message; a proposal naming a
+/// real tool is the model saying the guess was wrong. One widening is the
+/// honest price of that, and it is recorded — an escalation is a request
+/// already spent, and the rate is what `depth = adaptive` ships on.
+#[tokio::test]
+async fn a_withheld_tool_is_admitted_after_one_illegal_action_and_the_manifest_records_it() {
+    let run = depth_run(
+        nscore::Depth::Adaptive,
+        "klikni na Save v panelu",
+        vec![
+            // The cue selected the ui group; this one is not in it.
+            pointer_proposal("pointer_scroll", "down"),
+            pointer_proposal("pointer_scroll", "down"),
+        ],
+    )
+    .await;
+    let recorded = manifest_tool_names(&run.events);
+    assert!(recorded.len() >= 2, "{recorded:?}");
+    assert!(
+        !recorded[0].contains(&"pointer_scroll".to_string()),
+        "withheld on the first call: {:?}",
+        recorded[0]
+    );
+    assert!(
+        recorded[1].contains(&"pointer_scroll".to_string()),
+        "and admitted on the next: {:?}",
+        recorded[1]
+    );
+    // The whole set, not one name: a task that needed the scroll needs
+    // whatever comes after it too.
+    assert!(recorded[1].contains(&"pointer_ui_find".to_string()));
+
+    // Counted, so T0.2's buckets can price it.
+    let tally = nscore::tally_rejections(&run.events);
+    assert_eq!(
+        tally.by_reason.get("IllegalAction").copied(),
+        Some(1),
+        "one escalation, counted once and for the rest of the turn: {}",
+        tally.line()
+    );
+    // And the action ran.
+    assert!(
+        run.events.iter().any(
+            |ev| matches!(&ev.kind, EventKind::ToolCalled { action, .. } if action == "pointer_scroll")
+        ),
+        "the widened set let it through"
+    );
+}
+
+/// M10 T4.1. The marker has to survive the fold, because the fold is what a
+/// long turn's earlier steps become — and a long turn is exactly where a
+/// completed call gets proposed again.
+#[tokio::test]
+async fn the_marker_survives_folding() {
+    let run = depth_run(
+        nscore::Depth::Full,
+        "klikni na Save v panelu",
+        vec![
+            pointer_proposal("pointer_ui_read", "a"),
+            pointer_proposal("pointer_ui_find", "b"),
+            pointer_proposal("pointer_click", "c"),
+        ],
+    )
+    .await;
+    let last = run.traces.last().expect("a trace was rendered").join("\n");
+    assert!(
+        last.contains("earlier this turn"),
+        "one verbatim outcome, so the rest folded: {last}"
+    );
+    // The fold's short form, on the folded steps.
+    assert!(
+        last.contains("pointer_ui_read ok done"),
+        "the folded call keeps the marker: {last}"
+    );
+    // And the verbatim one keeps the long form.
+    assert!(
+        last.contains("[done; an identical call is denied]"),
+        "the verbatim call keeps the marker: {last}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M10 P3 / M8 Phase 3: the tier rule, and exemplars as a tool return.
+// ---------------------------------------------------------------------------
+
+/// Counts what the turn dials. This *is* the recorded transport: the store
+/// reaches the service through exactly this trait, so a turn that calls
+/// `/embed` increments it and a turn that does not cannot.
+struct CountingEncoder {
+    embeds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every document any rerank was asked about, in order. A count says
+    /// *that* the service was dialled; these say **which retriever** dialled
+    /// it, which is the only way to tell a fact search from a turn search
+    /// when both run in one turn (M11 T1.1 follow-up).
+    reranked: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+const EXEMPLAR_CONCEPTS: &[&[&str]] = &[
+    &["invoice", "faktury", "billing", "invoices", "print"],
+    &["holiday", "vacation", "leave", "july"],
+];
+
+impl CountingEncoder {
+    fn vector(text: &str) -> Vec<f32> {
+        let tokens = nscore::query_tokens(text);
+        let mut v: Vec<f32> = EXEMPLAR_CONCEPTS
+            .iter()
+            .map(|set| {
+                tokens
+                    .iter()
+                    .filter(|t| set.iter().any(|w| t.starts_with(w)))
+                    .count() as f32
+            })
+            .collect();
+        // A non-zero last component keeps a text with no concept word from
+        // being the zero vector, which has no direction to compare.
+        v.push(0.25);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+        v
+    }
+}
+
+#[async_trait::async_trait]
+impl TextEncoder for CountingEncoder {
+    fn model(&self) -> &str {
+        "bge-m3"
+    }
+    async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+        self.embeds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(texts.iter().map(|t| Self::vector(t)).collect())
+    }
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, StoreError> {
+        self.reranked.lock().unwrap().extend(docs.iter().cloned());
+        let q = Self::vector(query);
+        let mut scored: Vec<(usize, f32)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i, nscore::cosine(&q, &Self::vector(d)).unwrap_or(0.0)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored)
+    }
+}
+
+struct FixedRouter(Tier);
+impl nsengine::router::Router for FixedRouter {
+    fn route(&self, _input: &nsengine::router::RouteInput<'_>) -> nsengine::router::Route {
+        nsengine::router::Route {
+            tier: self.0,
+            cues: vec!["fixed".into()],
+            tools: None,
+        }
+    }
+}
+
+fn hybrid_engine(
+    store: Arc<nsmemory_sqlite::SqliteStore>,
+    tier: Tier,
+    cfg: EngineConfig,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal("ok")])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            router: Some(Arc::new(FixedRouter(tier))),
+            ..cfg
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+fn hybrid_store(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<nsmemory_sqlite::SqliteStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (store, embeds, _docs) = watching_hybrid_store(dir);
+    (store, embeds)
+}
+
+/// [`hybrid_store`] plus the rerank documents, for the tests that have to
+/// tell which retriever made the call.
+fn watching_hybrid_store(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<nsmemory_sqlite::SqliteStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let embeds: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let reranked: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let store = nsmemory_sqlite::SqliteStore::open(&dir.path().join("h.sqlite"))
+        .unwrap()
+        .with_encoder(Arc::new(CountingEncoder {
+            embeds: embeds.clone(),
+            reranked: reranked.clone(),
+        }));
+    (Arc::new(store), embeds, reranked)
+}
+
+/// M8 T3.1: the backfill lives in the idle pass, so a turn — on the shipped
+/// default, with an encoder wired up — calls `/embed` exactly zero times.
+#[tokio::test]
+async fn a_turn_never_calls_embed_on_the_shipped_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, embeds) = hybrid_store(&dir);
+    let e = hybrid_engine(store.clone(), Tier::Deep, EngineConfig::default());
+    e.run_turn(Incoming {
+        session: SessionId("s".into()),
+        text: "what did I say about the invoices".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "recall_hybrid is off by default and a turn never backfills"
+    );
+}
+
+/// M8 T3.3: the hybrid path is reachable only from `Task`/`Deep`. A `Chat`
+/// turn issues no `/embed` call even with the knob on and the vectors there.
+#[tokio::test]
+async fn a_chat_tier_turn_issues_no_embed_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, embeds) = hybrid_store(&dir);
+    let sid = SessionId("s".into());
+    let mut log = EventLog::new(sid.clone());
+    for t in 1..=8u32 {
+        log.append(
+            t,
+            Timestamp(t as u64),
+            EventKind::UserSaid {
+                text: format!("turn {t}: the invoice window is titled Faktury"),
+            },
+        );
+    }
+    store.append(&sid, log.events()).await.unwrap();
+    store.backfill_embeddings(100).await.unwrap();
+    let after_backfill = embeds.load(std::sync::atomic::Ordering::Relaxed);
+
+    let on = || EngineConfig {
+        recall_hybrid: true,
+        ..EngineConfig::default()
+    };
+    let chat = hybrid_engine(store.clone(), Tier::Chat, on());
+    chat.run_turn(Incoming {
+        session: sid.clone(),
+        text: "where do I find billing documents".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed),
+        after_backfill,
+        "a Chat turn's recall stays lexical"
+    );
+
+    // And the same message on the deep tier does dial it — otherwise the
+    // assertion above would pass on a knob that never works anywhere.
+    let deep = hybrid_engine(store, Tier::Deep, on());
+    deep.run_turn(Incoming {
+        session: sid,
+        text: "where do I find billing documents".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        embeds.load(std::sync::atomic::Ordering::Relaxed) > after_backfill,
+        "the deep tier is where the hybrid path lives"
+    );
+}
+
+async fn digest_of(store: &nsmemory_sqlite::SqliteStore, session: &str, topic: &str) {
+    store
+        .put_session_digest(&SessionDigest {
+            session: SessionId(session.into()),
+            scope: "global".into(),
+            summary: SessionSummary {
+                topic: topic.into(),
+                established: vec![],
+                open: vec![],
+                trust: Trust::External,
+                through_turn: 4,
+                rebuilt_from: 1,
+            },
+            last_turn: 4,
+            at: Timestamp(7),
+        })
+        .await
+        .unwrap();
+}
+
+/// M10 T3.6. The exemplars arrive as one `ToolReturned` against one
+/// `ToolCalled`, carrying the digests' lowest trust — not as an extra block
+/// of prompt text with no call to point at and no trust to carry.
+#[tokio::test]
+async fn exemplars_enter_as_a_tool_returned_not_as_a_context_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds) = hybrid_store(&dir);
+    digest_of(&store, "older-a", "printing the invoices for Faktury").await;
+    digest_of(&store, "older-b", "the holiday plan for July").await;
+    store.backfill_embeddings(100).await.unwrap();
+
+    let sid = SessionId("now".into());
+    let e = hybrid_engine(
+        store.clone(),
+        Tier::Deep,
+        EngineConfig {
+            exemplars_max: 1,
+            ..EngineConfig::default()
+        },
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "print the invoices again".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let call = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. } if action == "exemplars"))
+        .expect("the exemplars step ran as a call");
+    let returned = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolReturned { call: c, outcome } if *c == call.id => Some(outcome),
+            _ => None,
+        })
+        .expect("and returned against that call");
+    let ToolOutcome::Ok { output } = returned else {
+        panic!("exemplars failed: {returned:?}");
+    };
+    assert!(
+        output.summary.contains("printing the invoices"),
+        "the nearest digest, by meaning: {}",
+        output.summary
+    );
+    assert!(
+        !output.summary.contains("holiday"),
+        "exemplars_max = 1 means one: {}",
+        output.summary
+    );
+    // The laundering rule: folded text carries the weakest trust it is made
+    // of, and these digests are External.
+    assert_eq!(output.trust, Trust::External);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. }
+                if action == "exemplars"))
+            .count(),
+        1,
+        "one call, one return — not one per digest"
+    );
+}
+
+/// The other half of the tier rule: exemplars are a deep-tier step, so a
+/// `Chat` turn retrieves none however the knob is set.
+#[tokio::test]
+async fn a_chat_tier_turn_retrieves_no_exemplars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds) = hybrid_store(&dir);
+    digest_of(&store, "older-a", "printing the invoices for Faktury").await;
+    store.backfill_embeddings(100).await.unwrap();
+
+    let sid = SessionId("now".into());
+    let e = hybrid_engine(
+        store.clone(),
+        Tier::Chat,
+        EngineConfig {
+            exemplars_max: 3,
+            ..EngineConfig::default()
+        },
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "print the invoices again".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. }
+                if action == "exemplars")),
+        "no exemplars step on the chat tier"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11 T1.1 follow-up: the *fact* path takes the same gate the turn path
+// already took. T1.1 landed `search_facts_hybrid` in the store and left every
+// caller on `search_facts`; `select_facts` now dials it when
+// `[recall] hybrid` is on **and** the turn's tier is above `Chat`.
+//
+// Probed through the encoder's rerank, not through a call count: a `Deep`
+// turn's recall reaches `/embed` and `/rerank` on its own, so a count cannot
+// say which retriever asked. A *fact* document can — `fact_text` renders
+// `user.city` as "user city", which no turn line in these fixtures contains.
+
+/// [`hybrid_engine`] with an emitter that answers directly instead of
+/// calling a tool.
+///
+/// Load-bearing, and the first version of these tests got it wrong: a turn
+/// whose emitter proposes a registered tool is *upgraded* to `Task`
+/// mid-loop (`turn.rs`, the tiered-out branch), so a `Chat`-routed turn that
+/// calls `echo` is legitimately no longer a `Chat` turn by the time the
+/// reply is drafted. To ask what the `Chat` tier does, the turn has to stay
+/// in it.
+fn fact_engine(store: Arc<nsmemory_sqlite::SqliteStore>, tier: Tier, cfg: EngineConfig) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+        rationale: "".into(),
+        action: "respond_directly".into(),
+        args: serde_json::json!({}),
+    }])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            router: Some(Arc::new(FixedRouter(tier))),
+            ..cfg
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+/// Whether any rerank this encoder answered was over fact documents.
+fn saw_fact_docs(docs: &std::sync::Mutex<Vec<String>>, needle: &str) -> bool {
+    docs.lock().unwrap().iter().any(|d| d.contains(needle))
+}
+
+async fn store_with_a_fact(
+    store: &nsmemory_sqlite::SqliteStore,
+    sid: &SessionId,
+) -> Result<(), StoreError> {
+    store
+        .put_fact(Fact {
+            scope: "global".into(),
+            key: "user.city".into(),
+            value: serde_json::json!("Praha"),
+            prov: nscore::Provenance::UserInput {
+                turn: 1,
+                start: 0,
+                end: 5,
+            },
+            trust: Trust::User,
+            confidence: 1.0,
+            state: nscore::FactState::Current,
+            valid_from: Timestamp(1),
+            valid_to: None,
+            last_validated: Timestamp(1),
+            uses: 0,
+            last_used: Timestamp(0),
+            exposures: 0,
+            credits: 0,
+        })
+        .await?;
+    // One turn of history, so the window and the recall path have something
+    // that is not a fact to work on.
+    let mut log = EventLog::new(sid.clone());
+    log.append(
+        1,
+        Timestamp(1),
+        EventKind::UserSaid {
+            text: "the invoice window is titled Faktury".into(),
+        },
+    );
+    store.append(sid, log.events()).await?;
+    store.backfill_embeddings(100).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chat_turn_selects_facts_lexically_even_with_hybrid_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds, docs) = watching_hybrid_store(&dir);
+    let sid = SessionId("chat".into());
+    store_with_a_fact(&store, &sid).await.unwrap();
+    docs.lock().unwrap().clear();
+
+    let e = fact_engine(
+        store.clone(),
+        Tier::Chat,
+        EngineConfig {
+            recall_hybrid: true,
+            ..EngineConfig::default()
+        },
+    );
+    // A query the lexical retriever can serve on its own — the whole claim is
+    // that a Chat turn still gets its facts, just without the round trip.
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what is my city".into(),
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !saw_fact_docs(&docs, "user city"),
+        "a Chat turn's facts stay lexical however the knob is set: {:?}",
+        docs.lock().unwrap()
+    );
+    // And not because the facts were skipped altogether: the reply path bumps
+    // `uses` on every fact it selected, so a 1 here is the lexical retriever
+    // having done the work. Without it the assertion above would also pass on
+    // a turn that showed no facts at all.
+    let after = store.facts("global", "user.city").await.unwrap();
+    assert_eq!(
+        after.first().map(|f| f.uses),
+        Some(1),
+        "the fact was still selected, by the lexical path"
+    );
+}
+
+#[tokio::test]
+async fn a_deep_turn_selects_facts_hybrid_when_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds, docs) = watching_hybrid_store(&dir);
+    let sid = SessionId("deep".into());
+    store_with_a_fact(&store, &sid).await.unwrap();
+    docs.lock().unwrap().clear();
+
+    let off = fact_engine(store.clone(), Tier::Deep, EngineConfig::default());
+    off.run_turn(Incoming {
+        session: sid.clone(),
+        text: "kde bydlím?".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !saw_fact_docs(&docs, "user city"),
+        "with the knob off the fact path is `search_facts`, as it always was"
+    );
+
+    docs.lock().unwrap().clear();
+    let on = fact_engine(
+        store.clone(),
+        Tier::Deep,
+        EngineConfig {
+            recall_hybrid: true,
+            ..EngineConfig::default()
+        },
+    );
+    on.run_turn(Incoming {
+        session: sid,
+        text: "kde bydlím?".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        saw_fact_docs(&docs, "user city"),
+        "a Deep turn with [recall] hybrid on reranks fact documents: {:?}",
+        docs.lock().unwrap()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11 T1.5: a due summary must complete even when the next inbound message is
+// already queued.
+//
+// The M11 measurement run found `Summarized` 0 times in 40 live turns at
+// `summary_every_turns = 4`. The cause is the biased `select!` in
+// `dispatch.rs`: the mailbox is polled first, so input that is already there
+// — or a channel that has already closed — wins before the summary future is
+// polled once, and the summary is dropped mid-flight at every boundary.
+// "The next boundary recomputes it" is only true if some boundary finds the
+// mailbox empty, and a user typing ahead never gives it one.
+
+/// Hands over every queued message as fast as it is asked for, then closes.
+/// Nothing here ever waits: that is the condition that starved the summary.
+struct BurstChannel(std::sync::Mutex<std::collections::VecDeque<&'static str>>);
+
+#[async_trait::async_trait]
+impl Channel for BurstChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        match self.0.lock().unwrap().pop_front() {
+            Some(t) => Ok(Incoming {
+                session: SessionId("burst".into()),
+                text: t.into(),
+            }),
+            None => Err(ChannelError::Closed),
+        }
+    }
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_due_summary_completes_when_the_next_message_is_already_queued() {
+    let store = Arc::new(InMemoryStore::new());
+    let calls: Arc<std::sync::Mutex<Vec<(bool, u32, u32)>>> = Default::default();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(BurstChannel(std::sync::Mutex::new(
+        ["one", "two", "three", "four", "five"].into(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.set_summarizer(Box::new(ScriptedSummarizer {
+        calls: calls.clone(),
+        fail_with: None,
+    }));
+    // window 1, every 4: turn 5 is the first boundary at which four turns
+    // have fallen out of the window, and by then the five messages are spent
+    // and the channel is closing — the case the old biased branch lost.
+    let cfg = EngineConfig {
+        window_turns: 1,
+        summary_every_turns: 4,
+        ..EngineConfig::default()
+    };
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    tokio::time::timeout(std::time::Duration::from_secs(10), e.run())
+        .await
+        .expect("the run must finish")
+        .unwrap();
+
+    let events = store.load(&SessionId("burst".into())).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::UserSaid { .. }))
+            .count(),
+        5,
+        "all five messages ran as turns"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Summarized { .. }))
+            .count(),
+        1,
+        "a due summary is finished, not dropped, when input is already queued"
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[(false, 1, 4)],
+        "and it folded exactly the turns that had fallen out of the window"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M9 follow-up 7: the fact scope rides in the manifest, so the fitness join
+// can credit `fact_keys` per `(scope, key)`.
+
+/// A summarizer double that records what its call cost, so the summary's own
+/// `ModelCall` — and with it the manifest that call wrote — reaches the log.
+/// `ScriptedSummarizer` does not meter, and an unmetered call writes no
+/// event at all.
+struct MeteredSummarizer;
+
+#[async_trait::async_trait]
+impl Summarizer for MeteredSummarizer {
+    async fn summarize(
+        &self,
+        input: SummaryInput<'_>,
+    ) -> Result<Option<SummaryDraft>, SummarizeError> {
+        input
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink")
+            .record(Usage {
+                role: "summarizer".into(),
+                model: "test-model".into(),
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                estimated: false,
+                attempts: 1,
+                latency_ms: 1,
+                tools_tokens: 0,
+                cached_tokens: 0,
+            });
+        Ok(Some(SummaryDraft {
+            topic: "scripted".into(),
+            established: vec![],
+            open: vec![],
+        }))
+    }
+}
+
+/// Every model call of a turn records the scope its session maps to, on all
+/// three roles. The join that scores facts is keyed by `(scope, key)`, and a
+/// call whose manifest named no scope would have its keys counted in every
+/// scope that holds them — right while every session maps to `global`, as on
+/// the CLI, wrong the moment two sessions have their own.
+#[tokio::test]
+async fn every_manifest_of_a_turn_names_the_session_scope() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("zeta".into());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(SessionTaggedEmitter {
+        records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    b.set_replier(Box::new(SessionTaggedReplier {
+        records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    b.set_summarizer(Box::new(MeteredSummarizer));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            scope_for: Arc::new(|sid| sid.0.clone()),
+            max_echo_ratio: 1.1,
+            // With no verbatim window one turn is already past the summary
+            // boundary, so the summarizer's own call is covered too.
+            window_turns: 0,
+            summary_every_turns: 1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "hello from zeta".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        e.maybe_summarize(&sid).await.unwrap(),
+        "the summary boundary was crossed"
+    );
+
+    let events = store.load(&sid).await.unwrap();
+    let calls: Vec<(String, ContextManifest)> = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } => {
+                Some((usage.role.clone(), manifest.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for role in ["emitter", "replier", "summarizer"] {
+        assert!(
+            calls.iter().any(|(r, _)| r == role),
+            "the {role} call was recorded: {:?}",
+            calls.iter().map(|(r, _)| r).collect::<Vec<_>>()
+        );
+    }
+    for (role, m) in &calls {
+        assert_eq!(
+            m.scope,
+            Some("zeta".into()),
+            "the {role} call names the session's scope"
+        );
+    }
+}
+
+/// And the default engine — the CLI's, where every session shares one store
+/// — records `global` rather than nothing, so a manifest written today is
+/// never mistaken for a pre-follow-up one on the join's fallback path.
+#[tokio::test]
+async fn the_default_engine_names_the_global_scope() {
+    let (_, manifests) = probed_turn(LearnedRules::default(), None, vec![]).await;
+    assert!(!manifests.is_empty(), "a call was recorded");
+    for m in &manifests {
+        assert_eq!(m.scope, Some("global".into()));
+    }
 }

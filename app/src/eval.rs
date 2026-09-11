@@ -21,7 +21,7 @@
 //! ledger already uses, and a run killed mid-write must leave the previous
 //! rows intact rather than half a file.
 
-use nstestkit::eval::{render_table, run_all, Ability};
+use nstestkit::eval::{render_table, run_all_for, Ability, Run};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,21 @@ struct AbilityRow {
     budget_drops: usize,
     #[serde(default)]
     escalations: usize,
+    /// Bits-over-Random on the deciding call (M10 T0.4): the action this
+    /// ability is about, the legal-set size it was chosen out of, whether it
+    /// was chosen at all, and `log₂(n)` bits for a hit against `0` for a
+    /// miss. Recorded in the ledger rather than only printed, because the
+    /// number this column exists for is a *difference* — P2 narrows the
+    /// legal set and the question is what the narrowing cost, which needs
+    /// the row before it to still be readable.
+    #[serde(default)]
+    target_action: String,
+    #[serde(default)]
+    target_proposed: bool,
+    #[serde(default)]
+    legal_size: usize,
+    #[serde(default)]
+    bits: f64,
     /// Why it failed. Empty on a pass, and then absent from the file: the
     /// interesting rows are the ones with text in this field.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -89,6 +104,10 @@ impl From<&Ability> for AbilityRow {
             inspections: a.inspections,
             budget_drops: a.budget_drops,
             escalations: a.escalations,
+            target_action: a.target_action.to_string(),
+            target_proposed: a.target_proposed,
+            legal_size: a.legal_size,
+            bits: a.bits,
             detail: a.detail.clone(),
         }
     }
@@ -120,6 +139,14 @@ impl Row {
             of: abilities.len(),
             abilities: abilities.iter().map(AbilityRow::from).collect(),
         }
+    }
+
+    /// Bits-over-Random summed over the set (M10 T0.4). A ledger row is
+    /// compared on this the way it is compared on requests: it is the number
+    /// P2's narrowing has to hold, and unlike the pass count it cannot be
+    /// bought by making the guess easier.
+    fn bits(&self) -> f64 {
+        self.abilities.iter().map(|a| a.bits).sum()
     }
 
     fn requests(&self) -> usize {
@@ -196,10 +223,11 @@ fn diff_lines(previous: Option<&Row>, current: &Row) -> String {
     let Some(previous) = previous else {
         return format!(
             "  first row in this ledger — nothing to diff against. {}/{} abilities pass, \
-             {} requests.\n",
+             {} requests, {:.2} bits over random.\n",
             current.passed,
             current.of,
-            current.requests()
+            current.requests(),
+            current.bits()
         );
     };
     let mut out = format!("  since {} ({}):\n", short(&previous.harness), previous.at);
@@ -240,13 +268,15 @@ fn diff_lines(previous: Option<&Row>, current: &Row) -> String {
         out.push_str("    no ability changed state.\n");
     }
     out.push_str(&format!(
-        "    requests {} → {} · {}/{} → {}/{}\n",
+        "    requests {} → {} · {}/{} → {}/{} · BoR {:.2} → {:.2}\n",
         previous.requests(),
         current.requests(),
         previous.passed,
         previous.of,
         current.passed,
-        current.of
+        current.of,
+        previous.bits(),
+        current.bits()
     ));
     out
 }
@@ -282,20 +312,57 @@ pub struct Args {
     /// harness's `EngineConfig` **and** to the stores it searches — the
     /// prior lives on the store.
     pub activation: f32,
+    /// `[router] depth` for this run (M10 T2.1), without editing the config.
+    ///
+    /// Mirrors `--activation` for the same reason: the question is whether
+    /// BoR on the desktop abilities and the hard-query fixture survive the
+    /// narrowing, and that is two runs of the same set, not two configs.
+    pub depth: nscore::Depth,
+    /// `[memory] obligation_check` on vs off (M9 T2.1, read by M10 T5.4).
+    ///
+    /// A mode rather than a value like `--activation`: the knob is a
+    /// boolean, and the only useful run of it is both arms at once, which is
+    /// what the mode does.
+    pub obligations: bool,
+    /// `[memory] summary_guidelines` empty vs three hand-written lines
+    /// (M9 T5.2, read by M10 T5.4). Same shape, same reason.
+    pub guidelines: bool,
+    /// `--paraphrase --facts`: run the paraphrased-recall arm over the
+    /// **facts** corpus instead of the turns corpus (M11 T1.1).
+    ///
+    /// A modifier on `--paraphrase` rather than a fourth mode, because it is
+    /// the same measurement — a miss rate over a paraphrase arm with a
+    /// verbatim control — asked of the other retriever. `search_facts` is
+    /// `lexical_rank`, not bm25, and the turns number says nothing about it.
+    pub facts: bool,
 }
 
-const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase] \
-     [--ablate facts|summary|guidance] [--activation <weight>]";
+const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase [--facts]] \
+     [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive] \
+     [--obligations] [--guidelines]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
     let mut paraphrase = false;
     let mut ablate = None;
     let mut activation = 0.0f32;
+    let mut depth = nscore::Depth::Full;
+    let mut obligations = false;
+    let mut guidelines = false;
+    let mut facts = false;
     let mut rest = args.iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--facts" => facts = true,
+            "--obligations" => obligations = true,
+            "--guidelines" => guidelines = true,
+            "--depth" => {
+                let d = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--depth needs full or adaptive)"))?;
+                depth = nscore::Depth::parse(d).map_err(|e| format!("{USAGE} ({e})"))?;
+            }
             "--activation" => {
                 let w = rest
                     .next()
@@ -321,12 +388,49 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             other => return Err(format!("{USAGE} (got {other:?})")),
         }
     }
+    // M10 T5.2. The weight used to reach the default mode through a static
+    // cell, because `main.rs` called `run(&parsed.ledger)` with no weight and
+    // `main.rs` belonged to another task. It now calls `run_at(&ledger,
+    // parsed.activation)`, so the cell and its `run` wrapper are gone and the
+    // flag travels as a parameter like every other argument here.
+    if facts && !paraphrase {
+        return Err(format!("{USAGE} (--facts is a modifier on --paraphrase)"));
+    }
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
         ablate,
         activation,
+        depth,
+        obligations,
+        guidelines,
+        facts,
     })
+}
+
+/// `ns-app eval --obligations` / `--guidelines` — the two M9 knobs that are
+/// neither a context block nor a ranking weight (M10 T5.4).
+///
+/// Exits 0 whatever the numbers are, for [`run_ablate`]'s reason. The
+/// guidelines arm prints *not measurable* rather than a zero: on the scripted
+/// summarizer the two arms are identical by construction, and a zero printed
+/// as a result would confirm the default with the instrument switched off.
+pub async fn run_knob(knob: Knob) -> i32 {
+    use nstestkit::knobs;
+
+    let report = match knob {
+        Knob::Obligations => knobs::measure_obligations().await,
+        Knob::Guidelines => knobs::measure_guidelines().await,
+    };
+    print!("{}", knobs::render(&report));
+    0
+}
+
+/// Which of the two knob modes to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Knob {
+    Obligations,
+    Guidelines,
 }
 
 /// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
@@ -362,9 +466,17 @@ pub async fn run_ablate(block: nscore::Ablate, activation: f32) -> i32 {
 /// Exits 0 whatever the number is. A fired trigger is not a failure — it is
 /// permission to build something, and a gate that went red on it would make
 /// the measurement something to avoid taking.
-pub async fn run_paraphrase(activation: f32) -> i32 {
+pub async fn run_paraphrase(activation: f32, facts: bool) -> i32 {
     use nstestkit::paraphrase;
 
+    // M11 T1.1 follow-up: `--facts` used to reach here through a static
+    // cell, because `main.rs` belonged to another task while T1.1 was
+    // written. It is a parameter now, like every other argument — the arm
+    // is chosen by the caller, so two runs in one process cannot see each
+    // other's flag.
+    if facts {
+        return run_paraphrase_facts(activation).await;
+    }
     let k = nsengine::turn::EngineConfig::default().recall_top_k;
     // M9 T3.3: the same half-life the shipped config defaults to, so a
     // sweep over `--activation` measures the knob and not a second one.
@@ -392,12 +504,155 @@ pub async fn run_paraphrase(activation: f32) -> i32 {
         Err(e) => eprintln!("paraphrase: the sqlite arm did not run ({e})"),
     }
 
+    // M8 T3.4 / M10 P3: the third arm, and the one the exit criterion is
+    // about. It is added **only when the service answers** — a hybrid arm
+    // against a dead service would be the bm25 arm again by design, and
+    // printing it as "hybrid" would be reporting a number for something that
+    // did not run. When it is absent the line below says so, which is what
+    // T3.4 means by "report the number as not measured".
+    //
+    // A separate database from the bm25 arm, so the two are not the same
+    // store measured twice with a knob moved: the vectors are written into
+    // this one by the same `backfill_embeddings` the idle pass calls.
+    let models = crate::config::ModelsSection {
+        enabled: true,
+        ..Default::default()
+    };
+    let recall = crate::config::RecallSection::default();
+    let mut hybrid_ran = false;
+    if crate::models::reachable(&models).await {
+        match nsmemory_sqlite::SqliteStore::open(&dir.path().join("paraphrase-hybrid.sqlite")) {
+            Ok(sqlite) => {
+                let sqlite = sqlite
+                    .with_activation(activation, half_life)
+                    .with_recall(crate::models::recall_tuning(&recall));
+                let sqlite = match crate::models::encoder(&models, &recall) {
+                    Some(enc) => sqlite.with_encoder(enc),
+                    None => sqlite,
+                };
+                let name = format!(
+                    "sqlite hybrid ({}, coarse {} → rerank)",
+                    recall.embed_model, recall.coarse_k
+                );
+                reports.push(paraphrase::measure(&sqlite, &name, k).await);
+                hybrid_ran = true;
+            }
+            Err(e) => eprintln!("paraphrase: the hybrid arm did not run ({e})"),
+        }
+    }
+
     print!("{}", paraphrase::render(&reports));
     println!(
         "  k = {k} (recall_top_k), activation_weight = {activation}, {} cases, \
-         no model calls and no requests spent.",
+         no requests spent.",
         paraphrase::corpus().len()
     );
+    if hybrid_ran {
+        println!(
+            "  the hybrid arm ran against nsmodels on {} — local CPU, no requests.",
+            models.base_url
+        );
+    } else {
+        println!(
+            "  hybrid arm: NOT MEASURED — no nsmodels service on {}. Start it with\n  \
+             `cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality \
+             --rerank`.",
+            models.base_url
+        );
+    }
+    0
+}
+
+/// `ns-app eval --paraphrase --facts` — the same measurement over the facts
+/// corpus (M11 T1.1).
+///
+/// Two arms, and the comparison is the whole point: `search_facts` under
+/// `lexical_rank` against `search_facts_hybrid` with the encoder. The exit
+/// criterion is "the hybrid paraphrase miss rate is below the lexical one
+/// with the verbatim arm at 0% on both", so both numbers have to be printed
+/// side by side and read off one table.
+///
+/// The hybrid arm is added **only when the service answers**, for the turns
+/// arm's reason: with nsmodels down `search_facts_hybrid` *is* `search_facts`
+/// by design, and printing that as "hybrid" would be reporting a number for
+/// something that did not run.
+async fn run_paraphrase_facts(activation: f32) -> i32 {
+    use nstestkit::paraphrase;
+
+    let k = nsengine::turn::EngineConfig::default().recall_top_k;
+    let half_life = nsengine::turn::EngineConfig::default().activation_half_life_days;
+    let mut reports = Vec::new();
+
+    // A throwaway database, never `ns.sqlite`: this arm *writes facts*, and a
+    // measurement that left twelve of them in the live store would be editing
+    // the memory every other number here is read from.
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("paraphrase --facts: no temp dir ({e})");
+            return 2;
+        }
+    };
+    match nsmemory_sqlite::SqliteStore::open(&dir.path().join("facts-lexical.sqlite")) {
+        Ok(sqlite) => {
+            let sqlite = sqlite.with_activation(activation, half_life);
+            reports
+                .push(paraphrase::measure_facts(&sqlite, "facts lexical (lexical_rank)", k).await);
+        }
+        Err(e) => eprintln!("paraphrase --facts: the lexical arm did not run ({e})"),
+    }
+
+    let models = crate::config::ModelsSection {
+        enabled: true,
+        ..Default::default()
+    };
+    let recall = crate::config::RecallSection::default();
+    let mut hybrid_ran = false;
+    if crate::models::reachable(&models).await {
+        match nsmemory_sqlite::SqliteStore::open(&dir.path().join("facts-hybrid.sqlite")) {
+            Ok(sqlite) => {
+                let sqlite = sqlite
+                    .with_activation(activation, half_life)
+                    .with_recall(crate::models::recall_tuning(&recall));
+                let sqlite = match crate::models::encoder(&models, &recall) {
+                    Some(enc) => sqlite.with_encoder(enc),
+                    None => sqlite,
+                };
+                let name = format!(
+                    "facts hybrid ({}, coarse {} → rerank)",
+                    recall.embed_model, recall.coarse_k
+                );
+                reports.push(paraphrase::measure_facts(&sqlite, &name, k).await);
+                hybrid_ran = true;
+            }
+            Err(e) => eprintln!("paraphrase --facts: the hybrid arm did not run ({e})"),
+        }
+    }
+
+    print!("{}", paraphrase::render(&reports));
+    println!(
+        "  k = {k} (recall_top_k), activation_weight = {activation}, {} facts in one \
+         scope, no requests spent.",
+        paraphrase::fact_corpus().len()
+    );
+    println!(
+        "  the corpus is built so every paraphrase shares zero tokens with its fact, \
+         which is\n  the lexical floor `lexical_rank` cannot climb: it drops a fact with \
+         no query token\n  in it before it ranks anything."
+    );
+    if hybrid_ran {
+        println!(
+            "  the hybrid facts arm ran against nsmodels on {} — local CPU, no requests.",
+            models.base_url
+        );
+    } else {
+        println!(
+            "  hybrid facts arm: NOT MEASURED — no nsmodels service on {}. Start it with\n  \
+             `cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality \
+             --rerank`.",
+            models.base_url
+        );
+    }
     0
 }
 
@@ -476,20 +731,81 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Runs the set, prints the table and the ledger diff, returns the process
-/// exit code: 0 when every ability passed, 1 otherwise.
-pub async fn run(ledger_path: &Path) -> i32 {
-    report(&run_all().await, ledger_path)
+/// Runs the set at one `[memory] activation_weight` (M9 T3.3, M10 T5.2),
+/// prints the table and the ledger diff, and returns the process exit code:
+/// 0 when every ability passed, 1 otherwise.
+///
+/// The ability set **and** the tie-heavy recall corpus, because the ability
+/// set alone is what M9 T3.3 already tried: *"suites insensitive … identical
+/// lists at every weight"*. Nothing there ties, so nothing there can move.
+/// The tie corpus is the arm built to move, and printing the two together is
+/// what makes the difference attributable — a run whose abilities held and
+/// whose ties changed is the reading the knob needs.
+pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
+    let abilities = run_all_for(Run {
+        activation_weight: activation,
+        depth,
+        ..Run::default()
+    })
+    .await;
+    if depth != nscore::Depth::Full {
+        println!("router depth: {} (M10 T2.1)", depth.as_str());
+    }
+    let code = report(&abilities, ledger_path, activation, depth);
+    print!(
+        "{}",
+        nstestkit::ties::render(&nstestkit::ties::measure(activation).await)
+    );
+    // M10 T5.4 arm 2. The tie corpus is where the weight is *meant* to move
+    // things; the thirty sessions are where it must not. Printing both under
+    // one flag is what makes `w = 1` a decision rather than a hope: the
+    // non-regressing half of the M9 rule is this table, not the tie table.
+    let fx = nstestkit::fixtures::run_all_for(Run {
+        activation_weight: activation,
+        depth,
+        ..Run::default()
+    })
+    .await;
+    print!(
+        "{}",
+        nstestkit::fixtures::render_by_ability(&format!("w = {activation}"), &fx)
+    );
+    code
 }
 
 /// The gate, separated from the run so that a failing set can be tested
 /// without one. The six abilities pass, which is exactly why the non-zero
 /// path needs its own test: an exit code nothing exercises is a gate nobody
 /// has checked.
-fn report(abilities: &[Ability], ledger_path: &Path) -> i32 {
+fn report(abilities: &[Ability], ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
     print!("{}", render_table(abilities));
 
     let current = Row::build(harness_hash(Path::new(".")), now_ms(), abilities);
+    // Same rule as the activation arm, and for the same reason: a run at
+    // `depth = adaptive` is a different arm, and recording it would make the
+    // next diff read as a harness change.
+    if depth != nscore::Depth::Full {
+        println!(
+            "ledger: not written — this run is the depth = {} arm, \
+             not the default one the ledger diffs.",
+            depth.as_str()
+        );
+        let failed = abilities.iter().filter(|a| !a.passed).count();
+        return i32::from(failed > 0);
+    }
+    // A row is the *default* arm's numbers, and the ledger's whole job is to
+    // let two runs be diffed position by position. A run at a non-default
+    // `activation_weight` is a different arm; recording it would make the
+    // next diff read as a harness change. So it prints and is not recorded,
+    // and says so rather than leaving a gap.
+    if activation != 0.0 {
+        println!(
+            "ledger: not written — this run is the activation_weight = {activation} arm, \
+             not the default one the ledger diffs."
+        );
+        let failed = abilities.iter().filter(|a| !a.passed).count();
+        return i32::from(failed > 0);
+    }
     println!(
         "ledger: {} · harness {}",
         ledger_path.display(),
@@ -542,6 +858,10 @@ mod tests {
             inspections: 0,
             budget_drops: 0,
             escalations: 0,
+            target_action: "remember_fact",
+            target_proposed: passed,
+            legal_size: 8,
+            bits: nstestkit::eval::bits_over_random(passed, 8),
             detail: if passed {
                 String::new()
             } else {
@@ -552,6 +872,54 @@ mod tests {
 
     fn row(abilities: &[Ability], harness: &str) -> Row {
         Row::build(harness.into(), 1_788_345_688_203, abilities)
+    }
+
+    /// **Bits-over-Random is chance-corrected** (M10 T0.4, tool-loading
+    /// §5.2).
+    ///
+    /// The property that makes the column worth printing: a target that was
+    /// not chosen scores nothing, a target chosen out of a legal set of one
+    /// also scores nothing — because there was no choice to get right — and
+    /// a target chosen out of a wider set scores strictly more than the same
+    /// target chosen out of a narrower one. That last line is the whole
+    /// defence against P2: a narrowing that keeps the pass count by making
+    /// the guess easier shows up here as a fall.
+    #[test]
+    fn bits_over_random_is_zero_at_chance_and_positive_when_the_target_is_chosen() {
+        use nstestkit::eval::bits_over_random;
+
+        // At chance, twice over: never proposed, and proposed out of a set
+        // with nothing to choose against.
+        assert_eq!(bits_over_random(false, 17), 0.0);
+        assert_eq!(bits_over_random(false, 1), 0.0);
+        assert_eq!(bits_over_random(true, 1), 0.0);
+        assert_eq!(bits_over_random(true, 0), 0.0);
+
+        // Chosen: log2(n) bits, exactly.
+        assert_eq!(bits_over_random(true, 2), 1.0);
+        assert_eq!(bits_over_random(true, 16), 4.0);
+        assert!((bits_over_random(true, 17) - 4.087_462_841_250_339).abs() < 1e-9);
+
+        // And breadth is what it pays for — the same hit out of a wider set
+        // is worth more, so a narrowing cannot buy the column.
+        assert!(bits_over_random(true, 17) > bits_over_random(true, 3));
+
+        // The ledger carries the sum, which is what a row is compared on.
+        let wide = row(
+            &[ability("information extraction", true, 19)],
+            &"a".repeat(40),
+        );
+        let missed = row(
+            &[ability("information extraction", false, 19)],
+            &"b".repeat(40),
+        );
+        assert_eq!(wide.bits(), 3.0, "log2(8)");
+        assert_eq!(missed.bits(), 0.0);
+        let diff = diff_lines(Some(&wide), &missed);
+        assert!(
+            diff.contains("BoR 3.00 → 0.00"),
+            "the diff has to carry the fall:\n{diff}"
+        );
     }
 
     /// The reason the ledger exists: 6/6 today reads exactly like 6/6 last
@@ -717,9 +1085,22 @@ mod tests {
     fn a_failing_ability_exits_non_zero_and_still_records_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
-        assert_eq!(report(&[ability("abstention", true, 7)], &path), 0);
         assert_eq!(
-            report(&[ability("abstention", false, 7)], &path),
+            report(
+                &[ability("abstention", true, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            0
+        );
+        assert_eq!(
+            report(
+                &[ability("abstention", false, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
             1,
             "a failed ability has to reach the exit code"
         );
@@ -741,13 +1122,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
         std::fs::write(&path, "{ this is not json").unwrap();
-        assert_eq!(report(&[ability("abstention", true, 7)], &path), 0);
+        assert_eq!(
+            report(
+                &[ability("abstention", true, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            0
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{ this is not json",
             "the operator's file is untouched"
         );
-        assert_eq!(report(&[ability("abstention", false, 7)], &path), 1);
+        assert_eq!(
+            report(
+                &[ability("abstention", false, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            1
+        );
     }
 
     #[test]
@@ -760,6 +1157,28 @@ mod tests {
         assert_eq!(named.ledger, PathBuf::from("other.json"));
 
         assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
+    }
+
+    /// M10 T5.4: the two knob modes are flags, they are off by default, and
+    /// they are separate — a run that turned both on would print one table
+    /// and silently drop the other, which is the failure a single `--knob`
+    /// argument would have made easy.
+    #[test]
+    fn the_two_knob_arms_are_separate_flags_and_default_off() {
+        let plain = parse_args(&[]).unwrap();
+        assert!(!plain.obligations);
+        assert!(!plain.guidelines);
+
+        let o = parse_args(&["--obligations".to_string()]).unwrap();
+        assert!(o.obligations && !o.guidelines);
+
+        let g = parse_args(&["--guidelines".to_string()]).unwrap();
+        assert!(g.guidelines && !g.obligations);
+
+        assert!(parse_args(&["--obligation".to_string()]).is_err());
+        assert!(parse_args(&["--guideline".to_string()]).is_err());
+        assert!(USAGE.contains("--obligations"));
+        assert!(USAGE.contains("--guidelines"));
     }
 
     /// `--paraphrase` is the M8 arm; `--live` is still the flag M7 refused,
@@ -782,6 +1201,15 @@ mod tests {
 
         assert!(parse_args(&["--live".to_string()]).is_err());
         assert!(parse_args(&["--paraphrases".to_string()]).is_err());
+
+        // M11 T1.1's modifier, and its follow-up: the flag is carried on
+        // `Args` and handed to `run_paraphrase` as a parameter, so parsing
+        // it sets nothing outside the value returned here. `--facts` alone
+        // is still refused.
+        assert!(!arm.facts, "a bare --paraphrase is the turns corpus");
+        let both = parse_args(&["--paraphrase".to_string(), "--facts".to_string()]).unwrap();
+        assert!(both.paraphrase && both.facts);
+        assert!(parse_args(&["--facts".to_string()]).is_err());
     }
 
     /// `--ablate` takes a block name in the next argument, composes with a
@@ -803,6 +1231,22 @@ mod tests {
         let with_block = a(vec!["--ablate", "facts", "--activation", "1.0"]).unwrap();
         assert_eq!(with_block.activation, 1.0);
         assert_eq!(with_block.ablate, Some(nscore::Ablate::Facts));
+
+        // M10 T2.1, mirroring `--activation`: a second arm of the same set,
+        // not a second config.
+        assert_eq!(a(vec![]).unwrap().depth, nscore::Depth::Full);
+        assert_eq!(
+            a(vec!["--depth", "adaptive"]).unwrap().depth,
+            nscore::Depth::Adaptive
+        );
+        assert_eq!(
+            a(vec!["--depth", "full", "--activation", "0.5"])
+                .unwrap()
+                .depth,
+            nscore::Depth::Full
+        );
+        assert!(a(vec!["--depth"]).is_err(), "the depth is required");
+        assert!(a(vec!["--depth", "shallow"]).is_err(), "and it is checked");
 
         assert!(a(vec!["--activation"]).is_err(), "the weight is required");
         assert!(a(vec!["--activation", "-1"]).is_err(), "no negative weight");

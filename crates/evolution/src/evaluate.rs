@@ -585,6 +585,14 @@ pub trait Evaluator: Send + Sync {
     fn revision(&self) -> String {
         "n/a".into()
     }
+    /// Requests this scorer has spent, for the scorers that spend any
+    /// (M11 T1.3). `None` — the default — means "this lane costs no
+    /// requests", which is the honest answer for the symbolic checks and for
+    /// the local scorer on loopback, and it is why the pass report prints a
+    /// line only for the lanes that have a number.
+    fn requests(&self) -> Option<u32> {
+        None
+    }
     async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError>;
 }
 

@@ -108,9 +108,102 @@ pub async fn announce(cfg: &crate::config::ModelsSection) {
     }
 }
 
+/// Whether the service is answering right now.
+///
+/// For the one caller that has to *decide* rather than degrade: the
+/// paraphrase arm adds its hybrid arm only when there is a service behind it,
+/// because an arm measured against a dead service is the bm25 arm wearing a
+/// different label, and printing that number as "hybrid" would be the worst
+/// outcome this whole phase could produce.
+pub async fn reachable(cfg: &crate::config::ModelsSection) -> bool {
+    health(&cfg.base_url, cfg.timeout_ms.max(2000))
+        .await
+        .is_ok()
+}
+
+/// The encoder the store runs its hybrid recall through (M8 T3.1/T3.2), or
+/// `None` when `[models]` is off.
+///
+/// `LocalEvaluator` and not a new client: it already carries the retry table,
+/// the refusal classification that survives a Czech Windows, and the rule
+/// that two unreachable calls take the lane out. A second client beside it
+/// would be a second copy of all three, and the one that drifted would be
+/// the one on the hot path.
+///
+/// It is a *different instance* from the one the evolution pass grades with,
+/// and deliberately: "disabled after two unreachable calls" is per instance,
+/// and a grading pass that gave up on a dead service must not also silence
+/// the recall path for the rest of the process — nor the other way round.
+pub fn encoder(
+    models: &crate::config::ModelsSection,
+    recall: &crate::config::RecallSection,
+) -> Option<std::sync::Arc<dyn nscore::TextEncoder>> {
+    if !models.enabled {
+        return None;
+    }
+    Some(std::sync::Arc::new(
+        nsevolution::local::LocalEvaluator::new(
+            nsevolution::local::LocalConfig {
+                base_url: models.base_url.clone(),
+                timeout_ms: models.timeout_ms,
+                reask_cosine: models.reask_cosine,
+                relevance_cut: models.relevance_cut,
+                embed_model: recall.embed_model.clone(),
+            },
+            nsevolution::evaluate::SymbolicEvaluator::default(),
+        ),
+    ))
+}
+
+/// `[recall]` as the store reads it.
+pub fn recall_tuning(recall: &crate::config::RecallSection) -> nsmemory_sqlite::Recall {
+    nsmemory_sqlite::Recall {
+        coarse_k: recall.coarse_k,
+        rerank_budget_ms: recall.rerank_budget_ms,
+    }
+}
+
+/// The store with everything `[memory]` and `[recall]` have to say about it.
+///
+/// One function because five call sites open this database and four of them
+/// were one `.with_activation` chain that a fifth knob would have made a
+/// fifth place to forget.
+pub fn store(cfg: &crate::config::AppConfig) -> nsmemory_sqlite::SqliteStore {
+    let mut store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
+        .expect("open sqlite store")
+        // M9 T3.1/T3.2. The composition root is where the `[memory]` knobs
+        // meet the store; `EngineConfig` carries the same two numbers for
+        // anything that reads the config as one object. Both default to
+        // today's ranking.
+        .with_activation(
+            cfg.memory.activation_weight,
+            cfg.memory.activation_half_life_days,
+        )
+        .with_recall(recall_tuning(&cfg.recall));
+    if let Some(enc) = encoder(&cfg.models, &cfg.recall) {
+        store = store.with_encoder(enc);
+    }
+    store
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Off by default, and off means no encoder at all — which is what makes
+    /// `[recall] hybrid = true` inert on a box with no service configured.
+    #[test]
+    fn no_encoder_without_the_models_section() {
+        let models = crate::config::ModelsSection::default();
+        let recall = crate::config::RecallSection::default();
+        assert!(encoder(&models, &recall).is_none());
+        let on = crate::config::ModelsSection {
+            enabled: true,
+            ..Default::default()
+        };
+        let enc = encoder(&on, &recall).expect("an encoder when [models] is on");
+        assert_eq!(enc.model(), "bge-m3", "`--model quality` is bge-m3");
+    }
 
     /// The shapes a person actually writes, and the one they should be told
     /// about rather than silently dialled on the wrong port.

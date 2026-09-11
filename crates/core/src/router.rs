@@ -82,6 +82,52 @@ impl Tier {
     }
 }
 
+/// How many of the registered tools ride on a turn (M10 T2.1).
+///
+/// `Full` is every registered tool the tier allows — today's behaviour, and
+/// the default. `Adaptive` lets the router map the message's own cues to
+/// tool groups and send only those, which is the one lever that shrinks the
+/// part of an emitter prompt no context knob touches: on the recorded
+/// turn 21 the array was 731 prompt tokens (findings §8.1), and §4.1
+/// measures selection accuracy falling as the array grows.
+///
+/// The selection is made **once per turn** and held across the turn's
+/// iterations, so the `tools` array is byte-stable and a provider prefix
+/// cache can survive the loop (decision 2, 2026-09-11). Escalation on an
+/// `IllegalAction` is the one legitimate mid-turn change, and it only ever
+/// widens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Depth {
+    /// Every registered tool the tier allows.
+    #[default]
+    Full,
+    /// The cue-selected subset, widened by escalation.
+    Adaptive,
+}
+
+impl Depth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Depth::Full => "full",
+            Depth::Adaptive => "adaptive",
+        }
+    }
+
+    /// Err carries the message a startup error should print — the shape
+    /// `SchemaProfile::parse` already uses, so `[router] depth` and
+    /// `[llm] schema_profile` fail the same way.
+    pub fn parse(s: &str) -> Result<Depth, String> {
+        match s {
+            "full" => Ok(Depth::Full),
+            "adaptive" => Ok(Depth::Adaptive),
+            other => Err(format!(
+                "depth {other:?} is unknown — known depths: full, adaptive"
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +153,18 @@ mod tests {
         assert_eq!(Tier::parse("expensive"), None);
         // Ordering is load-bearing: escalation only ever moves up.
         assert_eq!(Tier::Chat.max(Tier::Deep), Tier::Deep);
+    }
+
+    #[test]
+    fn depth_defaults_to_full_and_round_trips_by_name() {
+        assert_eq!(Depth::default(), Depth::Full);
+        for d in [Depth::Full, Depth::Adaptive] {
+            assert_eq!(Depth::parse(d.as_str()), Ok(d));
+            let json = serde_json::to_string(&d).unwrap();
+            assert_eq!(serde_json::from_str::<Depth>(&json).unwrap(), d);
+        }
+        assert!(Depth::parse("shallow")
+            .unwrap_err()
+            .contains("full, adaptive"));
     }
 }

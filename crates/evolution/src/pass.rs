@@ -47,6 +47,17 @@ pub struct PassConfig {
     /// measurement, not something to average away, and the gate has to be
     /// able to say *whose* verdict it acted on.
     pub authoritative_evaluator: String,
+    /// M8 T2.7 / M10 T5.3: the κ an evaluator must reach against the symbolic
+    /// proxies before the notes gate will believe it.
+    ///
+    /// Below it — or on a table too small to estimate κ from at all — the
+    /// evaluator still grades, and every grade is still recorded as a
+    /// `Graded` event (T2.3a). What it loses is authority: the gate falls
+    /// back to the symbolic checks, so the evaluator contributes
+    /// observations and no candidates. That is the same treatment a paid
+    /// judge below threshold gets, which is the whole argument for admitting
+    /// a local scorer here at all.
+    pub evaluator_min_kappa: f64,
     /// M9 T4.4: exposures a fact needs before zero credits mean anything.
     pub fitness_min_exposures: u32,
     /// Whether the fitness signal demotes or only reports. Off for a release.
@@ -55,6 +66,21 @@ pub struct PassConfig {
     /// pinned_prefixes`). Threaded through the pass the way `fact_stale_days`
     /// is: the knob belongs to memory, and the pass is where it is applied.
     pub pinned_prefixes: Vec<String>,
+    /// M8 T3.1: rows the embeddings backfill may embed in one batch, and how
+    /// many batches one pass may run.
+    ///
+    /// Two numbers rather than one total because they bound different
+    /// things. The batch is one `/embed` round trip and therefore one
+    /// memory spike on a CPU encoder; the cap is how long the *pass* may
+    /// spend on it before the idle window is needed for something else. The
+    /// backfill is resumable, so a cap that stops early costs nothing but a
+    /// later pass finishing the job.
+    ///
+    /// This never runs in a turn. It is a step of `run_report`, which runs
+    /// while the harness is waiting for the next message — the guard M8
+    /// names for the risk "the embeddings backfill runs in a turn".
+    pub embed_backfill_batch: usize,
+    pub embed_backfill_batches: usize,
 }
 
 impl Default for PassConfig {
@@ -69,9 +95,12 @@ impl Default for PassConfig {
             digest_scope: "global".into(),
             evaluate: EvaluateConfig::default(),
             authoritative_evaluator: "symbolic".into(),
+            evaluator_min_kappa: 0.4,
             fitness_min_exposures: 8,
             fitness_demote: false,
             pinned_prefixes: vec!["user.".into()],
+            embed_backfill_batch: 64,
+            embed_backfill_batches: 16,
         }
     }
 }
@@ -82,6 +111,67 @@ pub enum PassError {
     Store(#[from] StoreError),
     #[error("file: {0}")]
     File(#[from] FileError),
+}
+
+/// The evaluator every other one is calibrated against (M8 T2.7).
+///
+/// Not `authoritative_evaluator`: that knob says whose verdict the gate acts
+/// on, and it is the thing κ decides. The reference has to be the scorer that
+/// costs nothing, never fails and is already in the diff — otherwise a scorer
+/// could be promoted by agreeing with itself.
+const KAPPA_REFERENCE: &str = "symbolic";
+
+/// `n` a ±0.2 interval on κ needs (Donner–Eliasziw, see `kappa.rs`), and the
+/// positives below which the estimate is resting on a handful of turns.
+const KAPPA_MIN_N: u32 = 96;
+const KAPPA_MIN_POSITIVES: u32 = 10;
+
+/// How one evaluator agreed with the reference, over the turns both graded.
+///
+/// M10 T5.3. The whole table travels rather than κ alone, because κ alone is
+/// unreadable at this lane's prevalence — see the module docs of
+/// [`crate::kappa`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatorAgreement {
+    pub evaluator: String,
+    pub reference: String,
+    /// `None` when the two never graded the same turn — which, for a scorer
+    /// that reports `Unavailable` on every call, is what a service being
+    /// down looks like from here.
+    pub scores: Option<crate::kappa::Scores>,
+    /// Whether the table is big enough for its κ to be worth reading.
+    pub decisive: bool,
+    /// Whether the notes gate acted on this evaluator's grades this run.
+    pub authoritative: bool,
+    /// Why it did not, empty when it did.
+    pub caveat: String,
+}
+
+impl EvaluatorAgreement {
+    /// May the gate believe this evaluator? Only with a κ at or above the
+    /// threshold *and* a table decisive enough to have measured it. An
+    /// indecisive κ is treated as below threshold, never as absent.
+    pub fn trusted(&self, min_kappa: f64) -> bool {
+        self.decisive && self.scores.as_ref().is_some_and(|s| s.kappa >= min_kappa)
+    }
+}
+
+impl std::fmt::Display for EvaluatorAgreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "κ {} vs {}: ", self.evaluator, self.reference)?;
+        match &self.scores {
+            None => write!(f, "unavailable (service down)")?,
+            Some(s) => write!(
+                f,
+                "{:.2} [{:.2}, {:.2}] over {} turns (ac1 {:.2}, rate {:.2} vs {:.2})",
+                s.kappa, s.kappa_lo, s.kappa_hi, s.n, s.ac1, s.a_rate, s.b_rate
+            )?,
+        }
+        if !self.caveat.is_empty() {
+            write!(f, " — {}", self.caveat)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,12 +205,40 @@ pub struct Report {
     /// Grade attempts the scorer could not answer. Not a failure of a turn
     /// and not counted against anything — the service was down.
     pub grades_unavailable: usize,
+    /// M10 T5.3: one entry per evaluator beside the symbolic baseline.
+    pub agreement: Vec<EvaluatorAgreement>,
+    /// M11 T1.3: requests each evaluator spent this pass, for the ones that
+    /// spend any. Absent for the free lanes rather than zero — "this scorer
+    /// costs nothing" and "this scorer was asked nothing" are different
+    /// facts, and only the second is a number.
+    pub evaluator_requests: BTreeMap<String, u32>,
+    /// The evaluator the notes gate actually believed this run, after the κ
+    /// threshold had its say — which is not always the configured one.
+    pub authoritative_evaluator: String,
+    /// Set when the configured authoritative evaluator was demoted, to the
+    /// name it was demoted from.
+    pub demoted_from: Option<String>,
     pub facts_written: usize,
     pub written: bool,
     /// M6 §6.4 fact consolidation numbers.
     pub consolidation: crate::consolidate::ConsolidationReport,
     /// M9 T4.3 fitness numbers, derived from the log on every run.
     pub fitness: crate::fitness::FitnessReport,
+    /// Rejected proposals bucketed by the guard that fired, summed over
+    /// every session this pass read (M10 T0.2). A rejection is a request
+    /// already spent, and the pass is the only place that sees every session
+    /// at once — which is what makes the rate comparable between runs, and
+    /// what makes it the instrument M10's prompt-side loop fix is graded on.
+    pub rejections: nscore::RejectionTally,
+    /// Rows the embeddings backfill embedded this run (M8 T3.1). 0 on a
+    /// store with no encoder, and 0 on a second pass over the same log —
+    /// that second 0 is the resumability property, reported rather than
+    /// asserted.
+    pub embedded: usize,
+    /// Set when the backfill stopped on `embed_backfill_batches` with rows
+    /// still unembedded, so a reader knows the next pass has work rather
+    /// than that the log is fully indexed.
+    pub embed_backfill_incomplete: bool,
 }
 
 impl std::fmt::Display for Report {
@@ -154,6 +272,36 @@ impl std::fmt::Display for Report {
             "graded turns: {} newly graded, {} read back from the log, {} unavailable",
             self.graded_turns, self.grades_reused, self.grades_unavailable
         )?;
+        for a in &self.agreement {
+            writeln!(f, "{a}")?;
+        }
+        // Printed next to κ deliberately: for a paid judge the two numbers
+        // are one sentence — what the agreement cost.
+        for (id, n) in &self.evaluator_requests {
+            writeln!(f, "requests spent: {id} {n}")?;
+        }
+        write!(
+            f,
+            "authoritative evaluator: {}",
+            self.authoritative_evaluator
+        )?;
+        match &self.demoted_from {
+            Some(from) => writeln!(
+                f,
+                " (configured {from:?} demoted: observations only, no candidates)"
+            )?,
+            None => writeln!(f)?,
+        }
+        writeln!(
+            f,
+            "embeddings backfilled: {}{}",
+            self.embedded,
+            if self.embed_backfill_incomplete {
+                " (batch cap reached — the next pass continues)"
+            } else {
+                ""
+            }
+        )?;
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
         // M9 T4.5: the numbers this phase exists to make readable without
@@ -180,6 +328,11 @@ impl std::fmt::Display for Report {
                 n.exposures, n.credits
             )?;
         }
+        // M10 T0.2. Printed next to the signatures because it is the same
+        // kind of number and the cheaper one: a signature says a turn went
+        // wrong, this says how much of the day's request budget the harness
+        // spent finding out.
+        writeln!(f, "rejections by reason: {}", self.rejections.line())?;
         writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
@@ -375,6 +528,105 @@ impl EvolutionPass {
         Ok(())
     }
 
+    /// Step 4b': κ of every evaluator beside the reference (M8 T2.7, M10 T5.3).
+    ///
+    /// Read out of the *log*, not out of this run's grades. A pass that
+    /// regraded nothing still reports κ, because the grades it is computed
+    /// from are recorded values — which is the same property T2.3a buys for
+    /// replay, applied to calibration.
+    ///
+    /// Only turns *both* graded enter the table. A turn the local scorer
+    /// could not answer is absent rather than counted as agreement, so a
+    /// service that is half up cannot inflate its own κ by staying silent on
+    /// the turns it would have got wrong.
+    fn agreement(&self, sessions: &[Recorded]) -> Vec<EvaluatorAgreement> {
+        // evaluator id -> (session, turn) -> did it see a problem here.
+        // `BTreeMap` twice so the two label streams are aligned by key and
+        // the order is the same on every run.
+        let mut labels: BTreeMap<String, BTreeMap<(usize, u32), bool>> = BTreeMap::new();
+        for (si, (_, events)) in sessions.iter().enumerate() {
+            for e in events {
+                if let nscore::EventKind::Graded {
+                    turn, grade, by, ..
+                } = &e.kind
+                {
+                    labels
+                        .entry(by.clone())
+                        .or_default()
+                        .insert((si, *turn), !grade.ok);
+                }
+            }
+        }
+        let empty = BTreeMap::new();
+        let reference = labels.get(KAPPA_REFERENCE).unwrap_or(&empty);
+
+        let mut out = Vec::new();
+        for ev in &self.evaluators {
+            let id = ev.id();
+            if id == KAPPA_REFERENCE {
+                continue;
+            }
+            let mut under_test = Vec::new();
+            let mut against = Vec::new();
+            if let Some(mine) = labels.get(&id) {
+                for (key, v) in mine {
+                    if let Some(r) = reference.get(key) {
+                        under_test.push(*v);
+                        against.push(*r);
+                    }
+                }
+            }
+            let (scores, decisive) = if under_test.is_empty() {
+                (None, false)
+            } else {
+                let table = crate::kappa::Agreement::tally(&under_test, &against);
+                let d = table.decisive(KAPPA_MIN_N, KAPPA_MIN_POSITIVES);
+                (Some(table.scores()), d)
+            };
+            let caveat = match &scores {
+                None => "no turn was graded by both; observations only".to_string(),
+                Some(sc) if sc.kappa < self.cfg.evaluator_min_kappa => format!(
+                    "κ below evaluator_min_kappa {:.2}: observations only, no candidates",
+                    self.cfg.evaluator_min_kappa
+                ),
+                Some(sc) if !decisive => format!(
+                    "not decisive (n={} needs {KAPPA_MIN_N}, positives={} needs                      {KAPPA_MIN_POSITIVES}): observations only, no candidates",
+                    sc.n, sc.positives
+                ),
+                Some(_) => String::new(),
+            };
+            out.push(EvaluatorAgreement {
+                evaluator: id,
+                reference: KAPPA_REFERENCE.to_string(),
+                scores,
+                decisive,
+                authoritative: false,
+                caveat,
+            });
+        }
+        out
+    }
+
+    /// Whose grades the notes gate believes this run.
+    ///
+    /// The configured name, unless κ says it has not earned it — and then the
+    /// reference, which needs no calibration because it *is* the
+    /// calibration. Demotion is the conservative direction by construction:
+    /// the grades are all still in the log, so nothing is lost but authority.
+    fn effective_authoritative(
+        &self,
+        agreement: &[EvaluatorAgreement],
+    ) -> (String, Option<String>) {
+        let want = self.cfg.authoritative_evaluator.clone();
+        if want == KAPPA_REFERENCE {
+            return (want, None);
+        }
+        match agreement.iter().find(|a| a.evaluator == want) {
+            Some(a) if a.trusted(self.cfg.evaluator_min_kappa) => (want, None),
+            _ => (KAPPA_REFERENCE.to_string(), Some(want)),
+        }
+    }
+
     pub async fn run_report(&self, store: &dyn MemoryStore) -> Result<Report, PassError> {
         // 1–2. An unparsable learned.toml aborts before anything is proposed.
         let base = load_rules(&self.learned_path)?;
@@ -409,6 +661,14 @@ impl EvolutionPass {
         for (sid, events) in &sessions {
             sigs.extend(mine(sid, events, &self.known_specs));
             sigs.extend(evaluate(sid, events, &self.cfg.evaluate));
+            // M10 T0.2: the same tally `ns-app budget` prints per session,
+            // summed over the pass's sessions. Free — it is one walk of
+            // events already in memory, and it needs no model.
+            let t = nscore::tally_rejections(events);
+            report.rejections.proposals += t.proposals;
+            for (reason, n) in t.by_reason {
+                *report.rejections.by_reason.entry(reason).or_default() += n;
+            }
         }
         // 4b. Grade (M8 T2.3a, M9 T1.1/T1.3).
         //
@@ -421,8 +681,71 @@ impl EvolutionPass {
         // chain is extended, never rewritten.
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
+        // M11 T1.3. Read off the evaluators rather than counted here: only
+        // the scorer knows what it dialled, retries included, and a tally
+        // kept beside `grade_sessions` would count grade *attempts*, which
+        // is a different number from requests the moment anything retries.
+        for ev in &self.evaluators {
+            if let Some(n) = ev.requests() {
+                report.evaluator_requests.insert(ev.id(), n);
+            }
+        }
 
-        // 4b'. Mine the success lane (M9 T5.1).
+        // 4b°. The embeddings backfill (M8 T3.1).
+        //
+        // Here and nowhere else. The recall path reads vectors; something has
+        // to write them, and the only two places that could are a turn and
+        // this pass. A turn is ruled out by M8's own risk line — an
+        // embedding is a network round trip per batch, and a turn that waited
+        // on one would pay a recall cost at the moment it has none to spare.
+        //
+        // After grading rather than before it: grading is what the idle
+        // window is *for*, and a backfill of a long log would otherwise spend
+        // the window and leave the grades for next time. Bounded, resumable,
+        // and silent on a store with no encoder — `backfill_embeddings`
+        // returns 0 without dialling anything.
+        //
+        // A dry run writes nothing anywhere else and writes nothing here.
+        if !self.cfg.dry_run {
+            let batch = self.cfg.embed_backfill_batch;
+            // A full last batch is how "there may be more" presents itself
+            // without a second query: the store selects `limit` rows and
+            // stops. Reported as *may have more*, which is the honest claim.
+            let mut last_was_full = false;
+            for _ in 0..self.cfg.embed_backfill_batches {
+                match store.backfill_embeddings(batch).await {
+                    Ok(0) => {
+                        last_was_full = false;
+                        break;
+                    }
+                    Ok(n) => {
+                        report.embedded += n;
+                        last_was_full = n == batch;
+                    }
+                    // The service being down is not a failed pass. Every
+                    // other lane here degrades the same way.
+                    Err(_) => {
+                        last_was_full = false;
+                        break;
+                    }
+                }
+            }
+            report.embed_backfill_incomplete = last_was_full;
+        }
+
+        // 4b′. Calibration (M8 T2.7, M10 T5.3), before anything downstream
+        // asks whose verdict to believe. It has to run here and not at
+        // report time: `authoritative` is an input to the success lane, to
+        // fitness and to the notes gate, and all three are below.
+        report.agreement = self.agreement(&sessions);
+        let (authoritative, demoted_from) = self.effective_authoritative(&report.agreement);
+        for a in &mut report.agreement {
+            a.authoritative = a.evaluator == authoritative;
+        }
+        report.authoritative_evaluator = authoritative.clone();
+        report.demoted_from = demoted_from;
+
+        // 4b''. Mine the success lane (M9 T5.1).
         //
         // A third source, and the only one that reads every session at once:
         // `Succeeded` is a route two graded-good turns both took, and no
@@ -431,10 +754,7 @@ impl EvolutionPass {
         // run's fresh verdicts into `sessions` — mining first would mean a
         // session could never yield a strategy until a second pass, which is
         // the sort of silence that reads as "nothing found".
-        sigs.extend(crate::mine::mine_succeeded(
-            &sessions,
-            &self.cfg.authoritative_evaluator,
-        ));
+        sigs.extend(crate::mine::mine_succeeded(&sessions, &authoritative));
         for s in &sigs {
             *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
             let turns = report.signature_turns.entry(s.kind.name()).or_default();
@@ -453,8 +773,7 @@ impl EvolutionPass {
         // log rather than whatever the last pass left in the columns. The
         // numbers are *derived and set*, never incremented — running this
         // twice over one log produces one answer.
-        report.fitness =
-            crate::fitness::derive(store, &sessions, &self.cfg.authoritative_evaluator).await?;
+        report.fitness = crate::fitness::derive(store, &sessions, &authoritative).await?;
         for note in &base.notes {
             report
                 .fitness
@@ -633,7 +952,7 @@ impl EvolutionPass {
                     // one keeps the path it had.
                     &crate::notes::NoteGate {
                         require_graded: s.kind.from_grades(),
-                        authoritative: self.cfg.authoritative_evaluator.clone(),
+                        authoritative: authoritative.clone(),
                     },
                 )
                 .await;
@@ -763,6 +1082,51 @@ mod tests {
         .unwrap();
     }
 
+    /// A reply that answers in the user's own words — and, when the user
+    /// asks for "details", invents some.
+    ///
+    /// A κ table whose reference never changes its mind is the prevalence
+    /// paradox rather than a measurement, so the fixture has to be able to
+    /// make the symbolic checks say *yes* on some turns and *no* on others.
+    /// `ScriptedReplier` cannot: it echoes the whole turn trace, which the
+    /// grounding check reads as a page of unsupported claims on every turn.
+    /// The three invented claims below are what `ground::ungrounded` is
+    /// built to catch — a name, a number and a place nothing showed it.
+    struct PlainReplier;
+    #[async_trait::async_trait]
+    impl nscore::Replier for PlainReplier {
+        async fn reply(&self, ctx: nscore::ReplyContext) -> Result<String, nscore::ReplyError> {
+            let mut r = format!("sure, about {}: done", ctx.user_text);
+            if ctx.user_text.contains("details") {
+                r.push_str(", Martin has 42 orders in Oslo");
+            }
+            Ok(r)
+        }
+    }
+
+    /// `record_into` with the user's words under the harness's control, so a
+    /// scorer can be scripted per turn without a session id it cannot see.
+    async fn record_asking(store: Arc<InMemoryStore>, name: &str, text: &str, p: Vec<Proposal>) {
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(p)));
+        b.set_replier(Box::new(PlainReplier));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(Closed));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig::default(),
+            Box::new(|| Timestamp(1)),
+        );
+        e.run_turn(Incoming {
+            session: SessionId(name.into()),
+            text: text.into(),
+        })
+        .await
+        .unwrap();
+    }
+
     fn typo() -> Proposal {
         Proposal {
             rationale: "".into(),
@@ -846,6 +1210,87 @@ mod tests {
         assert!(!dir.path().join("learned.toml").exists());
         assert!(!dir.path().join("ledger.json").exists());
         assert_eq!(rules.load().alias("eko"), None);
+    }
+
+    /// A constant-vector encoder. The pass does not care what a vector
+    /// *means* — the ranking is tested where the ranking lives — only that
+    /// something was written and that a second run writes nothing.
+    struct FlatEncoder(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl nscore::TextEncoder for FlatEncoder {
+        fn model(&self) -> &str {
+            "bge-m3"
+        }
+        async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(texts
+                .iter()
+                .map(|t| vec![t.len() as f32 / 100.0, 1.0])
+                .collect())
+        }
+        async fn rerank(
+            &self,
+            _q: &str,
+            docs: &[String],
+            k: usize,
+        ) -> Result<Vec<(usize, f32)>, StoreError> {
+            Ok((0..docs.len().min(k)).map(|i| (i, 1.0)).collect())
+        }
+    }
+
+    /// M8 T3.1: the backfill is a step of the idle pass, it is resumable,
+    /// and a dry run — which writes nothing anywhere else — writes no
+    /// vectors either.
+    #[tokio::test]
+    async fn the_idle_pass_backfills_embeddings_once_and_then_has_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = Arc::new(FlatEncoder(Default::default()));
+        let sqlite_dir = tempfile::tempdir().unwrap();
+        let store = nsmemory_sqlite::SqliteStore::open(&sqlite_dir.path().join("p.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        let sid = SessionId("s".into());
+        let mut l = EventLog::new(sid.clone());
+        l.append(1, Timestamp(1), EventKind::UserSaid { text: "hi".into() });
+        l.append(
+            1,
+            Timestamp(2),
+            EventKind::Replied {
+                text: "hello".into(),
+            },
+        );
+        store.append(&sid, l.events()).await.unwrap();
+
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let dry = pass(dir.path(), rules.clone(), true)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(
+            dry.embedded, 0,
+            "a dry run writes nothing, vectors included"
+        );
+        assert_eq!(enc.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let first = pass(dir.path(), rules.clone(), false)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(first.embedded, 2);
+        assert!(!first.embed_backfill_incomplete);
+        let dialled = enc.0.load(std::sync::atomic::Ordering::Relaxed);
+
+        let second = pass(dir.path(), rules, false)
+            .run_report(&store)
+            .await
+            .unwrap();
+        assert_eq!(second.embedded, 0, "resumable: the second pass has nothing");
+        assert_eq!(
+            enc.0.load(std::sync::atomic::Ordering::Relaxed),
+            dialled,
+            "and it does not dial the service to discover that"
+        );
     }
 
     #[tokio::test]
@@ -1407,5 +1852,179 @@ mod tests {
             tools_tokens: 0,
             cached_tokens: 0,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M8 T2.7 / M10 T5.3 — κ per evaluator, and what a low one costs
+    // -----------------------------------------------------------------
+
+    /// A second scorer that *is* the symbolic one, disagreeing on exactly the
+    /// turns it is told to.
+    ///
+    /// Nothing weaker gives a test control of a κ table. The reference's own
+    /// labels are whatever the checks make of the recorded turns, so a fixed
+    /// script would agree or disagree by accident and the table would be
+    /// measuring the fixture rather than the arithmetic. Mirroring and
+    /// flipping makes the off-diagonal exactly `flip_on.len()`.
+    struct MirrorEvaluator {
+        flip_on: Vec<String>,
+        inner: crate::evaluate::SymbolicEvaluator,
+    }
+    #[async_trait::async_trait]
+    impl Evaluator for MirrorEvaluator {
+        fn id(&self) -> String {
+            "scripted".into()
+        }
+        async fn grade(
+            &self,
+            view: &crate::evaluate::TurnView<'_>,
+        ) -> Result<crate::evaluate::TurnGrade, crate::evaluate::GradeError> {
+            use crate::evaluate::Issue;
+            let mut g = self.inner.grade(view).await?;
+            if self.flip_on.iter().any(|t| t == view.user) {
+                // The binary κ is computed over is `!grade.ok`, and `ok` is
+                // false when *either* the issue or the grounding flag says
+                // so — so both have to move together for the flip to land.
+                if g.issue.is_problem() || !g.grounded {
+                    g.issue = Issue::None;
+                    g.grounded = true;
+                } else {
+                    g.issue = Issue::Reask;
+                }
+            }
+            g.scorer = self.id();
+            Ok(g)
+        }
+    }
+
+    /// Ten one-turn sessions, five of which the symbolic checks call a
+    /// problem. Half and half on purpose: κ at a degenerate prevalence is
+    /// zero however well two raters agree, and a fixture that could not be
+    /// read is not a test of the arithmetic.
+    async fn ten_turns(store: &Arc<InMemoryStore>) {
+        for i in 0..10 {
+            let text = if i % 2 == 0 {
+                format!("ask {i}")
+            } else {
+                format!("ask {i} with details")
+            };
+            record_asking(store.clone(), &format!("s{i}"), &text, vec![good()]).await;
+        }
+    }
+
+    fn mirror(flip: &[&str]) -> Arc<MirrorEvaluator> {
+        Arc::new(MirrorEvaluator {
+            flip_on: flip.iter().map(|s| s.to_string()).collect(),
+            inner: crate::evaluate::SymbolicEvaluator::default(),
+        })
+    }
+
+    /// T5.3's first exit line: a second evaluator that agrees on 8 of 10
+    /// turns gets a κ against the symbolic baseline, and the number is in
+    /// the report a dry run prints rather than only in a struct.
+    #[tokio::test]
+    async fn a_second_evaluator_prints_kappa_against_the_symbolic_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        ten_turns(&store).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        let report = pass(dir.path(), rules, true)
+            .with_evaluator(mirror(&["ask 0", "ask 3 with details"]))
+            .run_report(&*store)
+            .await
+            .unwrap();
+
+        assert_eq!(report.agreement.len(), 1, "{report}");
+        let a = &report.agreement[0];
+        assert_eq!(
+            (a.evaluator.as_str(), a.reference.as_str()),
+            ("scripted", "symbolic")
+        );
+        let sc = a
+            .scores
+            .as_ref()
+            .expect("both scorers graded all ten turns");
+        assert_eq!(sc.n, 10, "{a}");
+        // Two flips, so the off-diagonal is exactly two: raw agreement 0.8.
+        assert!((sc.observed - 0.8).abs() < 1e-9, "{a}");
+        // Five replies invented a name, a number and a place, so the
+        // reference calls half of them a problem — which is what makes κ
+        // readable here: (0.80 − 0.50) / (1 − 0.50).
+        assert!((sc.b_rate - 0.5).abs() < 1e-9, "{a}");
+        assert!((sc.kappa - 0.6).abs() < 1e-9, "κ was not computed: {a}");
+        // … and it is printed, which is the half of the task a struct field
+        // does not satisfy.
+        let printed = report.to_string();
+        assert!(
+            printed.contains("κ scripted vs symbolic:") && printed.contains("over 10 turns"),
+            "{printed}"
+        );
+        // Ten turns cannot resolve the gate, and the line says so rather
+        // than letting a small-sample κ pass for a measurement.
+        assert!(!a.decisive, "{a}");
+    }
+
+    /// T5.3's second: below the threshold an evaluator still grades and its
+    /// grades are still recorded — what it loses is the gate.
+    #[tokio::test]
+    async fn an_evaluator_below_min_kappa_is_reported_but_not_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        ten_turns(&store).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        // Disagrees on half the turns, and is nonetheless configured as the
+        // scorer the gate should believe.
+        let p = EvolutionPass::new(
+            rules,
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                authoritative_evaluator: "scripted".into(),
+                evaluator_min_kappa: 0.4,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123))
+        .with_evaluator(mirror(&[
+            "ask 0",
+            "ask 1 with details",
+            "ask 2",
+            "ask 3 with details",
+            "ask 4",
+        ]));
+        let report = p.run_report(&*store).await.unwrap();
+
+        let a = &report.agreement[0];
+        let sc = a.scores.as_ref().expect("it graded every turn");
+        assert!(
+            sc.kappa < 0.4,
+            "the fixture has to land under the gate: {a}"
+        );
+        assert!(!a.trusted(0.4) && !a.authoritative, "{a}");
+        assert_eq!(report.authoritative_evaluator, "symbolic", "{report}");
+        assert_eq!(report.demoted_from.as_deref(), Some("scripted"), "{report}");
+        let printed = report.to_string();
+        assert!(
+            printed.contains("below evaluator_min_kappa")
+                && printed.contains("observations only, no candidates")
+                && printed.contains("demoted"),
+            "{printed}"
+        );
+
+        // Observations only — but observations, not silence: every grade it
+        // produced is in the log under its own name (T2.3a).
+        let events = store.load(&SessionId("s0".into())).await.unwrap();
+        let recorded: Vec<String> = graded_events(&events)
+            .iter()
+            .map(|e| serde_json::to_string(&e.kind).unwrap())
+            .collect();
+        assert!(
+            recorded.iter().any(|j| j.contains(r#""by":"scripted""#)),
+            "{recorded:?}"
+        );
+        assert!(recorded.iter().any(|j| j.contains(r#""by":"symbolic""#)));
     }
 }

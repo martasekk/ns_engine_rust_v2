@@ -202,6 +202,122 @@ run a non-dry evolution pass on `ns-run/ns.sqlite`, copy it first.
   they remove text and applicability mismatches, and the snapshot test is their record.
 - After the branch lands: `graphify <root> --update`; update findings §8.5 with the numbers.
 
+## Decisions taken during execution (2026-09-11, user)
+
+Asked and answered while wave 3 ran; they bind the waves that follow.
+
+1. **Chat path: measure only.** Plain chat turns keep the emitter-first shape for now. A
+   counter lands in `ns-app budget` (with P4): *chat-tier turns whose only proposal was
+   `respond_directly`: N of M*. The single-call path is decided later, with that number.
+2. **A paid tier is coming soon.** Tokens and cache hits count again. Consequences, applied
+   before wave 4: (a) P2's adaptive depth selects the tool set **once per turn**, not per
+   iteration, so the `tools` array is byte-stable across a turn's iterations and the prefix
+   can cache — "remove, don't mask" stays correct *between* turns, "stable within a turn" is
+   the new rule; escalation (T2.2) still widens the set, and that is the one legitimate
+   mid-turn cache miss; (b) M9 T2.3 is reopened for the emitter: on turn 21 the tool array
+   (731) plus facts+summary+window (538) already clears the 1,024 floor, so an emitter
+   breakpoint after the window block is applicable once the array is stable — it goes into
+   P4 behind `[llm] prompt_cache_emitter` (default off) and is verified by `cached_tokens`
+   on the first paid-tier session, never by code review; (c) the replier prefix (225
+   tokens) stays under the floor; no change.
+3. **Priority after M10: chat and personal memory.** The desktop line stays parked; the tool
+   array work continues because the chat floor is where its cost lives.
+4. **Delivery: one draft PR to `main`** carrying `worktree-m9-memory` and
+   `worktree-m10-tool-array`, with both plans' Results as the description, opened when M10's
+   last wave lands.
+
 ## Results
 
-*(empty until execution)*
+Executed 2026-09-11 on `worktree-m10-tool-array` (cut from `worktree-m9-memory`), one Opus
+agent per wave, waves sequenced by file overlap. Requests spent by the plan: **0**.
+
+### P0 — done (commit `5e0b209`)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T0.1 | per-tool table sums to `Σ tools_tokens`; old logs `n/a` | met. `tool_names` serializes as **absent when empty** — the first cut without that changed the bytes of every older `ModelCall` and the chain reported `skipped broken: 1`. Rule pinned by `an_empty_tool_names_serializes_to_nothing_so_old_events_still_hash`: **every future manifest field must serialize as absent at its default.** M9's fields are safe only because the recorded log was written after them |
+| T0.2 | `repeat_gate 6, IllegalAction 2, Malformed 1 — 11.1 per 100` | reproduced exactly, in `ns-app budget` and `evolve --dry-run`; one `tally_rejections` shared by both |
+| T0.3 | passes on the full set, fails with the tool withheld | met: `desktop hard query`, a scroll to a control below the fold; `Run.withhold` removes (not masks) tools in the harness |
+| T0.4 | a BoR column, baseline recorded | **28.80 bits over 10 abilities (2.88 mean)**; legal 6 on the memory half, 10 on desktop |
+
+### P1 — done (commit `c9832b7`)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T1.1 | turn-21 array ≤ 2,250 chars | **unreachable**: a compiled tool costs ~60 tokens before it says anything (`a_tool_costs_sixty_tokens_before_it_says_anything`), so ≤ 2,250 would leave ~40 chars of description per tool. `_rationale` 106 → 18 chars, instruction sent once; turn-21 set 3,256 → **2,640 chars (814 → 660 tokens)**, −19% |
+| T1.2 | click ≤ 130, move ≤ 100 tokens | unreachable for the same reason (click's five parameters + `_rationale` ≈ 105 tokens alone); measured **click 235 → 176, move 174 → 143**, −25% |
+| T1.3 | desktop ≤ 1,350 tokens, chat floor ≤ 420 | desktop **2,477 → 2,018 full / 1,800 slim** (−27% slim), target unreachable; **chat floor 650 → 283 full / 265 slim** — met. `schema_profile` default `full`; per-profile snapshot hashes |
+| T1.4 | turn 1 of an empty store sends three tools, ≤ 300 tokens | met (283). **T1.4 broke replay**: a fresh store narrowed `forget_all` away and a recorded proposal came back illegal — `prune_inapplicable` is `false` in `replay_session`; replay may widen, never narrow |
+| T1.5 | examples only where a bucket names a tool | `Malformed` = `pointer_click` missing `x`; both `IllegalAction` = `pointer_move`; one `Ex: {"x":640,"y":400}` each |
+| BoR | — | **28.80 → 22.74** after T1.4: smaller legal sets score fewer bits at equal accuracy (10/10); P2's baseline |
+
+The abstention ability now runs with `window_turns = 1` so `recall` is legal on its question
+turn; meaning and ledger row unchanged.
+
+### P5 (T5.1–T5.3) — done (commits `96b49a2`, `64fa2e5`)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T5.3 | κ per evaluator prints | met. Service down: `κ local vs symbolic: unavailable (service down) — observations only`. Service up: **κ 0.35 [−0.05, 0.74] over 21 turns** (AC1 0.36), below `evaluator_min_kappa` 0.4 → observations only, `symbolic` stays authoritative; same direction as M8's held-out 0.466, and 21 turns cannot resolve the gate |
+| T5.1 | ≥ 5 sessions per ability; ablation arms no longer blind | **30 sessions**, 5 per memory ability, 15 cs / 15 en, each with a real `Summarized` event, two reply notes and a global note, one knowledge update, a paraphrased question (overlap ≤ 0.30), an unanswerable turn scored in its own abstention arm. `--ablate summary`: answerable **30/30 → 0/30**, abstention 30/30 → 30/30; `--ablate guidance` likewise. The ten original abilities still read 9/10 → 9/10 under both: **insensitivity, now provably not blindness** |
+| T5.2 | `--activation 0` and `1` differ | **0/8 at w = 0, 8/8 at w = 1** on eight cases of five exactly tied facts |
+
+### P2 + P4 — done (commit `370a781`)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T2.1 | BoR not lower at equal accuracy; hard query passes | `--depth adaptive`: **10/10, BoR 21.55** vs 22.74 at `full`; hard query passes (legal 7 → 6); the fall is the narrowing itself (fewer bits per hit), no ability regressed; `adaptive` stays default off |
+| T2.2 | escalation admits the tool, counted, in the manifest | met: `Rejected{IllegalAction}` + `selected_tools = None` for the rest of the turn; `tool_names` grows; no escalation fired on the fixtures |
+| stability | tools array byte-stable within a turn | met for a turn with no rejections and no clipped results, at both depths. **Still moves mid-turn** through `inspect_result` entering on a clip, `confirm_pending` on a staged action, `forget_*` leaving after a `remember_fact`, and narrowing after a rejection — pre-existing movers, recorded; the emitter cache breakpoint will miss on those turns |
+| T4.1 | marker on every executed call | met: `[done; an identical call is denied]`, short form when folded, never on `inspect_result` (the repeat gate exempts it); one system line |
+| cache knob | off is byte-identical | met: `[llm] prompt_cache_emitter` default false; breakpoint after the window block when on |
+| chat counter | the line on the recorded copy | `no chat-tier turns in this log (the tier is recorded only when a router is configured)` — turns 1–20 predate `ModelCall`, turn 21 is deep-tier. Needs one session recorded with a router configured; arithmetic covered by its unit test |
+
+T4.2 (`repeat_gate` per 100 on live sessions vs 7.4) and T1.6 (`slim`'s Malformed/Illegal
+rates vs 11.1 per 100) are live monitoring and stay open until sessions are run.
+
+### P3 — done (commit `ba4fe3e`), 0 requests, service up for the measurement
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T3.1 | backfill twice → 0 the second time; a turn never embeds | met: `embeddings (kind, owner, row_id, model, dim, vector)` with the **model in the primary key**, backfilled by the pass in bounded batches (`[evolution] embed_backfill_batch(es)`), `a_turn_never_calls_embed_on_the_shipped_default` |
+| T3.2 | service down → exactly today's bm25 list | met byte-for-byte, with and without an encoder; RRF k = 5 in core (`rrf_fuse`, rank never score) |
+| T3.3 | a Chat turn issues no `/embed` | met (`a_chat_tier_turn_issues_no_embed_call`, and Deep does) |
+| T3.4 | paraphrase miss < 20%, verbatim not regressed | **sqlite hybrid (bge-m3, coarse 10 → rerank): 11/12, 8% miss; verbatim 12/12, 0%** — against in-memory 75% and bm25 83%. M8 §6's 8% reproduced exactly; the one miss is `cs/name` |
+| T3.5 | over-budget recall falls back to lexical | met (`[recall] coarse_k` 10, `rerank_budget_ms` 800, scripted slow transport) |
+| T3.6 | exemplars as a `ToolReturned`, default 0 | met: `nearest_digests` by cosine over digest vectors written at digest time; `[memory] exemplars_max = 0`; `exemplars_enter_as_a_tool_returned_not_as_a_context_block` |
+
+`[recall] hybrid` defaults to today's behaviour (off); the arm is added to `ns-app eval
+--paraphrase` only when the service answers, and prints `NOT MEASURED` otherwise so M6
+§12.8's "stay lexical" verdict is never read off a non-lexical arm.
+
+### P5 T5.4 — done, 0 requests. Every M9 knob re-read on the 30 fixtures + 10 abilities
+
+| Arm | Off | On | Verdict |
+|---|---|---|---|
+| `--ablate summary` | abilities 10/10, fixtures 30/30 answerable, 30/30 abstention | 10/10, **0/30**, 30/30 | the summary block carries every fixture's answer; the ten abilities are insensitive, not blind (30/30 carry a summary) |
+| `--ablate guidance` | same | 10/10, **0/30**, 30/30 | same reading for the reply notes |
+| `--activation 0 / 0.5 / 1` | tie corpus 0/8; fixtures 30/30; abilities 10/10, BoR 22.74 | **8/8 at 0.5 and at 1**; fixtures 30/30 at every weight; abilities and BoR unchanged | **clears the M9 rule**: the verbatim arms do not move and the tie corpus separates. `activation_weight` default moves **0.0 → 0.5**, the smaller weight that clears the ties; caveat recorded: the tie corpus was built to be separable, so the live fitness signal (`credits`) is what the prior will actually rank by, and `ns-app eval --activation` stays the check |
+| `obligation_check` | 10/10, 30/30, 30/30, 405 replier requests | 10/10, 30/30, 30/30, **436 replier requests (+31, +7.7%)** | fires, buys nothing graded, costs regenerations: **stays false** |
+| `summary_guidelines` | identical | identical | **not measurable offline**: the fixtures' scripted summarizer builds its draft from records and never renders a system prompt; the plumbing (`Run.summary_guidelines` → `summarizer_double`) waits for a live summarizer arm. Stays empty |
+
+Workspace after wave 6: **34 test targets, 673 passed, 0 failed, 1 ignored** (the live-service
+probe). Open live-monitoring items, unchanged: T1.6 (`slim` rates), T4.2 (`repeat_gate` per
+100), the chat counter (needs a router-configured session), the emitter cache knob (needs a
+paid-tier session with `cached_tokens`), and `summary_guidelines` (needs a live summarizer arm).
+
+### Status after waves 1–6
+
+Every knob defaults to today's behaviour except `activation_weight`, now 0.5 on the measured
+tie corpus. `schema_profile = full`, `[router] depth = full`, `[recall] hybrid = false`,
+`prompt_cache_emitter = false`, `exemplars_max = 0`, `obligation_check = false`,
+`fitness_demote = false`, `summary_guidelines = []`. What a user of an old config sees: a
+smaller tool array on every call (chat floor 650 → 283 tokens with no knob), `forget_*` and
+`recall` only when applicable, the done marker in the trace, four new footer lines in
+`ns-app budget`, embeddings backfilled by the idle pass when `[models]` is enabled, and κ per
+evaluator in `ns-app evolve --dry-run`. The `TextEncoder`
+trait lives in core; the local evaluator's transport is its one implementation, with the
+same retry table and disable-after-two rule. Note: the measurement ran against an nsmodels
+instance already listening on 7374, which the agent then stopped; restart it before the
+next idle pass (`cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model
+quality --rerank`).

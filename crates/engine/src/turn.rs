@@ -124,6 +124,21 @@ pub struct EngineConfig {
     /// beyond this one. 0 keeps recall inside the current conversation, as
     /// it was before digests existed.
     pub recall_sessions: usize,
+    /// M10 T1.3: which spelling of every tool description the emitter is
+    /// shown. `Full` — the default — is today's text unchanged.
+    pub schema_profile: nscore::SchemaProfile,
+    /// M10 T1.4: whether the synthetic tools that cannot apply are left out
+    /// of the legal set. On by default, and **off under replay**.
+    ///
+    /// Applicability is the one thing in the legal set that is read from the
+    /// store rather than from this turn's own events, and replay runs against
+    /// a fresh double: a session that had two facts when it was recorded has
+    /// none when it is replayed, so `forget_all` would be narrowed away and a
+    /// recorded proposal would come back `IllegalAction`. Replay must never
+    /// *narrow* the set — offering a superset can only turn a rejection back
+    /// into the recorded outcome — so it turns the pruning off and compares
+    /// what the run actually did.
+    pub prune_inapplicable: bool,
     /// M7 Phase 3: decides each turn's tier before the first model call.
     /// `None` — every scripted double and every replay — routes nothing and
     /// behaves exactly as the engine did before the router existed.
@@ -152,6 +167,33 @@ pub struct EngineConfig {
     /// daily allowance, so N slots never mean N times the requests
     /// (findings §2.9).
     pub worker_slots: usize,
+    /// M8 T3.2/T3.3: whether recall may take the hybrid path — bm25 ∪ vector
+    /// candidates, fused by rank, reranked — instead of staying lexical.
+    ///
+    /// Off by default, as M8 §8 writes it, and the store is the second gate:
+    /// without an encoder and without stored vectors `search_turns_hybrid`
+    /// *is* `search_turns_in`, so turning this on against a store that has
+    /// neither changes nothing at all.
+    ///
+    /// **Never reached from `Chat`.** A conversational turn's recall stays
+    /// lexical however this is set, which is the tier rule stated once here
+    /// and asserted by `a_chat_tier_turn_issues_no_embed_call`. The reason is
+    /// the one M8 §6 gives for the whole phase: coarse-vector-to-rerank costs
+    /// a round trip of about half a second, and a tier whose budget is half
+    /// the ceiling is not where that is spent.
+    pub recall_hybrid: bool,
+    /// M9 T5.3 / M10 T3.6: how many nearest earlier conversations the deep
+    /// tier's pre-emptive step may bring in as exemplars. **0 — off — until
+    /// `--ablate` decides otherwise**, which is the M9 rule for every knob
+    /// whose fixture does not exist yet.
+    ///
+    /// An exemplar enters as a `ToolReturned`, never as a context block.
+    /// That is not presentation: a context block has no provenance, no
+    /// trust and no call to point at, and a digest built from External tool
+    /// output stays External (M6 §5.1, the laundering rule). As a tool
+    /// return it carries the digests' *lowest* trust, it is in the
+    /// provenance index, and it replays.
+    pub exemplars_max: usize,
 }
 
 impl Default for EngineConfig {
@@ -175,7 +217,7 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
-            activation_weight: 0.0,
+            activation_weight: 0.5,
             activation_half_life_days: 7.0,
             obligations_max: 5,
             obligation_check: false,
@@ -191,11 +233,15 @@ impl Default for EngineConfig {
             trace_verbatim_lines: 5,
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
+            schema_profile: nscore::SchemaProfile::Full,
+            prune_inapplicable: true,
             router: None,
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
             worker_slots: 1,
+            recall_hybrid: false,
+            exemplars_max: 0,
         }
     }
 }
@@ -264,14 +310,38 @@ fn explain_error(detail: &str) -> String {
     )
 }
 
+/// Every action the engine itself puts in a legal set, in one list.
+///
+/// The registry holds the tools a deployment wired in; these seven are
+/// compiled in, and a report that prices a recorded tool array needs both or
+/// it can price neither (M10 T0.1). Exposed as specs rather than as names
+/// because the price is the schema, not the label. Nothing here is a
+/// statement about which of them were *legal* on any given call — that is
+/// what the manifest's `tool_names` records.
+pub fn synthetic_specs(profile: nscore::SchemaProfile) -> Vec<nscore::ActionSpec> {
+    vec![
+        ask_clarification_spec(profile),
+        confirm_pending_spec(profile),
+        remember_fact_spec(profile),
+        forget_fact_spec(profile),
+        forget_all_spec(profile),
+        recall_spec(profile),
+        inspect_result_spec(profile),
+    ]
+}
+
 /// Engine-owned synthetic action: ask the user one question (spec §5.1).
 pub const ASK_CLARIFICATION: &str = "ask_clarification";
 
-fn ask_clarification_spec() -> nscore::ActionSpec {
+fn ask_clarification_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: ASK_CLARIFICATION.into(),
-        description: "Ask the user one short question to resolve missing or ungrounded \
-                      information required by the next action."
+        description: profile
+            .pick(
+                "Ask the user one short question to resolve missing or ungrounded \
+                 information required by the next action.",
+                "Ask the user one short question the next action needs answered.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -287,10 +357,15 @@ fn ask_clarification_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: the user just confirmed the staged action.
 pub const CONFIRM_PENDING: &str = "confirm_pending";
 
-fn confirm_pending_spec() -> nscore::ActionSpec {
+fn confirm_pending_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: CONFIRM_PENDING.into(),
-        description: "The user has just confirmed the pending action; execute it.".into(),
+        description: profile
+            .pick(
+                "The user has just confirmed the pending action; execute it.",
+                "Execute the pending action the user just confirmed.",
+            )
+            .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Pure,
         residual_policy: Default::default(),
@@ -301,11 +376,15 @@ fn confirm_pending_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: store one durable fact.
 pub const REMEMBER_FACT: &str = "remember_fact";
 
-fn remember_fact_spec() -> nscore::ActionSpec {
+fn remember_fact_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: REMEMBER_FACT.into(),
-        description: "Store one durable fact about the user or task as key/value \
-                      (dotted keys, e.g. user.name)."
+        description: profile
+            .pick(
+                "Store one durable fact about the user or task as key/value \
+                 (dotted keys, e.g. user.name).",
+                "Store one durable fact under a dotted key, e.g. user.name.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -324,11 +403,15 @@ fn remember_fact_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: soft-delete one fact (M6 §6.2).
 pub const FORGET_FACT: &str = "forget_fact";
 
-fn forget_fact_spec() -> nscore::ActionSpec {
+fn forget_fact_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_FACT.into(),
-        description: "Delete one stored fact by its key (e.g. user.name). Only when the user \
-                      explicitly asks to forget or remove something stored."
+        description: profile
+            .pick(
+                "Delete one stored fact by its key (e.g. user.name). Only when the user \
+                 explicitly asks to forget or remove something stored.",
+                "Delete one stored fact by key, only when the user asks to forget it.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -345,11 +428,16 @@ fn forget_fact_spec() -> nscore::ActionSpec {
 /// (M6 §6.2). Irreversible: staged behind the confirmation flow.
 pub const FORGET_ALL: &str = "forget_all";
 
-fn forget_all_spec() -> nscore::ActionSpec {
+fn forget_all_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: FORGET_ALL.into(),
-        description: "Erase everything stored about the user; asks for confirmation first. Only \
-                      when the user explicitly asks to reset or wipe the memory."
+        description: profile
+            .pick(
+                "Erase everything stored about the user; asks for confirmation first. Only \
+                 when the user explicitly asks to reset or wipe the memory.",
+                "Erase every stored fact, only when the user asks to wipe the memory; \
+                 confirmation is asked first.",
+            )
             .into(),
         args_schema: serde_json::json!({"type": "object", "properties": {}}),
         side_effect: nscore::SideEffect::Irreversible,
@@ -361,13 +449,43 @@ fn forget_all_spec() -> nscore::ActionSpec {
 /// Engine-owned synthetic action: search memory beyond the context (M6 §7).
 pub const RECALL: &str = "recall";
 
-fn recall_spec() -> nscore::ActionSpec {
+fn recall_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: RECALL.into(),
-        description: "Search earlier turns of this conversation and stored facts for words the \
-                      user is asking about. Use when the answer is not in the recent turns \
-                      or facts shown."
+        description: profile
+            .pick(
+                "Search earlier turns of this conversation and stored facts for words the \
+                 user is asking about. Use when the answer is not in the recent turns \
+                 or facts shown.",
+                "Search earlier turns and stored facts when the answer is not in what is \
+                 shown.",
+            )
             .into(),
+        args_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        }),
+        side_effect: nscore::SideEffect::Pure,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+/// Engine-owned, engine-*run* action: the nearest earlier conversations
+/// (M9 T5.3, M10 T3.6).
+///
+/// It has a spec because every call in the log has one — `classify` reads it
+/// for provenance and a replay resolves the call through it — but it is
+/// never put in a legal set and never offered to the emitter. The deep tier
+/// runs it for the same reason it runs `recall` itself: an emitter iteration
+/// spent asking for context is a request that bought no progress.
+pub const EXEMPLARS: &str = "exemplars";
+
+fn exemplars_spec() -> nscore::ActionSpec {
+    nscore::ActionSpec {
+        name: EXEMPLARS.into(),
+        description: "Earlier conversations most like this one, by meaning.".into(),
         args_schema: serde_json::json!({
             "type": "object",
             "properties": { "query": { "type": "string" } },
@@ -383,13 +501,18 @@ fn recall_spec() -> nscore::ActionSpec {
 /// (M7 T1.2).
 pub const INSPECT_RESULT: &str = "inspect_result";
 
-fn inspect_result_spec() -> nscore::ActionSpec {
+fn inspect_result_spec(profile: nscore::SchemaProfile) -> nscore::ActionSpec {
     nscore::ActionSpec {
         name: INSPECT_RESULT.into(),
-        description: "Read more of a tool result that was shown clipped. `id` is the handle in \
-                      the trace, like r42. With `query`, returns the part of the result around \
-                      the first match; without one, the next part. For a desktop, prefer \
-                      pointer_ui_find, which searches the live screen instead."
+        description: profile
+            .pick(
+                "Read more of a tool result that was shown clipped. `id` is the handle in \
+                 the trace, like r42. With `query`, returns the part of the result around \
+                 the first match; without one, the next part. For a desktop, prefer \
+                 pointer_ui_find, which searches the live screen instead.",
+                "Read more of a clipped tool result by its trace handle, like r42; with a \
+                 query, the part around the first match.",
+            )
             .into(),
         args_schema: serde_json::json!({
             "type": "object",
@@ -488,14 +611,31 @@ impl Engine {
         pinned
     }
 
-    async fn select_facts(&self, scope: &str, user_text: &str) -> Vec<nscore::Fact> {
+    /// The pinned core plus the query-relevant slice.
+    ///
+    /// `hybrid` is the caller's decision, never this function's: M11 T1.1
+    /// landed `search_facts_hybrid` in the store and left every caller on
+    /// `search_facts`, and the follow-up is that the fact path takes the same
+    /// gate the turn path already takes at `recall_outcome` —
+    /// `cfg.recall_hybrid` **and** a tier above `Chat`. A `Chat` turn is the
+    /// cheap one by construction (it is already denied the query-relevant
+    /// facts on the emitter side and every registered tool), and paying a
+    /// round trip to `/embed` and `/rerank` on it would spend the tier's whole
+    /// saving on its reply prompt. With `hybrid` false this is byte-for-byte
+    /// what it always was, and with no encoder `search_facts_hybrid` is
+    /// `search_facts` anyway — the knob can only ever add.
+    async fn select_facts(&self, scope: &str, user_text: &str, hybrid: bool) -> Vec<nscore::Fact> {
         let pinned = self.pinned_facts(scope).await;
-        let relevant = self
-            .parts
-            .memory
-            .search_facts(scope, user_text, self.cfg.relevant_max + pinned.len())
-            .await
-            .unwrap_or_default();
+        let k = self.cfg.relevant_max + pinned.len();
+        let relevant = if hybrid {
+            self.parts
+                .memory
+                .search_facts_hybrid(scope, user_text, k)
+                .await
+        } else {
+            self.parts.memory.search_facts(scope, user_text, k).await
+        }
+        .unwrap_or_default();
         let mut out = pinned;
         for f in relevant {
             if out.len() >= self.cfg.facts_in_context
@@ -555,7 +695,11 @@ impl Engine {
         };
         let rebuilt_from = first.turn;
         let scope = (self.cfg.scope_for)(sid);
-        let selected = self.select_facts(&scope, "").await;
+        // Never hybrid: the query is the empty string, so there is nothing
+        // for a cosine arm to be near, and the summary runs off the user's
+        // critical path precisely so it costs no round trips it does not
+        // need.
+        let selected = self.select_facts(&scope, "", false).await;
         let facts = self.fact_views(&scope, &selected).await;
         let previous = if rebuild {
             None
@@ -580,6 +724,7 @@ impl Engine {
             fact_keys: facts.iter().map(|f| f.key.clone()).collect(),
             summary_through: previous.map(|s| s.through_turn),
             window: window_range(&records),
+            scope: Some(scope.clone()),
             ..Default::default()
         };
         let summarized = self.parts.summarizer.summarize(input).await;
@@ -692,6 +837,9 @@ impl Engine {
             return crate::router::Route {
                 tier: nscore::Tier::Task,
                 cues: Vec::new(),
+                // No router, no narrowing: the full set, which is what every
+                // scripted double and every replay has always been sent.
+                tools: None,
             };
         };
         let state = fold(events);
@@ -727,20 +875,37 @@ impl Engine {
     /// the `Deep` tier running it pre-emptively (M7 Phase 3). Two copies
     /// would drift, and the one that drifted would be the one a model reached
     /// for after the other had already failed it.
+    ///
+    /// M8 T3.3: `tier` is here and not inferred because the hybrid arm is
+    /// tier-gated, and both callers know their tier. `Chat` recall stays
+    /// lexical — a conversational turn never dials a model — and the
+    /// `recall` action is reachable from `Chat`, so the gate cannot live at
+    /// the pre-emptive call site alone.
     async fn recall_outcome(
         &self,
         sid: &nscore::SessionId,
         scope: &str,
         query: &str,
         turn: u32,
+        tier: nscore::Tier,
     ) -> ToolOutcome {
         let k = self.cfg.recall_top_k;
+        let hybrid = self.cfg.recall_hybrid && tier != nscore::Tier::Chat;
         // Turns already visible in the window (and this one) add nothing.
         let visible_from = turn.saturating_sub(self.cfg.window_turns as u32);
         let mut lines: Vec<String> = Vec::new();
         let mut trusts: Vec<nscore::Trust> = Vec::new();
         let mut failure: Option<String> = None;
-        match self.parts.memory.search_turns(sid, query, k * 3).await {
+        let this_session = std::slice::from_ref(sid);
+        let within = if hybrid {
+            self.parts
+                .memory
+                .search_turns_hybrid(this_session, query, k * 3)
+                .await
+        } else {
+            self.parts.memory.search_turns(sid, query, k * 3).await
+        };
+        match within {
             Ok(hits) => {
                 for h in hits.into_iter().filter(|h| h.turn < visible_from).take(k) {
                     trusts.push(if h.speaker == "user" {
@@ -772,7 +937,15 @@ impl Engine {
                         .take(self.cfg.recall_sessions)
                         .collect();
                     if !earlier.is_empty() {
-                        match self.parts.memory.search_turns_in(&earlier, query, k).await {
+                        let across = if hybrid {
+                            self.parts
+                                .memory
+                                .search_turns_hybrid(&earlier, query, k)
+                                .await
+                        } else {
+                            self.parts.memory.search_turns_in(&earlier, query, k).await
+                        };
+                        match across {
                             Ok(hits) => {
                                 for h in hits.into_iter().take(k) {
                                     trusts.push(if h.speaker == "user" {
@@ -851,6 +1024,74 @@ impl Engine {
         }
     }
 
+    /// The exemplars step (M9 T5.3, M10 T3.6): at most `exemplars_max`
+    /// digests of this scope nearest the message by cosine, as **one**
+    /// `ToolReturned` carrying their lowest trust.
+    ///
+    /// One return and not one per digest: they are a single answer to a
+    /// single question, and N returns would be N entries in the trace
+    /// competing with the turn's real tool results for the verbatim lines
+    /// `trace_verbatim_lines` allows.
+    ///
+    /// Lowest trust, not each digest's own: they arrive folded into one
+    /// text, a reader cannot tell which sentence came from which
+    /// conversation, and trust that cannot be attributed has to be the
+    /// weakest of what it is made of (M6 §5.1).
+    ///
+    /// The current session is excluded — a conversation is not an exemplar
+    /// of itself — and so is a store with no digest vectors, which returns
+    /// an empty list and therefore "no similar conversations".
+    async fn exemplars_outcome(
+        &self,
+        sid: &nscore::SessionId,
+        scope: &str,
+        query: &str,
+    ) -> ToolOutcome {
+        let digests = match self
+            .parts
+            .memory
+            .nearest_digests(scope, query, self.cfg.exemplars_max + 1)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return ToolOutcome::Err {
+                    kind: "store".into(),
+                    detail: e.to_string(),
+                }
+            }
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut trusts: Vec<nscore::Trust> = Vec::new();
+        for d in digests
+            .into_iter()
+            .filter(|d| &d.session != sid)
+            .take(self.cfg.exemplars_max)
+        {
+            trusts.push(d.summary.trust);
+            lines.push(format!(
+                "a similar earlier conversation (through t{}) was about: {}",
+                d.last_turn, d.summary.topic
+            ));
+        }
+        if lines.is_empty() {
+            return ToolOutcome::Ok {
+                output: nscore::ToolOutput {
+                    summary: "no similar conversations".into(),
+                    artifact: None,
+                    trust: nscore::Trust::System,
+                },
+            };
+        }
+        ToolOutcome::Ok {
+            output: nscore::ToolOutput {
+                summary: lines.join("; "),
+                artifact: None,
+                trust: nscore::min_trust(&trusts),
+            },
+        }
+    }
+
     /// Append one `ModelCall` for every provider call recorded in `sink`
     /// since its last drain (M7 T0.1).
     ///
@@ -919,6 +1160,16 @@ impl Engine {
         // model call, from the message and this turn's own history only.
         let routed = self.route_turn(&incoming.text, log.events(), turn);
         let mut tier = routed.tier;
+        // M10 T2.1: which registered tools ride this turn, chosen once here
+        // and held across every iteration. `None` is the full set.
+        //
+        // Once per turn rather than once per iteration is the whole rule: a
+        // set recomputed each pass would change the `tools` array under a
+        // provider prefix cache and buy nothing, since nothing between two
+        // iterations of one turn changes what the *message* asked for
+        // (decision 2, 2026-09-11). Escalation below is the one thing
+        // allowed to move it, and it only ever widens.
+        let mut selected_tools = routed.tools.clone();
         // `Deep` runs the recall itself rather than waiting to be asked for
         // it. That is the saving: on a fifty-request day an emitter iteration
         // spent proposing `recall` is a request that bought no progress, and
@@ -927,7 +1178,7 @@ impl Engine {
         // enters the provenance index, carries its own trust, and replays.
         if tier == nscore::Tier::Deep {
             let args = serde_json::json!({ "query": incoming.text });
-            let spec = recall_spec();
+            let spec = recall_spec(self.cfg.schema_profile);
             let classified = classify(log.events(), &args, &spec, turn);
             let call_id = log
                 .append(
@@ -940,7 +1191,7 @@ impl Engine {
                 )
                 .id;
             let outcome = self
-                .recall_outcome(&sid, &scope, &incoming.text, turn)
+                .recall_outcome(&sid, &scope, &incoming.text, turn, tier)
                 .await;
             log.append(
                 turn,
@@ -950,7 +1201,83 @@ impl Engine {
                     outcome,
                 },
             );
+
+            // M10 T3.6: exemplars — the nearest earlier *conversations*,
+            // by cosine over their digests' stored vectors.
+            //
+            // A second call rather than more lines inside the recall return,
+            // because it answers a different question: recall finds the line
+            // that says the thing, an exemplar is a whole conversation shaped
+            // like this one. Keeping them apart is also what lets `--ablate`
+            // decide the default later — a knob folded into another step's
+            // output cannot be turned off and measured.
+            //
+            // Off at `exemplars_max = 0`, which is every deployment today,
+            // and the store returns nothing without an encoder, so this is
+            // two comparisons on the ordinary path.
+            if self.cfg.exemplars_max > 0 {
+                let args = serde_json::json!({ "query": incoming.text });
+                let spec = exemplars_spec();
+                let classified = classify(log.events(), &args, &spec, turn);
+                let call_id = log
+                    .append(
+                        turn,
+                        now(),
+                        EventKind::ToolCalled {
+                            action: EXEMPLARS.into(),
+                            args: classified,
+                        },
+                    )
+                    .id;
+                let outcome = self
+                    .exemplars_outcome(&sid, &scope, &incoming.text)
+                    .await;
+                log.append(
+                    turn,
+                    now(),
+                    EventKind::ToolReturned {
+                        call: call_id,
+                        outcome,
+                    },
+                );
+            }
         }
+
+        // M10 T1.4: applicability, asked once per turn rather than per
+        // iteration. A tool in the schema that cannot do anything is tokens
+        // spent on a choice that can only fail — `forget_fact` and
+        // `forget_all` were sent on all 21 recorded turns while the store
+        // held zero facts (~216 tokens a turn), and `recall` was sent on
+        // turn 1 (findings §8.1).
+        //
+        // This is store state deciding legality, which the narrowing below
+        // deliberately avoids for *this turn's own* events. The difference
+        // is that these two questions are answered before the loop and held
+        // fixed across it, so an iteration cannot see the set change under
+        // it; and both fail **open** — a store that errors keeps the tool.
+        let scope_holds_facts = !self.cfg.prune_inapplicable
+            || self
+                .parts
+                .memory
+                .facts(&scope, "")
+                .await
+                .map(|f| !f.is_empty())
+                .unwrap_or(true);
+        // Recall is worth its schema when there is something out of sight:
+        // turns older than the verbatim window, or an earlier conversation
+        // in the same scope.
+        let recall_applies = !self.cfg.prune_inapplicable || turn > self.cfg.window_turns as u32 || {
+            self.cfg.recall_sessions > 0
+                && match self
+                    .parts
+                    .memory
+                    .session_digests(&scope, self.cfg.recall_sessions + 1)
+                    .await
+                {
+                    Ok(digests) => digests.into_iter().any(|d| d.session != sid),
+                    Err(_) => true,
+                }
+        };
 
         let mut rejections_this_turn: Vec<String> = Vec::new();
         let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
@@ -978,7 +1305,7 @@ impl Engine {
                 // occurred and nothing grounds the arg — the only way forward
                 // is to ask (respond_directly stays available at schema level).
                 LegalActionSet {
-                    actions: vec![ask_clarification_spec()],
+                    actions: vec![ask_clarification_spec(self.cfg.schema_profile)],
                 }
             } else {
                 // Narrowed schema (spec §2): actions rejected this turn are
@@ -994,16 +1321,26 @@ impl Engine {
                         .iter()
                         .map(|t| t.spec().clone())
                         .filter(|s| !denied_this_turn.contains(&s.name))
+                        // M10 T2.1. A *turn*-level decision consulted here
+                        // rather than re-taken here: `selected_tools` is
+                        // fixed for the loop except when escalation widens
+                        // it, so this filter yields the same names on every
+                        // iteration and the array's bytes do not move.
+                        .filter(|s| {
+                            selected_tools
+                                .as_ref()
+                                .map_or(true, |sel| sel.contains(&s.name))
+                        })
                         .collect()
                 } else {
                     Vec::new()
                 };
-                actions.push(ask_clarification_spec());
+                actions.push(ask_clarification_spec(self.cfg.schema_profile));
                 if !denied_this_turn.contains(REMEMBER_FACT) {
-                    actions.push(remember_fact_spec());
+                    actions.push(remember_fact_spec(self.cfg.schema_profile));
                 }
-                if !denied_this_turn.contains(RECALL) {
-                    actions.push(recall_spec());
+                if !denied_this_turn.contains(RECALL) && recall_applies {
+                    actions.push(recall_spec(self.cfg.schema_profile));
                 }
                 // Offered only while there is something to inspect. An
                 // action in the schema that can only fail is a way for a
@@ -1011,7 +1348,7 @@ impl Engine {
                 if !denied_this_turn.contains(INSPECT_RESULT)
                     && !clipped_results(log.events(), turn, self.cfg.tool_result_max_chars).is_empty()
                 {
-                    actions.push(inspect_result_spec());
+                    actions.push(inspect_result_spec(self.cfg.schema_profile));
                 }
                 // Forgetting is legal only while it can mean something: not
                 // after a fact was written this turn (seen live: "my name is
@@ -1023,16 +1360,16 @@ impl Engine {
                     .iter()
                     .any(|k| k.starts_with(&format!("{REMEMBER_FACT}\u{0}")));
                 let forgot = calls_this_turn.iter().any(|k| k.starts_with("forget_"));
-                if !wrote_fact && !forgot {
+                if !wrote_fact && !forgot && scope_holds_facts {
                     if !denied_this_turn.contains(FORGET_FACT) {
-                        actions.push(forget_fact_spec());
+                        actions.push(forget_fact_spec(self.cfg.schema_profile));
                     }
                     if !denied_this_turn.contains(FORGET_ALL) {
-                        actions.push(forget_all_spec());
+                        actions.push(forget_all_spec(self.cfg.schema_profile));
                     }
                 }
                 if active_pending.is_some() {
-                    actions.push(confirm_pending_spec());
+                    actions.push(confirm_pending_spec(self.cfg.schema_profile));
                 }
                 LegalActionSet { actions }
             };
@@ -1056,7 +1393,16 @@ impl Engine {
             // emitter asking again for a name it already has (M6 F2). The
             // query-relevant slice is what a `Chat` turn does without.
             let selected = if tier.allows_relevant_facts() {
-                self.select_facts(&scope, &incoming.text).await
+                // M11 T1.1 follow-up: the same gate `recall_outcome` takes.
+                // Read here rather than bound once above because `tier` is
+                // still mutable at this point — a tool-cued turn is upgraded
+                // to `Task` mid-loop, and the next iteration must see it.
+                self.select_facts(
+                    &scope,
+                    &incoming.text,
+                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                )
+                .await
             } else {
                 self.pinned_facts(&scope).await
             };
@@ -1122,8 +1468,16 @@ impl Engine {
                 .take(ctx.guidance.len())
                 .map(|(h, _)| h.clone())
                 .collect();
+            // The names, not just the count (M10 T0.1): `tools_tokens` says
+            // what the array cost and nothing about which tool carried it,
+            // and the whole of P1 is a decision about which text to cut.
+            // `respond_directly` is absent because it is not in the legal
+            // set — `build_tools` appends it, and a report adds it back the
+            // same way.
+            let tool_names: Vec<String> =
+                legal.actions.iter().map(|s| s.name.clone()).collect();
             let mut manifest =
-                emitter_manifest(&ctx, legal.actions.len(), clipped_chars, note_hashes);
+                emitter_manifest(&scope, &ctx, tool_names, clipped_chars, note_hashes);
             manifest.budget = Some(budget);
             manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
@@ -1220,14 +1574,67 @@ impl Engine {
                 // guess about the message (MemFlow's validator-retries, with
                 // no second model). The tier only ever rises, so this cannot
                 // loop.
-                let tiered_out = tier < nscore::Tier::Task
-                    && self
-                        .parts
-                        .tools
-                        .iter()
-                        .any(|t| t.spec().name == proposal.action);
-                if tiered_out {
-                    tier = nscore::Tier::Task;
+                let registered = self
+                    .parts
+                    .tools
+                    .iter()
+                    .any(|t| t.spec().name == proposal.action);
+                let tiered_out = tier < nscore::Tier::Task && registered;
+                // M10 T2.2: escalation is adaptive depth's discovery path,
+                // and the same argument as the tier's. The cue table is a
+                // guess about the message; a proposal naming a real tool is
+                // the model telling us the guess was wrong, and one widening
+                // is cheaper than a turn that cannot reach the action at
+                // all. It widens to the *full* set for the rest of the turn
+                // rather than adding one name, because a task that needed
+                // `pointer_scroll` needs whatever comes after it too — and
+                // it is the one legitimate mid-turn change to the `tools`
+                // array, so it happens once and never again.
+                //
+                // A tool already refused this turn is excluded: widening
+                // would not make it legal, and the loop would spin.
+                let withheld = registered
+                    && !denied_this_turn.contains(&proposal.action)
+                    && selected_tools
+                        .as_ref()
+                        .is_some_and(|sel| !sel.contains(&proposal.action));
+                if tiered_out || withheld {
+                    if tiered_out {
+                        tier = nscore::Tier::Task;
+                    }
+                    if withheld {
+                        selected_tools = None;
+                        // Recorded, because an escalation is a request
+                        // already spent and T0.2's `rejections by reason` is
+                        // where that is read — the rate this depth is gated
+                        // on (under 5 per 100 proposals) has to come from
+                        // the log rather than from a counter nothing
+                        // persists.
+                        //
+                        // Recorded but *not* denied: `denied_this_turn`
+                        // would keep the tool illegal for the rest of the
+                        // turn, which is exactly what the widening just
+                        // undid. It differs from the tier's escalation
+                        // (which records nothing) for one reason — the tier
+                        // is bounded and self-announcing, while the cue
+                        // table is a guess whose error rate is the number
+                        // `depth = adaptive` ships on, and a guess nobody
+                        // counts is a guess nobody can retire. The line
+                        // reaches the emitter through the trace, and it is
+                        // true: that proposal was refused on that
+                        // iteration. It is left out of
+                        // `rejections_this_turn` so it is said once.
+                        log.append(
+                            turn,
+                            now(),
+                            EventKind::Rejected {
+                                proposal_of: pid,
+                                reason: RejectReason::IllegalAction {
+                                    action: proposal.action.clone(),
+                                },
+                            },
+                        );
+                    }
                     continue;
                 }
                 let reason = RejectReason::IllegalAction {
@@ -1352,7 +1759,7 @@ impl Engine {
                     rejections_this_turn.push("ask_clarification missing question".into());
                     continue;
                 };
-                let ask_spec = ask_clarification_spec();
+                let ask_spec = ask_clarification_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &ask_spec, turn);
                 let classified = ClassifiedProposal {
                     proposal: proposal.clone(),
@@ -1464,7 +1871,7 @@ impl Engine {
                         .push(format!("remember_fact rejected malformed key {key:?}"));
                     continue;
                 }
-                let fact_spec = remember_fact_spec();
+                let fact_spec = remember_fact_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &fact_spec, turn);
                 let prov = classified_args
                     .iter()
@@ -1644,7 +2051,7 @@ impl Engine {
                     rejections_this_turn.push("recall missing query".into());
                     continue;
                 };
-                let spec = recall_spec();
+                let spec = recall_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
@@ -1657,7 +2064,7 @@ impl Engine {
                     )
                     .id;
                 calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = self.recall_outcome(&sid, &scope, &query, turn).await;
+                let outcome = self.recall_outcome(&sid, &scope, &query, turn, tier).await;
                 log.append(
                     turn,
                     now(),
@@ -1709,7 +2116,7 @@ impl Engine {
                     denied_this_turn.insert(INSPECT_RESULT.to_string());
                     continue;
                 };
-                let spec = inspect_result_spec();
+                let spec = inspect_result_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let page = inspect_page(log.events(), turn, id);
                 let call_id = log
@@ -1822,7 +2229,7 @@ impl Engine {
                     }
                     continue;
                 }
-                let spec = forget_fact_spec();
+                let spec = forget_fact_spec(self.cfg.schema_profile);
                 let classified_args = classify(log.events(), &proposal.args, &spec, turn);
                 let call_id = log
                     .append(
@@ -2130,8 +2537,16 @@ impl Engine {
                 None => format!("[{id}] {vars}"),
             },
             ReplyPolicy::Generate => {
-                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn, &usage)
-                    .await
+                self.generate_reply(
+                    &scope,
+                    &incoming.text,
+                    &rules,
+                    &mut log,
+                    turn,
+                    &usage,
+                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                )
+                .await
             }
         };
 
@@ -2159,6 +2574,10 @@ impl Engine {
         log: &mut EventLog,
         turn: u32,
         usage: &std::sync::Arc<nscore::UsageSink>,
+        // Whether this turn's tier and config allow the hybrid fact path
+        // (M11 T1.1 follow-up). Passed in rather than re-derived: the tier
+        // is the caller's, and it may have been upgraded mid-turn.
+        hybrid_facts: bool,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2178,7 +2597,7 @@ impl Engine {
         // Implicit recall (spec §5): standing facts enter the reply
         // context; each recall bumps `uses` (lifecycle metadata for
         // the future consolidation pass).
-        let mut selected = self.select_facts(scope, user_text).await;
+        let mut selected = self.select_facts(scope, user_text, hybrid_facts).await;
         for f in selected.iter_mut() {
             f.uses += 1;
             f.last_used = now();
@@ -2242,7 +2661,7 @@ impl Engine {
             .take(budgeted.guidance.len())
             .map(|(h, _)| h.clone())
             .collect();
-        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars, note_hashes);
+        let mut manifest = reply_manifest(scope, &budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
         manifest.ablated = self.cfg.ablate;
         let drafted = self.parts.replier.reply(budgeted).await;
@@ -2469,15 +2888,10 @@ mod tests {
     /// half of the legal set the engine owns itself is the unchecked half.
     #[test]
     fn every_builtin_spec_keeps_the_rationale_first() {
-        for spec in [
-            ask_clarification_spec(),
-            confirm_pending_spec(),
-            remember_fact_spec(),
-            forget_fact_spec(),
-            forget_all_spec(),
-            recall_spec(),
-            inspect_result_spec(),
-        ] {
+        for spec in [nscore::SchemaProfile::Full, nscore::SchemaProfile::Slim]
+            .into_iter()
+            .flat_map(synthetic_specs)
+        {
             let name = spec.name.clone();
             spec.check_arg_names()
                 .unwrap_or_else(|e| panic!("builtin `{name}` breaks think-then-commit: {e}"));

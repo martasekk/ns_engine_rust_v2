@@ -12,7 +12,24 @@ use std::sync::Arc;
 
 type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
 
-async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
+/// Every spec `ns-app budget` can price a recorded tool array with (M10
+/// T0.1): the engine's seven synthetic actions, the desktop set, and the one
+/// built-in tool. Deliberately *not* `build_tools` — that dials the pointer
+/// daemon and reads the http component config, and `budget` reads a log on a
+/// box where neither has to be up. A name the snapshot does not hold prints
+/// `n/a` rather than a guess.
+pub(crate) fn budget_specs(profile: nscore::SchemaProfile) -> Vec<nscore::ActionSpec> {
+    let mut specs = nsengine::turn::synthetic_specs(profile);
+    specs.extend(nscomponents_std::pointer_tool::specs(profile));
+    specs.push(
+        nscomponents_std::time_tool::GetTimeTool::new()
+            .spec()
+            .clone(),
+    );
+    specs
+}
+
+async fn build_tools(cfg: &AppConfig, profile: nscore::SchemaProfile) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> =
         vec![Arc::new(nscomponents_std::time_tool::GetTimeTool::new())];
     let tool_transport = Arc::new(nscomponents_std::transport::ReqwestToolTransport::new());
@@ -34,7 +51,7 @@ async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
             );
             std::process::exit(1);
         };
-        match connect_pointer(&target.addr, &token).await {
+        match connect_pointer(&target.addr, &token, profile).await {
             Ok(more) => tools.extend(more),
             Err(e) => eprintln!("pointer: {e}\npointer: the desktop actions are not registered."),
         }
@@ -77,7 +94,11 @@ async fn desktop_messages(cfg: &AppConfig) -> Option<nspointer::messages::Messag
 /// `initialize` to carry it, and a session that starts not armed or with no
 /// local brake is something the person at this end should know before the
 /// emitter's first click.
-async fn connect_pointer(addr: &str, token: &str) -> Result<Vec<Arc<dyn Tool>>, String> {
+async fn connect_pointer(
+    addr: &str,
+    token: &str,
+    profile: nscore::SchemaProfile,
+) -> Result<Vec<Arc<dyn Tool>>, String> {
     use nspointer::client::RemotePointer;
     let dial = tokio::net::TcpStream::connect(addr);
     let stream = tokio::time::timeout(std::time::Duration::from_secs(5), dial)
@@ -103,7 +124,7 @@ async fn connect_pointer(addr: &str, token: &str) -> Result<Vec<Arc<dyn Tool>>, 
         );
     }
     let shared: Arc<dyn nspointer::Pointer> = Arc::new(pointer);
-    let tools = nscomponents_std::pointer_tool::tools(shared)
+    let tools = nscomponents_std::pointer_tool::tools(shared, profile)
         .await
         .map_err(|e| format!("could not read the screen layout from {addr}: {e}"))?;
     eprintln!("pointer: {} desktop actions on {addr}", tools.len());
@@ -178,6 +199,31 @@ fn client_for(
 fn role_or_exit(cfg: &AppConfig, role: Role) -> RoleTarget {
     match cfg.llm.role(role) {
         Ok(t) => t,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolve one role's request shape, or exit: an unparseable `reasoning` or
+/// `sampling` must not be dropped silently — a shape that did not take looks
+/// exactly like a model that ignores the knob (M11 T0.2/T0.3).
+///
+/// The coercion line prints here, once per role at startup, so a request
+/// that quietly lost its `temperature` is never a mystery in a later 400.
+fn shape_or_exit(
+    cfg: &AppConfig,
+    target: &RoleTarget,
+    base: nsllm::provider::RequestShape,
+) -> nsllm::provider::RequestShape {
+    match cfg.llm.shape(target.role, &target.model, base) {
+        Ok((shape, note)) => {
+            if let Some(line) = note {
+                println!("{line}");
+            }
+            shape
+        }
         Err(e) => {
             eprintln!("config.toml: {e}");
             std::process::exit(1);
@@ -298,14 +344,46 @@ fn build_pass(
     dry_run: bool,
 ) -> nsevolution::pass::EvolutionPass {
     let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
-    let pass = nsevolution::pass::EvolutionPass::new(
+    let pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
+    let evaluate_cfg = pass_cfg.evaluate.clone();
+    let mut pass = nsevolution::pass::EvolutionPass::new(
         rules,
         specs.clone(),
         std::path::PathBuf::from(&cfg.evolution.learned_path),
         std::path::PathBuf::from(&cfg.evolution.ledger_path),
-        cfg.evolution
-            .pass_config(dry_run, &cfg.memory, cfg.models.evaluate_budget_turns),
+        pass_cfg,
     );
+    // M10 T5.3: the local scorer joins the always-present symbolic one when
+    // `[models] enabled`, and only then. It needs no key — that is the whole
+    // point of it — so it is added before the notes lane's key check, and a
+    // pass with no API key still grades with it.
+    //
+    // Nothing here checks whether the service is up. It should not: the lane
+    // disables itself after two unreachable calls and reports every signal
+    // `Unavailable`, so a service that is down costs two timeouts and prints
+    // `unavailable (service down)` beside its κ. A reachability probe at
+    // startup would only be a third way to learn the same thing, one pass
+    // earlier.
+    if cfg.models.enabled {
+        pass = pass.with_evaluator(std::sync::Arc::new(
+            nsevolution::local::LocalEvaluator::new(
+                nsevolution::local::LocalConfig {
+                    base_url: cfg.models.base_url.clone(),
+                    timeout_ms: cfg.models.timeout_ms,
+                    reask_cosine: cfg.models.reask_cosine,
+                    relevance_cut: cfg.models.relevance_cut,
+                    embed_model: cfg.recall.embed_model.clone(),
+                },
+                // The local scorer keeps the structural half of the symbolic
+                // checks rather than re-deriving it: I6 is two logged facts
+                // and grounding is span attribution, and an embedding
+                // improves on neither.
+                nsevolution::evaluate::SymbolicEvaluator {
+                    cfg: evaluate_cfg.clone(),
+                },
+            ),
+        ));
+    }
     match emitter.key() {
         None => {
             eprintln!(
@@ -317,6 +395,38 @@ fn build_pass(
         Some(key) => {
             let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
             let model = emitter.model.clone();
+            // M11 T1.3: the paid judge, and only when `[models] judge_model`
+            // names one. `for_model` is the gate — `None` in, `None` out —
+            // so an unset id cannot reach a request, and `pass` is handed
+            // back unchanged. It rides the emitter's endpoint, key and
+            // throttle because it is the same provider account; what makes
+            // it not a role is that it is added here, to the idle pass, and
+            // nowhere a turn can see it.
+            let mut pass = pass;
+            if let Some(judge) = nsevolution::client_eval::ClientEvaluator::for_model(
+                cfg.models.judge_model.as_deref(),
+                client_for(emitter, transport.clone(), &key),
+                |c| nsevolution::client_eval::JudgeConfig {
+                    // Sonnet 5's shape, and harmless on anything else: no
+                    // sampling key at all, one short reasoning block, a
+                    // 1,024-token cap on a two-field answer.
+                    unsampled: true,
+                    structured_output: nsllm::provider::for_base_url(
+                        emitter.base_url_or_default(),
+                    )
+                    .is_some_and(|p| p.structured_output),
+                    ..c
+                },
+                nsevolution::evaluate::SymbolicEvaluator { cfg: evaluate_cfg },
+            ) {
+                eprintln!(
+                    "judge: {} grades up to {} turns per idle pass, κ-gated at {:.2}.",
+                    cfg.models.judge_model.as_deref().unwrap_or_default(),
+                    cfg.models.evaluate_budget_turns,
+                    cfg.models.evaluator_min_kappa
+                );
+                pass = pass.with_evaluator(std::sync::Arc::new(judge));
+            }
             // The probe builds a fresh emitter per run, on the same target.
             let factory_target = emitter.clone();
             let factory_transport = transport.clone();
@@ -355,6 +465,21 @@ async fn main() {
     cfg.llm
         .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
     let cfg = cfg;
+    // M10 T1.3: resolved once, here, because every subcommand that prices or
+    // sends a tool array has to price or send the same one.
+    let schema_profile = match cfg.llm.schema_profile() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    // M10 T2.3, resolved here for the same reason: an unreadable depth is a
+    // startup error, not a turn that silently runs at the default.
+    if let Err(e) = cfg.router.depth() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().collect();
 
     // `ns-app providers`: which backends exist, which keys are present, and
@@ -422,6 +547,7 @@ async fn main() {
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
                 cfg.persona.text.len(),
+                &budget_specs(schema_profile),
             )
         );
         return;
@@ -441,13 +567,20 @@ async fn main() {
             }
         };
         if parsed.paraphrase {
-            std::process::exit(eval::run_paraphrase(parsed.activation).await);
+            std::process::exit(eval::run_paraphrase(parsed.activation, parsed.facts).await);
+        }
+        // M10 T5.4. The same shape: a report, not a gate.
+        if parsed.obligations {
+            std::process::exit(eval::run_knob(eval::Knob::Obligations).await);
+        }
+        if parsed.guidelines {
+            std::process::exit(eval::run_knob(eval::Knob::Guidelines).await);
         }
         // M9 T0.4. A report, not a gate: exits 0 whatever the delta.
         if let Some(block) = parsed.ablate {
             std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
-        std::process::exit(eval::run(&parsed.ledger).await);
+        std::process::exit(eval::run_at(&parsed.ledger, parsed.activation, parsed.depth).await);
     }
 
     // `ns-app grade [--local] [--split dev|held|all]`: what an evaluator is
@@ -484,11 +617,14 @@ async fn main() {
             }
         };
         let rules = load_rules_or_exit(&cfg);
-        let tools = build_tools(&cfg).await;
+        let tools = build_tools(&cfg, schema_profile).await;
         let emitter = role_or_exit(&cfg, Role::Emitter);
         let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run);
-        let store = nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store");
+        // M8 T3.1: `evolve` is the idle pass run by hand, and the embeddings
+        // backfill is one of its steps — so this store needs the encoder the
+        // running harness's does, or `ns-app evolve` would be the one place
+        // the backfill never happens.
+        let store = models::store(&cfg);
         match pass.run_report(&store).await {
             Ok(report) => println!("{report}"),
             Err(e) => {
@@ -570,7 +706,7 @@ async fn main() {
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
-    let tools = build_tools(&cfg).await;
+    let tools = build_tools(&cfg, schema_profile).await;
 
     // M7 T0.1: the engine hands each of its own calls a sink of its own
     // through the call's context, so this one is only the fallback for calls
@@ -578,31 +714,36 @@ async fn main() {
     let usage = Arc::new(nscore::UsageSink::new());
 
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(nsllm::emitter::CloudEmitter::new(
-        client_for(&emitter_target, transport.clone(), &emitter_key)
-            .with_usage_sink(usage.clone(), "emitter"),
-        emitter_target.model.clone(),
-    )));
+    b.set_emitter(Box::new(
+        nsllm::emitter::CloudEmitter::new(
+            client_for(&emitter_target, transport.clone(), &emitter_key)
+                .with_usage_sink(usage.clone(), "emitter"),
+            emitter_target.model.clone(),
+        )
+        .with_shape(shape_or_exit(
+            &cfg,
+            &emitter_target,
+            nsllm::emitter::default_shape(),
+        ))
+        // M10 P4. Both halves have to hold: the endpoint must forward a
+        // breakpoint at all, and the operator must have said the emitter
+        // prefix is worth one. Either off means the request is today's.
+        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter),
+    ));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
             client_for(&replier_target, transport.clone(), &replier_key)
                 .with_usage_sink(usage.clone(), "replier"),
             replier_target.model.clone(),
         )
+        .with_shape(shape_or_exit(
+            &cfg,
+            &replier_target,
+            nsllm::replier::default_shape(),
+        ))
         .with_prompt_cache(replier_target.prompt_cache),
     ));
-    b.set_memory(Arc::new(
-        nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store")
-            // M9 T3.1/T3.2. The composition root is where the `[memory]`
-            // knobs meet the store; `EngineConfig` carries the same two
-            // numbers for anything that reads the config as one object.
-            // Both default to today's ranking.
-            .with_activation(
-                cfg.memory.activation_weight,
-                cfg.memory.activation_half_life_days,
-            ),
-    ));
+    b.set_memory(Arc::new(models::store(&cfg)));
     // Says whether the local model service is answering, when one is asked
     // for. Before the channel so the line lands with the other startup
     // reports rather than in the middle of the first turn.
@@ -635,6 +776,18 @@ async fn main() {
                     .with_usage_sink(usage.clone(), "summarizer");
                 b.set_summarizer(Box::new(
                     nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
+                        .with_shape(shape_or_exit(
+                            &cfg,
+                            &target,
+                            nsllm::summarizer::default_shape(),
+                        ))
+                        // M11 T0.5: the fixed fields as a schema, where the
+                        // endpoint the summarizer actually reaches knows the
+                        // field. The prompt keeps asking for JSON either way.
+                        .with_structured_output(
+                            nsllm::provider::for_base_url(target.base_url_or_default())
+                                .is_some_and(|p| p.structured_output),
+                        )
                         .with_guidelines(cfg.memory.summary_guidelines.clone()),
                 ));
             }
@@ -717,6 +870,8 @@ async fn main() {
         trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
         tool_result_max_chars: cfg.memory.tool_result_max_chars,
         recall_sessions: cfg.memory.recall_sessions,
+        schema_profile,
+        prune_inapplicable: true,
         router: cfg
             .router
             .enabled
@@ -725,6 +880,12 @@ async fn main() {
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
         worker_slots,
+        // M8 T3.2/T3.3 and M10 T3.6. Both off by default, and both inert
+        // without `[models] enabled` — the store gets no encoder, so the
+        // hybrid path *is* the lexical path and there are no digest vectors
+        // to be near.
+        recall_hybrid: cfg.recall.hybrid,
+        exemplars_max: cfg.memory.exemplars_max,
     };
     let engine = Engine::new(parts, engine_cfg);
     println!(
@@ -921,12 +1082,12 @@ mod tests {
             let _ = serve_listener(agent, listener).await;
         });
 
-        let tools = connect_pointer(&addr, "t0k").await.unwrap();
+        let tools = connect_pointer(&addr, "t0k", nscore::SchemaProfile::Full).await.unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
         assert_eq!(names.len(), 10, "{names:?}");
         assert!(names.contains(&"pointer_click") && names.contains(&"pointer_ui_read"));
 
-        let err = match connect_pointer(&addr, "wrong").await {
+        let err = match connect_pointer(&addr, "wrong", nscore::SchemaProfile::Full).await {
             Err(e) => e,
             Ok(_) => panic!("a wrong token must be refused"),
         };

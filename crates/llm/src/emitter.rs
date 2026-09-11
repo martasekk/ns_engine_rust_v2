@@ -3,28 +3,82 @@ use crate::schema::build_tools;
 use async_trait::async_trait;
 use nscore::{EmitError, Emitter, EmitterContext, LegalActionSet, Proposal};
 
-const SYSTEM: &str = "You translate the user's latest message into exactly one action call \
-from the provided tools. Choose respond_directly when no tool applies. Never invent argument \
-values the user did not supply. The context lists actions already performed this turn with \
-their results; never repeat a completed action — when those results answer the user, choose \
-respond_directly.";
+/// The instruction every tool's `_rationale` property used to carry (M10
+/// T1.1). Sent once, in the system prompt, instead of once per tool: on the
+/// recorded turn-21 array the per-tool copy was 106 chars × 7 tools and a
+/// quarter of every call's tool tokens (findings §8.1). The schema keeps only
+/// a short label ([`crate::schema::RATIONALE_HINT`]); this is the sentence
+/// that says what to put there.
+pub const RATIONALE_INSTRUCTION: &str = "Every tool takes `_rationale` first: one sentence \
+saying why this action, grounded in the user's words.";
+
+const SYSTEM_PREAMBLE: &str = "You translate the user's latest message into exactly one action \
+call from the provided tools. Choose respond_directly when no tool applies. Never invent \
+argument values the user did not supply. The context lists actions already performed this turn \
+with their results; never repeat a completed action — when those results answer the user, \
+choose respond_directly. A line marked done is such an action: proposing it again is refused \
+and costs a step. ";
+
+/// Assembled rather than written out so the rationale instruction has exactly
+/// one home in the workspace and the test can assert it appears once.
+fn system_prompt() -> String {
+    format!("{SYSTEM_PREAMBLE}{RATIONALE_INSTRUCTION}")
+}
+
+/// 4096, not 1024: reasoning models spend output tokens on reasoning before
+/// the tool call; a tight cap yields finish_reason "length" with null content
+/// and no tool_calls. A floor, and `[llm.emitter] max_tokens` may lower it
+/// where the model's effort is known (M11 T0.4 recommends 2048 on Sonnet at
+/// effort low).
+pub const MAX_TOKENS: u32 = 4096;
+
+/// The request shape this emitter has always sent: `temperature: 0`, no
+/// reasoning block, 4096 output tokens. What `[llm.emitter]`'s shaping
+/// fields are folded onto (M11 T0.2).
+pub fn default_shape() -> crate::provider::RequestShape {
+    crate::provider::RequestShape::pinned(MAX_TOKENS)
+}
 
 pub struct CloudEmitter {
     client: OpenRouterClient,
     model: String,
-    max_tokens: u32,
+    shape: crate::provider::RequestShape,
+    prompt_cache: bool,
 }
 
 impl CloudEmitter {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
-        // 4096, not 1024: reasoning models spend output tokens on reasoning
-        // before the tool call; a tight cap yields finish_reason "length"
-        // with null content and no tool_calls.
         Self {
             client,
             model,
-            max_tokens: 4096,
+            shape: default_shape(),
+            prompt_cache: false,
         }
+    }
+
+    /// `[llm.emitter]`'s `sampling`, `reasoning`, `thinking` and `max_tokens`,
+    /// already resolved against the model id (M11 T0.2). Unset everywhere is
+    /// [`default_shape`], which is byte-for-byte the request above.
+    pub fn with_shape(mut self, shape: crate::provider::RequestShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// `[llm] prompt_cache_emitter` (M10 P4, decision 2b). Off by default,
+    /// and off is byte-identical to the request this emitter has always
+    /// sent.
+    ///
+    /// Worth turning on only where the two conditions hold together: the
+    /// provider forwards cache breakpoints (the OpenRouter preset), and the
+    /// `tools` array is stable across the turn's iterations, which is P2's
+    /// rule. On the recorded turn 21 the array (731 tokens) plus
+    /// facts+summary+window (538) clears the 1,024-token floor a breakpoint
+    /// needs; the replier's prefix (225) does not, which is why only this
+    /// one is behind a knob. Verified by `cached_tokens` on a paid-tier
+    /// session, never by reading this code.
+    pub fn with_prompt_cache(mut self, on: bool) -> Self {
+        self.prompt_cache = on;
+        self
     }
 }
 
@@ -32,6 +86,21 @@ impl CloudEmitter {
 /// turn → this turn's actions → pending/rejections → guidance. Stable blocks
 /// first.
 fn render_context(ctx: &EmitterContext) -> String {
+    let (stable, rest) = render_context_split(ctx);
+    format!("{stable}{rest}")
+}
+
+/// The same text, cut where a cache breakpoint belongs (M10 P4, decision
+/// 2b): everything through the verbatim window, then everything from the
+/// current turn on.
+///
+/// The cut is not arbitrary. Above it is the run of blocks that does not
+/// change between two iterations of one turn — facts, summary, obligations,
+/// window — and below it is the trace, which is the thing that *does* change
+/// on every iteration and is why the emitter prefix is worth caching at all.
+/// Concatenated, the two halves are the string `render_context` has always
+/// produced, which is what makes the knob's off position byte-identical.
+fn render_context_split(ctx: &EmitterContext) -> (String, String) {
     let mut s = String::new();
     if !ctx.facts.is_empty() {
         s.push_str("Facts:\n");
@@ -61,6 +130,8 @@ fn render_context(ctx: &EmitterContext) -> String {
         ));
         s.push('\n');
     }
+    // ---- breakpoint ----
+    let stable = std::mem::take(&mut s);
     s.push_str(&format!("Current turn:\nuser: {}\n", ctx.user_text));
     if !ctx.trace_so_far.is_empty() {
         s.push_str("This turn so far:\n");
@@ -89,7 +160,7 @@ fn render_context(ctx: &EmitterContext) -> String {
         }
     }
     s.push_str("Propose the next action.");
-    s
+    (stable, s)
 }
 
 #[async_trait]
@@ -99,17 +170,33 @@ impl Emitter for CloudEmitter {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
-        let request = serde_json::json!({
+        // Content-parts only when the knob is on, and the same form the
+        // replier already uses: one `cache_control` breakpoint on the part
+        // that ends the window block, so what the provider is asked to keep
+        // is the tool array plus the blocks that do not move inside a turn.
+        // Off, this is `serde_json::Value::String` and the request is the
+        // one this emitter has always sent, byte for byte.
+        let user_content = if self.prompt_cache {
+            let (stable, rest) = render_context_split(&ctx);
+            serde_json::json!([
+                {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": rest},
+            ])
+        } else {
+            serde_json::Value::String(render_context(&ctx))
+        };
+        let mut request = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": 0,
             "tool_choice": "required",
             "tools": build_tools(legal),
             "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": render_context(&ctx)},
+                {"role": "system", "content": system_prompt()},
+                {"role": "user", "content": user_content},
             ],
         });
+        // `max_tokens`, `temperature` and the `reasoning` block — the only
+        // keys that differ per model — are written in one place.
+        self.shape.apply(&mut request);
         let body = self
             .client
             .chat_into(request, ctx.usage.as_deref())
@@ -207,6 +294,34 @@ impl Emitter for CloudEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M10 T1.1. The instruction moved out of every tool and into the one
+    /// message that is sent once — so it has to actually be there, and it has
+    /// to be there exactly once, or the cut traded a repeated instruction for
+    /// a missing one.
+    #[test]
+    fn the_system_prompt_carries_the_rationale_instruction_once() {
+        let prompt = system_prompt();
+        assert_eq!(
+            prompt.matches(RATIONALE_INSTRUCTION).count(),
+            1,
+            "the rationale instruction is not in the system prompt exactly once: {prompt:?}"
+        );
+        assert!(
+            prompt.contains("_rationale"),
+            "the instruction must name the field the schema injects"
+        );
+        assert_eq!(
+            prompt.matches("_rationale").count(),
+            1,
+            "one mention, not a restatement per paragraph"
+        );
+        // And the schema is now the short label, not this sentence.
+        assert!(
+            !crate::schema::RATIONALE_HINT.contains("grounded"),
+            "the per-tool property is still carrying the instruction"
+        );
+    }
     use crate::client::OpenRouterClient;
     use crate::transport::{HttpResponse, MockTransport, TransportError};
     use nscore::{ActionSpec, EmitterContext, LegalActionSet, SideEffect};
@@ -305,6 +420,57 @@ mod tests {
         assert!(own.drain().is_empty(), "the client's own sink was not used");
     }
 
+    /// M10 P4 (decision 2b). The breakpoint ends the window block, because
+    /// that is the last thing in an emitter prompt that does not change
+    /// between two iterations of one turn — the trace below it changes on
+    /// every one. And off is not "nearly the same request": it is the same
+    /// string, in the same shape, which is what lets this ship default off
+    /// and be turned on by one line of config.
+    #[tokio::test]
+    async fn the_emitter_breakpoint_falls_after_the_window_block_and_is_absent_when_off() {
+        let on = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        emitter(on.clone())
+            .with_prompt_cache(true)
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+        let reqs = on.requests.lock().unwrap();
+        let parts = reqs[0]["messages"][1]["content"]
+            .as_array()
+            .expect("content-parts form");
+        assert_eq!(parts.len(), 2);
+        let head = parts[0]["text"].as_str().unwrap();
+        let tail = parts[1]["text"].as_str().unwrap();
+        assert_eq!(
+            parts[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the breakpoint is on the part that ends the window"
+        );
+        assert!(parts[1].get("cache_control").is_none());
+        assert!(head.contains("Facts:"), "{head}");
+        assert!(head.contains("Recent turns:"), "{head}");
+        assert!(head.ends_with("\n"), "the window block ends it: {head:?}");
+        assert!(!head.contains("Current turn:"), "{head}");
+        assert!(tail.starts_with("Current turn:"), "{tail}");
+        assert!(tail.contains("This turn so far:"), "{tail}");
+        let joined = format!("{head}{tail}");
+        drop(reqs);
+
+        let off = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        emitter(off.clone()).propose(ctx(), &legal()).await.unwrap();
+        let reqs = off.requests.lock().unwrap();
+        let plain = reqs[0]["messages"][1]["content"]
+            .as_str()
+            .expect("a plain string, as it has always been");
+        assert_eq!(plain, joined, "the two halves are the one prompt");
+    }
+
     #[tokio::test]
     async fn parses_tool_call_into_proposal_and_strips_rationale_from_args() {
         let mock = MockTransport::ok(vec![tool_call_response(
@@ -318,6 +484,48 @@ mod tests {
         assert_eq!(p.action, "echo");
         assert_eq!(p.rationale, "user asked");
         assert_eq!(p.args, serde_json::json!({"text": "hi"}));
+    }
+
+    /// M11 T0.2, the exit criterion: `sampling = "none"` removes the key,
+    /// it does not send a different value. Claude Sonnet 5 400s on the
+    /// *presence* of `temperature`, so `temperature: 1` would fail exactly
+    /// as `temperature: 0` does.
+    #[tokio::test]
+    async fn sampling_none_omits_temperature_entirely() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        let client = OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1);
+        let (shape, coercion) = crate::provider::RoleShaping {
+            reasoning: Some("low".into()),
+            max_tokens: Some(2048),
+            ..Default::default()
+        }
+        .resolve(
+            "emitter",
+            "anthropic/claude-sonnet-5",
+            crate::emitter::default_shape(),
+        );
+        assert!(coercion.is_some(), "the safety net announced itself");
+        CloudEmitter::new(client, "anthropic/claude-sonnet-5".into())
+            .with_shape(shape)
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+
+        let reqs = mock.requests.lock().unwrap();
+        let req = &reqs[0];
+        assert!(
+            req.get("temperature").is_none(),
+            "not a different value — no key at all: {req}"
+        );
+        assert!(!req.to_string().contains("temperature"));
+        assert_eq!(req["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(req["max_tokens"], 2048);
+        // Everything else about the emitter's request is untouched.
+        assert_eq!(req["tool_choice"], "required");
+        assert_eq!(req["messages"][0]["role"], "system");
     }
 
     #[tokio::test]
@@ -336,6 +544,10 @@ mod tests {
         let req = &reqs[0];
         assert_eq!(req["model"], "anthropic/claude-haiku-4.5");
         assert_eq!(req["temperature"], 0);
+        // M11 T0.2: the default shape is the request that has always gone
+        // out — an integer 0, 4096 tokens, and no `reasoning` block.
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none(), "{req}");
         assert_eq!(req["tool_choice"], "required");
         assert_eq!(
             req["tools"].as_array().unwrap().len(),

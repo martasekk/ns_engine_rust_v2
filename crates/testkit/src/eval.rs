@@ -59,7 +59,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-struct NullChannel;
+pub(crate) struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
     async fn recv(&self) -> Result<Incoming, ChannelError> {
@@ -119,16 +119,27 @@ fn render_prompt(ctx: &ReplyContext) -> String {
 /// row — a missing row would read as "not run" rather than "failed" — so it
 /// grades the empty one and says why.
 #[derive(Clone, Default)]
-struct Shown {
+pub(crate) struct Shown {
     /// One `render_fact` line per fact, exactly as the prompt carries it —
     /// including the `(was "Martin" until 17:35 UTC)` marker, which is how a
     /// superseded value reaches the model at all.
-    facts: Vec<String>,
-    fact_keys: Vec<String>,
-    window: String,
-    trace: String,
-    do_not_state: Vec<String>,
-    prompt: String,
+    pub(crate) facts: Vec<String>,
+    pub(crate) fact_keys: Vec<String>,
+    pub(crate) window: String,
+    pub(crate) trace: String,
+    pub(crate) do_not_state: Vec<String>,
+    pub(crate) prompt: String,
+    /// The rolling summary block exactly as the prompt carries it, or `None`
+    /// when the engine had no summary to show (M10 T5.1).
+    ///
+    /// Captured as its own field rather than inferred from `prompt`: the
+    /// point of the fixtures module is to be able to say *this session
+    /// carried a summary of n characters and the graded turn still failed*,
+    /// and a substring search over the prompt cannot tell an absent block
+    /// apart from a present one the question did not need.
+    pub(crate) summary: Option<String>,
+    /// The guidance notes rendered into this context, one per note (M10 T5.1).
+    pub(crate) guidance: Vec<String>,
 }
 
 impl Shown {
@@ -140,10 +151,12 @@ impl Shown {
             trace: ctx.turn_trace.clone(),
             do_not_state: ctx.do_not_state.clone(),
             prompt: render_prompt(ctx),
+            summary: ctx.summary.as_ref().map(render_summary),
+            guidance: ctx.guidance.clone(),
         }
     }
 
-    fn chars(&self) -> usize {
+    pub(crate) fn chars(&self) -> usize {
         self.prompt.chars().count()
     }
 
@@ -151,11 +164,11 @@ impl Shown {
     /// substring, which is the same test the grounding interceptor applies in
     /// `ground::Material::contains` — a fixture must not hold the harness to a
     /// stricter standard than the harness holds a reply to.
-    fn shows(&self, value: &str) -> bool {
+    pub(crate) fn shows(&self, value: &str) -> bool {
         self.prompt.to_lowercase().contains(&value.to_lowercase())
     }
 
-    fn fact_line(&self, key: &str) -> Option<&str> {
+    pub(crate) fn fact_line(&self, key: &str) -> Option<&str> {
         let prefix = format!("{key}: ");
         self.facts
             .iter()
@@ -163,7 +176,7 @@ impl Shown {
             .map(String::as_str)
     }
 
-    fn rows_for(&self, key: &str) -> usize {
+    pub(crate) fn rows_for(&self, key: &str) -> usize {
         self.fact_keys.iter().filter(|k| *k == key).count()
     }
 }
@@ -175,10 +188,10 @@ impl Shown {
 /// nowhere, so the abstention fixture can grade the grounding interceptor
 /// (M6 §4.5) — which is harness, not model — instead of the double's manners.
 /// The regeneration falls back to the inert marker.
-struct Probe {
-    shown: Arc<Mutex<Vec<Shown>>>,
-    first_draft: Option<&'static str>,
-    drafts: AtomicU32,
+pub(crate) struct Probe {
+    pub(crate) shown: Arc<Mutex<Vec<Shown>>>,
+    pub(crate) first_draft: Option<&'static str>,
+    pub(crate) drafts: AtomicU32,
 }
 
 /// Deliberately claim-free: no digits, no mid-sentence capitals, no quotes,
@@ -212,8 +225,8 @@ impl Replier for Probe {
 /// A number a fixture computes for itself drifts from what the harness did,
 /// and then the set measures the test; the same argument
 /// [`Harness::counters`] is built on.
-struct MeteredEmitter {
-    inner: Box<dyn Emitter>,
+pub(crate) struct MeteredEmitter {
+    pub(crate) inner: Box<dyn Emitter>,
 }
 
 #[async_trait::async_trait]
@@ -280,6 +293,27 @@ const TAIL_CONTROL: &str = "Sloučit buňky";
 /// in the tool's output.
 const TAIL_POINT: (i64, i64) = (1704, 928);
 
+/// The control the hard-query task reaches (M10 T0.3). **Not in
+/// [`control_tree`] at all** — it is below the fold, so no `pointer_ui_read`
+/// carries it and no `inspect_result` can page to it either. The only thing
+/// on this desktop that brings it into view is `pointer_scroll`.
+///
+/// That is the whole point of the fixture. Tool-loading §5.3: a narrower
+/// legal set looks like a pure win on every existing task, because none of
+/// them needs a tool a narrow tier would withhold. This one does, so
+/// withholding it reads as a failed ability rather than as a silent
+/// capability loss.
+const DEEP_CONTROL: &str = "Zmrazit příčky";
+/// Its click point, off the filler grid (`x` is 1704, and the grid's
+/// columns stop at 1560) and past the tree's own tail row, so `control_at`
+/// cannot resolve a click to some other control.
+const DEEP_POINT: (i64, i64) = (1704, 2104);
+/// Notches, the unit `pointer_scroll` takes ("Positive dy scrolls down",
+/// `components-std/src/pointer_tool.rs`).
+const SCROLL_NOTCHES: i64 = 12;
+/// The one action the hard query has, under the name the real tool uses.
+const POINTER_SCROLL: &str = "pointer_scroll";
+
 /// The recorded control tree, as the `pointer_ui_read` fixture.
 ///
 /// **Not `NullPlatform`, which the plan names (§9).** `ns-engine` does not
@@ -344,6 +378,14 @@ fn control_tree() -> String {
 /// screen says was under it, so a fixture that reached the wrong control
 /// fails loudly instead of passing on the fact that a click happened.
 fn control_at(x: i64, y: i64) -> Option<String> {
+    // Below the fold, and answered separately because it is deliberately not
+    // in the rendered tree: a screen read never prints it, so the only way
+    // an emitter can arrive at this point is out of a `pointer_scroll`
+    // result. The click still lands — the control is real, it was just off
+    // the visible page.
+    if (x, y) == DEEP_POINT {
+        return Some(format!("button {DEEP_CONTROL:?}"));
+    }
     let point = format!(" ({x},{y})");
     control_tree()
         .lines()
@@ -387,6 +429,10 @@ enum Desk {
     Read,
     Click,
     Type,
+    /// `Reversible`, as the real spec has it: scrolling back undoes it. It
+    /// is also the only action on this desktop that reaches what is below
+    /// the fold — see [`DEEP_CONTROL`].
+    Scroll,
 }
 
 struct DeskTool {
@@ -432,6 +478,20 @@ impl DeskTool {
             ),
         }
     }
+
+    /// The tool the hard query needs and nothing else can stand in for
+    /// (M10 T0.3). Description and side-effect class from the real spec.
+    fn scroll() -> Self {
+        Self {
+            act: Desk::Scroll,
+            spec: tool_spec(
+                POINTER_SCROLL,
+                "Scroll the remote machine in notches. Positive dy scrolls down.",
+                SideEffect::Reversible,
+                &[("dx", "integer"), ("dy", "integer")],
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -467,6 +527,22 @@ impl Tool for DeskTool {
                 }
             }
             Desk::Type => format!("typed {:?}", text("text")),
+            // The result is the only place the below-the-fold control's
+            // point ever appears, in the same `role "name" (x,y)` rendering
+            // a screen read uses — so the double reads it out of what it was
+            // shown, exactly as it reads a point out of `pointer_ui_read`.
+            Desk::Scroll => {
+                let Some(dy) = n("dy") else {
+                    return Err(ToolError::Failed {
+                        kind: "args".into(),
+                        detail: "needs a numeric dy".into(),
+                    });
+                };
+                format!(
+                    "scrolled {dy} notches; below the fold: button \"{DEEP_CONTROL}\" ({},{})",
+                    DEEP_POINT.0, DEEP_POINT.1
+                )
+            }
         };
         Ok(ToolOutput {
             summary,
@@ -484,6 +560,7 @@ fn desktop_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(DeskTool::read()),
         Arc::new(DeskTool::click()),
         Arc::new(DeskTool::typing()),
+        Arc::new(DeskTool::scroll()),
     ]
 }
 
@@ -503,6 +580,11 @@ enum Step {
     /// clipped, follow the handle first and look again.
     Reach(&'static str),
     Type(&'static str),
+    /// `pointer_scroll` by this many notches. The step the hard query is
+    /// built on: with the tool out of the legal set there is no other action
+    /// that does it, and the double says so by settling rather than by
+    /// spending twelve iterations proposing something illegal.
+    Scroll(i64),
 }
 
 /// The click point the trace shows for a control, or `None` when the trace
@@ -634,6 +716,17 @@ impl Emitter for DesktopEmitter {
         Ok(match step {
             Step::Read(query) => proposal("pointer_ui_read", serde_json::json!({"query": query})),
             Step::Type(text) => proposal("pointer_type", serde_json::json!({"text": text})),
+            // Withheld: nothing else on this desktop brings the control into
+            // view, so the turn ends here and the ability fails on the click
+            // that never happened — the honest failure, and the one the
+            // fixture exists to produce (M10 T0.3).
+            Step::Scroll(dy) if !legal.contains(POINTER_SCROLL) => {
+                plan.steps.clear();
+                plan.current = None;
+                let _ = dy;
+                settle()
+            }
+            Step::Scroll(dy) => proposal(POINTER_SCROLL, serde_json::json!({"dx": 0, "dy": dy})),
             Step::Reach(name) => match point_of(&trace, name) {
                 Some((x, y)) => proposal("pointer_click", serde_json::json!({"x": x, "y": y})),
                 None => match handle_in(&trace).filter(|_| legal.contains(INSPECT_RESULT)) {
@@ -668,12 +761,12 @@ impl Emitter for DesktopEmitter {
 /// `valid_to` as wall-clock time. Under a frozen clock every "what was it
 /// before" marker reads `until 00:00 UTC`, which is exactly the rendering a
 /// small model has to make sense of, so it should be real.
-fn clock(ticks: Arc<AtomicU64>) -> Box<dyn Fn() -> Timestamp + Send + Sync> {
+pub(crate) fn clock(ticks: Arc<AtomicU64>) -> Box<dyn Fn() -> Timestamp + Send + Sync> {
     const BASE_MS: u64 = 1_788_370_524_628;
     Box::new(move || Timestamp(BASE_MS + ticks.fetch_add(1, Ordering::SeqCst) * 1_000))
 }
 
-struct Harness {
+pub(crate) struct Harness {
     store: Arc<InMemoryStore>,
     shown: Arc<Mutex<Vec<Shown>>>,
     /// What the *emitter* was shown, one entry per iteration: this turn's
@@ -688,6 +781,32 @@ struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
+    /// M10 T1.4: the verbatim window this fixture runs with, when it needs a
+    /// narrower one than the default six.
+    ///
+    /// Applicability pruning makes `recall` legal only once there is
+    /// something out of sight — a turn older than the window, or an earlier
+    /// session. The `abstention` fixture asks its question on turn 2 of a
+    /// fresh store, so under the default window there is nothing out of sight
+    /// and `recall` is (correctly) not offered. A one-turn window puts turn 1
+    /// out of sight and restores the ability's own shape: the search runs,
+    /// finds nothing, and the reply has to decline.
+    window_turns: Option<usize>,
+    /// M10 T5.1: the learned rules this fixture hands the engine, which is
+    /// where the guidance block comes from. Empty on the ten abilities, so
+    /// their rows are the numbers they have always been.
+    learned: std::sync::Arc<arc_swap::ArcSwap<LearnedRules>>,
+    /// M10 T5.1: the persona the seed authored, in front of the reply model
+    /// exactly as `[persona]` would be on the live path. Empty on the ten
+    /// abilities.
+    persona: String,
+    /// M10 T5.1: run the engine's own summarizer path at every turn
+    /// boundary, so `state.summary` is non-empty when a graded turn runs.
+    ///
+    /// Off on the ten abilities for the same reason: `maybe_summarize` is a
+    /// model call, and turning it on for them would change `requests` on
+    /// every row of the ledger.
+    summaries: bool,
     /// What this arm does differently: the blanked block (M9 T0.4) and the
     /// activation weight (M9 T3.3). Passed straight into every
     /// `EngineConfig` the fixture builds, so every turn of an arm runs with
@@ -710,13 +829,71 @@ pub struct Run {
     /// the store the fixtures search and mirrored into `EngineConfig`.
     /// `0.0` is the default and is pre-M9 ranking.
     pub activation_weight: f32,
+    /// Tool names this arm does **not** register, so the engine never puts
+    /// them in the legal set (M10 T0.3).
+    ///
+    /// The narrowing P2 will do lives in the router; this is the same effect
+    /// reached from outside the engine, which is what lets the hard-query
+    /// fixture prove it guards before any of that exists. A `&'static`
+    /// slice rather than a `Vec` so [`Run`] stays `Copy` — it is passed by
+    /// value into every fixture, and the names are literals at every call
+    /// site anyway.
+    pub withhold: &'static [&'static str],
+    /// `[router] depth` for this arm (M10 T2.1/T2.3). `Full` is the default
+    /// and is the engine's behaviour before adaptive depth existed.
+    ///
+    /// Only the desktop fixtures feel it: the memory abilities register one
+    /// tool and run with no router, and an arm that changed their numbers
+    /// would be reporting a narrowing nothing narrowed.
+    pub depth: nscore::Depth,
+    /// `[memory] obligation_check` for this arm (M9 T2.1, read by M10 T5.4).
+    ///
+    /// `false` is the default and is the engine's behaviour before the
+    /// obligation interceptor existed; `true` lets one unaddressed clause
+    /// cost the turn a second replier call.
+    pub obligation_check: bool,
+    /// `[memory] summary_guidelines` for this arm (M9 T5.2, read by M10 T5.4).
+    ///
+    /// Plumbed to the one place the harness builds a summarizer, so a live
+    /// summarizer dropped in there is measured by this arm without a second
+    /// change. The double the fixtures run today ignores them — see
+    /// [`summarizer_honours_guidelines`], which is this arm's finding, not an
+    /// oversight. A `&'static` slice for [`Run`]'s `Copy`, as `withhold`.
+    pub summary_guidelines: &'static [&'static str],
+}
+
+/// Whether the summarizer the fixtures run can see `summary_guidelines` at
+/// all (M10 T5.4, arm 4).
+///
+/// `false`, and it is a property of the double rather than of the knob:
+/// `nsengine::script::ScriptedSummarizer` returns `"scripted summary of turns
+/// {first}-{last}"` with `established` copied verbatim off the records and
+/// `open` empty — computed from the records alone. Guidelines reach a real
+/// summarizer through `nsllm::summarizer::LlmSummarizer::with_guidelines`,
+/// which renders them into a **system prompt**: a prompt the double never
+/// builds and never sends. So the on-arm and off-arm summaries are
+/// byte-identical by construction, and the honest reading of this arm offline
+/// is *not measurable*, not *zero effect*.
+pub fn summarizer_honours_guidelines() -> bool {
+    false
+}
+
+/// The one place the harness chooses a summarizer (M10 T5.4).
+///
+/// It takes the guidelines even though today's double discards them: this is
+/// the line a live summarizer is swapped into — `LlmSummarizer::new(..)
+/// .with_guidelines(guidelines.iter().map(|g| g.to_string()).collect())` —
+/// and keeping the argument here makes that swap one line rather than a
+/// re-plumbing.
+fn summarizer_double(_guidelines: &'static [&'static str]) -> Box<dyn nscore::Summarizer> {
+    Box::new(ScriptedSummarizer::default())
 }
 
 impl Harness {
     /// The full arm passes `Run::default()`; `ns-app eval --ablate <block>`
     /// and `--activation <w>` fill it in, and every engine and every store
     /// this fixture builds is configured from it.
-    fn for_run(run: Run) -> Self {
+    pub(crate) fn for_run(run: Run) -> Self {
         Self {
             store: Arc::new(
                 InMemoryStore::new().with_activation(run.activation_weight, ACTIVATION_HALF_LIFE),
@@ -726,7 +903,26 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
+            window_turns: None,
+            learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
+            summaries: false,
+            persona: String::new(),
             run,
+        }
+    }
+
+    /// M10 T5.1: the same harness with notes in front of both models and the
+    /// summarizer running between turns.
+    ///
+    /// Two flags rather than two harnesses because the fixtures module grades
+    /// what the ten abilities grade — the [`ReplyContext`] the engine built —
+    /// and a second harness would be a second definition of that.
+    pub(crate) fn for_fixture(run: Run, rules: LearnedRules, persona: &str) -> Self {
+        Self {
+            learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(rules)),
+            summaries: true,
+            persona: persona.to_string(),
+            ..Self::for_run(run)
         }
     }
 
@@ -738,11 +934,16 @@ impl Harness {
         }
     }
 
-    async fn turn(&self, session: &SessionId, text: &str, script: Vec<Proposal>) -> Vec<Shown> {
+    pub(crate) async fn turn(
+        &self,
+        session: &SessionId,
+        text: &str,
+        script: Vec<Proposal>,
+    ) -> Vec<Shown> {
         self.turn_drafting(session, text, script, None).await
     }
 
-    async fn turn_drafting(
+    pub(crate) async fn turn_drafting(
         &self,
         session: &SessionId,
         text: &str,
@@ -808,8 +1009,15 @@ impl Harness {
         // `turn_loop.rs` turns it off on its own doubles for the same reason.
         // The grounding check stays on: it is the interceptor the abstention
         // fixture grades.
+        if self.summaries {
+            b.set_summarizer(summarizer_double(self.run.summary_guidelines));
+        }
         let common = EngineConfig {
             max_echo_ratio: 1.1,
+            persona: self.persona.clone(),
+            // M10 T5.1. The default is an empty rule set, so the ten
+            // abilities render no guidance and their rows do not move.
+            learned: self.learned.clone(),
             // M9 T0.4. `None` on every existing run, so the suite's numbers
             // are the ones they have always been.
             ablate: self.run.ablate,
@@ -818,10 +1026,23 @@ impl Harness {
             // configuration sees the weight the arm is actually running at.
             activation_weight: self.run.activation_weight,
             activation_half_life_days: ACTIVATION_HALF_LIFE,
+            // M10 T5.4. `false` on every existing run, so the ten abilities
+            // and the thirty fixtures keep the numbers they have.
+            obligation_check: self.run.obligation_check,
+            window_turns: self
+                .window_turns
+                .unwrap_or(EngineConfig::default().window_turns),
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {
             for t in desktop_tools() {
+                // M10 T0.3. Removing rather than masking, which is the rule
+                // this engine narrows by: an unregistered tool is out of
+                // `legal.actions` and out of the schemas, so the arm costs
+                // what a narrowed arm would cost.
+                if self.run.withhold.contains(&t.spec().name.as_str()) {
+                    continue;
+                }
                 b.add_tool(t);
             }
             EngineConfig {
@@ -843,7 +1064,12 @@ impl Harness {
                 // The real router, not a stub. `tier` is one of the columns,
                 // and a fixture that decided the tier itself would report a
                 // routing nothing routed.
-                router: Some(Arc::new(KeywordRouter::default())),
+                router: Some(Arc::new(KeywordRouter {
+                    // M10 T2.1. `Full` on every existing run, so the ten
+                    // abilities' rows are the ones they have always been.
+                    depth: self.run.depth,
+                    ..KeywordRouter::default()
+                })),
                 ..common
             }
         } else {
@@ -858,12 +1084,18 @@ impl Harness {
             })
             .await
             .unwrap();
+        // M10 T5.1. The dispatcher, not `run_turn`, is what calls this on the
+        // live path (`dispatch.rs`), so a fixture that wants a summary has to
+        // call it too — at the same place, after the reply is sent.
+        if self.summaries {
+            engine.maybe_summarize(session).await.unwrap();
+        }
         self.shown.lock().unwrap()[before..].to_vec()
     }
 
     /// Reply-model calls over the whole fixture: one per captured context, so
     /// a regeneration counts, which is the point of counting it.
-    fn reply_calls(&self) -> usize {
+    pub(crate) fn reply_calls(&self) -> usize {
         self.shown.lock().unwrap().len()
     }
 
@@ -919,11 +1151,17 @@ impl Harness {
             .unwrap_or(0)
     }
 
+    /// The store this fixture built, so a caller can seed and read facts
+    /// through the same rows the engine ranks (M10 T5.2).
+    pub(crate) fn store(&self) -> Arc<InMemoryStore> {
+        self.store.clone()
+    }
+
     /// The plan's per-run numbers, read back off the event log of every
     /// session the fixture touched. Read back rather than counted by hand: a
     /// number a fixture computes for itself drifts from what the harness did,
     /// and then the regression set is measuring the test.
-    async fn counters(&self) -> Counters {
+    pub(crate) async fn counters(&self) -> Counters {
         let sessions = self.sessions.lock().unwrap().clone();
         let mut c = Counters::default();
         for sid in sessions {
@@ -940,11 +1178,19 @@ impl Harness {
             // afresh at every turn boundary — so a rise between two adjacent
             // calls of one turn is an escalation and nothing else is.
             let mut previous_tier: Option<(u32, Tier)> = None;
+            // M10 T0.4: the legal-set size the *last* model call was given.
+            // `record_model_calls` appends the emitter's `ModelCall`
+            // immediately before the `Proposed` it produced (`turn.rs`), so
+            // the last one seen is that proposal's own call and the pairing
+            // cannot drift.
+            let mut legal_on_last_call = 0usize;
             for e in &events {
                 match &e.kind {
                     EventKind::UserSaid { .. } => c.turns += 1,
                     EventKind::Proposed { proposal } => {
                         c.emitter_calls += 1;
+                        c.proposals
+                            .push((proposal.action.clone(), legal_on_last_call));
                         if proposal.action == ASK_CLARIFICATION {
                             c.clarifications += 1;
                         }
@@ -961,6 +1207,8 @@ impl Harness {
                     // built from the context immediately before it is moved
                     // into the call, so it cannot drift from what was sent.
                     EventKind::ModelCall { manifest, .. } => {
+                        legal_on_last_call = manifest.tools;
+                        c.legal_max = c.legal_max.max(manifest.tools);
                         c.clipped_chars += manifest.clipped_chars;
                         c.budget_drops += manifest
                             .budget
@@ -1004,14 +1252,14 @@ impl Harness {
 }
 
 #[derive(Default)]
-struct Counters {
-    turns: usize,
-    emitter_calls: usize,
-    tool_calls: usize,
-    recall_calls: usize,
-    recall_hits: usize,
-    flags: usize,
-    clarifications: usize,
+pub(crate) struct Counters {
+    pub(crate) turns: usize,
+    pub(crate) emitter_calls: usize,
+    pub(crate) tool_calls: usize,
+    pub(crate) recall_calls: usize,
+    pub(crate) recall_hits: usize,
+    pub(crate) flags: usize,
+    pub(crate) clarifications: usize,
     /// The four M7 numbers, summed over every model call the fixture made.
     clipped_chars: usize,
     inspections: usize,
@@ -1023,9 +1271,57 @@ struct Counters {
     /// iteration discovering its tools, and `escalations == 0` alone cannot
     /// tell that apart from a turn that never proposed one.
     chat_calls: usize,
+    /// Every proposal the fixture made, in order, with the legal-set size
+    /// the call that produced it was given (M10 T0.4). The raw material for
+    /// Bits-over-Random, kept as the pair rather than as a computed number
+    /// so a run can be re-scored against a different target without rerunning
+    /// the fixture.
+    proposals: Vec<(String, usize)>,
+    /// The widest legal set any model call of the fixture saw. What a miss is
+    /// scored against: without it a fixture whose target was never proposed
+    /// would have no `n` to report at all.
+    legal_max: usize,
 }
 
-fn remember(key: &str, value: &str) -> Proposal {
+impl Counters {
+    /// The deciding call for `target`: the first proposal of that action and
+    /// the legal-set size it was chosen from, or the widest set seen and a
+    /// miss (M10 T0.4).
+    ///
+    /// *First*, not best: the question BoR answers is whether the right tool
+    /// was reachable when it was needed, and a fixture that proposed it on
+    /// iteration nine after eight wrong ones did not choose it from that set
+    /// the way iteration one would have.
+    fn decision(&self, target: &str) -> (usize, bool) {
+        match self.proposals.iter().find(|(a, _)| a == target) {
+            Some((_, n)) => (*n, true),
+            None => (self.legal_max, false),
+        }
+    }
+}
+
+/// **Bits-over-Random** (tool-loading §5.2, arXiv:2605.24660).
+///
+/// `BoR = log₂(P_obs / P_rand)`. One fixture is one observation, so
+/// `P_obs = 1` on a hit and `0` on a miss; a uniform guess over `n` legal
+/// actions has `P_rand = 1/n`. A hit is therefore `log₂(n)` bits and a miss
+/// is scored `0` rather than `−∞`, which is the convention that lets the
+/// column be summed and averaged.
+///
+/// The chance correction is the whole reason to report it: raw hit rate
+/// *rises* as the legal set shrinks, because guessing gets easier, so a
+/// narrowing that cost accuracy could still read as a win. BoR charges the
+/// narrowing for the ease it bought — `n = 1` is worth zero bits, however
+/// certainly the one action was chosen.
+pub fn bits_over_random(chosen: bool, legal_set_size: usize) -> f64 {
+    if chosen && legal_set_size > 1 {
+        (legal_set_size as f64).log2()
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn remember(key: &str, value: &str) -> Proposal {
     Proposal {
         rationale: "durable".into(),
         action: REMEMBER_FACT.into(),
@@ -1033,7 +1329,7 @@ fn remember(key: &str, value: &str) -> Proposal {
     }
 }
 
-fn forget(key: &str) -> Proposal {
+pub(crate) fn forget(key: &str) -> Proposal {
     Proposal {
         rationale: "the user asked".into(),
         action: FORGET_FACT.into(),
@@ -1044,7 +1340,7 @@ fn forget(key: &str) -> Proposal {
 /// The query is a span of the user's own words, so provenance classifies it
 /// `UserInput` rather than `Residual` — a recall query the model invented is
 /// a different failure and would muddy this one.
-fn recall_for(query: &str) -> Proposal {
+pub(crate) fn recall_for(query: &str) -> Proposal {
     Proposal {
         rationale: "not in the window".into(),
         action: RECALL.into(),
@@ -1116,6 +1412,17 @@ pub struct Ability {
     /// guess, and it is a request, which is the resource the free tier
     /// meters — so it is counted rather than assumed harmless.
     pub escalations: usize,
+    /// The action this ability is about — the one a narrowing would have to
+    /// keep for the ability to remain possible (M10 T0.4).
+    pub target_action: &'static str,
+    /// Whether it was proposed, and the legal-set size on the call that
+    /// proposed it (or the widest set seen, on a miss).
+    pub target_proposed: bool,
+    pub legal_size: usize,
+    /// [`bits_over_random`] of the two above. Zero at chance — a miss, or a
+    /// legal set of one — and `log₂(n)` when the target was chosen out of
+    /// `n`. Today's number is the baseline P2's narrowing is compared to.
+    pub bits: f64,
     /// Empty on a pass; on a failure, every condition that failed and what
     /// the harness showed instead.
     pub detail: String,
@@ -1124,13 +1431,19 @@ pub struct Ability {
 impl Ability {
     fn build(
         ability: &'static str,
+        target_action: &'static str,
         graded: &Shown,
         h: &Harness,
         c: &Counters,
         fails: Vec<String>,
     ) -> Self {
+        let (legal_size, target_proposed) = c.decision(target_action);
         Self {
             ability,
+            target_action,
+            target_proposed,
+            legal_size,
+            bits: bits_over_random(target_proposed, legal_size),
             passed: fails.is_empty(),
             turns: c.turns,
             requests: c.emitter_calls + h.reply_calls(),
@@ -1153,7 +1466,7 @@ impl Ability {
 /// One graded condition. Collected rather than asserted: a run has to report
 /// every condition that failed, across all six abilities, or the first broken
 /// one hides the rest and the next run rediscovers them one at a time.
-fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
+pub(crate) fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
     if !ok {
         fails.push(why());
     }
@@ -1161,10 +1474,10 @@ fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
 
 /// Header, rule and every row through one set of widths, so a column cannot
 /// drift out of line with its heading when a number grows.
-fn row_line(cells: [&str; 15]) -> String {
+fn row_line(cells: [&str; 17]) -> String {
     format!(
         "  {:<24}  {:<4}  {:>5}  {:>4}  {:>6}  {:>4}  {:>4}  {:>5}  {:<6}  {:>4}  {:>5}  \
-         {:>7}  {:>5}  {:>5}  {:>4}\n",
+         {:>7}  {:>5}  {:>5}  {:>4}  {:>5}  {:>5}\n",
         cells[0],
         cells[1],
         cells[2],
@@ -1180,6 +1493,8 @@ fn row_line(cells: [&str; 15]) -> String {
         cells[12],
         cells[13],
         cells[14],
+        cells[15],
+        cells[16],
     )
 }
 
@@ -1187,7 +1502,7 @@ pub fn render_table(rows: &[Ability]) -> String {
     let mut out = String::from("\nM7 T5.1 — memory and desktop abilities, scripted model\n\n");
     out.push_str(&row_line([
         "ability", "pass", "turns", "reqs", "prompt", "~tok", "peak", "tools", "recall", "hits",
-        "flags", "clipped", "insp", "drops", "esc",
+        "flags", "clipped", "insp", "drops", "esc", "legal", "BoR",
     ]));
     out.push_str(&row_line([
         "------------------------",
@@ -1205,6 +1520,8 @@ pub fn render_table(rows: &[Ability]) -> String {
         "-----",
         "-----",
         "----",
+        "-----",
+        "-----",
     ]));
     for r in rows {
         out.push_str(&row_line([
@@ -1223,12 +1540,34 @@ pub fn render_table(rows: &[Ability]) -> String {
             &r.inspections.to_string(),
             &r.budget_drops.to_string(),
             &r.escalations.to_string(),
+            // A miss prints its `n` too — "0.00 out of 17" and "0.00 out of
+            // 3" are different findings, and a bare zero hides which.
+            &if r.target_proposed {
+                r.legal_size.to_string()
+            } else {
+                format!("{}!", r.legal_size)
+            },
+            &format!("{:.2}", r.bits),
         ]));
     }
+    let bits: f64 = rows.iter().map(|r| r.bits).sum();
     out.push_str(&format!(
         "\n  {}/{} abilities pass.\n",
         rows.iter().filter(|r| r.passed).count(),
         rows.len()
+    ));
+    // M10 T0.4. Printed beside the pass counts because it is the number P2's
+    // narrowing is judged on: a narrower legal set that keeps every ability
+    // passing but drops BoR bought its pass rate from an easier guess.
+    out.push_str(&format!(
+        "  Bits-over-Random: {bits:.2} bits over {} abilities ({:.2} mean); \
+         `n!` marks a target that was never proposed.\n",
+        rows.len(),
+        if rows.is_empty() {
+            0.0
+        } else {
+            bits / rows.len() as f64
+        },
     ));
     for r in rows.iter().filter(|r| !r.passed) {
         out.push_str(&format!("  {} FAILED: {}\n", r.ability, r.detail));
@@ -1310,7 +1649,14 @@ async fn information_extraction(run: Run) -> Ability {
             c.recall_calls
         )
     });
-    Ability::build("information extraction", graded, &h, &c, fails)
+    Ability::build(
+        "information extraction",
+        REMEMBER_FACT,
+        graded,
+        &h,
+        &c,
+        fails,
+    )
 }
 
 /// **Multi-session reasoning.** A fact stated in one session, needed in
@@ -1360,7 +1706,14 @@ async fn multi_session_reasoning(run: Run) -> Ability {
             c.clarifications
         )
     });
-    Ability::build("multi-session reasoning", graded, &h, &c, fails)
+    Ability::build(
+        "multi-session reasoning",
+        REMEMBER_FACT,
+        graded,
+        &h,
+        &c,
+        fails,
+    )
 }
 
 /// **Temporal reasoning.** The name changes on turn 6; "what was it before"
@@ -1418,7 +1771,7 @@ async fn temporal_reasoning(run: Run) -> Ability {
         || "both values must be in the context for the answer to name both".into(),
     );
     let c = h.counters().await;
-    Ability::build("temporal reasoning", graded, &h, &c, fails)
+    Ability::build("temporal reasoning", REMEMBER_FACT, graded, &h, &c, fails)
 }
 
 /// **Knowledge updates.** The age is restated with a new value.
@@ -1500,7 +1853,7 @@ async fn knowledge_updates(run: Run) -> Ability {
         None => fails.push("user.age was not in the reply context".into()),
     }
     let c = h.counters().await;
-    Ability::build("knowledge updates", graded, &h, &c, fails)
+    Ability::build("knowledge updates", REMEMBER_FACT, graded, &h, &c, fails)
 }
 
 /// **Abstention.** A question about a fact that was never stated.
@@ -1528,7 +1881,16 @@ async fn abstention(run: Run) -> Ability {
     const INVENTED: &str = "Ostrava";
     const INVENTING_DRAFT: &str = "You live in Ostrava.";
 
-    let h = Harness::for_run(run);
+    // One turn of verbatim window rather than six (M10 T1.4): the question
+    // is asked on turn 2, and `recall` is offered only once a turn has left
+    // the window. What the ability grades is unchanged — the search still
+    // runs, still finds nothing, and the reply still has to decline — but
+    // now turn 1 is genuinely out of sight, which is the situation a model
+    // reaches for `recall` in.
+    let h = Harness {
+        window_turns: Some(1),
+        ..Harness::for_run(run)
+    };
     let sid = SessionId("eval-abstention".into());
     h.turn(
         &sid,
@@ -1595,7 +1957,7 @@ async fn abstention(run: Run) -> Ability {
             },
         );
     }
-    Ability::build("abstention", graded, &h, &c, fails)
+    Ability::build("abstention", RECALL, graded, &h, &c, fails)
 }
 
 /// **Selective forgetting** (MemoryAgentBench, per the Phase 7 table).
@@ -1666,7 +2028,7 @@ async fn selective_forgetting(run: Run) -> Ability {
         },
     );
     let c = h.counters().await;
-    Ability::build("selective forgetting", graded, &h, &c, fails)
+    Ability::build("selective forgetting", FORGET_FACT, graded, &h, &c, fails)
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,7 +2155,14 @@ async fn desktop_open_and_search(run: Run) -> Ability {
             c.chat_calls
         )
     });
-    Ability::build("desktop open-and-search", &graded, &h, &c, fails)
+    Ability::build(
+        "desktop open-and-search",
+        "pointer_click",
+        &graded,
+        &h,
+        &c,
+        fails,
+    )
 }
 
 /// **Find and click.** Reach a control by name, from one screen read.
@@ -1872,7 +2241,14 @@ async fn desktop_find_and_click(run: Run) -> Ability {
             c.chat_calls, c.escalations
         )
     });
-    Ability::build("desktop find-and-click", &graded, &h, &c, fails)
+    Ability::build(
+        "desktop find-and-click",
+        "pointer_click",
+        &graded,
+        &h,
+        &c,
+        fails,
+    )
 }
 
 /// **The clipped tail.** The control exists only past the cap.
@@ -1959,7 +2335,123 @@ async fn desktop_clipped_tail(run: Run) -> Ability {
             c.chat_calls, c.escalations
         )
     });
-    Ability::build("desktop clipped tail", &graded, &h, &c, fails)
+    Ability::build(
+        "desktop clipped tail",
+        INSPECT_RESULT,
+        &graded,
+        &h,
+        &c,
+        fails,
+    )
+}
+
+/// **The hard query.** The control is below the fold, and one tool reaches it.
+///
+/// M10 T0.3, and the risk it guards is written down: *"adaptive depth
+/// withholds the tool a hard task needs"*. Tool-loading §1.3 measured what
+/// that looks like — a fixed depth of five scores 64.7% on ToolBench on
+/// average and **0% on hard queries** — and §5.3 says why it has to be a
+/// fixture: without one, a narrower legal set "will look like a pure win on
+/// every existing fixture, because none of them needs a tool the router
+/// would withhold".
+///
+/// So this one does. [`DEEP_CONTROL`] is not in [`control_tree`] at all: no
+/// `pointer_ui_read` prints it and no `inspect_result` can page to it,
+/// because there is nothing clipped that holds it. `pointer_scroll` is the
+/// only action on this desktop whose result carries its point — and it is
+/// one of the two pointer tools the recorded log never called, which is
+/// exactly the kind a cue-driven selection would drop first.
+///
+/// The proof that it guards is the other half, in
+/// `the_hard_query_ability_fails_when_its_tool_is_withheld`: the same
+/// fixture under `Run { withhold: &["pointer_scroll"], .. }` must fail. An
+/// ability that passed both ways would be measuring nothing about depth.
+async fn desktop_hard_query(run: Run) -> Ability {
+    let h = Harness::desktop_for_run(run);
+    let sid = SessionId("eval-desktop-hard".into());
+    let shown = h
+        .desktop_turn(
+            &sid,
+            // "klikni" is the task cue, so the tier is `Task` from the
+            // message — and it stays the cue whether or not `pointer_scroll`
+            // is registered, so the withheld arm differs in one thing only.
+            "sjeď dolů v panelu a klikni na Zmrazit příčky",
+            vec![
+                Step::Read("zmrazit"),
+                Step::Scroll(SCROLL_NOTCHES),
+                Step::Reach(DEEP_CONTROL),
+            ],
+        )
+        .await;
+    let graded = shown.first().cloned().unwrap_or_default();
+
+    let mut fails = Vec::new();
+    let c = h.counters().await;
+    let outcomes = h.outcomes().await;
+    // The one action the task has. Read off the log, so a turn that talked
+    // about scrolling without scrolling fails here.
+    require(
+        &mut fails,
+        outcomes.iter().any(|o| o.starts_with("scrolled ")),
+        || {
+            format!(
+                "pointer_scroll never ran, so nothing brought {DEEP_CONTROL:?} into view; \
+                 the turn did: {outcomes:?}"
+            )
+        },
+    );
+    require(
+        &mut fails,
+        outcomes
+            .iter()
+            .any(|o| o.starts_with("clicked") && o.contains(DEEP_CONTROL)),
+        || format!("{DEEP_CONTROL:?} was never clicked; the turn did: {outcomes:?}"),
+    );
+    require(&mut fails, c.tool_calls == 3, || {
+        format!(
+            "{} tool calls, want a read, a scroll and a click",
+            c.tool_calls
+        )
+    });
+    // And the point arrived through the scroll and nothing else. The screen
+    // read cannot have carried it — the control is not in the tree — so the
+    // first trace holding the point must be the one holding the scroll's
+    // own outcome. If that ever stops being true, the tree grew the control
+    // and the fixture is no longer hard.
+    let point = format!("({},{})", DEEP_POINT.0, DEEP_POINT.1);
+    let traces = h.traces();
+    match traces.iter().position(|t| t.join("\n").contains(&point)) {
+        Some(at) => require(
+            &mut fails,
+            traces[at].join("\n").contains("ToolReturned(ok: scrolled "),
+            || {
+                format!(
+                    "the control's point reached a prompt some other way than the scroll:\n{}",
+                    traces[at].join("\n")
+                )
+            },
+        ),
+        None => fails.push("no prompt ever carried the control's point".into()),
+    }
+    // Not a paging problem. The handle leads into the screen read, and the
+    // screen read does not have this control, so an inspection here would be
+    // a request that could not have bought the answer.
+    require(&mut fails, c.inspections == 0, || {
+        format!(
+            "{} inspections for a control no screen read carries",
+            c.inspections
+        )
+    });
+    require(&mut fails, c.clipped_chars > 0, || {
+        "nothing was clipped, so this is not the recorded desktop".into()
+    });
+    require(&mut fails, c.escalations + c.chat_calls == 0, || {
+        format!(
+            "a desktop instruction routed to Chat: {} calls there, {} escalations",
+            c.chat_calls, c.escalations
+        )
+    });
+    Ability::build("desktop hard query", POINTER_SCROLL, &graded, &h, &c, fails)
 }
 
 // ---------------------------------------------------------------------------
@@ -2007,6 +2499,7 @@ pub async fn run_all_for(run: Run) -> Vec<Ability> {
         desktop_open_and_search(run).await,
         desktop_find_and_click(run).await,
         desktop_clipped_tail(run).await,
+        desktop_hard_query(run).await,
     ]
 }
 
@@ -2035,6 +2528,10 @@ mod tests {
             inspections: 2,
             budget_drops: 1,
             escalations: 1,
+            target_action: REMEMBER_FACT,
+            target_proposed: true,
+            legal_size: 8,
+            bits: 3.0,
             detail: detail.into(),
         };
         let table = render_table(&[
@@ -2058,6 +2555,48 @@ mod tests {
         for heading in ["clipped", "insp", "drops", "esc"] {
             assert!(table.contains(heading), "{heading} missing from:\n{table}");
         }
+        // M10 T0.4: the column and the summed line, both.
+        assert!(table.contains("BoR"), "{table}");
+        assert!(table.contains("3.00"), "log2(8) per row:\n{table}");
+        assert!(
+            table.contains("Bits-over-Random: 6.00 bits over 2 abilities (3.00 mean)"),
+            "the summed line is what a narrowing is judged on:\n{table}"
+        );
+    }
+
+    /// A miss and a one-action legal set both read zero, and the miss says
+    /// which `n` it missed out of — the two ways BoR refuses to flatter.
+    #[test]
+    fn a_missed_target_prints_its_legal_set_size_and_zero_bits() {
+        let mut r = Ability {
+            ability: "desktop hard query",
+            passed: false,
+            turns: 1,
+            requests: 2,
+            prompt_chars: 0,
+            prompt_tokens: 0,
+            peak_chars: 0,
+            tool_calls: 1,
+            recall_fired: false,
+            recall_hits: 0,
+            flags: 0,
+            clipped_chars: 1,
+            inspections: 0,
+            budget_drops: 0,
+            escalations: 0,
+            target_action: POINTER_SCROLL,
+            target_proposed: false,
+            legal_size: 16,
+            bits: 0.0,
+            detail: "pointer_scroll never ran".into(),
+        };
+        let table = render_table(std::slice::from_ref(&r));
+        assert!(table.contains("16!"), "a miss names its n:\n{table}");
+        assert!(table.contains("0.00"), "{table}");
+        // And a legal set of one is worth nothing however certain the pick.
+        r.target_proposed = true;
+        r.legal_size = 1;
+        assert_eq!(bits_over_random(r.target_proposed, r.legal_size), 0.0);
     }
 
     /// `ns-app eval` diffs two ledger rows position by position and the test
@@ -2065,7 +2604,7 @@ mod tests {
     /// returns a different number of rows or reorders them. Memory first,
     /// desktop after: the order is the file's and the ledger's.
     #[tokio::test]
-    async fn run_all_returns_the_nine_abilities_in_a_fixed_order() {
+    async fn run_all_returns_the_ten_abilities_in_a_fixed_order() {
         let names: Vec<&str> = run_all().await.iter().map(|r| r.ability).collect();
         assert_eq!(
             names,
@@ -2079,7 +2618,55 @@ mod tests {
                 "desktop open-and-search",
                 "desktop find-and-click",
                 "desktop clipped tail",
+                "desktop hard query",
             ]
+        );
+    }
+
+    /// **The point of the hard-query fixture** (M10 T0.3).
+    ///
+    /// It passes on today's full legal set and fails with `pointer_scroll`
+    /// out of it. Both halves are the assertion: a fixture that only passed
+    /// would prove nothing about depth, and one that only failed would be
+    /// broken. This is what lets P2's narrowing be judged rather than
+    /// assumed — tool-loading §1.3's "0% on hard queries" shows up here as a
+    /// red row instead of as a capability that quietly stopped existing.
+    #[tokio::test]
+    async fn the_hard_query_ability_fails_when_its_tool_is_withheld() {
+        let full = desktop_hard_query(Run::default()).await;
+        assert!(
+            full.passed,
+            "the hard query must pass on the full set: {}",
+            full.detail
+        );
+        // It is the *tool* that carries it, so the full arm's BoR has to be
+        // a real choice out of a real legal set rather than a set of one.
+        assert!(full.target_proposed && full.legal_size > 1, "{full:?}");
+        assert!(full.bits > 0.0, "{full:?}");
+
+        let narrowed = desktop_hard_query(Run {
+            withhold: &[POINTER_SCROLL],
+            ..Run::default()
+        })
+        .await;
+        assert!(
+            !narrowed.passed,
+            "withholding pointer_scroll must fail the ability, or it guards nothing: {narrowed:?}"
+        );
+        assert!(
+            narrowed.detail.contains("pointer_scroll never ran"),
+            "and it must fail on the missing action, not on some side effect: {}",
+            narrowed.detail
+        );
+        // Chance-corrected, the withheld arm scores nothing: the target was
+        // never proposed because it was never offered.
+        assert!(!narrowed.target_proposed, "{narrowed:?}");
+        assert_eq!(narrowed.bits, 0.0, "{narrowed:?}");
+        assert!(
+            narrowed.legal_size < full.legal_size,
+            "the narrowed arm really was narrower: {} vs {}",
+            narrowed.legal_size,
+            full.legal_size
         );
     }
 

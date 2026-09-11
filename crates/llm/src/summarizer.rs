@@ -11,10 +11,41 @@ Reply with JSON only: {\"topic\": \"<one sentence: what the user is trying to do
 questions or unconfirmed requests>\"]}. Keep every string short and plain. Do not repeat the \
 known facts. Do not invent anything absent from the input.";
 
+/// The fixed fields, as a JSON schema (M11 T0.5). The same three the prompt
+/// asks for and [`nscore::SummaryDraft`] deserializes — written twice on
+/// purpose: the prompt is what a model without structured output reads, this
+/// is what a provider that has it enforces, and both must describe the same
+/// object or the fence parser and the schema path would disagree.
+pub fn summary_schema() -> serde_json::Value {
+    serde_json::json!({
+        "name": "summary",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "established": {"type": "array", "items": {"type": "string"}},
+                "open": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["topic", "established", "open"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// The summarizer's output is three short lists; the engine clamps it anyway.
+pub const MAX_TOKENS: u32 = 400;
+
+/// The request shape this summarizer has always sent (M11 T0.2).
+pub fn default_shape() -> crate::provider::RequestShape {
+    crate::provider::RequestShape::pinned(MAX_TOKENS)
+}
+
 pub struct CloudSummarizer {
     client: OpenRouterClient,
     model: String,
-    max_tokens: u32,
+    shape: crate::provider::RequestShape,
+    structured_output: bool,
     guidelines: Vec<String>,
 }
 
@@ -23,9 +54,26 @@ impl CloudSummarizer {
         Self {
             client,
             model,
-            max_tokens: 400,
+            shape: default_shape(),
+            structured_output: false,
             guidelines: Vec::new(),
         }
+    }
+
+    /// `[llm.summarizer]`'s shaping fields, already resolved against the
+    /// model id (M11 T0.2). Unset everywhere is [`default_shape`].
+    pub fn with_shape(mut self, shape: crate::provider::RequestShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// Send `response_format: json_schema` (M11 T0.5). On only where the
+    /// preset advertises it ([`crate::provider::Provider::structured_output`]),
+    /// because a provider that does not know the field may 400 on it. Off is
+    /// the request this summarizer has always sent.
+    pub fn with_structured_output(mut self, on: bool) -> Self {
+        self.structured_output = on;
+        self
     }
 
     /// `[memory] summary_guidelines` (M9 T5.2) — hand-written lines appended
@@ -99,15 +147,23 @@ impl Summarizer for CloudSummarizer {
         &self,
         input: SummaryInput<'_>,
     ) -> Result<Option<SummaryDraft>, SummarizeError> {
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": 0,
             "messages": [
                 {"role": "system", "content": system_prompt(&self.guidelines)},
                 {"role": "user", "content": render_input(&input)},
             ],
         });
+        self.shape.apply(&mut request);
+        if self.structured_output {
+            // The prompt's JSON instruction stays: `response_format` is the
+            // belt, the instruction the braces, and `strip_fence` below
+            // still parses whatever comes back.
+            request["response_format"] = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": summary_schema(),
+            });
+        }
         let body = self
             .client
             .chat_into(request, input.usage.as_deref())
@@ -238,6 +294,136 @@ mod tests {
         assert!(at("Known facts (do not repeat):\n- user.name") < at("Previous summary:\n"));
         assert!(at("Previous summary:") < at("Turns to fold in:\n[t1] user: hi"));
         assert!(user.contains("[t2] user: what time is it"));
+    }
+
+    fn input_of<'a>(recs: &'a [TurnRecord], caps: &'a Caps) -> nscore::SummaryInput<'a> {
+        nscore::SummaryInput {
+            previous: None,
+            records: recs,
+            caps,
+            facts: &[],
+            usage: None,
+        }
+    }
+
+    /// M11 T0.2. The summarizer takes the same shape as the other two roles:
+    /// `sampling = "none"` removes the key, effort rides as a block, and the
+    /// role's `max_tokens` replaces its constant.
+    #[tokio::test]
+    async fn the_summarizer_takes_the_same_shape() {
+        let mock = MockTransport::new(vec![Ok(reply(
+            "{\"topic\": \"t\", \"established\": [], \"open\": []}",
+        ))]);
+        let (shape, coercion) = crate::provider::RoleShaping {
+            reasoning: Some("low".into()),
+            max_tokens: Some(1024),
+            ..Default::default()
+        }
+        .resolve(
+            "summarizer",
+            "anthropic/claude-sonnet-5",
+            crate::summarizer::default_shape(),
+        );
+        assert!(coercion.is_some());
+        let s = CloudSummarizer::new(
+            OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1),
+            "anthropic/claude-sonnet-5".into(),
+        )
+        .with_shape(shape);
+        let recs = records();
+        let caps = Caps::default();
+        s.summarize(input_of(&recs, &caps)).await.unwrap().unwrap();
+        let req = mock.requests.lock().unwrap()[0].clone();
+        assert!(req.get("temperature").is_none(), "{req}");
+        assert_eq!(req["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(req["max_tokens"], 1024);
+    }
+
+    /// M11 T0.5. The field goes out where the preset says the endpoint knows
+    /// it, and nowhere else — an unknown top-level field is a 400 on several
+    /// of the presets this workspace ships.
+    #[tokio::test]
+    async fn structured_output_is_sent_only_where_the_preset_advertises_it() {
+        async fn request_with(on: bool) -> serde_json::Value {
+            let mock = MockTransport::new(vec![Ok(reply(
+                "{\"topic\": \"Asking the time.\", \"established\": [\"time given\"], \"open\": []}",
+            ))]);
+            let s = CloudSummarizer::new(
+                OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1),
+                "m".into(),
+            )
+            .with_structured_output(on);
+            let recs = records();
+            let caps = Caps::default();
+            s.summarize(input_of(&recs, &caps)).await.unwrap().unwrap();
+            let req = mock.requests.lock().unwrap()[0].clone();
+            req
+        }
+        // Default off: the request is the one that has always gone out.
+        let off = request_with(false).await;
+        assert!(off.get("response_format").is_none(), "{off}");
+        assert_eq!(off["temperature"], 0);
+        assert_eq!(off["max_tokens"], 400);
+
+        let on = request_with(true).await;
+        assert_eq!(on["response_format"]["type"], "json_schema");
+        let js = &on["response_format"]["json_schema"];
+        assert_eq!(js["name"], "summary");
+        assert_eq!(js["strict"], true);
+        assert_eq!(js["schema"]["additionalProperties"], false);
+        assert_eq!(
+            js["schema"]["required"],
+            serde_json::json!(["topic", "established", "open"])
+        );
+        assert_eq!(js["schema"]["properties"]["topic"]["type"], "string");
+        assert_eq!(
+            js["schema"]["properties"]["open"]["items"]["type"],
+            "string"
+        );
+        // The prompt still carries the instruction: the schema is the belt,
+        // not a replacement for the braces.
+        let system = on["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Reply with JSON only"), "{system}");
+        // Only the two presets that advertise it get it.
+        for p in crate::provider::PROVIDERS {
+            assert_eq!(
+                p.structured_output,
+                p.name == "openrouter" || p.name == "openai"
+            );
+        }
+    }
+
+    /// M11 T0.5's exit criterion: identical `SummaryDraft` from both paths —
+    /// a bare object (what the schema path returns) and a fenced one (what a
+    /// prompt-forced model returns).
+    #[tokio::test]
+    async fn a_fenced_reply_still_parses() {
+        async fn draft_of(content: &str, structured: bool) -> SummaryDraft {
+            let mock = MockTransport::new(vec![Ok(reply(content))]);
+            let s = CloudSummarizer::new(
+                OpenRouterClient::new(mock, "k".into()).with_retry(1, 1),
+                "m".into(),
+            )
+            .with_structured_output(structured);
+            let recs = records();
+            let caps = Caps::default();
+            s.summarize(input_of(&recs, &caps)).await.unwrap().unwrap()
+        }
+        let bare = draft_of(
+            "{\"topic\": \"Asking the time.\", \"established\": [\"time given\"], \"open\": []}",
+            true,
+        )
+        .await;
+        let fenced = draft_of(
+            "```json\n{\"topic\": \"Asking the time.\", \"established\": [\"time given\"], \
+             \"open\": []}\n```",
+            true,
+        )
+        .await;
+        assert_eq!(bare.topic, fenced.topic);
+        assert_eq!(bare.established, fenced.established);
+        assert_eq!(bare.open, fenced.open);
+        assert_eq!(fenced.topic, "Asking the time.");
     }
 
     /// See the emitter's twin: the input's sink takes the call's cost, the

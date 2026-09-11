@@ -14,3 +14,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 arc-swap = { workspace = true }
+
+# M8 Phase 3's tier rule is about what a *turn* dials, and the only store
+# with a hybrid path is the sqlite one. A double with a hand-written
+# `search_turns_hybrid` would be a test of the double.
+[dev-dependencies]
+ns-memory-sqlite = { path = "../memory-sqlite" }
+tempfile = { workspace = true }

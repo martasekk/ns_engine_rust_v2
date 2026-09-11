@@ -38,6 +38,66 @@ provider = "openrouter"
 # [llm.replier]
 # model = "openrouter/free"
 
+# ── Per-role request shape ────────────────────────────────────────────────
+# Four optional fields per role; every one unset (the default) sends the
+# request this engine has always sent.
+#
+#   reasoning   "low" | "medium" | "high" — OpenRouter's reasoning effort.
+#   max_tokens  output cap. Unset: emitter and replier 4096, summarizer 400.
+#   sampling    "default" (temperature 0 where the role had one) or "none"
+#               (no sampling param at all — not a different value, no key).
+#   thinking    false sends reasoning {"enabled": false}, for models that
+#               reason by default where a tool call is wanted instead.
+#
+# Claude Sonnet 5 rejects temperature/top_p/top_k and manual thinking budgets
+# with a 400, so any `anthropic/claude-sonnet-5*` id defaults sampling to
+# "none" on its own and says so at startup. These are the recommended shapes
+# for it — the emitter's job is one tool call, the replier's is the prose:
+#
+#   [llm.emitter]
+#   model = "anthropic/claude-sonnet-5"
+#   reasoning = "low"
+#   max_tokens = 2048
+#
+#   [llm.replier]
+#   model = "anthropic/claude-sonnet-5"
+#   reasoning = "medium"
+#   max_tokens = 4096
+#
+#   [llm.summarizer]
+#   model = "anthropic/claude-sonnet-5"
+#   reasoning = "low"
+#   max_tokens = 1024
+#
+# OpenAI GPT-5.6 Luna is the cost-efficient default: it accepts `temperature`
+# (no safety net needed) and honours the reasoning block, at $0.20 / $1.20 per
+# MTok against Sonnet's $2 / $10. `reasoning = "low"` in all three roles is
+# what the M11 measurement ran; the emitter's job is one tool call, the
+# replier's is the prose, and 1024 is enough for the summarizer's four fields:
+#
+#   [llm.emitter]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 2048
+#
+#   [llm.replier]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 4096
+#
+#   [llm.summarizer]
+#   model = "openai/gpt-5.6-luna"
+#   reasoning = "low"
+#   max_tokens = 1024
+#
+# A local Qwen3 thinks by default and will spend the whole output budget on
+# it before the tool call; the emitter switches that off and keeps its
+# pinned temperature:
+#
+#   [llm.emitter]
+#   model = "ollama:qwen3:8b"
+#   thinking = false
+
 [engine]
 max_iterations = 5
 max_emit_retries = 3

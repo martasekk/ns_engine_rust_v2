@@ -265,6 +265,37 @@ pub struct SessionDigest {
     pub at: crate::event::Timestamp,
 }
 
+/// What a store needs from a model to run the hybrid path (M8 §6).
+///
+/// It lives here, in the crate with no dependencies, for one reason: the
+/// client that implements it is `nsevolution::LocalEvaluator`, which carries
+/// `reqwest`, the retry table and the "disable after two unreachable calls"
+/// rule, and `ns-memory-sqlite` must not grow an HTTP stack to use it. A
+/// trait in `ns-core` lets `app/` hand the one existing client to the store
+/// rather than a second one being written beside it.
+///
+/// `model` is not decoration. A stored vector records which model produced
+/// it, so switching the embedder **invalidates** rather than silently mixes
+/// two geometries in one index — the failure that looks like a retriever
+/// quietly getting worse.
+#[async_trait]
+pub trait TextEncoder: Send + Sync {
+    /// The embedder's name, stored beside every vector it produces.
+    fn model(&self) -> &str;
+    /// Embed each text. `kind` is "query" or "passage" — E5-family models
+    /// want the matching prefix, and nsmodels applies it per model, so the
+    /// only thing a caller must get right is not to mix the two.
+    async fn embed(&self, texts: &[String], kind: &str) -> Result<Vec<Vec<f32>>, StoreError>;
+    /// Cross-encoder scores for `docs` against `query`, best first, as
+    /// `(index into docs, score)`.
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, StoreError>;
+}
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn append(&self, session: &SessionId, events: &[Event]) -> Result<(), StoreError>;
@@ -284,6 +315,59 @@ pub trait MemoryStore: Send + Sync {
     /// a real index overrides it with a single query, because recall runs on
     /// the hot path and `recall_sessions` is 3 today only because nothing
     /// cheaper existed.
+    /// The hybrid path (M8 T3.2): lexical candidates ∪ vector candidates,
+    /// fused by rank, reranked by a cross-encoder, top `k`.
+    ///
+    /// A default that *is* the lexical path, so the four implementors need no
+    /// change and so the contract is stated once: **with no encoder, no
+    /// stored vectors, or a service that does not answer, this returns
+    /// exactly what `search_turns_in` returns — same order, same count.** The
+    /// hybrid arm can only ever be an addition on top of a list that already
+    /// exists, which is what makes it safe to reach for on the hot path.
+    ///
+    /// Only the `Task`/`Deep` tier calls it (T3.3). `Chat` recall stays
+    /// lexical, so a conversational turn never dials a model.
+    async fn search_turns_hybrid(
+        &self,
+        sessions: &[SessionId],
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<TurnHit>, StoreError> {
+        self.search_turns_in(sessions, query, k).await
+    }
+
+    /// Embed up to `limit` rows that have no vector for the current model
+    /// (M8 T3.1), returning how many were embedded.
+    ///
+    /// Called from the **idle pass and never from a turn**: an embedding is a
+    /// network round trip per batch, and a turn that waited for one would be
+    /// paying a recall cost at exactly the moment it has none to spare. `0`
+    /// back means there is nothing left to do, which is what makes the
+    /// backfill resumable — a second run over the same log embeds nothing.
+    ///
+    /// The default embeds nothing, for every store without an index.
+    async fn backfill_embeddings(&self, limit: usize) -> Result<usize, StoreError> {
+        let _ = limit;
+        Ok(0)
+    }
+
+    /// The `k` digests of `scope` nearest `query` by cosine over their stored
+    /// embeddings (M10 T3.6, the exemplars step).
+    ///
+    /// Distinct from `search_digests`, which is lexical: an exemplar is "a
+    /// conversation like this one", and likeness is the one question a
+    /// bm25 index cannot answer. Empty without an encoder or without stored
+    /// digest vectors, and an empty list is a step that did not happen.
+    async fn nearest_digests(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<SessionDigest>, StoreError> {
+        let _ = (scope, query, k);
+        Ok(vec![])
+    }
+
     async fn search_turns_in(
         &self,
         sessions: &[SessionId],
@@ -393,6 +477,29 @@ pub trait MemoryStore: Send + Sync {
         query: &str,
         k: usize,
     ) -> Result<Vec<Fact>, StoreError>;
+    /// The hybrid facts path (M11 T1.1): `lexical_rank` candidates ∪ cosine
+    /// candidates, fused by rank, reranked by a cross-encoder, top `k`.
+    ///
+    /// A default that *is* `search_facts`, for [`Self::search_turns_hybrid`]'s
+    /// reasons exactly: the four implementors need no change, and the
+    /// contract is stated once — **with no encoder, no stored fact vectors,
+    /// or a service that does not answer, this returns exactly what
+    /// `search_facts` returns, same order, same count.** The hybrid arm is
+    /// only ever an addition on top of a list that already exists.
+    ///
+    /// Its own method rather than a knob inside `search_facts` because
+    /// `search_facts` is on every turn's context path and the hybrid arm is
+    /// not: the caller decides, from what it knows about the tier and the
+    /// config, and a store cannot be made to dial a model by a caller that
+    /// did not ask for it.
+    async fn search_facts_hybrid(
+        &self,
+        scope: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Fact>, StoreError> {
+        self.search_facts(scope, query, k).await
+    }
     /// Every scope holding at least one fact row.
     async fn scopes(&self) -> Result<Vec<String>, StoreError>;
     async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError>;
