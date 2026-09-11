@@ -126,6 +126,7 @@ pub async fn measure(block: Ablate, activation_weight: f32) -> Report {
     let arm = |ablate| Run {
         ablate,
         activation_weight,
+        ..Run::default()
     };
     let full = run_all_for(arm(None)).await;
     let ablated = run_all_for(arm(Some(block))).await;
@@ -260,6 +261,10 @@ mod tests {
             inspections: 0,
             budget_drops: 0,
             escalations: 0,
+            target_action: "remember_fact",
+            target_proposed: passed,
+            legal_size: 8,
+            bits: crate::eval::bits_over_random(passed, 8),
             detail: if passed {
                 String::new()
             } else {

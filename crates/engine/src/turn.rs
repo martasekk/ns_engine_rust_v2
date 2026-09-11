@@ -264,6 +264,26 @@ fn explain_error(detail: &str) -> String {
     )
 }
 
+/// Every action the engine itself puts in a legal set, in one list.
+///
+/// The registry holds the tools a deployment wired in; these seven are
+/// compiled in, and a report that prices a recorded tool array needs both or
+/// it can price neither (M10 T0.1). Exposed as specs rather than as names
+/// because the price is the schema, not the label. Nothing here is a
+/// statement about which of them were *legal* on any given call — that is
+/// what the manifest's `tool_names` records.
+pub fn synthetic_specs() -> Vec<nscore::ActionSpec> {
+    vec![
+        ask_clarification_spec(),
+        confirm_pending_spec(),
+        remember_fact_spec(),
+        forget_fact_spec(),
+        forget_all_spec(),
+        recall_spec(),
+        inspect_result_spec(),
+    ]
+}
+
 /// Engine-owned synthetic action: ask the user one question (spec §5.1).
 pub const ASK_CLARIFICATION: &str = "ask_clarification";
 
@@ -1122,8 +1142,16 @@ impl Engine {
                 .take(ctx.guidance.len())
                 .map(|(h, _)| h.clone())
                 .collect();
+            // The names, not just the count (M10 T0.1): `tools_tokens` says
+            // what the array cost and nothing about which tool carried it,
+            // and the whole of P1 is a decision about which text to cut.
+            // `respond_directly` is absent because it is not in the legal
+            // set — `build_tools` appends it, and a report adds it back the
+            // same way.
+            let tool_names: Vec<String> =
+                legal.actions.iter().map(|s| s.name.clone()).collect();
             let mut manifest =
-                emitter_manifest(&ctx, legal.actions.len(), clipped_chars, note_hashes);
+                emitter_manifest(&ctx, tool_names, clipped_chars, note_hashes);
             manifest.budget = Some(budget);
             manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);

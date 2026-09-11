@@ -97,113 +97,142 @@ fn xy_schema(extra: serde_json::Value) -> serde_json::Value {
     base
 }
 
-impl PointerTool {
-    fn new(act: Act, shared: Shared) -> Self {
-        let (name, description, side_effect, args_schema) = match act {
-            Act::Screens => (
-                "pointer_screens",
-                "List the remote machine's displays: id, pixel bounds, DPI scale, which is \
+/// Every desktop action, as specs, with no connection and no daemon (M10
+/// T0.1). `ns-app budget` prices a recorded tool array from the names in the
+/// manifest, and it has to do that on a box where the pointer daemon is not
+/// running — the log is the measurement, not the machine.
+pub fn specs() -> Vec<ActionSpec> {
+    [
+        Act::Screens,
+        Act::Position,
+        Act::Move,
+        Act::Click,
+        Act::Scroll,
+        Act::Type,
+        Act::ClipRead,
+        Act::ClipWrite,
+        Act::UiRead,
+        Act::UiFind,
+    ]
+    .into_iter()
+    .map(spec_of)
+    .collect()
+}
+
+/// The one place an action's name, description and argument schema are
+/// written. Split out of `PointerTool::new` so a spec can be had without a
+/// session; `new` still goes through it, so the two cannot drift.
+fn spec_of(act: Act) -> ActionSpec {
+    let (name, description, side_effect, args_schema) = match act {
+        Act::Screens => (
+            "pointer_screens",
+            "List the remote machine's displays: id, pixel bounds, DPI scale, which is \
                  primary. Call before using absolute coordinates.",
-                SideEffect::Pure,
-                serde_json::json!({"type": "object", "properties": {}}),
-            ),
-            Act::Position => (
-                "pointer_position",
-                "Where the remote pointer is now.",
-                SideEffect::Pure,
-                serde_json::json!({"type": "object", "properties": {}}),
-            ),
-            Act::Move => (
-                "pointer_move",
-                "Move the remote pointer. Does not click.",
-                SideEffect::Reversible,
-                xy_schema(serde_json::json!({})),
-            ),
-            Act::Click => (
-                "pointer_click",
-                "Click on the remote machine. Irreversible: whatever is under the pointer \
+            SideEffect::Pure,
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        Act::Position => (
+            "pointer_position",
+            "Where the remote pointer is now.",
+            SideEffect::Pure,
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        Act::Move => (
+            "pointer_move",
+            "Move the remote pointer. Does not click.",
+            SideEffect::Reversible,
+            xy_schema(serde_json::json!({})),
+        ),
+        Act::Click => (
+            "pointer_click",
+            "Click on the remote machine. Irreversible: whatever is under the pointer \
                  will be activated.",
-                SideEffect::Irreversible,
-                xy_schema(serde_json::json!({
-                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
-                    "count": {"type": "integer", "description": "2 to double-click."},
-                })),
-            ),
-            Act::Scroll => (
-                "pointer_scroll",
-                "Scroll the remote machine in notches. Positive dy scrolls down.",
-                SideEffect::Reversible,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"dx": {"type": "integer"}, "dy": {"type": "integer"}},
-                    "required": ["dy"]
-                }),
-            ),
-            Act::Type => (
-                "pointer_type",
-                "Type text, or press a key, on the remote machine. Irreversible: it goes to \
+            SideEffect::Irreversible,
+            xy_schema(serde_json::json!({
+                "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                "count": {"type": "integer", "description": "2 to double-click."},
+            })),
+        ),
+        Act::Scroll => (
+            "pointer_scroll",
+            "Scroll the remote machine in notches. Positive dy scrolls down.",
+            SideEffect::Reversible,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"dx": {"type": "integer"}, "dy": {"type": "integer"}},
+                "required": ["dy"]
+            }),
+        ),
+        Act::Type => (
+            "pointer_type",
+            "Type text, or press a key, on the remote machine. Irreversible: it goes to \
                  whatever has focus. Use `text` for characters and `key` (with optional \
                  `modifiers`) for Enter, F5 or a shortcut like ctrl+c.",
-                SideEffect::Irreversible,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "key": {"type": "string"},
-                        "modifiers": {"type": "array", "items": {"type": "string"}},
-                    }
-                }),
-            ),
-            Act::ClipRead => (
-                "pointer_clipboard_read",
-                "Read the remote machine's clipboard. With ctrl+a then ctrl+c, this reads a \
+            SideEffect::Irreversible,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "key": {"type": "string"},
+                    "modifiers": {"type": "array", "items": {"type": "string"}},
+                }
+            }),
+        ),
+        Act::ClipRead => (
+            "pointer_clipboard_read",
+            "Read the remote machine's clipboard. With ctrl+a then ctrl+c, this reads a \
                  text field or document without a screenshot.",
-                SideEffect::Pure,
-                serde_json::json!({"type": "object", "properties": {}}),
-            ),
-            Act::ClipWrite => (
-                "pointer_clipboard_write",
-                "Replace the remote machine's clipboard, then paste it with pointer_type \
+            SideEffect::Pure,
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        Act::ClipWrite => (
+            "pointer_clipboard_write",
+            "Replace the remote machine's clipboard, then paste it with pointer_type \
                  key=v modifiers=[ctrl]. Prefer this to typing anything long.",
-                SideEffect::Reversible,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}},
-                    "required": ["text"]
-                }),
-            ),
-            Act::UiRead => (
-                "pointer_ui_read",
-                "The remote machine's controls as text — role, name and a clickable point \
+            SideEffect::Reversible,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            }),
+        ),
+        Act::UiRead => (
+            "pointer_ui_read",
+            "The remote machine's controls as text — role, name and a clickable point \
                  each. Prefer this to guessing coordinates. Anything blocking the screen is \
                  listed first under MODAL.",
-                SideEffect::Pure,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}}
-                }),
-            ),
-            Act::UiFind => (
-                "pointer_ui_find",
-                "Find a control by name and get the point to click. The route to a click \
+            SideEffect::Pure,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}}
+            }),
+        ),
+        Act::UiFind => (
+            "pointer_ui_find",
+            "Find a control by name and get the point to click. The route to a click \
                  that does not involve guessing pixels.",
-                SideEffect::Pure,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "required": ["name"]
-                }),
-            ),
-        };
+            SideEffect::Pure,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }),
+        ),
+    };
+    ActionSpec {
+        name: name.into(),
+        description: description.into(),
+        args_schema,
+        side_effect,
+        residual_policy: Default::default(),
+        dedupe_tag: None,
+    }
+}
+
+impl PointerTool {
+    fn new(act: Act, shared: Shared) -> Self {
         Self {
-            spec: ActionSpec {
-                name: name.into(),
-                description: description.into(),
-                args_schema,
-                side_effect,
-                residual_policy: Default::default(),
-                dedupe_tag: None,
-            },
+            spec: spec_of(act),
             act,
             shared,
         }

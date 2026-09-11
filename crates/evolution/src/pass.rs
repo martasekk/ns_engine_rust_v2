@@ -121,6 +121,12 @@ pub struct Report {
     pub consolidation: crate::consolidate::ConsolidationReport,
     /// M9 T4.3 fitness numbers, derived from the log on every run.
     pub fitness: crate::fitness::FitnessReport,
+    /// Rejected proposals bucketed by the guard that fired, summed over
+    /// every session this pass read (M10 T0.2). A rejection is a request
+    /// already spent, and the pass is the only place that sees every session
+    /// at once — which is what makes the rate comparable between runs, and
+    /// what makes it the instrument M10's prompt-side loop fix is graded on.
+    pub rejections: nscore::RejectionTally,
 }
 
 impl std::fmt::Display for Report {
@@ -180,6 +186,11 @@ impl std::fmt::Display for Report {
                 n.exposures, n.credits
             )?;
         }
+        // M10 T0.2. Printed next to the signatures because it is the same
+        // kind of number and the cheaper one: a signature says a turn went
+        // wrong, this says how much of the day's request budget the harness
+        // spent finding out.
+        writeln!(f, "rejections by reason: {}", self.rejections.line())?;
         writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
@@ -409,6 +420,14 @@ impl EvolutionPass {
         for (sid, events) in &sessions {
             sigs.extend(mine(sid, events, &self.known_specs));
             sigs.extend(evaluate(sid, events, &self.cfg.evaluate));
+            // M10 T0.2: the same tally `ns-app budget` prints per session,
+            // summed over the pass's sessions. Free — it is one walk of
+            // events already in memory, and it needs no model.
+            let t = nscore::tally_rejections(events);
+            report.rejections.proposals += t.proposals;
+            for (reason, n) in t.by_reason {
+                *report.rejections.by_reason.entry(reason).or_default() += n;
+            }
         }
         // 4b. Grade (M8 T2.3a, M9 T1.1/T1.3).
         //

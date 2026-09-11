@@ -149,6 +149,95 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Rejected proposals bucketed by the guard or parse step that fired, and
+/// the proposals they are rated against (M10 T0.2).
+///
+/// Every rejection is a request already spent — the emitter was called, the
+/// provider answered, and the answer was thrown away — so the count that
+/// matters is not "how many rejections" but "how many per hundred things the
+/// emitter proposed". On the recorded 21-turn desktop log that rate is 11.1,
+/// and six of the nine are `repeat_gate`: the model re-proposing a call the
+/// trace already shows as done. Which bucket is largest decides what to fix,
+/// and the buckets are different fixes — a `repeat_gate` loop is prompt-side,
+/// a `Malformed` is the schema, an `IllegalAction` is the legal set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RejectionTally {
+    /// `Proposed` events, the denominator. Every one of them cost a request.
+    pub proposals: usize,
+    /// Reason label to count, ordered by label so a report is stable; the
+    /// rendered line reorders by size.
+    pub by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+impl RejectionTally {
+    pub fn rejections(&self) -> usize {
+        self.by_reason.values().sum()
+    }
+
+    /// Rejections per hundred proposals, or `None` when nothing was
+    /// proposed — a rate over an empty denominator is not zero, it is
+    /// absent, and printing `0.0` would read as a session that proposed
+    /// cleanly.
+    pub fn per_hundred(&self) -> Option<f64> {
+        (self.proposals > 0).then(|| 100.0 * self.rejections() as f64 / self.proposals as f64)
+    }
+
+    /// Largest bucket first, ties by label, then the rate. One line, because
+    /// both readers of it (`ns-app budget`'s footer and the evolution pass's
+    /// report) print it among other one-line numbers.
+    pub fn line(&self) -> String {
+        if self.proposals == 0 {
+            return "no proposals in this log".to_string();
+        }
+        let rate = self.per_hundred().unwrap_or_default();
+        if self.by_reason.is_empty() {
+            return format!("none — 0.0 per 100 proposals ({} proposed)", self.proposals);
+        }
+        let mut buckets: Vec<(&String, &usize)> = self.by_reason.iter().collect();
+        buckets.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let list: Vec<String> = buckets.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        format!(
+            "{} \u{2014} {rate:.1} per 100 proposals ({} proposed)",
+            list.join(", "),
+            self.proposals
+        )
+    }
+}
+
+/// The bucket one rejection falls in. A `GuardDenied` is labelled by the
+/// guard that fired, because "GuardDenied 6" names no fix; the other three
+/// are labelled by the variant, because the variant *is* the step that
+/// failed.
+pub fn reject_bucket(reason: &crate::action::RejectReason) -> String {
+    match reason {
+        crate::action::RejectReason::GuardDenied { guard, .. } => guard.clone(),
+        crate::action::RejectReason::IllegalAction { .. } => "IllegalAction".to_string(),
+        crate::action::RejectReason::Malformed { .. } => "Malformed".to_string(),
+        crate::action::RejectReason::ProviderUnavailable { .. } => {
+            "ProviderUnavailable".to_string()
+        }
+    }
+}
+
+/// Count `Proposed` and bucket `Rejected` over one session's events.
+///
+/// Pure over the slice so both callers share one definition of the number:
+/// a rate that meant one thing in `ns-app budget` and another in the
+/// evolution pass would be worse than no rate at all.
+pub fn tally_rejections(events: &[Event]) -> RejectionTally {
+    let mut tally = RejectionTally::default();
+    for e in events {
+        match &e.kind {
+            EventKind::Proposed { .. } => tally.proposals += 1,
+            EventKind::Rejected { reason, .. } => {
+                *tally.by_reason.entry(reject_bucket(reason)).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    tally
+}
+
 /// Serialize [u8; 32] as lowercase hex.
 pub(crate) mod hash_serde {
     use serde::{Deserialize, Deserializer, Serializer};

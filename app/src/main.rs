@@ -12,6 +12,23 @@ use std::sync::Arc;
 
 type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
 
+/// Every spec `ns-app budget` can price a recorded tool array with (M10
+/// T0.1): the engine's seven synthetic actions, the desktop set, and the one
+/// built-in tool. Deliberately *not* `build_tools` — that dials the pointer
+/// daemon and reads the http component config, and `budget` reads a log on a
+/// box where neither has to be up. A name the snapshot does not hold prints
+/// `n/a` rather than a guess.
+fn budget_specs() -> Vec<nscore::ActionSpec> {
+    let mut specs = nsengine::turn::synthetic_specs();
+    specs.extend(nscomponents_std::pointer_tool::specs());
+    specs.push(
+        nscomponents_std::time_tool::GetTimeTool::new()
+            .spec()
+            .clone(),
+    );
+    specs
+}
+
 async fn build_tools(cfg: &AppConfig) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> =
         vec![Arc::new(nscomponents_std::time_tool::GetTimeTool::new())];
@@ -422,6 +439,7 @@ async fn main() {
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
                 cfg.persona.text.len(),
+                &budget_specs(),
             )
         );
         return;

@@ -205,6 +205,28 @@ const MEASURED_COLUMNS: &[(&str, usize)] = &[
     ("tools", 7),
 ];
 
+/// One line of the per-tool table (M10 T0.1).
+#[derive(Default)]
+struct ToolRow {
+    name: String,
+    /// Calls this tool rode on. Not tool *calls*: a schema is paid for on
+    /// every request that carried it, whether or not the model chose it, and
+    /// the tools nobody chooses are the ones P1 is looking for.
+    calls: usize,
+    /// `calls × schema_tokens`, or `None` when no spec for this name is in
+    /// the snapshot — a tool a deployment has since dropped, or one this
+    /// binary was not built with.
+    tokens: Option<u64>,
+}
+
+const TOOL_COLUMNS: &[(&str, usize)] = &[
+    ("tool", 26),
+    ("calls", 8),
+    ("tokens", 9),
+    ("each", 8),
+    ("share", 9),
+];
+
 const RECONSTRUCTED_COLUMNS: &[(&str, usize)] = &[
     ("turn", 7),
     ("window", 9),
@@ -229,16 +251,17 @@ pub fn render_budget(
     verbatim_lines: usize,
     tool_result_max_chars: usize,
     persona_chars: usize,
+    specs: &[nscore::ActionSpec],
 ) -> String {
     if events.is_empty() {
         return "budget: no events for this session — `ns-app dump <session_id>` shows the log.\n"
             .to_string();
     }
-    if events
+    let mut out = if events
         .iter()
         .any(|e| matches!(e.kind, EventKind::ModelCall { .. }))
     {
-        render_measured(events, persona_chars)
+        render_measured(events, persona_chars, specs)
     } else {
         render_reconstructed(
             events,
@@ -247,10 +270,20 @@ pub fn render_budget(
             verbatim_lines,
             tool_result_max_chars,
         )
-    }
+    };
+    // Printed on both paths (M10 T0.2). A rejection is a request already
+    // spent — the emitter was called and the answer thrown away — and the
+    // `Proposed`/`Rejected` pair is in every log, including the ones written
+    // before `ModelCall` existed, so the rate is readable where nothing else
+    // about cost is.
+    out.push_str(&format!(
+        "rejections by reason: {}\n",
+        nscore::tally_rejections(events).line()
+    ));
+    out
 }
 
-fn render_measured(events: &[Event], persona_chars: usize) -> String {
+fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::ActionSpec]) -> String {
     let mut rows: Vec<Measured> = Vec::new();
     for e in events {
         if !rows.iter().any(|r| r.turn == e.turn) {
@@ -339,6 +372,7 @@ fn render_measured(events: &[Event], persona_chars: usize) -> String {
         prefix_summary(&total.emitter_prefix),
         prefix_summary(&total.replier_prefix),
     ));
+    out.push_str(&render_tool_table(events, specs));
     out.push_str(&format!(
         "the free tier meters requests, not tokens: 50 a day on openrouter/free, {} spent here\n",
         total.requests
@@ -349,6 +383,145 @@ fn render_measured(events: &[Event], persona_chars: usize) -> String {
              those tokens are chars/4.\n",
         );
     }
+    out
+}
+
+/// Which tool carried how much of the session's schema bill (M10 T0.1).
+///
+/// `tools_tokens` says what the array cost and nothing about which tool cost
+/// it, and every cut M10 P1 proposes is a decision about *which text*. The
+/// names come from the manifest — what was legal on that call — and the
+/// price from `nsllm::schema`, recompiled here at report time from the same
+/// function the request was built with, so a row is the request's own bytes
+/// rather than a model of them. `respond_directly` is added once per call
+/// because `build_tools` appends it to every array; without it the table
+/// could not sum to what the call was charged.
+///
+/// The total lands within `estimate_tokens` rounding of `Σ tools_tokens` on
+/// the calls that carried names: each tool's chars/4 is floored separately,
+/// and the array's own two brackets and `n - 1` commas are in the call's
+/// number and in no row.
+fn render_tool_table(events: &[Event], specs: &[nscore::ActionSpec]) -> String {
+    let by_name: std::collections::HashMap<&str, &nscore::ActionSpec> =
+        specs.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut rows: Vec<ToolRow> = Vec::new();
+    let mut calls_with_names = 0usize;
+    let mut calls_without = 0usize;
+    let mut measured: u64 = 0;
+    for e in events {
+        let EventKind::ModelCall { usage, manifest } = &e.kind else {
+            continue;
+        };
+        if manifest.tool_names.is_empty() {
+            // A call that was sent tools but recorded no names: a log
+            // written before M10. A call that was sent none (replier,
+            // summarizer, a `Chat` turn's floor) is simply not a row.
+            if manifest.tools > 0 {
+                calls_without += 1;
+            }
+            continue;
+        }
+        calls_with_names += 1;
+        measured += u64::from(usage.tools_tokens);
+        for name in manifest
+            .tool_names
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(nsllm::schema::RESPOND_DIRECTLY))
+        {
+            let tokens = if name == nsllm::schema::RESPOND_DIRECTLY {
+                Some(u64::from(nsllm::schema::respond_directly_tokens()))
+            } else {
+                by_name
+                    .get(name)
+                    .map(|s| u64::from(nsllm::schema::schema_tokens(s)))
+            };
+            match rows.iter_mut().find(|r| r.name == name) {
+                Some(row) => {
+                    row.calls += 1;
+                    row.tokens = match (row.tokens, tokens) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        _ => None,
+                    };
+                }
+                None => rows.push(ToolRow {
+                    name: name.to_string(),
+                    calls: 1,
+                    tokens,
+                }),
+            }
+        }
+    }
+
+    if calls_with_names == 0 {
+        return format!(
+            "per-tool schemas: n/a — {} (M10 T0.1 records the names; this log predates it)\n",
+            if calls_without == 0 {
+                "no call in this session was sent a tool array".to_string()
+            } else {
+                plural(calls_without, "call") + " carried tools but recorded no names"
+            }
+        );
+    }
+
+    // Largest bill first: the table is read to decide what to shorten.
+    rows.sort_by(|a, b| b.tokens.cmp(&a.tokens).then(a.name.cmp(&b.name)));
+    let table_total: u64 = rows.iter().filter_map(|r| r.tokens).sum();
+    let unpriced = rows.iter().filter(|r| r.tokens.is_none()).count();
+
+    let mut out = String::from("\nper-tool schemas (M10 T0.1)\n\n");
+    out.push_str(&line(TOOL_COLUMNS, &headings(TOOL_COLUMNS)));
+    for r in &rows {
+        out.push_str(&line(
+            TOOL_COLUMNS,
+            &[
+                r.name.clone(),
+                r.calls.to_string(),
+                r.tokens.map(|t| t.to_string()).unwrap_or("n/a".into()),
+                r.tokens
+                    .map(|t| (t / r.calls.max(1) as u64).to_string())
+                    .unwrap_or("n/a".into()),
+                r.tokens
+                    .map(|t| percent(t, table_total))
+                    .unwrap_or("n/a".into()),
+            ],
+        ));
+    }
+    out.push_str(&line(
+        TOOL_COLUMNS,
+        &[
+            "total".to_string(),
+            calls_with_names.to_string(),
+            table_total.to_string(),
+            String::new(),
+            percent(table_total, table_total),
+        ],
+    ));
+    // The invariant, printed rather than assumed: if these two ever drift by
+    // more than the separators, the table is pricing a different array from
+    // the one that was sent.
+    out.push_str(&format!(
+        "per-tool total {table_total} tok vs {measured} measured on {} \u{2014} {} within estimate_tokens rounding\n",
+        plural(calls_with_names, "call"),
+        if table_total > measured {
+            format!("+{}", table_total - measured)
+        } else {
+            format!("-{}", measured - table_total)
+        }
+    ));
+    if unpriced > 0 {
+        out.push_str(&format!(
+            "  {} of those names has no spec in this build \u{2014} priced n/a, and out of the total\n",
+            plural(unpriced, "tool")
+        ));
+    }
+    if calls_without > 0 {
+        out.push_str(&format!(
+            "  {} carried tools before M10 recorded names and are out of this table\n",
+            plural(calls_without, "call")
+        ));
+    }
+    out.push('\n');
     out
 }
 
@@ -625,7 +798,7 @@ mod tests {
             usage("replier", 1, 800, 0),
             manifest(0, 900, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -664,7 +837,7 @@ mod tests {
             usage("replier", 1, 2_000, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         assert!(row.contains("20.0%"), "200 of 1000 emitter tokens: {row}");
@@ -699,7 +872,7 @@ mod tests {
         let mut guessed = cached("replier", 5_000, 999);
         guessed.estimated = true;
         call(&mut log, 1, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -732,7 +905,7 @@ mod tests {
             usage("summarizer", 1, 100, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         let line = out
             .lines()
@@ -762,7 +935,7 @@ mod tests {
         let mut guessed = usage("replier", 1, 100, 0);
         guessed.estimated = true;
         call(&mut log, 2, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         assert!(
             out.lines().any(|l| l.starts_with("t1 ")),
@@ -793,7 +966,7 @@ mod tests {
             },
         );
         replied(&mut log, 2, "je poledne");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         assert!(out.contains("estimated (reconstructed)"), "{out}");
         assert!(out.contains("A floor, not a measurement"), "{out}");
@@ -869,7 +1042,7 @@ mod tests {
             },
         );
         replied(&mut log, 1, "a browser window");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
 
         let t1 = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = t1.split_whitespace().collect();
@@ -886,9 +1059,249 @@ mod tests {
         );
     }
 
+    /// A spec whose schema is big enough that two of them are visibly
+    /// different sizes, so a row that mixed them up would show.
+    fn spec(name: &str, description: &str, props: serde_json::Value) -> nscore::ActionSpec {
+        nscore::ActionSpec {
+            name: name.into(),
+            description: description.into(),
+            args_schema: serde_json::json!({"type": "object", "properties": props}),
+            side_effect: nscore::SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        }
+    }
+
+    /// The exit criterion for M10 T0.1: a table built from the manifest's
+    /// names and the compiler's own bytes adds up to what the calls were
+    /// charged, within the floor in `estimate_tokens` and the array's
+    /// brackets and commas. Built the only honest way — the `tools_tokens`
+    /// on each call is measured from the real `build_tools` output, exactly
+    /// as `nsllm::client` measures it from the real request.
+    #[test]
+    fn the_tool_table_sums_to_the_sessions_tools_tokens() {
+        let specs = vec![
+            spec(
+                "pointer_click",
+                "Click on the remote machine. Irreversible: whatever is under the pointer \
+                 will be activated.",
+                serde_json::json!({
+                    "x": {"type": "number", "description": "Absolute pixel from the left."},
+                    "y": {"type": "number", "description": "Absolute pixel from the top."},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                }),
+            ),
+            spec("ask_clarification", "Ask one short question.", serde_json::json!({
+                "question": {"type": "string"}
+            })),
+            spec("recall", "Search earlier turns.", serde_json::json!({})),
+        ];
+        // Turn 1 was legal for all three, turn 2 for one — the narrowing the
+        // engine does between iterations, and the reason a per-call list is
+        // recorded rather than a per-session one.
+        let sets: [&[usize]; 3] = [&[0, 1, 2], &[0, 1, 2], &[1]];
+        let mut log = log();
+        let mut expected_calls: Vec<Vec<String>> = Vec::new();
+        for (i, set) in sets.iter().enumerate() {
+            let legal = nscore::LegalActionSet {
+                actions: set.iter().map(|&k| specs[k].clone()).collect(),
+            };
+            // What the client would have recorded for this request.
+            let tools_tokens =
+                nscore::estimate_tokens(nsllm::schema::build_tools(&legal).to_string().len());
+            let names: Vec<String> = legal.actions.iter().map(|s| s.name.clone()).collect();
+            expected_calls.push(names.clone());
+            call(
+                &mut log,
+                1 + i as u32,
+                usage("emitter", 1, 1_000, tools_tokens),
+                ContextManifest {
+                    tools: names.len(),
+                    tool_names: names,
+                    ..Default::default()
+                },
+            );
+        }
+        // A replier: no tools, so it is not a row and not in the comparison.
+        call(
+            &mut log,
+            3,
+            usage("replier", 1, 500, 0),
+            ContextManifest::default(),
+        );
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &specs);
+
+        let table: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("per-tool schemas"))
+            .collect();
+        assert!(!table.is_empty(), "no per-tool table: {out}");
+        // Calls it rode on, per tool, plus respond_directly on every call.
+        let row_of = |name: &str| -> Vec<String> {
+            table
+                .iter()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{out}"))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(row_of("pointer_click")[1], "2", "legal on two of three");
+        assert_eq!(row_of("ask_clarification")[1], "3", "legal on all three");
+        assert_eq!(row_of("recall")[1], "2");
+        assert_eq!(
+            row_of("respond_directly")[1],
+            "3",
+            "build_tools appends it to every array"
+        );
+        // Each tool's own bytes, not an apportionment of the total.
+        assert_eq!(
+            row_of("pointer_click")[3],
+            nsllm::schema::schema_tokens(&specs[0]).to_string(),
+            "per-call price is the compiler's"
+        );
+
+        // The invariant. The gap is bounded by what the array adds and the
+        // floor takes: per call, `n + 1` tools each losing under a token to
+        // the floor, against `n + 1` separator characters worth under a
+        // token in total.
+        let total_line = out
+            .lines()
+            .find(|l| l.starts_with("per-tool total"))
+            .expect("the comparison line");
+        let nums: Vec<u64> = total_line
+            .split_whitespace()
+            .filter_map(|w| w.parse::<u64>().ok())
+            .collect();
+        let (table_total, measured) = (nums[0], nums[1]);
+        let slack: u64 = expected_calls
+            .iter()
+            .map(|names| names.len() as u64 + 2)
+            .sum();
+        assert!(
+            table_total.abs_diff(measured) <= slack,
+            "table {table_total} vs measured {measured}, slack {slack}: {out}"
+        );
+        assert!(table_total > 0 && measured > 0, "{out}");
+        assert!(
+            total_line.contains("within estimate_tokens rounding"),
+            "{total_line}"
+        );
+    }
+
+    /// The other half of T0.1: the recorded 21-turn log was written before
+    /// `tool_names` and can never gain one, so the table says `n/a` and says
+    /// why, rather than printing a table of nothing.
+    #[test]
+    fn a_log_without_tool_names_prints_n_a_for_the_tool_table() {
+        let mut log = log();
+        call(
+            &mut log,
+            1,
+            usage("emitter", 1, 1_000, 731),
+            manifest(17, 0, 0),
+        );
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        assert!(out.contains("per-tool schemas: n/a"), "{out}");
+        assert!(
+            out.contains("1 call carried tools but recorded no names"),
+            "{out}"
+        );
+        // And the session-level schema number is untouched: T0.1 added a
+        // breakdown, it did not change what was measured.
+        assert!(out.contains("tool schemas: 731 of the 1000"), "{out}");
+    }
+
+    /// The exit criterion for M10 T0.2. Nine rejections against 81
+    /// proposals is 11.1 per 100 — the recorded desktop log's own shape,
+    /// with its own split: six repeat-gate loops, two illegal actions, one
+    /// malformed. The buckets are different fixes, which is why the line is
+    /// a split and not a total.
+    #[test]
+    fn rejections_are_bucketed_by_reason_and_rated_per_hundred_proposals() {
+        let mut log = log();
+        let mut proposal_ids = Vec::new();
+        for i in 0..81u32 {
+            let e = log.append(
+                1,
+                Timestamp(i as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: "pointer_click".into(),
+                        args: serde_json::json!({}),
+                        rationale: String::new(),
+                    },
+                },
+            );
+            proposal_ids.push(e.id);
+        }
+        let reasons = std::iter::repeat_n(
+            nscore::RejectReason::GuardDenied {
+                guard: "repeat_gate".into(),
+                reason: "identical call already executed this turn".into(),
+            },
+            6,
+        )
+        .chain(std::iter::repeat_n(
+            nscore::RejectReason::IllegalAction {
+                action: "pointer_drag".into(),
+            },
+            2,
+        ))
+        .chain(std::iter::once(nscore::RejectReason::Malformed {
+            detail: "x is not a number".into(),
+        }));
+        for (i, reason) in reasons.enumerate() {
+            log.append(
+                1,
+                Timestamp(100 + i as u64),
+                EventKind::Rejected {
+                    proposal_of: proposal_ids[i],
+                    reason,
+                },
+            );
+        }
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("rejections by reason"))
+            .expect("a rejections line");
+        assert_eq!(
+            line,
+            "rejections by reason: repeat_gate 6, IllegalAction 2, Malformed 1 \u{2014} 11.1 per 100 proposals (81 proposed)",
+            "the M10 T0.2 exit line: {out}"
+        );
+
+        // A guard is named by the guard, not by the variant: "GuardDenied 6"
+        // names no fix, and the whole point of the bucket is that a
+        // repeat-gate loop is prompt-side while a malformed argument is the
+        // schema.
+        let tally = nscore::tally_rejections(log.events());
+        assert_eq!(tally.by_reason.get("repeat_gate"), Some(&6));
+        assert!(!tally.by_reason.contains_key("GuardDenied"));
+        assert_eq!(tally.rejections(), 9);
+        assert!((tally.per_hundred().unwrap() - 11.111).abs() < 0.01);
+    }
+
+    /// A log with no proposals has no rate, and a printed `0.0 per 100`
+    /// would read as a session that proposed cleanly.
+    #[test]
+    fn a_session_that_proposed_nothing_has_no_rejection_rate() {
+        let mut log = log();
+        said(&mut log, 1, "ahoj");
+        replied(&mut log, 1, "zdravím");
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        assert!(
+            out.contains("rejections by reason: no proposals in this log"),
+            "{out}"
+        );
+        assert!(!out.contains("0.0 per 100"), "{out}");
+    }
+
     #[test]
     fn an_empty_session_says_so_instead_of_printing_a_table() {
-        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP, 0);
+        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
         assert!(out.contains("no events for this session"), "{out}");
         assert!(!out.contains("turn"), "no header for nothing: {out}");
     }

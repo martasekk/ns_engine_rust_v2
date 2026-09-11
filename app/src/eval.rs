@@ -65,6 +65,21 @@ struct AbilityRow {
     budget_drops: usize,
     #[serde(default)]
     escalations: usize,
+    /// Bits-over-Random on the deciding call (M10 T0.4): the action this
+    /// ability is about, the legal-set size it was chosen out of, whether it
+    /// was chosen at all, and `log₂(n)` bits for a hit against `0` for a
+    /// miss. Recorded in the ledger rather than only printed, because the
+    /// number this column exists for is a *difference* — P2 narrows the
+    /// legal set and the question is what the narrowing cost, which needs
+    /// the row before it to still be readable.
+    #[serde(default)]
+    target_action: String,
+    #[serde(default)]
+    target_proposed: bool,
+    #[serde(default)]
+    legal_size: usize,
+    #[serde(default)]
+    bits: f64,
     /// Why it failed. Empty on a pass, and then absent from the file: the
     /// interesting rows are the ones with text in this field.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -89,6 +104,10 @@ impl From<&Ability> for AbilityRow {
             inspections: a.inspections,
             budget_drops: a.budget_drops,
             escalations: a.escalations,
+            target_action: a.target_action.to_string(),
+            target_proposed: a.target_proposed,
+            legal_size: a.legal_size,
+            bits: a.bits,
             detail: a.detail.clone(),
         }
     }
@@ -120,6 +139,14 @@ impl Row {
             of: abilities.len(),
             abilities: abilities.iter().map(AbilityRow::from).collect(),
         }
+    }
+
+    /// Bits-over-Random summed over the set (M10 T0.4). A ledger row is
+    /// compared on this the way it is compared on requests: it is the number
+    /// P2's narrowing has to hold, and unlike the pass count it cannot be
+    /// bought by making the guess easier.
+    fn bits(&self) -> f64 {
+        self.abilities.iter().map(|a| a.bits).sum()
     }
 
     fn requests(&self) -> usize {
@@ -196,10 +223,11 @@ fn diff_lines(previous: Option<&Row>, current: &Row) -> String {
     let Some(previous) = previous else {
         return format!(
             "  first row in this ledger — nothing to diff against. {}/{} abilities pass, \
-             {} requests.\n",
+             {} requests, {:.2} bits over random.\n",
             current.passed,
             current.of,
-            current.requests()
+            current.requests(),
+            current.bits()
         );
     };
     let mut out = format!("  since {} ({}):\n", short(&previous.harness), previous.at);
@@ -240,13 +268,15 @@ fn diff_lines(previous: Option<&Row>, current: &Row) -> String {
         out.push_str("    no ability changed state.\n");
     }
     out.push_str(&format!(
-        "    requests {} → {} · {}/{} → {}/{}\n",
+        "    requests {} → {} · {}/{} → {}/{} · BoR {:.2} → {:.2}\n",
         previous.requests(),
         current.requests(),
         previous.passed,
         previous.of,
         current.passed,
-        current.of
+        current.of,
+        previous.bits(),
+        current.bits()
     ));
     out
 }
@@ -542,6 +572,10 @@ mod tests {
             inspections: 0,
             budget_drops: 0,
             escalations: 0,
+            target_action: "remember_fact",
+            target_proposed: passed,
+            legal_size: 8,
+            bits: nstestkit::eval::bits_over_random(passed, 8),
             detail: if passed {
                 String::new()
             } else {
@@ -552,6 +586,54 @@ mod tests {
 
     fn row(abilities: &[Ability], harness: &str) -> Row {
         Row::build(harness.into(), 1_788_345_688_203, abilities)
+    }
+
+    /// **Bits-over-Random is chance-corrected** (M10 T0.4, tool-loading
+    /// §5.2).
+    ///
+    /// The property that makes the column worth printing: a target that was
+    /// not chosen scores nothing, a target chosen out of a legal set of one
+    /// also scores nothing — because there was no choice to get right — and
+    /// a target chosen out of a wider set scores strictly more than the same
+    /// target chosen out of a narrower one. That last line is the whole
+    /// defence against P2: a narrowing that keeps the pass count by making
+    /// the guess easier shows up here as a fall.
+    #[test]
+    fn bits_over_random_is_zero_at_chance_and_positive_when_the_target_is_chosen() {
+        use nstestkit::eval::bits_over_random;
+
+        // At chance, twice over: never proposed, and proposed out of a set
+        // with nothing to choose against.
+        assert_eq!(bits_over_random(false, 17), 0.0);
+        assert_eq!(bits_over_random(false, 1), 0.0);
+        assert_eq!(bits_over_random(true, 1), 0.0);
+        assert_eq!(bits_over_random(true, 0), 0.0);
+
+        // Chosen: log2(n) bits, exactly.
+        assert_eq!(bits_over_random(true, 2), 1.0);
+        assert_eq!(bits_over_random(true, 16), 4.0);
+        assert!((bits_over_random(true, 17) - 4.087_462_841_250_339).abs() < 1e-9);
+
+        // And breadth is what it pays for — the same hit out of a wider set
+        // is worth more, so a narrowing cannot buy the column.
+        assert!(bits_over_random(true, 17) > bits_over_random(true, 3));
+
+        // The ledger carries the sum, which is what a row is compared on.
+        let wide = row(
+            &[ability("information extraction", true, 19)],
+            &"a".repeat(40),
+        );
+        let missed = row(
+            &[ability("information extraction", false, 19)],
+            &"b".repeat(40),
+        );
+        assert_eq!(wide.bits(), 3.0, "log2(8)");
+        assert_eq!(missed.bits(), 0.0);
+        let diff = diff_lines(Some(&wide), &missed);
+        assert!(
+            diff.contains("BoR 3.00 → 0.00"),
+            "the diff has to carry the fall:\n{diff}"
+        );
     }
 
     /// The reason the ledger exists: 6/6 today reads exactly like 6/6 last

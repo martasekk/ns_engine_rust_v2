@@ -460,7 +460,7 @@ pub(crate) fn window_range(window: &[nscore::TurnRecord]) -> Option<(u32, u32)> 
 /// immediately before it is moved into the call, so the two cannot drift.
 pub(crate) fn emitter_manifest(
     ctx: &nscore::EmitterContext,
-    tools: usize,
+    tool_names: Vec<String>,
     clipped_chars: usize,
     note_hashes: Vec<String>,
 ) -> nscore::ContextManifest {
@@ -471,7 +471,10 @@ pub(crate) fn emitter_manifest(
         trace_lines: ctx.trace_so_far.len(),
         trace_chars: ctx.trace_so_far.iter().map(|l| l.chars().count()).sum(),
         clipped_chars,
-        tools,
+        // Count and list filled from one legal set, the invariant
+        // `tool_names.len() == tools` states (M10 T0.1).
+        tools: tool_names.len(),
+        tool_names,
         guidance: ctx.guidance.len(),
         note_hashes,
         obligations: ctx.obligations.len(),
@@ -505,6 +508,7 @@ pub(crate) fn reply_manifest(
         trace_chars: ctx.turn_trace.chars().count(),
         clipped_chars,
         tools: 0,
+        tool_names: Vec::new(),
         guidance: ctx.guidance.len(),
         note_hashes,
         obligations: ctx.obligations.len(),
@@ -818,7 +822,13 @@ mod tests {
         ];
         let window = vec![record(1, "ahoj", "hello"), record(2, "who am I", "Martin")];
         let ctx = emitter_ctx(facts.clone(), Some(summary.clone()), window.clone());
-        let m = emitter_manifest(&ctx, 3, 0, vec![]);
+        let m = emitter_manifest(
+            &ctx,
+            vec!["echo".into(), "recall".into(), "respond".into()],
+            0,
+            vec![],
+        );
+        assert_eq!(m.tools, 3, "the count is the list's length");
         assert_eq!(m.facts_chars, nscore::facts_chars(&facts));
         assert_eq!(m.summary_chars, nscore::summary_chars(Some(&summary)));
         assert_eq!(
@@ -830,7 +840,7 @@ mod tests {
         // An empty context is three zeros, not three defaults that happen to
         // look like one: nothing was sent, so nothing is charged to the
         // prefix.
-        let empty = emitter_manifest(&emitter_ctx(vec![], None, vec![]), 0, 0, vec![]);
+        let empty = emitter_manifest(&emitter_ctx(vec![], None, vec![]), vec![], 0, vec![]);
         assert_eq!(
             (empty.facts_chars, empty.summary_chars, empty.window_chars),
             (0, 0, 0)
@@ -845,7 +855,7 @@ mod tests {
         let mut ctx = emitter_ctx(vec![], None, vec![]);
         ctx.guidance = vec!["prefer echo".into(), "never wipe".into()];
         let hashes = vec!["sha256:a".to_string(), "sha256:b".to_string()];
-        let m = emitter_manifest(&ctx, 0, 0, hashes.clone());
+        let m = emitter_manifest(&ctx, vec![], 0, hashes.clone());
         assert_eq!(m.guidance, 2);
         assert_eq!(m.note_hashes, hashes);
     }

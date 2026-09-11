@@ -114,6 +114,31 @@ pub struct ContextManifest {
     /// with a desktop wired in there are seventeen.
     #[serde(default)]
     pub tools: usize,
+    /// The names in the legal set the call's tool array was compiled from,
+    /// in the order `schema::build_tools` serialized them (M10 T0.1).
+    ///
+    /// The count came first and stays, for the same reason `note_hashes`
+    /// left `guidance` alone: `tools` is what every recorded call carries,
+    /// and events are hash-chained over their JSON, so no old manifest can
+    /// be rewritten to gain a list. `tool_names.len() == tools` on every
+    /// call written since — the invariant that says both were filled from
+    /// one legal set — and a manifest written before M10 reads as an empty
+    /// list, which `ns-app budget` prints as `n/a` rather than as a session
+    /// that sent no tools.
+    ///
+    /// `respond_directly` is deliberately absent: it is not in the legal
+    /// set, it is appended by `build_tools`, and a report that wants the
+    /// whole array adds it back the same way the compiler does.
+    ///
+    /// `skip_serializing_if` is load-bearing and is not tidiness. `event_hash`
+    /// re-serializes a whole event to recompute the chain, so a field that
+    /// serialized as `"tool_names":[]` would change the bytes of every
+    /// `ModelCall` event ever written and `verify_chain` would report the
+    /// recorded 21-turn log as broken — which is exactly what it did, once,
+    /// before this attribute. An empty list is absent, which is the state a
+    /// pre-M10 event was written in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_names: Vec<String>,
     /// Guidance notes rendered, and the hash of each.
     ///
     /// The count came first, and stays: the notes live in `learned.toml`,
@@ -263,6 +288,7 @@ mod tests {
             trace_chars: 120,
             clipped_chars: 13_225,
             tools: 17,
+            tool_names: vec!["pointer_click".into()],
             tier: Some(crate::router::Tier::Task),
             route_cues: vec!["click".into()],
             guidance: 1,
@@ -313,5 +339,68 @@ mod tests {
         // The other M9 fields read the same way.
         assert_eq!((m.facts_chars, m.summary_chars, m.window_chars), (0, 0, 0));
         assert_eq!(m.ablated, None);
+    }
+
+    /// The same rule one milestone later (M10 T0.1). The recorded 21-turn
+    /// desktop log was written before `tool_names` existed and can never be
+    /// rewritten to carry one, so the field has to read as an empty list
+    /// with `tools` intact — and an empty list next to a non-zero `tools`
+    /// is exactly the state `ns-app budget` prints as `n/a`, rather than as
+    /// a call that was sent no tools.
+    #[test]
+    fn an_old_manifest_without_tool_names_still_parses() {
+        let old = r#"{
+            "fact_keys": [],
+            "trace_lines": 3,
+            "trace_chars": 120,
+            "tools": 17,
+            "guidance": 2,
+            "note_hashes": ["sha256:a", "sha256:b"],
+            "obligations": 1,
+            "facts_chars": 40,
+            "tier": "task"
+        }"#;
+        let m: ContextManifest = serde_json::from_str(old).unwrap();
+        assert!(m.tool_names.is_empty(), "no list is an empty list");
+        assert_eq!(m.tools, 17, "the count it did carry is untouched");
+        assert_eq!(m.note_hashes.len(), 2, "M9's list still reads");
+        assert_eq!(m.obligations, 1);
+        assert_eq!(m.facts_chars, 40);
+        assert_eq!(m.tier, Some(crate::router::Tier::Task));
+        // And the new field is not required to round-trip a new manifest
+        // either: a call that sent no tools carries an empty list, which is
+        // the same bytes as a pre-M10 one. The distinction that matters —
+        // "nothing was sent" vs "nothing was recorded" — is `tools`, and
+        // that is why it stays.
+        let none: ContextManifest = serde_json::from_str(r#"{"tools": 0}"#).unwrap();
+        assert!(none.tool_names.is_empty());
+        assert_eq!(none.tools, 0);
+    }
+
+    /// The rule stated as the thing it protects. `event_hash` re-serializes
+    /// an event to recompute the chain, so a manifest read from an old log
+    /// and written back has to be byte-identical or every `ModelCall` event
+    /// in the store becomes unverifiable — the failure this test was written
+    /// after seeing: `sessions: 0 (skipped broken: 1)` on the recorded
+    /// 21-turn log.
+    #[test]
+    fn an_empty_tool_names_serializes_to_nothing_so_old_events_still_hash() {
+        let old = r#"{"tools":17,"guidance":0}"#;
+        let m: ContextManifest = serde_json::from_str(old).unwrap();
+        let round = serde_json::to_string(&m).unwrap();
+        assert!(
+            !round.contains("tool_names"),
+            "an absent list must stay absent: {round}"
+        );
+        // And a manifest that does carry names writes them, so a new event
+        // records what it sent.
+        let new = ContextManifest {
+            tools: 1,
+            tool_names: vec!["recall".into()],
+            ..Default::default()
+        };
+        assert!(serde_json::to_string(&new)
+            .unwrap()
+            .contains(r#""tool_names":["recall"]"#));
     }
 }
