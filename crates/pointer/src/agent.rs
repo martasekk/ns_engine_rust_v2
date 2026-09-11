@@ -56,7 +56,7 @@ impl Default for Limits {
             max_steps: 4096,
             performs_per_sec: 20.0,
             burst: 40.0,
-            suspend_ms: 3_000,
+            suspend_ms: 4_000,
             max_connections: 4,
         }
     }

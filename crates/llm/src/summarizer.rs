@@ -19,10 +19,13 @@ pub struct CloudSummarizer {
 
 impl CloudSummarizer {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
+        // 4096, not 400: reasoning models spend output tokens on reasoning
+        // before the summary JSON; a tight cap yields finish_reason "length"
+        // and truncated invalid JSON.
         Self {
             client,
             model,
-            max_tokens: 400,
+            max_tokens: 4096,
         }
     }
 }
@@ -34,7 +37,16 @@ fn strip_fence(s: &str) -> &str {
         .or_else(|| t.strip_prefix("```"))
         .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t);
-    t.trim()
+    let t = t.trim();
+    let t = t.strip_prefix('`').unwrap_or(t);
+    let t = t.strip_suffix('`').unwrap_or(t);
+    let t = t.trim();
+    if let (Some(start), Some(end)) = (t.find('{'), t.rfind('}')) {
+        if start <= end {
+            return &t[start..=end];
+        }
+    }
+    t
 }
 
 /// Known facts → previous summary → the verbatim records to fold in.

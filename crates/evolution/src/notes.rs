@@ -40,7 +40,16 @@ fn strip_fence(s: &str) -> &str {
         .or_else(|| t.strip_prefix("```"))
         .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t);
-    t.trim()
+    let t = t.trim();
+    let t = t.strip_prefix('`').unwrap_or(t);
+    let t = t.strip_suffix('`').unwrap_or(t);
+    let t = t.trim();
+    if let (Some(start), Some(end)) = (t.find('{'), t.rfind('}')) {
+        if start <= end {
+            return &t[start..=end];
+        }
+    }
+    t
 }
 
 #[async_trait]
@@ -54,7 +63,7 @@ impl NoteProposer for ClientNoteProposer {
         user.push_str(trace);
         let request = serde_json::json!({
             "model": self.model,
-            "max_tokens": 300,
+            "max_tokens": 4096,
             "temperature": 0,
             "messages": [
                 {"role": "system", "content": PROPOSER_SYSTEM},
