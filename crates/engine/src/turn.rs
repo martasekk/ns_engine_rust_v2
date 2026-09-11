@@ -74,6 +74,14 @@ pub struct EngineConfig {
     /// M9 T2.2: guidance notes rendered into either context, at most. The
     /// tail is dropped and reported; file order is the priority order.
     pub guidance_max: usize,
+    /// M12 T3.2: skip guidance notes learned on a model other than
+    /// `learning_model`. Off, so the default renders every note, the way it
+    /// always did.
+    pub archive_foreign_notes: bool,
+    /// M12 T3.2: the emitter model this deployment runs, as the composition
+    /// root resolved it. Only `archive_foreign_notes` reads it; the engine
+    /// otherwise has no model id at render time.
+    pub learning_model: Option<String>,
     /// M9 T0.4: blank one context block after the fit, to measure what it
     /// was worth. Set programmatically by the evaluation harness only —
     /// there is deliberately no config key for it, because an ablated engine
@@ -222,6 +230,8 @@ impl Default for EngineConfig {
             obligations_max: 5,
             obligation_check: false,
             guidance_max: 6,
+            archive_foreign_notes: false,
+            learning_model: None,
             ablate: None,
             summary_every_turns: 4,
             summary_rebuild_every: 3,
@@ -1411,7 +1421,13 @@ impl Engine {
             // Notes and their hashes together, so the manifest can say which
             // note sat in this prompt (M9 T0.3). The texts go into the
             // context; the hashes are cut to whatever survived to be sent.
-            let guidance_notes = rules.guidance_notes_for(&legal_names);
+            // M12 T3.2: with the archive knob on, a note learned on another
+            // emitter never reaches this prompt.
+            let guidance_notes = if self.cfg.archive_foreign_notes {
+                rules.guidance_notes_for_model(&legal_names, self.cfg.learning_model.as_deref())
+            } else {
+                rules.guidance_notes_for(&legal_names)
+            };
             let mut ctx = nscore::EmitterContext {
                 facts,
                 summary: state.summary.clone(),
@@ -2607,7 +2623,12 @@ impl Engine {
         // M6 §4.3: the reply model gets the user's message, the
         // verbatim window and the summary — not a counter string.
         let window = state.window(self.cfg.window_turns);
-        let guidance_notes = rules.guidance_notes_for_reply();
+        // M12 T3.2: the reply path archives by the same rule as the emitter.
+        let guidance_notes = if self.cfg.archive_foreign_notes {
+            rules.guidance_notes_for_reply_model(self.cfg.learning_model.as_deref())
+        } else {
+            rules.guidance_notes_for_reply()
+        };
         let guidance: Vec<String> = guidance_notes.iter().map(|(_, t)| t.clone()).collect();
         // M9 T2.1: the same pure function the emitter path calls, on the
         // same message.

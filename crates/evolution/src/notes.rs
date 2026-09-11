@@ -130,7 +130,15 @@ impl NoteProposer for ClientNoteProposer {
         if !scope_ok || text.is_empty() || text.chars().count() > 200 {
             return Err(format!("proposer returned an invalid note: {v}"));
         }
-        Ok(Some(Note::new(&scope, &text, 0.0)))
+        // M12 T3.1: stamp the note with the model that proposed it, the only
+        // model id this side knows, so the engine can later tell a note
+        // learned here from one learned elsewhere.
+        Ok(Some(Note::new_learned_on(
+            &scope,
+            &text,
+            0.0,
+            self.model.as_str(),
+        )))
     }
 }
 

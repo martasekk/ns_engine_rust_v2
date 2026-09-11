@@ -91,6 +91,12 @@ pub struct Note {
     pub lift: f64,
     #[serde(default)]
     pub hash: String,
+    /// The emitter model this note was learned on (M12 T3.1). Notes written
+    /// before the field carry none, and none means "no model claims it".
+    /// Deliberately outside the hash: the hash names the sentence, not where
+    /// it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_on: Option<String>,
 }
 
 impl Note {
@@ -100,6 +106,22 @@ impl Note {
             text: text.into(),
             lift,
             hash: Note::hash_of(scope, text),
+            learned_on: None,
+        }
+    }
+    /// `new`, plus the emitter model the note was distilled from.
+    pub fn new_learned_on(scope: &str, text: &str, lift: f64, model: impl Into<String>) -> Note {
+        Note {
+            learned_on: Some(model.into()),
+            ..Note::new(scope, text, lift)
+        }
+    }
+    /// Whether this note survives a filter for `model` (M12 T3.2): a note
+    /// with no model is always kept, and no model asked for keeps everything.
+    fn learned_on_matches(&self, model: Option<&str>) -> bool {
+        match (self.learned_on.as_deref(), model) {
+            (Some(mine), Some(asked)) => mine == asked,
+            _ => true,
         }
     }
     pub fn hash_of(scope: &str, text: &str) -> String {
@@ -173,18 +195,35 @@ impl LearnedRules {
     /// text lives in `learned.toml`, which the evolution pass rewrites, so
     /// only the hash survives into the manifest (M9 T0.3).
     pub fn guidance_notes_for(&self, legal: &[String]) -> Vec<(String, String)> {
+        self.guidance_notes_for_model(legal, None)
+    }
+
+    /// `guidance_notes_for`, minus the notes learned on another emitter
+    /// (M12 T3.2). `model` is `None` when the archive knob is off, and then
+    /// nothing is skipped.
+    pub fn guidance_notes_for_model(
+        &self,
+        legal: &[String],
+        model: Option<&str>,
+    ) -> Vec<(String, String)> {
         self.notes
             .iter()
-            .filter(|n| n.applies_to(legal))
+            .filter(|n| n.applies_to(legal) && n.learned_on_matches(model))
             .map(|n| (n.hash.clone(), n.text.clone()))
             .collect()
     }
 
     /// Notes scoped `reply` (M6 §8.5) with their hashes.
     pub fn guidance_notes_for_reply(&self) -> Vec<(String, String)> {
+        self.guidance_notes_for_reply_model(None)
+    }
+
+    /// `guidance_notes_for_reply`, minus the notes learned on another
+    /// emitter (M12 T3.2).
+    pub fn guidance_notes_for_reply_model(&self, model: Option<&str>) -> Vec<(String, String)> {
         self.notes
             .iter()
-            .filter(|n| n.scope == "reply")
+            .filter(|n| n.scope == "reply" && n.learned_on_matches(model))
             .map(|n| (n.hash.clone(), n.text.clone()))
             .collect()
     }
@@ -197,9 +236,26 @@ impl LearnedRules {
             .collect()
     }
 
+    /// `guidance_for`, minus the notes learned on another emitter (M12 T3.2).
+    pub fn guidance_for_model(&self, legal: &[String], model: Option<&str>) -> Vec<String> {
+        self.guidance_notes_for_model(legal, model)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
     /// Notes scoped `reply` (M6 §8.5): rendered to the reply model only.
     pub fn guidance_for_reply(&self) -> Vec<String> {
         self.guidance_notes_for_reply()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// `guidance_for_reply`, minus the notes learned on another emitter
+    /// (M12 T3.2).
+    pub fn guidance_for_reply_model(&self, model: Option<&str>) -> Vec<String> {
+        self.guidance_notes_for_reply_model(model)
             .into_iter()
             .map(|(_, text)| text)
             .collect()
@@ -317,6 +373,88 @@ mod tests {
             vec!["Answer the question first.".to_string()]
         );
         assert_eq!(rules.guidance_for(&[]), vec!["G".to_string()]);
+    }
+
+    /// What the note struct below serialized to before `learned_on` existed.
+    const OLD_NOTE_TOML: &str = "version = 1\nnormalize_arg = []\nalias_action = []\n\n[[note]]\nscope = \"global\"\ntext = \"Prefer a tool over guessing.\"\nlift = 0.5\nhash = \"sha256:abc\"\n";
+
+    /// M12 T3.1. `learned_on` is additive: a `learned.toml` written before
+    /// the field parses to `None`, and a note with `None` serializes to
+    /// exactly the bytes it did before the field existed, so an upgrade does
+    /// not rewrite every note the first time the pass saves.
+    #[test]
+    fn an_old_note_parses_without_a_model_and_serializes_without_one() {
+        let text = r#"
+            version = 1
+            [[note]]
+            scope = "global"
+            text = "Prefer a tool over guessing."
+            lift = 0.5
+            hash = "sha256:abc"
+        "#;
+        let rules: LearnedRules = toml::from_str(text).unwrap();
+        assert_eq!(rules.notes[0].learned_on, None);
+        let back = toml::to_string(&rules).unwrap();
+        assert!(!back.contains("learned_on"), "{back}");
+        assert_eq!(back, OLD_NOTE_TOML);
+        assert_eq!(toml::from_str::<LearnedRules>(&back).unwrap(), rules);
+    }
+
+    /// M12 T3.1. The hash names the note, not where it was learned: the same
+    /// sentence learned on two emitters still dedupes, and a manifest's
+    /// `note_hashes` stay comparable across models.
+    #[test]
+    fn a_note_hash_ignores_the_learning_model() {
+        let plain = Note::new("global", "x", 0.0);
+        let learned = Note::new_learned_on("global", "x", 0.0, "anthropic/claude-haiku-4.5");
+        assert_eq!(plain.hash, learned.hash);
+        assert_eq!(
+            learned.learned_on.as_deref(),
+            Some("anthropic/claude-haiku-4.5")
+        );
+        assert_eq!(plain.learned_on, None);
+    }
+
+    /// M12 T3.2. A note learned on another emitter is skipped only when a
+    /// model is named, and a note from before the field is never skipped,
+    /// because nothing knows which model it came from.
+    #[test]
+    fn a_foreign_note_is_archived_only_when_the_knob_is_on() {
+        let all = vec!["old".to_string(), "mine".to_string(), "theirs".to_string()];
+        let mine = vec!["old".to_string(), "mine".to_string()];
+        let rules = LearnedRules {
+            notes: vec![
+                Note::new("global", "old", 0.0),
+                Note::new_learned_on("global", "mine", 0.0, "m"),
+                Note::new_learned_on("global", "theirs", 0.0, "other"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(rules.guidance_for(&[]), all);
+        assert_eq!(rules.guidance_for_model(&[], None), all);
+        assert_eq!(rules.guidance_for_model(&[], Some("m")), mine);
+        assert_eq!(
+            texts(rules.guidance_notes_for_model(&[], Some("m"))),
+            mine.clone()
+        );
+        assert_eq!(texts(rules.guidance_notes_for(&[])), all);
+
+        let reply = LearnedRules {
+            notes: vec![
+                Note::new("reply", "old", 0.0),
+                Note::new_learned_on("reply", "mine", 0.0, "m"),
+                Note::new_learned_on("reply", "theirs", 0.0, "other"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(reply.guidance_for_reply(), all);
+        assert_eq!(reply.guidance_for_reply_model(None), all);
+        assert_eq!(reply.guidance_for_reply_model(Some("m")), mine);
+        assert_eq!(texts(reply.guidance_notes_for_reply_model(Some("m"))), mine);
+    }
+
+    fn texts(notes: Vec<(String, String)>) -> Vec<String> {
+        notes.into_iter().map(|(_, t)| t).collect()
     }
 
     #[test]

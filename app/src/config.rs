@@ -494,6 +494,12 @@ pub struct MemorySection {
     /// Guidance notes rendered into either context, at most (M9 T2.2).
     #[serde(default = "default_guidance_max")]
     pub guidance_max: usize,
+    /// Skip guidance notes learned on another emitter model (M12 T3.2). Off,
+    /// because a note learned before the field carries no model and is kept
+    /// either way: the knob is for a deployment that changed emitters and
+    /// wants the old model's notes to stop steering the new one.
+    #[serde(default)]
+    pub archive_foreign_notes: bool,
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
@@ -687,6 +693,7 @@ impl Default for MemorySection {
             obligations_max: default_obligations_max(),
             obligation_check: false,
             guidance_max: default_guidance_max(),
+            archive_foreign_notes: false,
             fact_stale_days: default_fact_stale_days(),
             fitness_min_exposures: default_fitness_min_exposures(),
             fitness_demote: false,
@@ -1428,6 +1435,18 @@ mod tests {
             .unwrap_err();
         assert!(err.starts_with("[router] "), "{err}");
         assert!(err.contains("full, adaptive"), "{err}");
+    }
+
+    /// M12 T3.2. Off is today's behaviour: every note reaches the prompt,
+    /// whichever emitter it was learned on. A deployment that switched
+    /// emitters turns it on to stop inheriting the old model's notes.
+    #[test]
+    fn archive_foreign_notes_defaults_to_off_and_round_trips() {
+        assert!(!AppConfig::parse("").unwrap().memory.archive_foreign_notes);
+        let on = AppConfig::parse("[memory]\narchive_foreign_notes = true\n").unwrap();
+        assert!(on.memory.archive_foreign_notes);
+        // The rest of [memory] is untouched by the knob.
+        assert_eq!(on.memory.window_turns, MemorySection::default().window_turns);
     }
 
     /// M10 T1.3. The knob defaults to today's behaviour, the way every knob

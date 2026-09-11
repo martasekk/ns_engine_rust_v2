@@ -132,6 +132,10 @@ pinned_prefixes = ["user."]   # always shown, newest first, with the value they 
 pinned_max = 5
 relevant_max = 5
 fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
+# Skip guidance notes learned on an emitter other than the one configured
+# now (M12 T3.2). Notes from before the field name no model and are kept
+# either way; turn this on after switching emitters.
+archive_foreign_notes = false
 # How many of a turn's own tool outcomes stay verbatim in the prompt (M7
 # T1.3). Older ones fold into one counted line — "earlier this turn (7
 # steps): pointer_move ok x3 ..." — and refusals never fold, since they are

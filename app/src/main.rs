@@ -904,6 +904,10 @@ async fn main() {
         obligations_max: cfg.memory.obligations_max,
         obligation_check: cfg.memory.obligation_check,
         guidance_max: cfg.memory.guidance_max,
+        // M12 T3.2: the engine has no model id of its own, so the resolved
+        // emitter target is what names the model notes are kept for.
+        archive_foreign_notes: cfg.memory.archive_foreign_notes,
+        learning_model: Some(emitter_target.model.clone()),
         // M9 T0.4 is an evaluation knob with no config key: the live harness
         // never ablates a block.
         ablate: None,
