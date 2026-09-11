@@ -185,6 +185,17 @@ pub struct ContextManifest {
     pub tier: Option<crate::router::Tier>,
     #[serde(default)]
     pub route_cues: Vec<String>,
+    /// The fact scope the call's session maps to — `EngineConfig::scope_for`,
+    /// which is `global` on the CLI and one scope per session on the serve
+    /// channel (M9 follow-up 7). Recorded because the fitness join credits
+    /// `fact_keys` per `(scope, key)`, and a key alone is ambiguous once two
+    /// scopes can hold it. `None` on manifests written before the field, which
+    /// are never backfilled; the join then falls back to the key alone —
+    /// today's behaviour, exact wherever every session maps to one scope.
+    /// Absent from the JSON when `None`, so a manifest read from an old log
+    /// re-serializes to its recorded bytes and the chain still hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// What the budget did, or would have done, to this context (M7 T2.1).
     /// `None` when no budget was set. Under `report` mode this is the whole
     /// point of the field: the drops that did *not* happen, so the no-impact
@@ -298,6 +309,7 @@ mod tests {
             summary_chars: 200,
             window_chars: 300,
             ablated: Some(Ablate::Summary),
+            scope: None,
             budget: None,
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -402,5 +414,35 @@ mod tests {
         assert!(serde_json::to_string(&new)
             .unwrap()
             .contains(r#""tool_names":["recall"]"#));
+    }
+
+    /// The same rule again for the fact scope (M9 follow-up 7). A manifest
+    /// written before the field names no scope and must keep naming none:
+    /// it re-serializes to the bytes the chain was hashed over, and the
+    /// fitness join reads that absence as "count this key in every scope
+    /// that holds it", which is what it did before the field existed.
+    #[test]
+    fn an_old_manifest_without_a_scope_parses_as_none_and_serializes_to_nothing() {
+        let old = r#"{"tools":17,"guidance":0}"#;
+        let m: ContextManifest = serde_json::from_str(old).unwrap();
+        assert_eq!(m.scope, None, "no scope is no scope, never a default one");
+        let round = serde_json::to_string(&m).unwrap();
+        assert!(
+            !round.contains("scope"),
+            "an absent scope must stay absent: {round}"
+        );
+        // A manifest that does name one writes it, and reads back the same.
+        let new = ContextManifest {
+            scope: Some("global".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains(r#""scope":"global""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ContextManifest>(&json)
+                .unwrap()
+                .scope,
+            Some("global".into())
+        );
     }
 }

@@ -724,6 +724,7 @@ impl Engine {
             fact_keys: facts.iter().map(|f| f.key.clone()).collect(),
             summary_through: previous.map(|s| s.through_turn),
             window: window_range(&records),
+            scope: Some(scope.clone()),
             ..Default::default()
         };
         let summarized = self.parts.summarizer.summarize(input).await;
@@ -1476,7 +1477,7 @@ impl Engine {
             let tool_names: Vec<String> =
                 legal.actions.iter().map(|s| s.name.clone()).collect();
             let mut manifest =
-                emitter_manifest(&ctx, tool_names, clipped_chars, note_hashes);
+                emitter_manifest(&scope, &ctx, tool_names, clipped_chars, note_hashes);
             manifest.budget = Some(budget);
             manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
@@ -2660,7 +2661,7 @@ impl Engine {
             .take(budgeted.guidance.len())
             .map(|(h, _)| h.clone())
             .collect();
-        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars, note_hashes);
+        let mut manifest = reply_manifest(scope, &budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
         manifest.ablated = self.cfg.ablate;
         let drafted = self.parts.replier.reply(budgeted).await;

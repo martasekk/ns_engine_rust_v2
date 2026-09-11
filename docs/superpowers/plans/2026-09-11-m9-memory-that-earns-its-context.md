@@ -386,7 +386,7 @@ re-derives it identically with `0 newly graded, 21 read back`.
 Caveat recorded: the manifest carries no scope, so counters are keyed by fact key and applied
 to whichever scope's current version holds it — exact on this deployment (every session maps
 to `global`); a multi-scope channel needs the scope in the manifest before `fitness_demote`
-may be turned on there.
+may be turned on there. **Lifted by follow-up 7, recorded after the status below.**
 
 ### P5 — done 2026-09-11 (T5.1, T5.2), 0 requests
 
@@ -420,4 +420,34 @@ emitter prompt — with `tools_tokens` as the before/after; (2) wire `LocalEvalu
 so `--ablate summary|guidance` and T5.2 can be read; (4) a recall corpus whose targets tie on
 hits so `activation_weight` can be decided; (5) M8 T3.1 embeddings, which unblocks T5.3;
 (6) a desktop-session `trace_lines` reading for the HiAgent trigger; (7) the scope in the
-manifest before `fitness_demote` is enabled on a multi-scope channel.
+manifest before `fitness_demote` is enabled on a multi-scope channel — **done below**, after
+M10 and M11 had closed (1), (2), (4) and (5) and parked (6) with the desktop line.
+
+### Follow-up 7 — done 2026-09-11, 0 requests
+
+The scope rides in the manifest, so the fitness join is exact on a multi-scope channel.
+`ContextManifest.scope: Option<String>` (`crates/core/src/usage.rs`) names the scope the
+call's session maps to — `EngineConfig::scope_for(sid)`: `global` on the CLI, one per
+session under `ns-app serve` — and every builder fills it: `emitter_manifest` and
+`reply_manifest` (`crates/engine/src/trace.rs`) take it as their first argument, and the
+summarizer's inline manifest in `maybe_summarize` sets it. Serialized **absent when `None`**,
+the M10 T0.1 rule: a manifest read from an old log re-serializes to its recorded bytes and the
+chain still hashes. `fitness::derive` keys exposures and credits by `(manifest.scope, key)`;
+a fact in scope S reads the `(Some(S), key)` count plus the `(None, key)` count, so a manifest
+written before the field — never backfilled — still counts in every scope holding the key,
+which is what the join did before and exact wherever every session maps to one scope.
+`ReplyCited` sources stay `fact:<key>`: a session maps to one scope, so the manifest's scope
+covers the citation too.
+
+| Exit criterion | Measured |
+|---|---|
+| an old manifest parses with no scope and re-serializes without one | met: `usage.rs` `an_old_manifest_without_a_scope_parses_as_none_and_serializes_to_nothing` |
+| every call of a turn, on all three roles, names the session's scope | met: `turn_loop.rs` `every_manifest_of_a_turn_names_the_session_scope` (`scope_for = sid`, `window_turns = 0` so the summarizer fires inside the same test); `the_default_engine_names_the_global_scope` — the CLI records `global`, never nothing, so a manifest written today never takes the fallback path |
+| a key held in two scopes is credited only where the manifest says | met: `fitness.rs` `a_key_held_in_two_scopes_is_credited_only_in_the_scope_the_manifest_names` (`a`: 1/1, `b`: 0/0) |
+| a scope-less manifest counts as before | met: `a_manifest_without_a_scope_still_counts_in_every_scope_holding_the_key` (both 1/1); the six P4 fitness tests pass unchanged on that path |
+
+Workspace suite: 706 passed, 0 failed, 1 ignored. The exhaustive `ContextManifest` literals
+elsewhere (`mine.rs`, `pass.rs`, `evaluate.rs`) build on `..Default::default()` and compiled
+untouched. The P4 caveat is lifted; `fitness_demote` stays `false` under the release rule.
+On the recorded `cli` log nothing moves: its old manifests take the fallback path and every
+new one carries `global`, so the next dry run derives the numbers the last one did.

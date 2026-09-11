@@ -503,6 +503,7 @@ pub(crate) fn window_range(window: &[nscore::TurnRecord]) -> Option<(u32, u32)> 
 /// What the emitter was shown, in keys (M7 T0.1). Built from the context
 /// immediately before it is moved into the call, so the two cannot drift.
 pub(crate) fn emitter_manifest(
+    scope: &str,
     ctx: &nscore::EmitterContext,
     tool_names: Vec<String>,
     clipped_chars: usize,
@@ -531,6 +532,9 @@ pub(crate) fn emitter_manifest(
         ablated: None,
         tier: None,
         route_cues: Vec::new(),
+        // The session's fact scope, so the fitness join can credit these
+        // keys per `(scope, key)` rather than by key alone (M9 follow-up 7).
+        scope: Some(scope.to_string()),
         // Filled in by the caller, which is the only place that knows what
         // the budget did to this context.
         budget: None,
@@ -540,6 +544,7 @@ pub(crate) fn emitter_manifest(
 /// What the replier was shown. `tools` is zero: the reply model is given no
 /// action schema at all, which is half of why it is the cheaper of the two.
 pub(crate) fn reply_manifest(
+    scope: &str,
     ctx: &nscore::ReplyContext,
     clipped_chars: usize,
     note_hashes: Vec<String>,
@@ -562,6 +567,7 @@ pub(crate) fn reply_manifest(
         ablated: None,
         tier: None,
         route_cues: Vec::new(),
+        scope: Some(scope.to_string()),
         budget: None,
     }
 }
@@ -972,6 +978,7 @@ mod tests {
         let window = vec![record(1, "ahoj", "hello"), record(2, "who am I", "Martin")];
         let ctx = emitter_ctx(facts.clone(), Some(summary.clone()), window.clone());
         let m = emitter_manifest(
+            "global",
             &ctx,
             vec!["echo".into(), "recall".into(), "respond".into()],
             0,
@@ -989,7 +996,13 @@ mod tests {
         // An empty context is three zeros, not three defaults that happen to
         // look like one: nothing was sent, so nothing is charged to the
         // prefix.
-        let empty = emitter_manifest(&emitter_ctx(vec![], None, vec![]), vec![], 0, vec![]);
+        let empty = emitter_manifest(
+            "global",
+            &emitter_ctx(vec![], None, vec![]),
+            vec![],
+            0,
+            vec![],
+        );
         assert_eq!(
             (empty.facts_chars, empty.summary_chars, empty.window_chars),
             (0, 0, 0)
@@ -1004,7 +1017,7 @@ mod tests {
         let mut ctx = emitter_ctx(vec![], None, vec![]);
         ctx.guidance = vec!["prefer echo".into(), "never wipe".into()];
         let hashes = vec!["sha256:a".to_string(), "sha256:b".to_string()];
-        let m = emitter_manifest(&ctx, vec![], 0, hashes.clone());
+        let m = emitter_manifest("global", &ctx, vec![], 0, hashes.clone());
         assert_eq!(m.guidance, 2);
         assert_eq!(m.note_hashes, hashes);
     }

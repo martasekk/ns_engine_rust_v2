@@ -5585,3 +5585,124 @@ async fn a_due_summary_completes_when_the_next_message_is_already_queued() {
         "and it folded exactly the turns that had fallen out of the window"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M9 follow-up 7: the fact scope rides in the manifest, so the fitness join
+// can credit `fact_keys` per `(scope, key)`.
+
+/// A summarizer double that records what its call cost, so the summary's own
+/// `ModelCall` — and with it the manifest that call wrote — reaches the log.
+/// `ScriptedSummarizer` does not meter, and an unmetered call writes no
+/// event at all.
+struct MeteredSummarizer;
+
+#[async_trait::async_trait]
+impl Summarizer for MeteredSummarizer {
+    async fn summarize(
+        &self,
+        input: SummaryInput<'_>,
+    ) -> Result<Option<SummaryDraft>, SummarizeError> {
+        input
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink")
+            .record(Usage {
+                role: "summarizer".into(),
+                model: "test-model".into(),
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                estimated: false,
+                attempts: 1,
+                latency_ms: 1,
+                tools_tokens: 0,
+                cached_tokens: 0,
+            });
+        Ok(Some(SummaryDraft {
+            topic: "scripted".into(),
+            established: vec![],
+            open: vec![],
+        }))
+    }
+}
+
+/// Every model call of a turn records the scope its session maps to, on all
+/// three roles. The join that scores facts is keyed by `(scope, key)`, and a
+/// call whose manifest named no scope would have its keys counted in every
+/// scope that holds them — right while every session maps to `global`, as on
+/// the CLI, wrong the moment two sessions have their own.
+#[tokio::test]
+async fn every_manifest_of_a_turn_names_the_session_scope() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("zeta".into());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(SessionTaggedEmitter {
+        records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    b.set_replier(Box::new(SessionTaggedReplier {
+        records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    b.set_summarizer(Box::new(MeteredSummarizer));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            scope_for: Arc::new(|sid| sid.0.clone()),
+            max_echo_ratio: 1.1,
+            // With no verbatim window one turn is already past the summary
+            // boundary, so the summarizer's own call is covered too.
+            window_turns: 0,
+            summary_every_turns: 1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "hello from zeta".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        e.maybe_summarize(&sid).await.unwrap(),
+        "the summary boundary was crossed"
+    );
+
+    let events = store.load(&sid).await.unwrap();
+    let calls: Vec<(String, ContextManifest)> = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } => {
+                Some((usage.role.clone(), manifest.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for role in ["emitter", "replier", "summarizer"] {
+        assert!(
+            calls.iter().any(|(r, _)| r == role),
+            "the {role} call was recorded: {:?}",
+            calls.iter().map(|(r, _)| r).collect::<Vec<_>>()
+        );
+    }
+    for (role, m) in &calls {
+        assert_eq!(
+            m.scope,
+            Some("zeta".into()),
+            "the {role} call names the session's scope"
+        );
+    }
+}
+
+/// And the default engine — the CLI's, where every session shares one store
+/// — records `global` rather than nothing, so a manifest written today is
+/// never mistaken for a pre-follow-up one on the join's fallback path.
+#[tokio::test]
+async fn the_default_engine_names_the_global_scope() {
+    let (_, manifests) = probed_turn(LearnedRules::default(), None, vec![]).await;
+    assert!(!manifests.is_empty(), "a call was recorded");
+    for m in &manifests {
+        assert_eq!(m.scope, Some("global".into()));
+    }
+}

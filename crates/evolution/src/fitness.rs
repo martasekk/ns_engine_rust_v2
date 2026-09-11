@@ -15,6 +15,13 @@
 //! no keys and are never backfilled, because events are hash-chained over
 //! their JSON — contribute exactly zero rather than a guess.
 //!
+//! Fact counters are per `(scope, key)`, from the scope the call's manifest
+//! names (M9 follow-up 7): two scopes can hold the same key, and crediting a
+//! key alone would hand one session's exposures to a copy no call rendered.
+//! A manifest written before the field names no scope and is never
+//! backfilled, so its counts land in every scope holding the key — what the
+//! join did before, and exact wherever every session maps to one scope.
+//!
 //! Recorded caveat (plan T4.3): the counters are set on the fact version
 //! *current at pass time*. A version superseded between the call that showed
 //! it and the pass that scores it is not credited — its exposures were real,
@@ -39,7 +46,10 @@ pub struct FitnessReport {
     /// Every current fact in the store, with its derived numbers:
     /// `(scope, key, exposures, credits)`. Facts nothing ever showed are in
     /// here at 0/0 — "never queried" and "queried and useless" are different
-    /// findings, and only the first number tells them apart.
+    /// findings, and only the first number tells them apart. The numbers are
+    /// counted per `(scope, key)`, from the scope each manifest names;
+    /// manifests written before that field name none and count in every
+    /// scope that holds the key.
     pub facts: Vec<(String, String, u32, u32)>,
     pub notes: BTreeMap<String, NoteFitness>,
     /// `lift` per note hash, filled by the pass from the notes library: the
@@ -99,8 +109,11 @@ pub async fn derive(
     sessions: &[Recorded],
     authoritative: &str,
 ) -> Result<FitnessReport, StoreError> {
-    let mut fact_exposures: BTreeMap<String, u32> = BTreeMap::new();
-    let mut fact_credits: BTreeMap<String, u32> = BTreeMap::new();
+    // Keyed by `(manifest scope, fact key)`: a key alone is ambiguous once
+    // two scopes can hold it (M9 follow-up 7). The `None` half is the
+    // pre-follow-up manifests, which name no scope and are never backfilled.
+    let mut fact_exposures: BTreeMap<(Option<String>, String), u32> = BTreeMap::new();
+    let mut fact_credits: BTreeMap<(Option<String>, String), u32> = BTreeMap::new();
     let mut notes: BTreeMap<String, NoteFitness> = BTreeMap::new();
     let mut alarms: Vec<String> = Vec::new();
 
@@ -144,9 +157,12 @@ pub async fn derive(
             let o = outcomes.get(&e.turn).unwrap_or(&none);
             for key in &manifest.fact_keys {
                 session_exposures += 1;
-                *fact_exposures.entry(key.clone()).or_insert(0) += 1;
+                let at = (manifest.scope.clone(), key.clone());
+                *fact_exposures.entry(at.clone()).or_insert(0) += 1;
+                // `ReplyCited` sources stay `fact:<key>`: a session maps to
+                // one scope, so the manifest's scope covers the citation too.
                 if o.good || o.cited.contains(&format!("fact:{key}")) {
-                    *fact_credits.entry(key.clone()).or_insert(0) += 1;
+                    *fact_credits.entry(at).or_insert(0) += 1;
                 }
             }
             for hash in &manifest.note_hashes {
@@ -168,11 +184,21 @@ pub async fn derive(
     let mut facts: Vec<(String, String, u32, u32)> = Vec::new();
     for scope in store.scopes().await? {
         for f in store.facts(&scope, "").await? {
+            // The calls that named this scope, plus the ones that named
+            // none: a scope-less manifest is pre-follow-up-7 and cannot say
+            // which copy it rendered, so it counts in every scope holding
+            // the key — the behaviour the join had before the field.
+            let at = |m: &BTreeMap<(Option<String>, String), u32>| {
+                m.get(&(Some(scope.clone()), f.key.clone()))
+                    .copied()
+                    .unwrap_or(0)
+                    + m.get(&(None, f.key.clone())).copied().unwrap_or(0)
+            };
             facts.push((
                 scope.clone(),
                 f.key.clone(),
-                fact_exposures.get(&f.key).copied().unwrap_or(0),
-                fact_credits.get(&f.key).copied().unwrap_or(0),
+                at(&fact_exposures),
+                at(&fact_credits),
             ));
         }
     }
@@ -225,6 +251,12 @@ mod tests {
             }
         }
         fn turn(&mut self, turn: u32, keys: &[&str]) -> &mut Self {
+            self.turn_in(turn, None, keys)
+        }
+        /// The same turn with the manifest naming a scope, as every call
+        /// written since M9 follow-up 7 does; `None` is a pre-follow-up
+        /// manifest.
+        fn turn_in(&mut self, turn: u32, scope: Option<&str>, keys: &[&str]) -> &mut Self {
             self.log.append(
                 turn,
                 Timestamp(turn as u64),
@@ -237,7 +269,10 @@ mod tests {
                 Timestamp(turn as u64),
                 EventKind::ModelCall {
                     usage: usage(),
-                    manifest: manifest(keys),
+                    manifest: ContextManifest {
+                        scope: scope.map(|s| s.to_string()),
+                        ..manifest(keys)
+                    },
                 },
             );
             self
@@ -283,6 +318,32 @@ mod tests {
                 .unwrap();
         }
         store
+    }
+
+    /// A store holding one fact per `(scope, key)` pair, for the join that
+    /// has to tell two copies of a key apart.
+    async fn store_with_scoped(pairs: &[(&str, &str)]) -> InMemoryStore {
+        let store = InMemoryStore::new();
+        for (scope, key) in pairs {
+            store
+                .put_fact(Fact {
+                    key: (*key).into(),
+                    value: serde_json::json!("x"),
+                    scope: (*scope).into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    fn scoped(r: &FitnessReport, scope: &str, key: &str) -> (u32, u32) {
+        r.facts
+            .iter()
+            .find(|(s, k, _, _)| s == scope && k == key)
+            .map(|(_, _, e, c)| (*e, *c))
+            .unwrap_or_else(|| panic!("no row for {scope}/{key} in {:?}", r.facts))
     }
 
     fn numbers(r: &FitnessReport, key: &str) -> (u32, u32) {
@@ -437,6 +498,42 @@ mod tests {
         // A graded session that showed a note but no fact is still the alarm:
         // the demotion signal reads facts, and it saw none.
         assert_eq!(r.graded_sessions_with_zero_exposures, vec!["n"]);
+    }
+
+    /// M9 follow-up 7. The join is keyed by `(scope, key)`, so a key two
+    /// scopes both hold is credited only where the call that showed it ran.
+    /// Keyed by the key alone — what the pass did before the manifest
+    /// carried a scope — session `a`'s exposure would also land on `b`'s
+    /// copy, which no call ever rendered.
+    #[tokio::test]
+    async fn a_key_held_in_two_scopes_is_credited_only_in_the_scope_the_manifest_names() {
+        let store = store_with_scoped(&[("a", "user.city"), ("b", "user.city")]).await;
+        let mut f = Fixture::new("a");
+        f.turn_in(1, Some("a"), &["user.city"])
+            .graded(1, true, "symbolic");
+        let r = derive(&store, &[f.recorded()], "symbolic").await.unwrap();
+        assert_eq!(scoped(&r, "a", "user.city"), (1, 1), "the scope it ran in");
+        assert_eq!(
+            scoped(&r, "b", "user.city"),
+            (0, 0),
+            "the other copy was never rendered"
+        );
+    }
+
+    /// The fallback, and the reason the field is an `Option`: manifests
+    /// written before it name no scope and are never backfilled, because
+    /// events are hash-chained over their JSON. Their counts land in every
+    /// scope holding the key — exact wherever every session maps to one
+    /// scope, which is what the CLI does and what the old join assumed.
+    #[tokio::test]
+    async fn a_manifest_without_a_scope_still_counts_in_every_scope_holding_the_key() {
+        let store = store_with_scoped(&[("a", "user.city"), ("b", "user.city")]).await;
+        let mut f = Fixture::new("a");
+        f.turn_in(1, None, &["user.city"])
+            .graded(1, true, "symbolic");
+        let r = derive(&store, &[f.recorded()], "symbolic").await.unwrap();
+        assert_eq!(scoped(&r, "a", "user.city"), (1, 1));
+        assert_eq!(scoped(&r, "b", "user.city"), (1, 1));
     }
 
     #[allow(dead_code)]
