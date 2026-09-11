@@ -40,6 +40,17 @@ pub struct EngineConfig {
     /// `main.rs` turns it off under `Capability::Strong`, where the draft
     /// is still flagged and still logged but stands as written.
     pub reply_regenerate: bool,
+    /// M12 T4.3: on a chat-tier turn, let the emitter call either act or
+    /// answer, and take its answer as the reply. Off by default, and off is
+    /// today's two-call chat turn, request for request and event for event.
+    ///
+    /// Chat only. On Task and Deep the emitter/replier split is doing real
+    /// work — one model chooses, the other narrates what happened — and a
+    /// model that answers mid-loop would be answering before the turn is
+    /// over. A chat turn has no loop to speak of: its emitter call exists to
+    /// say "no tool applies", which is a sentence the same call could have
+    /// spent on the user instead.
+    pub chat_act_or_answer: bool,
     /// Reporting threshold, not a gate: a draft at or over this fraction of
     /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
     /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
@@ -229,6 +240,7 @@ impl Default for EngineConfig {
             facts_in_context: 10,
             reply_grounding_check: true,
             reply_regenerate: true,
+            chat_act_or_answer: false,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
@@ -1311,6 +1323,10 @@ impl Engine {
         // which fallback reason the user is given.
         let mut proposed_this_turn = false;
         let mut settled: Option<ReplyPolicy> = None;
+        // M12 T4.3: the reply text the emitter call already produced, when
+        // the turn settled on an answer rather than an action. `None` is
+        // every turn before M12 and every turn with the knob off.
+        let mut pre_draft: Option<String> = None;
 
         for _ in 0..self.cfg.max_iterations {
             // a. project
@@ -1461,6 +1477,7 @@ impl Engine {
                 guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
                 budget_line: None,
                 usage: Some(usage.clone()),
+                answer: None,
             };
 
             // c. propose
@@ -1493,6 +1510,25 @@ impl Engine {
                 Some(nscore::Ablate::Guidance) => ctx.guidance.clear(),
                 None => {}
             }
+            // M12 T4.3: chat-tier only, and only with the knob on. Filled
+            // after the fit and the ablation, so `memory_silent` is a
+            // statement about the context as sent rather than as composed —
+            // the same thing the replier's silence line says.
+            let offered_answer = self.cfg.chat_act_or_answer && tier == nscore::Tier::Chat;
+            if offered_answer {
+                let reply_guidance = if self.cfg.archive_foreign_notes {
+                    rules.guidance_for_reply_model(self.cfg.learning_model.as_deref())
+                } else {
+                    rules.guidance_for_reply()
+                };
+                ctx.answer = Some(nscore::AnswerBlocks {
+                    persona: self.cfg.persona.clone(),
+                    reply_guidance,
+                    memory_silent: ctx.facts.is_empty()
+                        && ctx.summary.is_none()
+                        && !ctx.trace_so_far.iter().any(|l| l.contains("recall")),
+                });
+            }
             // Cut to what survived: nothing drops guidance from the middle,
             // so a prefix is exact, and it keeps `note_hashes.len() ==
             // guidance` true whether the list was clamped or blanked.
@@ -1515,10 +1551,21 @@ impl Engine {
             manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
             manifest.route_cues = routed.cues.clone();
-            let proposed = self.parts.emitter.propose(ctx, &legal).await;
+            let proposed = self.parts.emitter.propose_or_answer(ctx, &legal).await;
             self.record_model_calls(&usage, &mut log, turn, &manifest);
+            // Carried only as far as the `respond_directly` branch below:
+            // an answer that arrives beside any other action is not an
+            // answer to this turn, and a stale one must not reach the reply.
+            let mut emitted_answer: Option<String>;
             let mut proposal = match proposed {
-                Ok(p) => p,
+                Ok(e) => {
+                    // An answer is only ever taken from a call that was
+                    // offered the choice. A double may return one anyway;
+                    // with the knob off this turn must be the turn it was
+                    // before M12, event for event.
+                    emitted_answer = offered_answer.then_some(e.answer).flatten();
+                    e.proposal
+                }
                 Err(e) => {
                     // Four failure classes, three recoveries. A refused or
                     // failed endpoint is not a malformed proposal, and a
@@ -1582,6 +1629,10 @@ impl Engine {
 
             // e. direct reply
             if proposal.action == "respond_directly" {
+                // M12 T4.3. `Settled { Generate }` either way: what changes
+                // is who drafts, not what the log says happened, so a replay
+                // of this turn is the shape it always was.
+                pre_draft = emitted_answer.take();
                 let e = log.append(
                     turn,
                     now(),
@@ -2578,6 +2629,7 @@ impl Engine {
                     turn,
                     &usage,
                     self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                    pre_draft,
                 )
                 .await
             }
@@ -2611,6 +2663,12 @@ impl Engine {
         // (M11 T1.1 follow-up). Passed in rather than re-derived: the tier
         // is the caller's, and it may have been upgraded mid-turn.
         hybrid_facts: bool,
+        // M12 T4.3: the answer the emitter call already produced. `Some`
+        // skips the replier and its `ModelCall` — the turn costs one
+        // request — and then runs the identical echo, grounding, obligation
+        // and citation block on the text, because an emitted answer is a
+        // draft like any other and is not owed a lighter check.
+        pre_draft: Option<String>,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2702,8 +2760,16 @@ impl Engine {
         let mut manifest = reply_manifest(scope, &budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
         manifest.ablated = self.cfg.ablate;
-        let drafted = self.parts.replier.reply(budgeted).await;
-        self.record_model_calls(usage, log, turn, &manifest);
+        // M12 T4.3. An emitted answer is already drafted and already paid
+        // for; everything below it is the same.
+        let drafted = match pre_draft {
+            Some(text) => Ok(text),
+            None => {
+                let d = self.parts.replier.reply(budgeted).await;
+                self.record_model_calls(usage, log, turn, &manifest);
+                d
+            }
+        };
         match drafted {
             Ok(draft) if self.cfg.reply_grounding_check => {
                 // M6 §4.5. Two checks, one of which acts.

@@ -45,6 +45,10 @@ provider = "openrouter"
 # tokens) and leaves the text fallback as a counter. Recommended with
 # Sonnet 5 or Luna; measured in the M11/M12 plans.
 #   capability = "strong"
+# On a chat-tier turn only, let the one emitter call either act or answer,
+# and take its answer as the reply — a chat turn for one request instead of
+# two. Off by default, and needs a router, because the tier decides it.
+#   chat_act_or_answer = true
 
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the

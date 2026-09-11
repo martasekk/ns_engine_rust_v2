@@ -338,9 +338,36 @@ fn chat_counter_line(events: &[Event]) -> String {
             any && all
         })
         .count();
+    // M12 T4.5: what the act-or-answer path actually bought, read from the
+    // same log rather than from the config. The first number is how often a
+    // chat turn's emitter call answered instead of acting; the second is the
+    // thing the phase exists to move, and it is a mean rather than a count
+    // because a chat turn that reached for a tool still costs its two.
+    let emitted = chat_turns
+        .iter()
+        .filter(|turn| {
+            events.iter().any(|e| {
+                e.turn == **turn
+                    && matches!(&e.kind, EventKind::Proposed { proposal }
+                        if proposal.rationale.starts_with(nscore::ANSWERED_IN_EMITTER_PREFIX))
+            })
+        })
+        .count();
+    let calls: usize = chat_turns
+        .iter()
+        .map(|turn| {
+            events
+                .iter()
+                .filter(|e| e.turn == *turn && matches!(e.kind, EventKind::ModelCall { .. }))
+                .count()
+        })
+        .sum();
+    let per_turn = calls as f64 / chat_turns.len() as f64;
     format!(
         "chat turns answered without a tool: {answered} of {} chat-tier turns proposed only \
-         respond_directly\n",
+         respond_directly\nanswered in the emitter call: {emitted} of {}; requests per chat \
+         turn: {per_turn:.2}\n",
+        chat_turns.len(),
         chat_turns.len()
     )
 }
@@ -1389,6 +1416,73 @@ mod tests {
             .position(|l| l.starts_with("rejections by reason"))
             .expect("a rejections line");
         assert_eq!(lines[at + 1], "text fallbacks: 2", "{out}");
+    }
+
+    /// M12 T4.5. The counter that says what act-or-answer bought: how many
+    /// chat turns the emitter call itself answered, and what a chat turn
+    /// costs on average. Read from the log — the rationale prefix and the
+    /// `ModelCall`s — so a deployment is priced on what it did rather than
+    /// on what its config says it would do.
+    #[test]
+    fn the_chat_counter_reads_answers_and_requests_per_chat_turn() {
+        fn proposed(log: &mut EventLog, turn: u32, action: &str, rationale: &str) {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: action.into(),
+                        args: serde_json::json!({}),
+                        rationale: rationale.into(),
+                    },
+                },
+            );
+        }
+        fn chat() -> ContextManifest {
+            ContextManifest {
+                tier: Some(nscore::Tier::Chat),
+                ..Default::default()
+            }
+        }
+
+        let mut log = log();
+        // Turn 1: answered in the emitter call — one request, no replier.
+        call(&mut log, 1, usage("emitter", 1, 100, 0), chat());
+        proposed(
+            &mut log,
+            1,
+            "respond_directly",
+            &format!("{} it is 10:41", nscore::ANSWERED_IN_EMITTER_PREFIX),
+        );
+        // Turn 2: the old shape — emitter, then replier.
+        call(&mut log, 2, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 2, "respond_directly", "no tool applies");
+        call(&mut log, 2, usage("replier", 1, 100, 0), chat());
+        // Turn 3: a tool first, so three requests.
+        call(&mut log, 3, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 3, "get_time", "the user asked");
+        call(&mut log, 3, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 3, "respond_directly", "done");
+        call(&mut log, 3, usage("replier", 1, 100, 0), chat());
+
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("answered in the emitter call"))
+            .expect("an act-or-answer counter line");
+        // (1 + 2 + 3) / 3 = 2.00.
+        assert_eq!(
+            line,
+            "answered in the emitter call: 1 of 3; requests per chat turn: 2.00",
+            "{out}"
+        );
+        // It sits with the line it qualifies, not somewhere else on the page.
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("chat turns answered without a tool"))
+            .expect("the chat counter line");
+        assert_eq!(lines[at + 1], line, "{out}");
     }
 
     /// M10, decision 1 — measure the chat path before changing it. A chat

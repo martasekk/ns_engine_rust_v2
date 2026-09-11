@@ -914,6 +914,16 @@ pub struct LlmConfig {
     /// for a weak emitter, and never adds any.
     #[serde(default)]
     pub capability: Option<String>,
+    /// M12 T4.3: on a chat-tier turn, let the one emitter call either act or
+    /// answer, and take its answer as the reply. Default **false**, and
+    /// false is today's two-call chat turn byte for byte.
+    ///
+    /// Chat only, and only where a router is configured — the tier is what
+    /// decides it. On Task and Deep the emitter/replier split is doing real
+    /// work; on Chat the emitter call exists to say "no tool applies", which
+    /// is a sentence the same call could have spent on the user.
+    #[serde(default)]
+    pub chat_act_or_answer: bool,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -1439,6 +1449,28 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
+    }
+
+    /// M12 T4.3. Off is the two-call chat turn every deployment has today,
+    /// so an absent key and an explicit `false` must be the same thing, and
+    /// the key has to survive being written down.
+    #[test]
+    fn chat_act_or_answer_defaults_to_off_and_round_trips() {
+        assert!(!AppConfig::parse("").unwrap().llm.chat_act_or_answer);
+        assert!(!AppConfig::parse("[llm]\ncapability = \"strong\"")
+            .unwrap()
+            .llm
+            .chat_act_or_answer);
+        assert!(
+            !AppConfig::parse("[llm]\nchat_act_or_answer = false")
+                .unwrap()
+                .llm
+                .chat_act_or_answer
+        );
+        assert!(AppConfig::parse("[llm]\nchat_act_or_answer = true")
+            .unwrap()
+            .llm
+            .chat_act_or_answer);
     }
 
     /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an

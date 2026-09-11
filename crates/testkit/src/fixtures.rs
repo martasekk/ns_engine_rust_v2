@@ -397,8 +397,31 @@ pub struct Fixture {
     /// context carried. Same pair of readings, same reason.
     pub notes_held: usize,
     pub notes_shown: usize,
+    /// `ReplyEchoed` events this fixture's two sessions hold (M12 T4.4b).
+    ///
+    /// Reported per arm because the act-or-answer arm is the first one that
+    /// changes *who writes the reply*: the double's fixed marker cannot echo
+    /// its own prompt, and a model's answer can. A column that stays zero on
+    /// both arms says the monitor saw nothing, not that nothing was there.
+    pub echoed: usize,
     pub detail: String,
     pub abstain_detail: String,
+}
+
+/// `ReplyEchoed` events these sessions hold (M12 T4.4b).
+async fn echoed_in(h: &Harness, sids: &[&SessionId]) -> usize {
+    let mut n = 0;
+    for sid in sids {
+        n += h
+            .store()
+            .load(sid)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ReplyEchoed { .. }))
+            .count();
+    }
+    n
 }
 
 /// The engine's own summary for this session, as the log holds it.
@@ -653,6 +676,7 @@ pub async fn run_one(session: &Session, run: Run) -> Fixture {
         summary_shown: g.summary.as_ref().map(|s| s.chars().count()).unwrap_or(0),
         notes_held: reply_notes.len(),
         notes_shown: g.guidance.len(),
+        echoed: echoed_in(&h, &[&a, &b]).await,
         detail: fails.join("; "),
         abstain_detail: declines.join("; "),
     }
@@ -719,6 +743,13 @@ pub fn render_table(rows: &[Fixture]) -> String {
          (two arms, never one rate: a harness that declined everything would \
          score 0 on the first).\n",
         rows.len(),
+        rows.len()
+    ));
+    // M12 T4.4b: per arm, so the act-or-answer arm can be set beside the
+    // default one on the only column its change can move.
+    out.push_str(&format!(
+        "  ReplyEchoed: {} over {} sessions.\n",
+        rows.iter().map(|r| r.echoed).sum::<usize>(),
         rows.len()
     ));
     let carrying = rows.iter().filter(|r| r.summary_chars > 0).count();
@@ -1494,10 +1525,86 @@ const SEEDS: [Seed; 30] = [
     },
 ];
 
+/// M12 T4.4b. The act-or-answer arm's own fixture: a chat-tier turn whose
+/// one emitter call answers, graded on the two things the arm claims — the
+/// user is told what the emitter said, and the replier never ran.
+///
+/// Outside the thirty-session table on purpose. Those sessions are a fixed
+/// twelve-turn shape over six memory abilities, with five seeds each; a
+/// thirty-first row would move every per-ability count and grade a claim
+/// none of the six is about. This is the arm's claim, run against the same
+/// harness.
+pub async fn answering_chat_turn(run: Run) -> (String, usize) {
+    let h = Harness::routed_for_run(Run {
+        act_or_answer: true,
+        ..run
+    });
+    let sid = SessionId("fx-act-or-answer".into());
+    let answer = "Je deset čtyřicet jedna.";
+    let shown = h
+        .turn_answering(
+            &sid,
+            // A plain conversational message: no cue the router reads as a
+            // task, so the turn routes to Chat and the path is reachable.
+            "ahoj, jak se máš?",
+            vec![nscore::Emission {
+                proposal: Proposal {
+                    rationale: format!("{} {answer}", nscore::ANSWERED_IN_EMITTER_PREFIX),
+                    action: "respond_directly".into(),
+                    args: serde_json::json!({}),
+                },
+                answer: Some(answer.into()),
+            }],
+        )
+        .await;
+    let replied = h
+        .store()
+        .load(&sid)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::Replied { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    (replied, shown.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::paraphrase::overlap;
+
+    /// M12 T4.4b. The arm's grader: the reply is the emitter's answer, and
+    /// the replier — the `Probe` that records every context it is shown —
+    /// was never called, which is the request the arm saves.
+    #[tokio::test]
+    async fn an_answering_chat_turn_replies_without_the_replier() {
+        let (reply, replier_calls) = answering_chat_turn(Run::default()).await;
+        assert_eq!(reply, "Je deset čtyřicet jedna.");
+        assert_eq!(replier_calls, 0, "the replier drafted after all");
+
+        // And with the knob off the same script costs the replier call: the
+        // fixture is measuring the knob, not the double.
+        let h = Harness::routed_for_run(Run::default());
+        let sid = SessionId("fx-act-or-answer-off".into());
+        let shown = h
+            .turn_answering(
+                &sid,
+                "ahoj, jak se máš?",
+                vec![nscore::Emission {
+                    proposal: Proposal {
+                        rationale: "answered".into(),
+                        action: "respond_directly".into(),
+                        args: serde_json::json!({}),
+                    },
+                    answer: Some("Je deset čtyřicet jedna.".into()),
+                }],
+            )
+            .await;
+        assert_eq!(shown.len(), 1, "the replier was skipped with the knob off");
+    }
 
     /// The plan's own risk line — *"fixtures generated by a model leak the
     /// model's style"* — answered the way it wrote: a seed a person authored,

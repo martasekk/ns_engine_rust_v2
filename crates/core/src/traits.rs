@@ -80,6 +80,37 @@ pub struct EmitterContext {
     /// their records. `None` — every scripted double, every caller outside a
     /// turn — leaves the client to the sink it was built with, or to none.
     pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
+    /// M12 T4.2: what this call would need to answer the user directly,
+    /// present only on a chat-tier turn with `[llm] chat_act_or_answer` on.
+    /// `None` — every other tier, every other config, every scripted double
+    /// — is the request the emitter has always sent, byte for byte.
+    pub answer: Option<AnswerBlocks>,
+}
+
+/// The reply-side blocks an act-or-answer emitter call carries in addition
+/// to its own context (M12 T4.2): what the replier would have been given,
+/// minus what the emitter context already holds.
+///
+/// In memory only. Nothing here is serialized and nothing here reaches the
+/// event log — the log records what the emitter proposed, which is the same
+/// shape whether it acted or answered.
+pub struct AnswerBlocks {
+    pub persona: String,
+    /// Reply-scoped guidance notes, the ones `guidance_for_reply` yields.
+    pub reply_guidance: Vec<String>,
+    /// Whether every reference block is empty, decided the way the replier
+    /// decides its silence line.
+    pub memory_silent: bool,
+}
+
+/// What one emitter call produced: the proposal the loop acts on, and — on
+/// an act-or-answer call that chose to answer — the reply text itself.
+pub struct Emission {
+    pub proposal: Proposal,
+    /// `Some` means this text is the user-facing reply and the replier call
+    /// is skipped; the proposal is `respond_directly` and exists so the log
+    /// and the replay path are unchanged.
+    pub answer: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +153,21 @@ pub trait Emitter: Send + Sync {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError>;
+
+    /// The same call, with the option of answering instead of acting (M12
+    /// T4.2). Defaulted, because only the two emitters that can read
+    /// `ctx.answer` have anything to add: everything else keeps `propose`
+    /// and never returns an answer, which is today's behaviour exactly.
+    async fn propose_or_answer(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        Ok(Emission {
+            proposal: self.propose(ctx, legal).await?,
+            answer: None,
+        })
+    }
 }
 
 /// What the reply model sees (M6 spec §4.2–4.3). Block order is stable-first

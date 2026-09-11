@@ -915,6 +915,8 @@ async fn main() {
         // M12 T1.2: a strong model is flagged and logged, never regenerated
         // at — the second call buys nothing it did not already do.
         reply_regenerate: capability != nscore::Capability::Strong,
+        // M12 T4.3: chat-tier act-or-answer, off unless `[llm]` says so.
+        chat_act_or_answer: cfg.llm.chat_act_or_answer,
         max_echo_ratio: cfg.memory.max_echo_ratio,
         scope_for,
         remember_residual,

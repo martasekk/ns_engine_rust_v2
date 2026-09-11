@@ -46,64 +46,21 @@ impl CloudReplier {
     }
 }
 
-/// Reference material: the stable blocks, tagged and fenced. M6 §4.3 order
-/// (facts → summary → verbatim window) is preserved; what changed is the
-/// role it is sent in and the fence around it.
-///
-/// Both changes answer the same failure. Flat, untagged, in the same `user`
-/// message as the task, the window reads as a document to continue rather
-/// than as background to draw on, and the model continues it — 16 replies of
-/// `fact user.previous_name = Tomas` in the live `cli` session, and t135's
-/// `"hi\nwhat time is it?"`, which is the user's own line handed back.
-/// Fencing untrusted or reference content behind explicit markers is
-/// spotlighting's *delimiting* variant (Microsoft, CEUR Vol-3920), reported
-/// at minimal task cost; datamarking and encoding are not used here — the
-/// problem is a lazy model, not an adversary, and both cost legibility.
+/// The fenced reference block, as this replier has always rendered it. The
+/// body moved to [`crate::reference`] in M12 T4.1 so the emitter can send
+/// the same one; this is the replier's view of it, unchanged byte for byte.
 fn render_reference(ctx: &ReplyContext) -> String {
-    let mut s = String::from(
-        "<reference>\nBackground, so you know what is true and what has already been \
-         said. Draw on it; never reproduce a line of it.\n",
-    );
-    if !ctx.facts.is_empty() {
-        s.push_str("\n<facts>\n");
-        for f in &ctx.facts {
-            s.push_str(&format!("- {}\n", nscore::render_fact(f)));
-        }
-        s.push_str("</facts>\n");
-    }
-    if let Some(summary) = &ctx.summary {
-        s.push_str("\n<summary>\n");
-        s.push_str(&nscore::render_summary(summary));
-        s.push_str("\n</summary>\n");
-    }
-    if !ctx.window.is_empty() {
-        s.push_str("\n<transcript>\n");
-        s.push_str(&nscore::render_window(
-            &ctx.window,
-            ctx.window.len(),
-            &ctx.caps,
-        ));
-        s.push_str("\n</transcript>\n");
-    }
-    s.push_str("</reference>");
-    s
+    crate::reference::render_reference(&ctx.facts, ctx.summary.as_ref(), &ctx.window, &ctx.caps)
 }
 
-/// M11 T1.2. The sentence added when every reference block is empty.
-///
-/// An empty `<reference>` is not the same as a reference that happens to say
-/// nothing relevant, and a model that is shown nothing tends to fill the gap
-/// from its own weights (2606.06055). Saying so is cheap — one sentence, and
-/// only on the turns that have nothing to draw on.
-pub const MEMORY_SILENCE: &str = "Nothing in memory bears on this; say so rather than guessing.";
+/// M11 T1.2. The sentence added when every reference block is empty. Lives
+/// in [`crate::reference`] with the block it talks about.
+pub use crate::reference::MEMORY_SILENCE;
 
-/// Whether this turn has any reference material at all: no facts, no
-/// summary, and no `recall` in the trace, which is the one action that goes
-/// looking for material the context did not carry.
+/// Whether this turn has any reference material at all; see
+/// [`crate::reference::memory_is_silent`].
 fn memory_is_silent(ctx: &ReplyContext) -> bool {
-    ctx.facts.is_empty()
-        && ctx.summary.is_none()
-        && !ctx.turn_trace.lines().any(|l| l.contains("recall"))
+    crate::reference::memory_is_silent(&ctx.facts, ctx.summary.as_ref(), &ctx.turn_trace)
 }
 
 /// The task: the user's message, what this turn did, and the instruction.
@@ -154,17 +111,11 @@ fn render_task(ctx: &ReplyContext) -> String {
         s.push_str(MEMORY_SILENCE);
         s.push('\n');
     }
-    // The old closing line asked the model to "state only outcomes and values
-    // that appear above", which read literally is a request for a copy — and
-    // got one. Answering comes first now; grounding is the constraint on the
-    // answer, not the task.
-    s.push_str(
-        "\nAnswer the user's message, in your own words, speaking to them. Never reproduce \
-         a line from <reference>, <did> or the user's message verbatim — a copied line is \
-         not an answer. State no outcome, value or name that does not appear above; if \
-         something failed or was refused, say so plainly. Do not invent tool results, \
-         names, or numbers. Plain text, no markdown.",
-    );
+    // The closing instruction lives in `crate::reference` (M12 T4.1), with
+    // the fence it refers to, so an emitter that may answer answers under
+    // the same constraint.
+    s.push('\n');
+    s.push_str(crate::reference::ANSWER_INSTRUCTION);
     s
 }
 
@@ -520,6 +471,20 @@ mod tests {
         let mut c = silent();
         c.turn_trace = "Proposed(recall)\nToolReturned(ok: recall: no matches)".into();
         assert!(!task_of(c).await.contains(MEMORY_SILENCE));
+    }
+
+    /// M12 T4.1. The fenced block moved to `crate::reference` so the emitter
+    /// can send the same one; the replier's bytes are not allowed to move
+    /// with it. The literal below is what the pre-extraction code rendered
+    /// for `ctx()`, so a fence, a tag or a newline that shifts fails here.
+    #[test]
+    fn the_reference_block_is_byte_identical_after_the_extraction() {
+        const BEFORE: &str = "<reference>\nBackground, so you know what is true and what has \
+             already been said. Draw on it; never reproduce a line of it.\n\n<facts>\n- \
+             user.name: \"Martin\"\n</facts>\n\n<summary>\nConversation so far (turns 1–1): \
+             greeting\n</summary>\n\n<transcript>\n[t2] user: what now\n      bot:  \
+             Hello!\n</transcript>\n</reference>";
+        assert_eq!(render_reference(&ctx()), BEFORE);
     }
 
     #[tokio::test]

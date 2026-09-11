@@ -243,6 +243,21 @@ impl Emitter for MeteredEmitter {
         }
         proposed
     }
+
+    /// Forwarded, or an act-or-answer arm would meter a call whose answer
+    /// never reached the engine (M12 T4.4b).
+    async fn propose_or_answer(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<nscore::Emission, EmitError> {
+        let sink = ctx.usage.clone();
+        let emitted = self.inner.propose_or_answer(ctx, legal).await;
+        if let Some(sink) = sink {
+            sink.record(spent("emitter"));
+        }
+        emitted
+    }
 }
 
 /// What one call by a scripted double cost.
@@ -781,6 +796,11 @@ pub(crate) struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
+    /// M12 T4.4b: a memory-shaped fixture with the real router wired in, so
+    /// its turns carry a tier. Nothing else needs one — the ten abilities
+    /// route nothing — and act-or-answer is a tier decision, so it cannot be
+    /// measured without one.
+    routed: bool,
     /// M10 T1.4: the verbatim window this fixture runs with, when it needs a
     /// narrower one than the default six.
     ///
@@ -880,6 +900,13 @@ pub struct Run {
     /// [`summarizer_honours_guidelines`], which is this arm's finding, not an
     /// oversight. A `&'static` slice for [`Run`]'s `Copy`, as `withhold`.
     pub summary_guidelines: &'static [&'static str],
+    /// `[llm] chat_act_or_answer` for this arm (M12 T4.3/T4.4b).
+    ///
+    /// `false` on every existing run, and false is the two-call chat turn
+    /// the whole table was measured on. On, a chat-tier turn's emitter call
+    /// may answer, and what moves is the request count and the `ReplyEchoed`
+    /// column — the reply is no longer written by a double that cannot echo.
+    pub act_or_answer: bool,
 }
 
 /// Whether the summarizer the fixtures run can see `summary_guidelines` at
@@ -923,6 +950,7 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
+            routed: false,
             // M12 T5.1. The arm's cap is the fixture's starting value; a
             // fixture that needs its own window says so afterwards, the way
             // `abstention` does.
@@ -955,6 +983,31 @@ impl Harness {
             desktop: true,
             ..Self::for_run(run)
         }
+    }
+
+    /// M12 T4.4b: the memory harness with the real router in front of it, so
+    /// a turn can be routed to `Chat` and the act-or-answer path can fire.
+    pub(crate) fn routed_for_run(run: Run) -> Self {
+        Self {
+            routed: true,
+            ..Self::for_run(run)
+        }
+    }
+
+    /// One turn whose script may answer instead of acting (M12 T4.4b).
+    pub(crate) async fn turn_answering(
+        &self,
+        session: &SessionId,
+        text: &str,
+        script: Vec<nscore::Emission>,
+    ) -> Vec<Shown> {
+        self.run(
+            session,
+            text,
+            Box::new(ScriptedEmitter::answering(script)),
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn turn(
@@ -1052,6 +1105,9 @@ impl Harness {
             // M10 T5.4. `false` on every existing run, so the ten abilities
             // and the thirty fixtures keep the numbers they have.
             obligation_check: self.run.obligation_check,
+            // M12 T4.4b. `false` on every existing run, and it needs a
+            // router to bite at all — only the desktop arm has one.
+            chat_act_or_answer: self.run.act_or_answer,
             window_turns: self
                 .window_turns
                 .unwrap_or(EngineConfig::default().window_turns),
@@ -1099,6 +1155,16 @@ impl Harness {
                     depth: self.run.depth,
                     ..KeywordRouter::default()
                 })),
+                ..common
+            }
+        } else if self.routed {
+            b.add_tool(Arc::new(EchoTool::new()));
+            // M12 T4.4b. The real router, for the same reason the desktop
+            // arm uses it: the tier is what act-or-answer turns on, and a
+            // fixture that fixed the tier itself would be reporting a
+            // routing nothing routed.
+            EngineConfig {
+                router: Some(Arc::new(KeywordRouter::default())),
                 ..common
             }
         } else {

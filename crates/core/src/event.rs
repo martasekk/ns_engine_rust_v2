@@ -227,6 +227,14 @@ pub fn reject_bucket(reason: &crate::action::RejectReason) -> String {
 /// the writer and the reader must agree on one string.
 pub const TEXT_FALLBACK_PREFIX: &str = "model answered in text:";
 
+/// How the emitter labels a proposal whose text *is* the reply, because a
+/// chat-tier act-or-answer call chose to answer rather than act (M12 T4.2).
+///
+/// Here for the same reason as [`TEXT_FALLBACK_PREFIX`], and distinct from
+/// it on purpose: a fallback is a request that bought nothing, and this is a
+/// request that bought the whole turn.
+pub const ANSWERED_IN_EMITTER_PREFIX: &str = "answered in the emitter call:";
+
 /// How many proposals in this log came from the emitter's text fallback.
 ///
 /// A fallback is a request that bought no tool call, so it belongs next to

@@ -954,6 +954,7 @@ mod tests {
             guidance: vec![],
             budget_line: None,
             usage: None,
+            answer: None,
         }
     }
 
