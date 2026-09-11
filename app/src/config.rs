@@ -850,8 +850,8 @@ pub struct RoleSection {
     /// the provider's own default and the request this role has always sent.
     #[serde(default)]
     pub reasoning: Option<String>,
-    /// Output-token cap for this role. Unset is the role's constant (emitter
-    /// and replier 4096, summarizer 400) — a floor chosen so a reasoning
+    /// Output-token cap for this role. Unset is the role's constant (4096 for
+    /// emitter, replier and summarizer alike) — a floor chosen so a reasoning
     /// model does not spend the whole budget before the content starts.
     #[serde(default)]
     pub max_tokens: Option<u32>,

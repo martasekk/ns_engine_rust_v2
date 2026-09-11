@@ -34,7 +34,11 @@ pub fn summary_schema() -> serde_json::Value {
 }
 
 /// The summarizer's output is three short lists; the engine clamps it anyway.
-pub const MAX_TOKENS: u32 = 400;
+///
+/// 4096, not 400: a reasoning model spends output tokens on reasoning before
+/// it writes the summary JSON, so a tight cap comes back as finish_reason
+/// "length" and a truncated object the fence parser cannot read.
+pub const MAX_TOKENS: u32 = 4096;
 
 /// The request shape this summarizer has always sent (M11 T0.2).
 pub fn default_shape() -> crate::provider::RequestShape {
@@ -114,7 +118,16 @@ fn strip_fence(s: &str) -> &str {
         .or_else(|| t.strip_prefix("```"))
         .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t);
-    t.trim()
+    let t = t.trim();
+    let t = t.strip_prefix('`').unwrap_or(t);
+    let t = t.strip_suffix('`').unwrap_or(t);
+    let t = t.trim();
+    if let (Some(start), Some(end)) = (t.find('{'), t.rfind('}')) {
+        if start <= end {
+            return &t[start..=end];
+        }
+    }
+    t
 }
 
 /// Known facts → previous summary → the verbatim records to fold in.
@@ -363,7 +376,7 @@ mod tests {
         let off = request_with(false).await;
         assert!(off.get("response_format").is_none(), "{off}");
         assert_eq!(off["temperature"], 0);
-        assert_eq!(off["max_tokens"], 400);
+        assert_eq!(off["max_tokens"], MAX_TOKENS);
 
         let on = request_with(true).await;
         assert_eq!(on["response_format"]["type"], "json_schema");
