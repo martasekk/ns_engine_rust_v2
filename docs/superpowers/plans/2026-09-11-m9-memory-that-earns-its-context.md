@@ -311,3 +311,16 @@ literal) and the `--ablate` dispatch; `Harness::new()`/`desktop()` were replaced
 `Harness::ablating(..)`/`desktop_ablating(..)` once nothing called the old ones. rustfmt
 collateral in `paraphrase.rs` was reverted; `turn.rs`, `config.rs`, `budget.rs` keep their
 pre-existing format diffs.
+
+### P1 — done 2026-09-11 (commit `0869bc8`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T1.1 | grade → stop the service → replay: verdicts byte-identical; fold unchanged | met: `grading_a_session_then_replaying_it_yields_identical_grades_without_a_service` grades with a stoppable scorer, flips it to Unavailable, re-runs — `Graded` JSON identical, `verify_chain` ok, `fold` and `replay::normalize` byte-equal. `Grade { ok, issues: Vec<String> }` lives in core; `Graded` is infrastructure in `replay.rs:48/:61`, `state.rs:204`, `mine.rs:327` |
+| T1.2 | reply-quality candidate Unverified without a graded turn; emitter-side unchanged | met: `NoteGate { require_graded, authoritative }`; `SignatureKind::from_grades()` = UserReask, UngroundedReply, IgnoredQuestion, IgnoredRequest; an ungraded reply-quality candidate costs zero probe budget |
+| T1.3 | second `evolve --dry-run` grades 0 new | met on a copy of `ns-run/ns.sqlite`: run 1 "20 newly graded, 0 read back", run 2 "0 newly graded, 20 read back", chain verifying. `[models] evaluate_budget_turns` default 40 |
+| exit | κ per evaluator, ≥10 signatures, zero requests | signatures 12 (FallbackReply 3, IgnoredQuestion 2, UserReask 7), unchanged from M8's numbers; **zero HTTP requests** (only the refused loopback to ns-pointerd during tool registration, before the pass). **κ not printed**: `build_pass` constructs only `SymbolicEvaluator`; `[models] enabled = true` dials nothing because `LocalEvaluator` is not added via `with_evaluator` yet. That wiring is M8 T2.7's gate, deferred by this plan — recorded as the one open piece of the M8 exit line |
+
+Deviation recorded: the replay test lives in `crates/evolution/src/pass.rs` (there is no
+`crates/engine/tests/replay.rs`, and the test needs `ScriptedEvaluator` and
+`EvolutionPass`, which sit above the engine).
