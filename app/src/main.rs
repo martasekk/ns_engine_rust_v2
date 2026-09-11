@@ -154,6 +154,43 @@ fn parse_evolve_args(args: &[String]) -> Result<(bool, bool), String> {
     Ok((dry_run, spend))
 }
 
+/// `ns-app [--max-requests N] [--session ID]` → Ok((max_requests, session))
+///
+/// M12 T6.1: the two things a metered live session needs that the config
+/// file cannot give it — a ceiling on what this run may spend, and an id of
+/// its own so the reading is separable from every other CLI session in the
+/// store. `NS_MAX_REQUESTS` and `NS_SESSION` are the fallback for each; the
+/// flag wins when both are given.
+fn parse_repl_args(
+    args: &[String],
+    env_max_requests: Option<String>,
+    env_session: Option<String>,
+) -> Result<(Option<u32>, String), String> {
+    let usage = || format!("usage: ns-app [--max-requests N] [--session ID] (got {args:?})");
+    let mut max_requests = env_max_requests;
+    let mut session = env_session;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let slot = match arg.as_str() {
+            "--max-requests" => &mut max_requests,
+            "--session" => &mut session,
+            _ => return Err(usage()),
+        };
+        let Some(value) = rest.next() else {
+            return Err(format!("{arg} needs a value — {}", usage()));
+        };
+        *slot = Some(value.clone());
+    }
+    let max_requests = match max_requests {
+        Some(n) => Some(
+            n.parse::<u32>()
+                .map_err(|_| format!("--max-requests wants a number, got {n:?}"))?,
+        ),
+        None => None,
+    };
+    Ok((max_requests, session.unwrap_or_else(|| "cli".into())))
+}
+
 /// One throttle per endpoint: roles sharing a base URL share the pacing,
 /// so the provider sees one paced stream (seen live: Mistral 429s on
 /// bursts). Roles on different providers are paced independently.
@@ -700,6 +737,21 @@ async fn main() {
     // at the points that differ: the channel, the fact scope, the banner.
     let serve = args.get(1).map(String::as_str) == Some("serve");
 
+    // M12 T6.1: the metered-session flags. `serve` takes its session ids
+    // from its clients, so only the ceiling means anything there.
+    let flags_from = if serve { 2 } else { 1 };
+    let (max_requests, cli_session) = match parse_repl_args(
+        &args[flags_from.min(args.len())..],
+        env_override("NS_MAX_REQUESTS"),
+        env_override("NS_SESSION"),
+    ) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+
     // Each role resolves on its own, so the emitter can sit on a local
     // model while the replier stays in the cloud (or the other way round).
     let emitter_target = role_or_exit(&cfg, Role::Emitter);
@@ -819,7 +871,7 @@ async fn main() {
         // The agent has offered that channel since 2026-09-05 and nothing
         // collected it; a line typed into the badge went into the outbox and
         // stopped there.
-        let cli = nschannel_cli::CliChannel::new_stdio();
+        let cli = nschannel_cli::CliChannel::new_stdio().with_session(cli_session.clone());
         match desktop_messages(&cfg).await {
             Some(client) => b.set_channel(Box::new(
                 nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
@@ -960,6 +1012,8 @@ async fn main() {
         // to be near.
         recall_hybrid: cfg.recall.hybrid,
         exemplars_max: cfg.memory.exemplars_max,
+        // M12 T6.1: no ceiling unless this run asked for one.
+        max_requests,
     };
     let engine = Engine::new(parts, engine_cfg);
     println!(
@@ -985,8 +1039,16 @@ async fn main() {
         ),
         None => println!("type text, /quit to exit  ·  `ns-app providers` lists the backends"),
     }
-    if let Err(e) = engine.run().await {
-        eprintln!("engine stopped: {e}");
+    match engine.run().await {
+        Ok(()) => {}
+        // M12 T6.1: the ceiling this run was given, reached. A stop by
+        // arrangement rather than a failure, but non-zero all the same, so a
+        // script driving the session can tell it ended early.
+        Err(nsengine::turn::EngineError::RequestCap { spent, cap }) => {
+            eprintln!("request cap {cap} reached after {spent} requests; stopping");
+            std::process::exit(3);
+        }
+        Err(e) => eprintln!("engine stopped: {e}"),
     }
 }
 
@@ -1126,6 +1188,44 @@ mod tests {
         assert_eq!(arg(&["--spend", "--dry-run"]), Ok((true, true)));
         assert!(arg(&["--wat"]).is_err());
         assert!(arg(&["--dry-run", "--dry-run"]).is_err());
+    }
+
+    /// M12 T6.1: the two flags a metered live session is run with.
+    #[test]
+    fn repl_args_accept_max_requests_and_session() {
+        let arg = |flags: &[&str]| {
+            parse_repl_args(
+                &flags.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                None,
+                None,
+            )
+        };
+        assert_eq!(arg(&[]), Ok((None, "cli".to_string())));
+        assert_eq!(
+            arg(&["--max-requests", "60", "--session", "m12-live"]),
+            Ok((Some(60), "m12-live".to_string()))
+        );
+        assert_eq!(
+            arg(&["--session", "m12-live"]),
+            Ok((None, "m12-live".to_string()))
+        );
+        assert!(arg(&["--max-requests", "sixty"]).is_err());
+        assert!(arg(&["--max-requests"]).is_err());
+        assert!(arg(&["--wat"]).is_err());
+        // The environment is the fallback; a flag beside it wins.
+        assert_eq!(
+            parse_repl_args(&[], Some("40".into()), Some("env-session".into())),
+            Ok((Some(40), "env-session".to_string()))
+        );
+        assert_eq!(
+            parse_repl_args(
+                &["--max-requests".to_string(), "60".to_string()],
+                Some("40".into()),
+                None
+            ),
+            Ok((Some(60), "cli".to_string()))
+        );
+        assert!(parse_repl_args(&[], Some("lots".into()), None).is_err());
     }
 
     /// The whole client hop, against an agent that records and touches

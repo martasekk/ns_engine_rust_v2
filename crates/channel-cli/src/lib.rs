@@ -43,6 +43,14 @@ impl<R: AsyncBufRead + Unpin + Send + Sync, W: AsyncWrite + Unpin + Send + Sync>
         }
     }
 
+    /// The session every line is delivered to. `cli` is the default and the
+    /// only id this channel had; M12 T6.1 lets a metered run name its own,
+    /// so its log is separable in the store from every other CLI session.
+    pub fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session = SessionId(session.into());
+        self
+    }
+
     pub fn into_writer(self) -> W {
         self.writer.into_inner()
     }

@@ -329,3 +329,89 @@ async fn with_the_knob_off_an_answering_emitter_is_never_asked() {
     assert_eq!(r.reply_calls, 1);
     assert_eq!(r.reply, "the replier drafted this");
 }
+
+/// Books a nominal cost so a replier call lands as a `ModelCall` too: the
+/// cap counts every role's requests, not the emitter's alone.
+struct BillingReplier;
+#[async_trait::async_trait]
+impl Replier for BillingReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        if let Some(sink) = ctx.usage.as_deref() {
+            sink.record(Usage {
+                role: "replier".into(),
+                model: "probe".into(),
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                estimated: true,
+                attempts: 1,
+                latency_ms: 0,
+                tools_tokens: 0,
+                cached_tokens: 0,
+            });
+        }
+        Ok("the replier drafted this".into())
+    }
+}
+
+/// M12 T6.1: a metered session stops itself. Two turns at two requests each
+/// against a cap of two: the first turn runs to the end, the second is
+/// refused before it calls anything.
+#[tokio::test]
+async fn the_engine_stops_at_the_request_cap() {
+    async fn two_turns(max_requests: Option<u32>) -> (Result<String, String>, usize) {
+        let store = Arc::new(InMemoryStore::new());
+        let sid = SessionId("cap".into());
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(AnswerProbe {
+            inner: ScriptedEmitter::answering(vec![
+                acts("respond_directly", serde_json::json!({})),
+                acts("respond_directly", serde_json::json!({})),
+            ]),
+            answer_offered: Arc::new(Mutex::new(Vec::new())),
+        }));
+        b.set_replier(Box::new(BillingReplier));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig {
+                max_requests,
+                max_echo_ratio: 1.1,
+                reply_grounding_check: false,
+                summary_every_turns: 0,
+                ..EngineConfig::default()
+            },
+            Box::new(|| Timestamp(42)),
+        );
+        let say = |text: &str| Incoming {
+            session: sid.clone(),
+            text: text.into(),
+        };
+        let first = e.run_turn(say("first")).await;
+        assert!(first.is_ok(), "the first turn must complete: {first:?}");
+        let second = e.run_turn(say("second")).await.map_err(|e| e.to_string());
+        let calls = store
+            .load(&sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::ModelCall { .. }))
+            .count();
+        (second, calls)
+    }
+
+    let (second, calls) = two_turns(Some(2)).await;
+    let err = second.expect_err("the second turn must be refused");
+    assert!(
+        err.contains("request cap 2") && err.contains("2 requests"),
+        "{err}"
+    );
+    assert_eq!(calls, 2, "the refused turn must not call anything");
+
+    // Uncapped, the same session runs both turns.
+    let (second, calls) = two_turns(None).await;
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(calls, 4);
+}

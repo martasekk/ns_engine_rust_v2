@@ -222,6 +222,15 @@ pub struct EngineConfig {
     /// return it carries the digests' *lowest* trust, it is in the
     /// provenance index, and it replays.
     pub exemplars_max: usize,
+    /// M12 T6.1: the hard ceiling on model requests this engine may spend
+    /// before it stops taking turns. `None` — the default — is no ceiling,
+    /// which is every deployment but a metered one.
+    ///
+    /// Counted across every role, the summarizer included, from the moment
+    /// the engine was built; checked at the start of a turn, never inside
+    /// one, so a run stops between turns rather than mid-flight with a tool
+    /// called and nothing said about it.
+    pub max_requests: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -275,6 +284,7 @@ impl Default for EngineConfig {
             worker_slots: 1,
             recall_hybrid: false,
             exemplars_max: 0,
+            max_requests: None,
         }
     }
 }
@@ -286,6 +296,12 @@ pub struct Engine {
     /// Always-on guard chain, checked before plugin guards. Plugins cannot
     /// remove these (spec §5.4).
     builtin_guards: Vec<Box<dyn nscore::Guard>>,
+    /// M12 T6.1: model requests recorded since this engine was built, what
+    /// `max_requests` is measured against. Every role counts, and it is
+    /// incremented where the calls are already counted once —
+    /// `record_model_calls` — so a role that books usage is capped by the
+    /// fact that it books usage, with nothing to keep in step.
+    spent: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -294,6 +310,11 @@ pub enum EngineError {
     Store(#[from] nscore::StoreError),
     #[error("channel: {0}")]
     Channel(String),
+    /// M12 T6.1: `max_requests` is spent, so no further turn is started.
+    /// Not a failure of the turn it is returned from — that turn made no
+    /// call at all — but the end of a metered run.
+    #[error("request cap {cap} reached after {spent} requests")]
+    RequestCap { spent: u32, cap: u32 },
 }
 
 pub const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
@@ -598,6 +619,7 @@ impl Engine {
             cfg,
             clock,
             builtin_guards: guards,
+            spent: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1146,6 +1168,7 @@ impl Engine {
         turn: u32,
         manifest: &nscore::ContextManifest,
     ) {
+        let mut calls = 0u32;
         for usage in sink.drain() {
             log.append(
                 turn,
@@ -1155,7 +1178,30 @@ impl Engine {
                     manifest: manifest.clone(),
                 },
             );
+            calls += 1;
         }
+        // M12 T6.1: what the request cap is measured against. Here because
+        // this is the one place the engine's own calls are already counted.
+        self.spent
+            .fetch_add(calls, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// M12 T6.1: whether this engine may start another turn.
+    ///
+    /// Checked at the start of a turn and again once it has ended — an
+    /// engine over its ceiling refuses the *next* turn, rather than cutting
+    /// the one in flight, whose tool calls have already happened and whose
+    /// reply is owed to whoever is reading. The check after the turn is the
+    /// same check: it is the one the next `run_turn` makes.
+    fn cap_reached(&self) -> Result<(), EngineError> {
+        let Some(cap) = self.cfg.max_requests else {
+            return Ok(());
+        };
+        let spent = self.spent.load(std::sync::atomic::Ordering::SeqCst);
+        if spent >= cap {
+            return Err(EngineError::RequestCap { spent, cap });
+        }
+        Ok(())
     }
 
     async fn flush(&self, sid: &nscore::SessionId, log: &EventLog, from: usize) {
@@ -1165,6 +1211,10 @@ impl Engine {
     }
 
     pub async fn run_turn(&self, incoming: Incoming) -> Result<String, EngineError> {
+        // Before anything is loaded or called: a capped run stops between
+        // turns, with the message it could not afford left unanswered
+        // rather than half answered.
+        self.cap_reached()?;
         let sid = incoming.session.clone();
         let scope = (self.cfg.scope_for)(&sid);
         let stored = self.parts.memory.load(&sid).await?;
