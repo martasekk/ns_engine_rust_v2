@@ -31,6 +31,12 @@ pub struct Provider {
     /// Local server: any non-empty key works, so an unset key env is not a
     /// startup error.
     pub local: bool,
+    /// Whether the endpoint honours `response_format: {"type": "json_schema"}`
+    /// (M11 T0.5). Only the summarizer uses it, and only as a stronger
+    /// spelling of what its prompt already asks for: `strip_fence` stays the
+    /// parser, so a provider that advertises the field and then ignores it
+    /// costs nothing.
+    pub structured_output: bool,
     pub note: &'static str,
 }
 
@@ -44,6 +50,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: true,
         local: false,
+        structured_output: true,
         note: "many models behind one key; free tier 50 requests/day",
     },
     Provider {
@@ -55,6 +62,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 1100,
         prompt_cache: false,
         local: false,
+        structured_output: false,
         note: "free Experiment tier, ~1 req/s, does function calling",
     },
     Provider {
@@ -65,6 +73,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: false,
         local: true,
+        structured_output: false,
         note: "local; pick a non-thinking model, the OpenAI endpoint ignores `think`",
     },
     Provider {
@@ -75,6 +84,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: false,
         local: true,
+        structured_output: false,
         note: "local; model id is whatever LM Studio has loaded",
     },
     Provider {
@@ -85,6 +95,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: false,
         local: true,
+        structured_output: false,
         note: "local; llama-server --jinja for tool calls",
     },
     Provider {
@@ -95,6 +106,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: false,
         local: false,
+        structured_output: true,
         note: "name the model explicitly; the catalogue moves",
     },
     Provider {
@@ -105,6 +117,7 @@ pub const PROVIDERS: &[Provider] = &[
         min_interval_ms: 0,
         prompt_cache: false,
         local: false,
+        structured_output: false,
         note: "fast, but the free tier is ~6K tokens/min per model",
     },
 ];
@@ -143,6 +156,180 @@ pub fn split_model(spec: &str) -> (Option<&'static Provider>, &str) {
             None => (None, spec),
         },
         None => (None, spec),
+    }
+}
+
+// ── Request shaping (M11 T0.1–T0.3) ──────────────────────────────────────
+//
+// Every role has always sent one fixed request shape, chosen for a small
+// model: `temperature: 0` on the emitter and summarizer, no sampling params
+// on the replier, `max_tokens` a constant. Claude Sonnet 5 rejects a
+// non-default `temperature`, `top_p`, `top_k` or a manual thinking budget
+// with a 400 and replaces budgets with `reasoning: {effort}` — so the shape
+// has to become per-role config rather than a literal in three `json!`
+// blocks. Everything here is optional: with nothing set, each role's own
+// default shape is the request it has always sent, byte for byte.
+
+/// Whether a role sends sampling params at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampling {
+    /// The role's own default — `temperature: 0` where it had one.
+    Default,
+    /// Send no sampling param at all. Not `temperature: 1`: the models that
+    /// need this reject the *presence* of the key, not its value.
+    None,
+}
+
+impl Sampling {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Sampling::Default),
+            "none" => Ok(Sampling::None),
+            other => Err(format!(
+                "sampling must be \"default\" or \"none\", got {other:?}"
+            )),
+        }
+    }
+}
+
+/// `low` | `medium` | `high`, the only spellings OpenRouter's `reasoning`
+/// block takes. Err names the bad value rather than dropping the knob: a
+/// typo would otherwise look exactly like a model that ignores effort.
+pub fn parse_effort(s: &str) -> Result<String, String> {
+    let e = s.trim().to_ascii_lowercase();
+    match e.as_str() {
+        "low" | "medium" | "high" => Ok(e),
+        other => Err(format!(
+            "reasoning must be \"low\", \"medium\" or \"high\", got {other:?}"
+        )),
+    }
+}
+
+/// The shape one role's request takes, after config and the safety net.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestShape {
+    /// The value to send as `temperature`, or `None` to omit the key
+    /// entirely. A `Value` rather than an `f32` because the request that
+    /// exists today carries the integer `0`, and "byte for byte" includes
+    /// not turning it into `0.0`.
+    pub temperature: Option<serde_json::Value>,
+    pub reasoning_effort: Option<String>,
+    /// `Some(false)` sends `reasoning: {"enabled": false}` — for models
+    /// (Qwen3 and kin) that think by default when the emitter needs a tool
+    /// call, not a monologue.
+    pub thinking_enabled: Option<bool>,
+    pub max_tokens: u32,
+}
+
+impl RequestShape {
+    /// Determinism pinned at `temperature: 0` — the emitter's and the
+    /// summarizer's shape since M2.
+    pub fn pinned(max_tokens: u32) -> Self {
+        Self {
+            temperature: Some(serde_json::json!(0)),
+            reasoning_effort: None,
+            thinking_enabled: None,
+            max_tokens,
+        }
+    }
+
+    /// No sampling param at all — the replier's shape since M6.
+    pub fn unsampled(max_tokens: u32) -> Self {
+        Self {
+            temperature: None,
+            reasoning_effort: None,
+            thinking_enabled: None,
+            max_tokens,
+        }
+    }
+
+    /// Insert this shape's keys into a request object, and omit the ones it
+    /// does not carry. The one place any of these four keys is written, so
+    /// "omit `temperature` entirely" is a property of the type rather than
+    /// of three `json!` blocks agreeing.
+    pub fn apply(&self, request: &mut serde_json::Value) {
+        let obj = request
+            .as_object_mut()
+            .expect("a chat-completions request is a JSON object");
+        obj.insert("max_tokens".into(), serde_json::json!(self.max_tokens));
+        match &self.temperature {
+            Some(t) => obj.insert("temperature".into(), t.clone()),
+            None => obj.remove("temperature"),
+        };
+        // One `reasoning` block, never two. An explicit effort wins over
+        // `thinking = false`: asking for effort and switching thinking off
+        // is a contradiction, and the effort is the narrower instruction.
+        if let Some(effort) = &self.reasoning_effort {
+            obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
+        } else if self.thinking_enabled == Some(false) {
+            obj.insert("reasoning".into(), serde_json::json!({"enabled": false}));
+        }
+    }
+}
+
+/// The four optional `[llm.<role>]` shaping fields, parsed. All unset — the
+/// default — means the role's own shape, unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleShaping {
+    pub reasoning: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub sampling: Option<Sampling>,
+    pub thinking: Option<bool>,
+}
+
+/// Model ids that 400 on any sampling param. Prefix match, because the
+/// catalogue appends dated and `:thinking` suffixes to the same model.
+pub const SAMPLING_REJECTED_BY: &[&str] = &["anthropic/claude-sonnet-5"];
+
+/// The safety net (T0.3): does this model reject sampling params outright?
+pub fn rejects_sampling(model: &str) -> bool {
+    let m = model.trim();
+    SAMPLING_REJECTED_BY.iter().any(|p| m.starts_with(p))
+}
+
+impl RoleShaping {
+    /// Fold the config onto the role's default shape.
+    ///
+    /// Returns the shape and, when the safety net fired, the one line to
+    /// print at startup — a coercion nobody asked for has to be visible, or
+    /// the next 400 is unexplainable.
+    pub fn resolve(
+        &self,
+        role: &str,
+        model: &str,
+        base: RequestShape,
+    ) -> (RequestShape, Option<String>) {
+        let mut shape = base;
+        let mut coercion = None;
+        let sampling = match self.sampling {
+            Some(s) => s,
+            None if rejects_sampling(model) => {
+                // Only worth a line when it actually removes something: the
+                // replier already sends none, and saying so every start
+                // would be noise.
+                if shape.temperature.is_some() {
+                    coercion = Some(format!(
+                        "{role}: {model} rejects sampling params — sending none \
+                         (set [llm.{role}] sampling = \"default\" to override)"
+                    ));
+                }
+                Sampling::None
+            }
+            None => Sampling::Default,
+        };
+        if sampling == Sampling::None {
+            shape.temperature = None;
+        }
+        if let Some(effort) = &self.reasoning {
+            shape.reasoning_effort = Some(effort.clone());
+        }
+        if let Some(t) = self.thinking {
+            shape.thinking_enabled = Some(t);
+        }
+        if let Some(m) = self.max_tokens {
+            shape.max_tokens = m;
+        }
+        (shape, coercion)
     }
 }
 
@@ -215,5 +402,127 @@ mod tests {
         for p in PROVIDERS {
             assert_eq!(p.prompt_cache, p.name == "openrouter", "{}", p.name);
         }
+    }
+
+    /// M11 T0.5. The two OpenAI-shaped cloud endpoints take `json_schema`;
+    /// the local servers and the smaller clouds do not, and a preset that
+    /// claims it wrongly means a 400 on every summary.
+    #[test]
+    fn structured_output_is_advertised_only_by_openrouter_and_openai() {
+        for p in PROVIDERS {
+            assert_eq!(
+                p.structured_output,
+                p.name == "openrouter" || p.name == "openai",
+                "{}",
+                p.name
+            );
+        }
+    }
+
+    /// M11 T0.1/T0.2. Nothing set is today's request: the role's own shape
+    /// reaches the wire untouched.
+    #[test]
+    fn an_unset_shaping_leaves_the_roles_own_shape_alone() {
+        let (shape, note) =
+            RoleShaping::default().resolve("emitter", "google/gemini-3.8-flash", pinned_4096());
+        assert_eq!(shape, pinned_4096());
+        assert!(note.is_none());
+        let mut req = serde_json::json!({"model": "google/gemini-3.8-flash"});
+        shape.apply(&mut req);
+        assert_eq!(req["temperature"], 0);
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none());
+    }
+
+    fn pinned_4096() -> RequestShape {
+        RequestShape::pinned(4096)
+    }
+
+    /// M11 T0.3, the exit criterion: the 400 is unreachable from a default
+    /// config that names Sonnet in a role. Built the way `main.rs` builds
+    /// it — the role's default shape folded through `resolve` with the
+    /// resolved model id and the section's (empty) shaping — so the test
+    /// fails if that path stops going through here.
+    #[test]
+    fn sonnet_five_never_receives_a_sampling_param() {
+        for model in [
+            "anthropic/claude-sonnet-5",
+            "anthropic/claude-sonnet-5:thinking",
+            "anthropic/claude-sonnet-5-20260514",
+        ] {
+            for (role, base) in [
+                ("emitter", RequestShape::pinned(4096)),
+                ("replier", RequestShape::unsampled(4096)),
+                ("summarizer", RequestShape::pinned(400)),
+            ] {
+                let (shape, note) = RoleShaping::default().resolve(role, model, base.clone());
+                let mut req = serde_json::json!({"model": model, "messages": []});
+                shape.apply(&mut req);
+                assert!(
+                    req.get("temperature").is_none(),
+                    "{role} {model} still carries a sampling param: {req}"
+                );
+                assert!(!req.to_string().contains("top_p"));
+                // The coercion is announced exactly where it changed
+                // something, and stays quiet where it did not.
+                assert_eq!(
+                    note.is_some(),
+                    base.temperature.is_some(),
+                    "{role}: {note:?}"
+                );
+                if let Some(line) = note {
+                    assert!(line.contains(model) && line.contains(role), "{line}");
+                }
+            }
+        }
+        // A model that is not Sonnet keeps its temperature.
+        let (shape, note) =
+            RoleShaping::default().resolve("emitter", "anthropic/claude-haiku-4.5", pinned_4096());
+        assert_eq!(shape.temperature, Some(serde_json::json!(0)));
+        assert!(note.is_none());
+    }
+
+    /// An explicit `sampling = "default"` overrides the net — the operator
+    /// gets to be wrong on purpose, e.g. when the id is a proxy alias.
+    #[test]
+    fn an_explicit_sampling_beats_the_safety_net() {
+        let shaping = RoleShaping {
+            sampling: Some(Sampling::Default),
+            ..Default::default()
+        };
+        let (shape, note) = shaping.resolve("emitter", "anthropic/claude-sonnet-5", pinned_4096());
+        assert_eq!(shape.temperature, Some(serde_json::json!(0)));
+        assert!(note.is_none(), "nothing was coerced");
+    }
+
+    #[test]
+    fn shaping_values_parse_case_insensitively_and_reject_typos() {
+        assert_eq!(Sampling::parse(" None ").unwrap(), Sampling::None);
+        assert_eq!(Sampling::parse("default").unwrap(), Sampling::Default);
+        assert!(Sampling::parse("off").unwrap_err().contains("\"none\""));
+        assert_eq!(parse_effort("HIGH").unwrap(), "high");
+        assert!(parse_effort("maximum").unwrap_err().contains("\"medium\""));
+    }
+
+    /// `reasoning` and `thinking` share one block, and the effort wins.
+    #[test]
+    fn reasoning_and_thinking_share_one_block() {
+        let mut req = serde_json::json!({});
+        RequestShape {
+            reasoning_effort: Some("low".into()),
+            thinking_enabled: Some(false),
+            ..RequestShape::pinned(2048)
+        }
+        .apply(&mut req);
+        assert_eq!(req["reasoning"], serde_json::json!({"effort": "low"}));
+
+        let mut req = serde_json::json!({});
+        RequestShape {
+            thinking_enabled: Some(false),
+            ..RequestShape::pinned(2048)
+        }
+        .apply(&mut req);
+        assert_eq!(req["reasoning"], serde_json::json!({"enabled": false}));
+        assert_eq!(req["max_tokens"], 2048);
     }
 }

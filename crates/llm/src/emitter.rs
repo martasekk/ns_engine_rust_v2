@@ -25,24 +25,43 @@ fn system_prompt() -> String {
     format!("{SYSTEM_PREAMBLE}{RATIONALE_INSTRUCTION}")
 }
 
+/// 4096, not 1024: reasoning models spend output tokens on reasoning before
+/// the tool call; a tight cap yields finish_reason "length" with null content
+/// and no tool_calls. A floor, and `[llm.emitter] max_tokens` may lower it
+/// where the model's effort is known (M11 T0.4 recommends 2048 on Sonnet at
+/// effort low).
+pub const MAX_TOKENS: u32 = 4096;
+
+/// The request shape this emitter has always sent: `temperature: 0`, no
+/// reasoning block, 4096 output tokens. What `[llm.emitter]`'s shaping
+/// fields are folded onto (M11 T0.2).
+pub fn default_shape() -> crate::provider::RequestShape {
+    crate::provider::RequestShape::pinned(MAX_TOKENS)
+}
+
 pub struct CloudEmitter {
     client: OpenRouterClient,
     model: String,
-    max_tokens: u32,
+    shape: crate::provider::RequestShape,
     prompt_cache: bool,
 }
 
 impl CloudEmitter {
     pub fn new(client: OpenRouterClient, model: String) -> Self {
-        // 4096, not 1024: reasoning models spend output tokens on reasoning
-        // before the tool call; a tight cap yields finish_reason "length"
-        // with null content and no tool_calls.
         Self {
             client,
             model,
-            max_tokens: 4096,
+            shape: default_shape(),
             prompt_cache: false,
         }
+    }
+
+    /// `[llm.emitter]`'s `sampling`, `reasoning`, `thinking` and `max_tokens`,
+    /// already resolved against the model id (M11 T0.2). Unset everywhere is
+    /// [`default_shape`], which is byte-for-byte the request above.
+    pub fn with_shape(mut self, shape: crate::provider::RequestShape) -> Self {
+        self.shape = shape;
+        self
     }
 
     /// `[llm] prompt_cache_emitter` (M10 P4, decision 2b). Off by default,
@@ -166,10 +185,8 @@ impl Emitter for CloudEmitter {
         } else {
             serde_json::Value::String(render_context(&ctx))
         };
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": 0,
             "tool_choice": "required",
             "tools": build_tools(legal),
             "messages": [
@@ -177,6 +194,9 @@ impl Emitter for CloudEmitter {
                 {"role": "user", "content": user_content},
             ],
         });
+        // `max_tokens`, `temperature` and the `reasoning` block — the only
+        // keys that differ per model — are written in one place.
+        self.shape.apply(&mut request);
         let body = self
             .client
             .chat_into(request, ctx.usage.as_deref())
@@ -466,6 +486,48 @@ mod tests {
         assert_eq!(p.args, serde_json::json!({"text": "hi"}));
     }
 
+    /// M11 T0.2, the exit criterion: `sampling = "none"` removes the key,
+    /// it does not send a different value. Claude Sonnet 5 400s on the
+    /// *presence* of `temperature`, so `temperature: 1` would fail exactly
+    /// as `temperature: 0` does.
+    #[tokio::test]
+    async fn sampling_none_omits_temperature_entirely() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        let client = OpenRouterClient::new(mock.clone(), "k".into()).with_retry(1, 1);
+        let (shape, coercion) = crate::provider::RoleShaping {
+            reasoning: Some("low".into()),
+            max_tokens: Some(2048),
+            ..Default::default()
+        }
+        .resolve(
+            "emitter",
+            "anthropic/claude-sonnet-5",
+            crate::emitter::default_shape(),
+        );
+        assert!(coercion.is_some(), "the safety net announced itself");
+        CloudEmitter::new(client, "anthropic/claude-sonnet-5".into())
+            .with_shape(shape)
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+
+        let reqs = mock.requests.lock().unwrap();
+        let req = &reqs[0];
+        assert!(
+            req.get("temperature").is_none(),
+            "not a different value — no key at all: {req}"
+        );
+        assert!(!req.to_string().contains("temperature"));
+        assert_eq!(req["reasoning"], serde_json::json!({"effort": "low"}));
+        assert_eq!(req["max_tokens"], 2048);
+        // Everything else about the emitter's request is untouched.
+        assert_eq!(req["tool_choice"], "required");
+        assert_eq!(req["messages"][0]["role"], "system");
+    }
+
     #[tokio::test]
     async fn request_carries_schema_context_and_forced_tool_choice() {
         let mock = MockTransport::ok(vec![tool_call_response(
@@ -482,6 +544,10 @@ mod tests {
         let req = &reqs[0];
         assert_eq!(req["model"], "anthropic/claude-haiku-4.5");
         assert_eq!(req["temperature"], 0);
+        // M11 T0.2: the default shape is the request that has always gone
+        // out — an integer 0, 4096 tokens, and no `reasoning` block.
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none(), "{req}");
         assert_eq!(req["tool_choice"], "required");
         assert_eq!(
             req["tools"].as_array().unwrap().len(),

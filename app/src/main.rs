@@ -206,6 +206,31 @@ fn role_or_exit(cfg: &AppConfig, role: Role) -> RoleTarget {
     }
 }
 
+/// Resolve one role's request shape, or exit: an unparseable `reasoning` or
+/// `sampling` must not be dropped silently — a shape that did not take looks
+/// exactly like a model that ignores the knob (M11 T0.2/T0.3).
+///
+/// The coercion line prints here, once per role at startup, so a request
+/// that quietly lost its `temperature` is never a mystery in a later 400.
+fn shape_or_exit(
+    cfg: &AppConfig,
+    target: &RoleTarget,
+    base: nsllm::provider::RequestShape,
+) -> nsllm::provider::RequestShape {
+    match cfg.llm.shape(target.role, &target.model, base) {
+        Ok((shape, note)) => {
+            if let Some(line) = note {
+                println!("{line}");
+            }
+            shape
+        }
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn key_or_exit(target: &RoleTarget) -> String {
     match target.key() {
         Some(k) => k,
@@ -661,6 +686,11 @@ async fn main() {
                 .with_usage_sink(usage.clone(), "emitter"),
             emitter_target.model.clone(),
         )
+        .with_shape(shape_or_exit(
+            &cfg,
+            &emitter_target,
+            nsllm::emitter::default_shape(),
+        ))
         // M10 P4. Both halves have to hold: the endpoint must forward a
         // breakpoint at all, and the operator must have said the emitter
         // prefix is worth one. Either off means the request is today's.
@@ -672,6 +702,11 @@ async fn main() {
                 .with_usage_sink(usage.clone(), "replier"),
             replier_target.model.clone(),
         )
+        .with_shape(shape_or_exit(
+            &cfg,
+            &replier_target,
+            nsllm::replier::default_shape(),
+        ))
         .with_prompt_cache(replier_target.prompt_cache),
     ));
     b.set_memory(Arc::new(models::store(&cfg)));
@@ -707,6 +742,18 @@ async fn main() {
                     .with_usage_sink(usage.clone(), "summarizer");
                 b.set_summarizer(Box::new(
                     nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
+                        .with_shape(shape_or_exit(
+                            &cfg,
+                            &target,
+                            nsllm::summarizer::default_shape(),
+                        ))
+                        // M11 T0.5: the fixed fields as a schema, where the
+                        // endpoint the summarizer actually reaches knows the
+                        // field. The prompt keeps asking for JSON either way.
+                        .with_structured_output(
+                            nsllm::provider::for_base_url(target.base_url_or_default())
+                                .is_some_and(|p| p.structured_output),
+                        )
                         .with_guidelines(cfg.memory.summary_guidelines.clone()),
                 ));
             }

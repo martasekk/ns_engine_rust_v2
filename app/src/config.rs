@@ -799,6 +799,28 @@ pub struct RoleSection {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// M11 T0.1. How much the model may think before it answers:
+    /// `"low"`, `"medium"` or `"high"`, sent as OpenRouter's
+    /// `reasoning: {"effort": …}`. Unset sends no reasoning block, which is
+    /// the provider's own default and the request this role has always sent.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Output-token cap for this role. Unset is the role's constant (emitter
+    /// and replier 4096, summarizer 400) — a floor chosen so a reasoning
+    /// model does not spend the whole budget before the content starts.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// `"default"` (the role's own `temperature`) or `"none"` (no sampling
+    /// param at all). Claude Sonnet 5 rejects the *presence* of
+    /// `temperature`, so `none` omits the key rather than changing its
+    /// value; a Sonnet model id defaults this to `none` on its own.
+    #[serde(default)]
+    pub sampling: Option<String>,
+    /// `thinking = false` sends `reasoning: {"enabled": false}`, for models
+    /// that reason by default where this role wants a tool call, not a
+    /// monologue. Unset sends nothing.
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -910,6 +932,13 @@ impl LlmConfig {
                     s.model = None;
                     s.base_url = None;
                     s.api_key_env = None;
+                    // M11 T0.1: a shape is chosen for a model — an effort
+                    // level or a sampling opt-out belongs to the backend
+                    // being left behind, exactly as its model id does.
+                    s.reasoning = None;
+                    s.max_tokens = None;
+                    s.sampling = None;
+                    s.thinking = None;
                 }
             }
         }
@@ -1013,6 +1042,48 @@ impl LlmConfig {
             prompt_cache,
             local,
         })
+    }
+
+    /// One role's four shaping fields, parsed (M11 T0.1). Err carries the
+    /// message a startup error prints, naming the section and the bad value
+    /// the way `schema_profile` and `budget_mode` do — a typo here would
+    /// otherwise look exactly like a model that ignores the knob.
+    pub fn shaping(&self, role: Role) -> Result<nsllm::provider::RoleShaping, String> {
+        let s = self.section(role);
+        let where_ = role.as_str();
+        let sampling = match &s.sampling {
+            None => None,
+            Some(v) => {
+                Some(nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
+            }
+        };
+        let reasoning = match &s.reasoning {
+            None => None,
+            Some(v) => {
+                Some(nsllm::provider::parse_effort(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
+            }
+        };
+        Ok(nsllm::provider::RoleShaping {
+            reasoning,
+            max_tokens: s.max_tokens,
+            sampling,
+            thinking: s.thinking,
+        })
+    }
+
+    /// The request shape one role sends: its own default folded through the
+    /// config and the Sonnet safety net (M11 T0.2/T0.3). The second half of
+    /// the pair is the startup line to print when the net fired.
+    ///
+    /// One function so `main.rs` cannot resolve a role's model down one path
+    /// and its shape down another.
+    pub fn shape(
+        &self,
+        role: Role,
+        model: &str,
+        base: nsllm::provider::RequestShape,
+    ) -> Result<(nsllm::provider::RequestShape, Option<String>), String> {
+        Ok(self.shaping(role)?.resolve(role.as_str(), model, base))
     }
 
     /// Emitter, replier, summarizer — the order the banner prints them in.
@@ -1616,6 +1687,81 @@ mod tests {
         for t in cfg.llm.roles().expect("example resolves") {
             assert!(!t.model.is_empty());
         }
+    }
+
+    /// M11 T0.1, the exit criterion: a bare `[llm.emitter]` produces today's
+    /// request. All four fields default to None, and None folded onto a
+    /// role's default shape is that shape.
+    #[test]
+    fn role_shaping_fields_default_to_none() {
+        let cfg = AppConfig::parse("[llm]\nprovider = \"openrouter\"\n[llm.emitter]\n").unwrap();
+        for role in [Role::Emitter, Role::Replier, Role::Summarizer] {
+            let shaping = cfg.llm.shaping(role).expect("an empty section parses");
+            assert_eq!(shaping, nsllm::provider::RoleShaping::default(), "{role:?}");
+        }
+        let base = nsllm::provider::RequestShape::pinned(4096);
+        let (shape, note) = cfg
+            .llm
+            .shape(Role::Emitter, "google/gemini-3.8-flash", base.clone())
+            .unwrap();
+        assert_eq!(shape, base);
+        assert!(note.is_none());
+        let mut req = serde_json::json!({"model": "google/gemini-3.8-flash"});
+        shape.apply(&mut req);
+        assert_eq!(req["temperature"], 0);
+        assert_eq!(req["max_tokens"], 4096);
+        assert!(req.get("reasoning").is_none(), "{req}");
+
+        // Set, they arrive as written.
+        let cfg = AppConfig::parse(
+            "[llm.emitter]\nreasoning = \"low\"\nmax_tokens = 2048\n\
+             sampling = \"none\"\nthinking = false\n",
+        )
+        .unwrap();
+        let shaping = cfg.llm.shaping(Role::Emitter).unwrap();
+        assert_eq!(shaping.reasoning.as_deref(), Some("low"));
+        assert_eq!(shaping.max_tokens, Some(2048));
+        assert_eq!(shaping.sampling, Some(nsllm::provider::Sampling::None));
+        assert_eq!(shaping.thinking, Some(false));
+        // and only for the role that set them.
+        assert_eq!(
+            cfg.llm.shaping(Role::Replier).unwrap(),
+            nsllm::provider::RoleShaping::default()
+        );
+    }
+
+    /// A typo is a startup error naming the section, like every other knob
+    /// in this file — not a silently dropped shape.
+    #[test]
+    fn unknown_shaping_values_are_rejected_at_parse() {
+        let cfg = AppConfig::parse("[llm.replier]\nreasoning = \"maximum\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Replier).unwrap_err();
+        assert!(err.starts_with("[llm.replier]"), "{err}");
+        assert!(err.contains("maximum") && err.contains("\"medium\""), "{err}");
+
+        let cfg = AppConfig::parse("[llm.summarizer]\nsampling = \"off\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
+        assert!(err.starts_with("[llm.summarizer]"), "{err}");
+        assert!(err.contains("off") && err.contains("\"none\""), "{err}");
+    }
+
+    /// T0.3 as the operator meets it: a config that only names Sonnet gets
+    /// a request without `temperature`, and one line saying so.
+    #[test]
+    fn a_config_naming_sonnet_resolves_to_a_sampling_free_shape() {
+        let cfg = AppConfig::parse(
+            "[llm]\nprovider = \"openrouter\"\n\
+             [llm.emitter]\nmodel = \"anthropic/claude-sonnet-5\"\n",
+        )
+        .unwrap();
+        let target = cfg.llm.role(Role::Emitter).unwrap();
+        let (shape, note) = cfg
+            .llm
+            .shape(Role::Emitter, &target.model, nsllm::emitter::default_shape())
+            .unwrap();
+        assert!(shape.temperature.is_none());
+        let line = note.expect("the coercion is announced");
+        assert!(line.contains("anthropic/claude-sonnet-5") && line.contains("emitter"));
     }
 
     #[test]
