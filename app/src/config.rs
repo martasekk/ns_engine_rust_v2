@@ -576,8 +576,10 @@ fn default_relevant_max() -> usize {
 }
 
 /// Off. The prior ships inert and a measurement turns it on (M9 T3.1).
+// 0.5 since M10 T5.4: the tie corpus separates at 0.5 and the verbatim arms do not move
+// (plan §Results); 0 restores the pre-M9 order byte for byte.
 fn default_activation_weight() -> f32 {
-    0.0
+    0.5
 }
 
 fn default_activation_half_life_days() -> f32 {
@@ -1791,7 +1793,7 @@ mod tests {
         assert_eq!(tuned.memory.guidance_max, 3);
         // M9 T3.1: the activation prior ships inert. A config that never
         // heard of it must rank exactly as it did before M9.
-        assert_eq!(cfg.memory.activation_weight, 0.0);
+        assert_eq!(cfg.memory.activation_weight, 0.5);
         assert_eq!(cfg.memory.activation_half_life_days, 7.0);
         let prior = AppConfig::parse(
             "[memory]\nactivation_weight = 0.5\nactivation_half_life_days = 14.0\n",

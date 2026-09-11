@@ -289,7 +289,33 @@ rates vs 11.1 per 100) are live monitoring and stay open until sessions are run.
 
 `[recall] hybrid` defaults to today's behaviour (off); the arm is added to `ns-app eval
 --paraphrase` only when the service answers, and prints `NOT MEASURED` otherwise so M6
-§12.8's "stay lexical" verdict is never read off a non-lexical arm. The `TextEncoder`
+§12.8's "stay lexical" verdict is never read off a non-lexical arm.
+
+### P5 T5.4 — done, 0 requests. Every M9 knob re-read on the 30 fixtures + 10 abilities
+
+| Arm | Off | On | Verdict |
+|---|---|---|---|
+| `--ablate summary` | abilities 10/10, fixtures 30/30 answerable, 30/30 abstention | 10/10, **0/30**, 30/30 | the summary block carries every fixture's answer; the ten abilities are insensitive, not blind (30/30 carry a summary) |
+| `--ablate guidance` | same | 10/10, **0/30**, 30/30 | same reading for the reply notes |
+| `--activation 0 / 0.5 / 1` | tie corpus 0/8; fixtures 30/30; abilities 10/10, BoR 22.74 | **8/8 at 0.5 and at 1**; fixtures 30/30 at every weight; abilities and BoR unchanged | **clears the M9 rule**: the verbatim arms do not move and the tie corpus separates. `activation_weight` default moves **0.0 → 0.5**, the smaller weight that clears the ties; caveat recorded: the tie corpus was built to be separable, so the live fitness signal (`credits`) is what the prior will actually rank by, and `ns-app eval --activation` stays the check |
+| `obligation_check` | 10/10, 30/30, 30/30, 405 replier requests | 10/10, 30/30, 30/30, **436 replier requests (+31, +7.7%)** | fires, buys nothing graded, costs regenerations: **stays false** |
+| `summary_guidelines` | identical | identical | **not measurable offline**: the fixtures' scripted summarizer builds its draft from records and never renders a system prompt; the plumbing (`Run.summary_guidelines` → `summarizer_double`) waits for a live summarizer arm. Stays empty |
+
+Workspace after wave 6: **34 test targets, 673 passed, 0 failed, 1 ignored** (the live-service
+probe). Open live-monitoring items, unchanged: T1.6 (`slim` rates), T4.2 (`repeat_gate` per
+100), the chat counter (needs a router-configured session), the emitter cache knob (needs a
+paid-tier session with `cached_tokens`), and `summary_guidelines` (needs a live summarizer arm).
+
+### Status after waves 1–6
+
+Every knob defaults to today's behaviour except `activation_weight`, now 0.5 on the measured
+tie corpus. `schema_profile = full`, `[router] depth = full`, `[recall] hybrid = false`,
+`prompt_cache_emitter = false`, `exemplars_max = 0`, `obligation_check = false`,
+`fitness_demote = false`, `summary_guidelines = []`. What a user of an old config sees: a
+smaller tool array on every call (chat floor 650 → 283 tokens with no knob), `forget_*` and
+`recall` only when applicable, the done marker in the trace, four new footer lines in
+`ns-app budget`, embeddings backfilled by the idle pass when `[models]` is enabled, and κ per
+evaluator in `ns-app evolve --dry-run`. The `TextEncoder`
 trait lives in core; the local evaluator's transport is its one implementation, with the
 same retry table and disable-after-two rule. Note: the measurement ran against an nsmodels
 instance already listening on 7374, which the agent then stopped; restart it before the

@@ -510,6 +510,13 @@ async fn main() {
         if parsed.paraphrase {
             std::process::exit(eval::run_paraphrase(parsed.activation).await);
         }
+        // M10 T5.4. The same shape: a report, not a gate.
+        if parsed.obligations {
+            std::process::exit(eval::run_knob(eval::Knob::Obligations).await);
+        }
+        if parsed.guidelines {
+            std::process::exit(eval::run_knob(eval::Knob::Guidelines).await);
+        }
         // M9 T0.4. A report, not a gate: exits 0 whatever the delta.
         if let Some(block) = parsed.ablate {
             std::process::exit(eval::run_ablate(block, parsed.activation).await);

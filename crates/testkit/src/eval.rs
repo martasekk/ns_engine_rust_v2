@@ -846,6 +846,47 @@ pub struct Run {
     /// tool and run with no router, and an arm that changed their numbers
     /// would be reporting a narrowing nothing narrowed.
     pub depth: nscore::Depth,
+    /// `[memory] obligation_check` for this arm (M9 T2.1, read by M10 T5.4).
+    ///
+    /// `false` is the default and is the engine's behaviour before the
+    /// obligation interceptor existed; `true` lets one unaddressed clause
+    /// cost the turn a second replier call.
+    pub obligation_check: bool,
+    /// `[memory] summary_guidelines` for this arm (M9 T5.2, read by M10 T5.4).
+    ///
+    /// Plumbed to the one place the harness builds a summarizer, so a live
+    /// summarizer dropped in there is measured by this arm without a second
+    /// change. The double the fixtures run today ignores them — see
+    /// [`summarizer_honours_guidelines`], which is this arm's finding, not an
+    /// oversight. A `&'static` slice for [`Run`]'s `Copy`, as `withhold`.
+    pub summary_guidelines: &'static [&'static str],
+}
+
+/// Whether the summarizer the fixtures run can see `summary_guidelines` at
+/// all (M10 T5.4, arm 4).
+///
+/// `false`, and it is a property of the double rather than of the knob:
+/// `nsengine::script::ScriptedSummarizer` returns `"scripted summary of turns
+/// {first}-{last}"` with `established` copied verbatim off the records and
+/// `open` empty — computed from the records alone. Guidelines reach a real
+/// summarizer through `nsllm::summarizer::LlmSummarizer::with_guidelines`,
+/// which renders them into a **system prompt**: a prompt the double never
+/// builds and never sends. So the on-arm and off-arm summaries are
+/// byte-identical by construction, and the honest reading of this arm offline
+/// is *not measurable*, not *zero effect*.
+pub fn summarizer_honours_guidelines() -> bool {
+    false
+}
+
+/// The one place the harness chooses a summarizer (M10 T5.4).
+///
+/// It takes the guidelines even though today's double discards them: this is
+/// the line a live summarizer is swapped into — `LlmSummarizer::new(..)
+/// .with_guidelines(guidelines.iter().map(|g| g.to_string()).collect())` —
+/// and keeping the argument here makes that swap one line rather than a
+/// re-plumbing.
+fn summarizer_double(_guidelines: &'static [&'static str]) -> Box<dyn nscore::Summarizer> {
+    Box::new(ScriptedSummarizer::default())
 }
 
 impl Harness {
@@ -969,7 +1010,7 @@ impl Harness {
         // The grounding check stays on: it is the interceptor the abstention
         // fixture grades.
         if self.summaries {
-            b.set_summarizer(Box::new(ScriptedSummarizer::default()));
+            b.set_summarizer(summarizer_double(self.run.summary_guidelines));
         }
         let common = EngineConfig {
             max_echo_ratio: 1.1,
@@ -985,6 +1026,9 @@ impl Harness {
             // configuration sees the weight the arm is actually running at.
             activation_weight: self.run.activation_weight,
             activation_half_life_days: ACTIVATION_HALF_LIFE,
+            // M10 T5.4. `false` on every existing run, so the ten abilities
+            // and the thirty fixtures keep the numbers they have.
+            obligation_check: self.run.obligation_check,
             window_turns: self
                 .window_turns
                 .unwrap_or(EngineConfig::default().window_turns),

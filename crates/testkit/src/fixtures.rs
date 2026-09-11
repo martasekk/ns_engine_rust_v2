@@ -377,6 +377,13 @@ pub struct Fixture {
     pub declined: bool,
     pub turns: usize,
     pub requests: usize,
+    /// Replier calls alone, both sessions of this fixture (M10 T5.4, arm 3).
+    ///
+    /// Split out of `requests` because the obligation interceptor's whole
+    /// cost is a *second* replier call on a turn that already had one: an
+    /// arm reported on `requests` would hide that regeneration among the
+    /// emitter's proposals, which the knob does not touch.
+    pub replier_requests: usize,
     pub prompt_chars: usize,
     /// Characters of `Summarized` this session **holds**, read off the event
     /// log. Non-zero even under `--ablate summary`, which is the point: a
@@ -640,6 +647,7 @@ pub async fn run_one(session: &Session, run: Run) -> Fixture {
         declined: declines.is_empty(),
         turns: c.turns,
         requests: c.emitter_calls + h.reply_calls(),
+        replier_requests: h.reply_calls(),
         prompt_chars: g.chars(),
         summary_chars: summary_chars_of(&h, &a).await,
         summary_shown: g.summary.as_ref().map(|s| s.chars().count()).unwrap_or(0),
@@ -731,6 +739,166 @@ pub fn render_table(rows: &[Fixture]) -> String {
             r.id, r.abstain_detail
         ));
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Two arms side by side (M10 T5.4)
+// ---------------------------------------------------------------------------
+
+/// One ability's counts in one arm: `(ability, answered, declined, of)`.
+///
+/// Seed order, deduplicated by first appearance rather than sorted, so the
+/// rows of two arms line up positionally the way [`crate::ablate::Report`]
+/// relies on — the arms run the same `generate()` and cannot disagree about
+/// which ability row three is.
+pub fn per_ability(rows: &[Fixture]) -> Vec<(&'static str, usize, usize, usize)> {
+    let mut out: Vec<(&'static str, usize, usize, usize)> = Vec::new();
+    for r in rows {
+        match out.iter_mut().find(|(a, ..)| *a == r.ability) {
+            Some(cell) => {
+                cell.1 += usize::from(r.passed);
+                cell.2 += usize::from(r.declined);
+                cell.3 += 1;
+            }
+            None => out.push((r.ability, usize::from(r.passed), usize::from(r.declined), 1)),
+        }
+    }
+    out
+}
+
+/// Replier calls per fixture, summed and averaged (M10 T5.4, arm 3).
+pub fn replier_requests(rows: &[Fixture]) -> (usize, f64) {
+    let total: usize = rows.iter().map(|r| r.replier_requests).sum();
+    let mean = if rows.is_empty() {
+        0.0
+    } else {
+        total as f64 / rows.len() as f64
+    };
+    (total, mean)
+}
+
+fn arm_row(cells: [&str; 6]) -> String {
+    format!(
+        "  {:<24}  {:>9}  {:>9}  {:>10}  {:>10}  {:>7}\n",
+        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+    )
+}
+
+/// The two arms of one knob over the thirty sessions, per ability, both
+/// graded arms, and the replier cost beside them.
+///
+/// One arm's per-ability rows, for a mode that runs a single weight and is
+/// compared against its own earlier runs rather than against a sibling arm
+/// (`ns-app eval --activation 0 | 0.5 | 1`, M10 T5.4 arm 2).
+pub fn render_by_ability(label: &str, rows: &[Fixture]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\nM10 T5.4 — the {} scripted sessions at {label}\n\n",
+        rows.len()
+    );
+    out.push_str(&arm_row([
+        "ability", "answer", "decline", "replier", "", "",
+    ]));
+    out.push_str(&arm_row([
+        "------------------------",
+        "---------",
+        "---------",
+        "----------",
+        "",
+        "",
+    ]));
+    for (a, answered, declined, of) in per_ability(rows) {
+        let replier: usize = rows
+            .iter()
+            .filter(|r| r.ability == a)
+            .map(|r| r.replier_requests)
+            .sum();
+        out.push_str(&arm_row([
+            a,
+            &format!("{answered}/{of}"),
+            &format!("{declined}/{of}"),
+            &replier.to_string(),
+            "",
+            "",
+        ]));
+    }
+    let (total, mean) = replier_requests(rows);
+    out.push_str(&arm_row([
+        "ALL",
+        &format!(
+            "{}/{}",
+            rows.iter().filter(|r| r.passed).count(),
+            rows.len()
+        ),
+        &format!(
+            "{}/{}",
+            rows.iter().filter(|r| r.declined).count(),
+            rows.len()
+        ),
+        &total.to_string(),
+        "",
+        "",
+    ]));
+    out.push_str(&format!(
+        "\n  replier requests: {total} ({mean:.2}/fixture) at {label}.\n"
+    ));
+    out
+}
+
+/// Per ability rather than only totals because "30/30 → 30/30" is the shape
+/// every one of these arms has so far, and a total that does not move cannot
+/// say whether five abilities each moved by one in opposite directions.
+pub fn render_arms(off_label: &str, off: &[Fixture], on_label: &str, on: &[Fixture]) -> String {
+    if off.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(&arm_row([
+        "ability",
+        off_label,
+        on_label,
+        "decline off",
+        "decline on",
+        "delta",
+    ]));
+    out.push_str(&arm_row([
+        "------------------------",
+        "---------",
+        "---------",
+        "----------",
+        "----------",
+        "-------",
+    ]));
+    for (a, b) in per_ability(off).iter().zip(per_ability(on)) {
+        out.push_str(&arm_row([
+            a.0,
+            &format!("{}/{}", a.1, a.3),
+            &format!("{}/{}", b.1, b.3),
+            &format!("{}/{}", a.2, a.3),
+            &format!("{}/{}", b.2, b.3),
+            &format!("{:+}", b.1 as i64 - a.1 as i64),
+        ]));
+    }
+    let answered = |r: &[Fixture]| r.iter().filter(|x| x.passed).count();
+    let declined = |r: &[Fixture]| r.iter().filter(|x| x.declined).count();
+    let (off_total, off_mean) = replier_requests(off);
+    let (on_total, on_mean) = replier_requests(on);
+    out.push_str(&arm_row([
+        "ALL",
+        &format!("{}/{}", answered(off), off.len()),
+        &format!("{}/{}", answered(on), on.len()),
+        &format!("{}/{}", declined(off), off.len()),
+        &format!("{}/{}", declined(on), on.len()),
+        &format!("{:+}", answered(on) as i64 - answered(off) as i64),
+    ]));
+    out.push_str(&format!(
+        "\n  replier requests: {off_total} ({off_mean:.2}/fixture) {off_label} → \
+         {on_total} ({on_mean:.2}/fixture) {on_label} ({:+}).\n",
+        on_total as i64 - off_total as i64
+    ));
     out
 }
 
@@ -1486,5 +1654,54 @@ mod tests {
             "a session with fewer than two rendered notes cannot say anything about \
              `--ablate guidance`"
         );
+    }
+
+    /// M10 T5.4, arm 2: the half of the activation reading that is not the
+    /// tie corpus.
+    ///
+    /// `ties.rs` proves the weight *moves* something (0/8 → 8/8). This
+    /// proves it breaks nothing, which is the other half of the M9 rule —
+    /// a knob moves off its default only on a **non-regressing** verbatim
+    /// arm, and "non-regressing" is measured here, not there. `w = 1`
+    /// because that is the value the tie corpus argues for; a run at 0.5
+    /// that regressed while 1 held would be a stranger finding than either.
+    #[tokio::test]
+    async fn the_thirty_sessions_do_not_regress_at_activation_weight_one() {
+        let base = run_all_for(Run::default()).await;
+        let hot = run_all_for(Run {
+            activation_weight: 1.0,
+            ..Run::default()
+        })
+        .await;
+        let table = render_arms("w = 0", &base, "w = 1", &hot);
+        let answered = |r: &[Fixture]| r.iter().filter(|x| x.passed).count();
+        let declined = |r: &[Fixture]| r.iter().filter(|x| x.declined).count();
+        assert_eq!(answered(&base), 30, "{table}");
+        assert!(answered(&hot) >= answered(&base), "{table}");
+        assert!(declined(&hot) >= declined(&base), "{table}");
+        // And the arms are comparable row for row, which is what lets the
+        // per-ability table be read positionally.
+        assert_eq!(
+            base.iter().map(|r| r.id).collect::<Vec<_>>(),
+            hot.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+        assert!(table.contains("w = 1"), "{table}");
+        assert!(table.contains("replier requests:"), "{table}");
+    }
+
+    /// The single-arm rendering the `--activation` sweep prints, and the
+    /// replier column it exists to carry.
+    #[tokio::test]
+    async fn the_single_arm_table_names_every_ability_and_its_replier_cost() {
+        let rows = run_all_for(Run::default()).await;
+        let t = render_by_ability("w = 0", &rows);
+        for (ability, answered, declined, of) in per_ability(&rows) {
+            assert_eq!(of, 5, "{ability} has {of} sessions, want 5");
+            assert_eq!((answered, declined), (5, 5), "{ability}:\n{t}");
+            assert!(t.contains(ability), "{t}");
+        }
+        let (total, mean) = replier_requests(&rows);
+        assert!(total > 0 && mean > 0.0, "{t}");
+        assert!(t.contains(&format!("{total} ({mean:.2}/fixture)")), "{t}");
     }
 }

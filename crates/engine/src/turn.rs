@@ -217,7 +217,7 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
-            activation_weight: 0.0,
+            activation_weight: 0.5,
             activation_half_life_days: 7.0,
             obligations_max: 5,
             obligation_check: false,

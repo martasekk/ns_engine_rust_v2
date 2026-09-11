@@ -318,10 +318,20 @@ pub struct Args {
     /// BoR on the desktop abilities and the hard-query fixture survive the
     /// narrowing, and that is two runs of the same set, not two configs.
     pub depth: nscore::Depth,
+    /// `[memory] obligation_check` on vs off (M9 T2.1, read by M10 T5.4).
+    ///
+    /// A mode rather than a value like `--activation`: the knob is a
+    /// boolean, and the only useful run of it is both arms at once, which is
+    /// what the mode does.
+    pub obligations: bool,
+    /// `[memory] summary_guidelines` empty vs three hand-written lines
+    /// (M9 T5.2, read by M10 T5.4). Same shape, same reason.
+    pub guidelines: bool,
 }
 
 const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase] \
-     [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive]";
+     [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive] \
+     [--obligations] [--guidelines]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
@@ -329,10 +339,14 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ablate = None;
     let mut activation = 0.0f32;
     let mut depth = nscore::Depth::Full;
+    let mut obligations = false;
+    let mut guidelines = false;
     let mut rest = args.iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--obligations" => obligations = true,
+            "--guidelines" => guidelines = true,
             "--depth" => {
                 let d = rest
                     .next()
@@ -375,7 +389,34 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         ablate,
         activation,
         depth,
+        obligations,
+        guidelines,
     })
+}
+
+/// `ns-app eval --obligations` / `--guidelines` — the two M9 knobs that are
+/// neither a context block nor a ranking weight (M10 T5.4).
+///
+/// Exits 0 whatever the numbers are, for [`run_ablate`]'s reason. The
+/// guidelines arm prints *not measurable* rather than a zero: on the scripted
+/// summarizer the two arms are identical by construction, and a zero printed
+/// as a result would confirm the default with the instrument switched off.
+pub async fn run_knob(knob: Knob) -> i32 {
+    use nstestkit::knobs;
+
+    let report = match knob {
+        Knob::Obligations => knobs::measure_obligations().await,
+        Knob::Guidelines => knobs::measure_guidelines().await,
+    };
+    print!("{}", knobs::render(&report));
+    0
+}
+
+/// Which of the two knob modes to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Knob {
+    Obligations,
+    Guidelines,
 }
 
 /// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
@@ -599,6 +640,20 @@ pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -
     print!(
         "{}",
         nstestkit::ties::render(&nstestkit::ties::measure(activation).await)
+    );
+    // M10 T5.4 arm 2. The tie corpus is where the weight is *meant* to move
+    // things; the thirty sessions are where it must not. Printing both under
+    // one flag is what makes `w = 1` a decision rather than a hope: the
+    // non-regressing half of the M9 rule is this table, not the tie table.
+    let fx = nstestkit::fixtures::run_all_for(Run {
+        activation_weight: activation,
+        depth,
+        ..Run::default()
+    })
+    .await;
+    print!(
+        "{}",
+        nstestkit::fixtures::render_by_ability(&format!("w = {activation}"), &fx)
     );
     code
 }
@@ -987,6 +1042,28 @@ mod tests {
         assert_eq!(named.ledger, PathBuf::from("other.json"));
 
         assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
+    }
+
+    /// M10 T5.4: the two knob modes are flags, they are off by default, and
+    /// they are separate — a run that turned both on would print one table
+    /// and silently drop the other, which is the failure a single `--knob`
+    /// argument would have made easy.
+    #[test]
+    fn the_two_knob_arms_are_separate_flags_and_default_off() {
+        let plain = parse_args(&[]).unwrap();
+        assert!(!plain.obligations);
+        assert!(!plain.guidelines);
+
+        let o = parse_args(&["--obligations".to_string()]).unwrap();
+        assert!(o.obligations && !o.guidelines);
+
+        let g = parse_args(&["--guidelines".to_string()]).unwrap();
+        assert!(g.guidelines && !g.obligations);
+
+        assert!(parse_args(&["--obligation".to_string()]).is_err());
+        assert!(parse_args(&["--guideline".to_string()]).is_err());
+        assert!(USAGE.contains("--obligations"));
+        assert!(USAGE.contains("--guidelines"));
     }
 
     /// `--paraphrase` is the M8 arm; `--live` is still the flag M7 refused,

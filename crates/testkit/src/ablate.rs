@@ -274,6 +274,15 @@ pub fn render_fixtures(r: &Report) -> String {
         full.len(),
         full.len(),
     );
+    // M10 T5.4 arm 1: the per-ability rows, so a total that did not move can
+    // be told from six abilities that each moved and cancelled.
+    out.push('\n');
+    out.push_str(&fixtures::render_arms(
+        "full",
+        full,
+        &format!("no {block}"),
+        ablated,
+    ));
     if r.fixture_delta() == 0 {
         out.push_str(&format!(
             "  a zero delta here is {}: the full arm's sessions {} carry `{block}`.\n",
