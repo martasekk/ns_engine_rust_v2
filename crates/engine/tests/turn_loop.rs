@@ -199,6 +199,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::ReplyFailed { .. } => "ReplyFailed",
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",
         EventKind::ReplyEchoed { .. } => "ReplyEchoed",
+        EventKind::ReplyCited { .. } => "ReplyCited",
         EventKind::Summarized { .. } => "Summarized",
         EventKind::ModelCall { .. } => "ModelCall",
         EventKind::Graded { .. } => "Graded",
@@ -4456,4 +4457,76 @@ async fn a_reply_leaving_an_obligation_unaddressed_regenerates_once() {
     let (seen, reply) = run(false).await;
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(reply, "Nothing to report just now.");
+}
+
+/// A replier that says exactly what the test scripted, whatever it was shown.
+struct FixedReplier(&'static str);
+#[async_trait::async_trait]
+impl Replier for FixedReplier {
+    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
+        Ok(self.0.to_string())
+    }
+}
+
+/// M9 T4.2. A grade says a turn went well; a citation says what was in the
+/// prompt when it did. Without the second, the fitness join could only credit
+/// every fact a good turn happened to be carrying.
+#[tokio::test]
+async fn a_reply_quoting_a_fact_value_records_that_fact_as_cited() {
+    async fn run(reply: &'static str) -> Vec<Vec<String>> {
+        let store = Arc::new(InMemoryStore::new());
+        let sid = SessionId("cited".into());
+        store
+            .put_fact(Fact {
+                key: "user.name".into(),
+                value: serde_json::json!("Martin"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+        b.set_replier(Box::new(FixedReplier(reply)));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let cfg = EngineConfig {
+            // The grounding interceptor runs; the citation is recorded on the
+            // draft that stands, regenerated or not.
+            reply_grounding_check: true,
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        };
+        let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "what is my name".into(),
+        })
+        .await
+        .unwrap();
+        store
+            .load(&sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::ReplyCited { sources } => Some(sources.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let cited = run("Your name is Martin.").await;
+    assert_eq!(cited.len(), 1, "one event, on the final draft: {cited:?}");
+    assert!(
+        cited[0].contains(&"fact:user.name".to_string()),
+        "the fact whose value the reply quoted: {:?}",
+        cited[0]
+    );
+
+    // A reply that names nothing it was shown cites nothing, and an empty
+    // list is never written — absence is how the join reads "nothing cited".
+    let cited = run("Sure.").await;
+    assert!(cited.is_empty(), "{cited:?}");
 }

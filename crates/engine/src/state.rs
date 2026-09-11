@@ -200,6 +200,7 @@ pub fn fold(events: &[Event]) -> SessionState {
             // measured.
             EventKind::ReplyFlagged { .. }
             | EventKind::ReplyEchoed { .. }
+            | EventKind::ReplyCited { .. }
             | EventKind::ModelCall { .. }
             | EventKind::Graded { .. } => {}
             EventKind::Summarized { summary } => {

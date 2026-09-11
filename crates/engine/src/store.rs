@@ -217,6 +217,29 @@ impl MemoryStore for InMemoryStore {
         Ok(())
     }
 
+    /// M9 T4.3: the two derived columns on the current version, in place.
+    /// Overridden rather than left to the trait's default only so the
+    /// in-memory store cannot drift from the SQLite one — it is the store
+    /// every engine test ranks against.
+    async fn set_fact_fitness(
+        &self,
+        scope: &str,
+        key: &str,
+        exposures: u32,
+        credits: u32,
+    ) -> Result<(), StoreError> {
+        let mut all = self.facts.lock().await;
+        for row in all.iter_mut().filter(|f| {
+            f.scope == scope
+                && f.key == key
+                && matches!(f.state, FactState::Current | FactState::Cold)
+        }) {
+            row.exposures = exposures;
+            row.credits = credits;
+        }
+        Ok(())
+    }
+
     async fn forget_fact(&self, scope: &str, key: &str, at: Timestamp) -> Result<bool, StoreError> {
         let mut all = self.facts.lock().await;
         let mut hit = false;
@@ -396,6 +419,80 @@ pub async fn fact_conformance(store: &dyn MemoryStore) {
         .unwrap()
         .is_empty());
     assert_eq!(store.facts("chat42", "").await.unwrap().len(), 1);
+}
+
+/// M9 T4.1/T4.3: the fitness counters round-trip through a write, and setting
+/// them moves *only* them — no new version, no changed value.
+///
+/// The second half is the property the whole design rests on. The evolution
+/// pass rescores every fact on every run; if that went through `put_fact`'s
+/// value path it would append a version per pass, and `fact_history` — the
+/// record M6 §6.1 exists for — would fill with rows that differ in nothing
+/// but a counter.
+pub async fn fitness_conformance(store: &dyn MemoryStore) {
+    let f = |key: &str, value: &str, at: u64| Fact {
+        key: key.into(),
+        value: serde_json::json!(value),
+        last_validated: Timestamp(at),
+        valid_from: Timestamp(at),
+        prov: nscore::Provenance::Constant,
+        ..Default::default()
+    };
+    // A write carries the counters it was given.
+    let mut born = f("user.name", "Martin", 10);
+    born.exposures = 4;
+    born.credits = 1;
+    store.put_fact(born).await.unwrap();
+    let cur = store.facts("global", "user.name").await.unwrap();
+    assert_eq!((cur[0].exposures, cur[0].credits), (4, 1));
+    // A new value supersedes, and the new version starts at 0/0.
+    store.put_fact(f("user.name", "Peter", 20)).await.unwrap();
+    let before = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!((before[0].exposures, before[0].credits), (0, 0));
+
+    store
+        .set_fact_fitness("global", "user.name", 9, 3)
+        .await
+        .unwrap();
+    let after = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(after.len(), 2, "no version was added");
+    let values: Vec<&serde_json::Value> = after.iter().map(|f| &f.value).collect();
+    let was: Vec<&serde_json::Value> = before.iter().map(|f| &f.value).collect();
+    assert_eq!(values, was, "values unchanged");
+    let states: Vec<_> = after.iter().map(|f| f.state).collect();
+    assert_eq!(
+        states,
+        before.iter().map(|f| f.state).collect::<Vec<_>>(),
+        "states unchanged"
+    );
+    assert_eq!(
+        after.iter().map(|f| f.valid_from).collect::<Vec<_>>(),
+        before.iter().map(|f| f.valid_from).collect::<Vec<_>>(),
+        "identities unchanged"
+    );
+    assert_eq!(
+        (after[0].exposures, after[0].credits),
+        (9, 3),
+        "counters set"
+    );
+    assert_eq!(
+        (after[1].exposures, after[1].credits),
+        (4, 1),
+        "the superseded version keeps the numbers it had"
+    );
+    // Setting is a set, not an add: a second call with smaller numbers wins.
+    store
+        .set_fact_fitness("global", "user.name", 2, 0)
+        .await
+        .unwrap();
+    let cur = store.facts("global", "user.name").await.unwrap();
+    assert_eq!((cur[0].exposures, cur[0].credits), (2, 0));
+    // A key with no current version is a no-op, not an error.
+    store
+        .set_fact_fitness("global", "user.nothing", 5, 5)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -676,6 +773,11 @@ mod tests {
     #[tokio::test]
     async fn fact_versions_scopes_search_forget_and_purge() {
         fact_conformance(&InMemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn setting_fitness_updates_the_current_version_in_place_without_superseding() {
+        fitness_conformance(&InMemoryStore::new()).await;
     }
 
     #[tokio::test]

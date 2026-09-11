@@ -55,7 +55,7 @@ fn parse_trust(s: &str) -> Trust {
 
 const FACT_COLUMNS: &str =
     "scope, key, valid_from, valid_to, state, value_json, confidence, uses, \
-                            last_validated, prov_json, trust, last_used";
+                            last_validated, prov_json, trust, last_used, exposures, credits";
 
 fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
     let value_json: String = r.get(5)?;
@@ -75,6 +75,8 @@ fn row_to_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
         prov: serde_json::from_str(&prov_json).unwrap_or(nscore::Provenance::Residual),
         trust: parse_trust(&trust),
         last_used: Timestamp(r.get::<_, u64>(11)?),
+        exposures: r.get(12)?,
+        credits: r.get(13)?,
     })
 }
 
@@ -299,6 +301,8 @@ impl SqliteStore {
                  prov_json      TEXT NOT NULL,
                  trust          TEXT NOT NULL DEFAULT 'System',
                  last_used      INTEGER NOT NULL DEFAULT 0,
+                 exposures      INTEGER NOT NULL DEFAULT 0,
+                 credits        INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (scope, key, valid_from)
              );
              CREATE INDEX IF NOT EXISTS facts_current ON facts(scope, state, key);",
@@ -314,6 +318,26 @@ impl SqliteStore {
                  DROP TABLE facts_v1;",
             )
             .map_err(io_err)?;
+        }
+        // M9 T4.1: a database written before the fitness counters existed has
+        // the versioned table but not the two columns. Same `table_info`
+        // sniff, one `ADD COLUMN` each — there is no `user_version` here, and
+        // `NOT NULL DEFAULT 0` is what makes "a pre-M9 database opens and
+        // reports 0/0" true of every row already in it.
+        let mut stmt = conn.prepare("PRAGMA table_info(facts)").map_err(io_err)?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(io_err)?
+            .collect::<Result<_, _>>()
+            .map_err(io_err)?;
+        drop(stmt);
+        for col in ["exposures", "credits"] {
+            if !cols.iter().any(|c| c == col) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE facts ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+                ))
+                .map_err(io_err)?;
+            }
         }
         Ok(())
     }
@@ -620,7 +644,8 @@ impl MemoryStore for SqliteStore {
         if exists.is_some() {
             conn.execute(
                 "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
-                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12
+                     uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12,
+                     exposures = ?13, credits = ?14
                  WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
                 rusqlite::params![
                     fact.scope,
@@ -635,6 +660,8 @@ impl MemoryStore for SqliteStore {
                     prov_json,
                     trust_str(fact.trust),
                     fact.last_used.0,
+                    fact.exposures,
+                    fact.credits,
                 ],
             )
             .map_err(io_err)?;
@@ -649,7 +676,7 @@ impl MemoryStore for SqliteStore {
         conn.execute(
             &format!(
                 "INSERT INTO facts ({FACT_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             rusqlite::params![
                 fact.scope,
@@ -664,7 +691,30 @@ impl MemoryStore for SqliteStore {
                 prov_json,
                 trust_str(fact.trust),
                 fact.last_used.0,
+                fact.exposures,
+                fact.credits,
             ],
+        )
+        .map_err(io_err)?;
+        Ok(())
+    }
+
+    /// M9 T4.3, overriding the trait's read-modify-write default: one UPDATE
+    /// on the primary key, touching only the two derived columns, so a pass
+    /// that rescores every fact costs one statement per fact and cannot
+    /// disturb a value, a timestamp or a version.
+    async fn set_fact_fitness(
+        &self,
+        scope: &str,
+        key: &str,
+        exposures: u32,
+        credits: u32,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE facts SET exposures = ?3, credits = ?4
+             WHERE scope = ?1 AND key = ?2 AND state IN ('current', 'cold')",
+            rusqlite::params![scope, key, exposures, credits],
         )
         .map_err(io_err)?;
         Ok(())
@@ -857,6 +907,110 @@ mod tests {
     async fn fact_versions_scopes_search_forget_and_purge() {
         let (_d, store) = tmp_store();
         nsengine_conformance(&store).await;
+    }
+
+    /// M9 T4.1/T4.3, the second half of the shared conformance suite (it
+    /// lives in ns-engine's `fitness_conformance`; this crate cannot depend
+    /// on ns-engine, so the same assertions are inlined).
+    #[tokio::test]
+    async fn setting_fitness_updates_the_current_version_in_place_without_superseding() {
+        let (_d, store) = tmp_store();
+        let f = |key: &str, value: &str, at: u64| Fact {
+            key: key.into(),
+            value: serde_json::json!(value),
+            last_validated: Timestamp(at),
+            valid_from: Timestamp(at),
+            prov: Provenance::Constant,
+            ..Default::default()
+        };
+        let mut born = f("user.name", "Martin", 10);
+        born.exposures = 4;
+        born.credits = 1;
+        store.put_fact(born).await.unwrap();
+        let cur = store.facts("global", "user.name").await.unwrap();
+        assert_eq!((cur[0].exposures, cur[0].credits), (4, 1));
+        store.put_fact(f("user.name", "Peter", 20)).await.unwrap();
+        let before = store.fact_history("global", "user.name").await.unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!((before[0].exposures, before[0].credits), (0, 0));
+
+        store
+            .set_fact_fitness("global", "user.name", 9, 3)
+            .await
+            .unwrap();
+        let after = store.fact_history("global", "user.name").await.unwrap();
+        assert_eq!(after.len(), 2, "no version was added");
+        assert_eq!(
+            after.iter().map(|f| f.value.clone()).collect::<Vec<_>>(),
+            before.iter().map(|f| f.value.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.iter().map(|f| f.state).collect::<Vec<_>>(),
+            before.iter().map(|f| f.state).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.iter().map(|f| f.valid_from).collect::<Vec<_>>(),
+            before.iter().map(|f| f.valid_from).collect::<Vec<_>>()
+        );
+        assert_eq!((after[0].exposures, after[0].credits), (9, 3));
+        assert_eq!((after[1].exposures, after[1].credits), (4, 1));
+        store
+            .set_fact_fitness("global", "user.name", 2, 0)
+            .await
+            .unwrap();
+        let cur = store.facts("global", "user.name").await.unwrap();
+        assert_eq!((cur[0].exposures, cur[0].credits), (2, 0));
+        store
+            .set_fact_fitness("global", "user.nothing", 5, 5)
+            .await
+            .unwrap();
+    }
+
+    /// A database written before the fitness columns existed opens, and every
+    /// row in it reports 0/0 — the migration test that matters (M9 T4.1).
+    #[tokio::test]
+    async fn a_pre_m9_database_opens_and_reports_zero_exposures_and_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-m9.sqlite");
+        {
+            // The M6 versioned table, exactly as it was before M9 — scope is
+            // present, so the v1 migration leaves it alone.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE facts (
+                     scope TEXT NOT NULL DEFAULT 'global',
+                     key TEXT NOT NULL,
+                     valid_from INTEGER NOT NULL,
+                     valid_to INTEGER,
+                     state TEXT NOT NULL DEFAULT 'current',
+                     value_json TEXT NOT NULL,
+                     confidence REAL NOT NULL,
+                     uses INTEGER NOT NULL,
+                     last_validated INTEGER NOT NULL,
+                     prov_json TEXT NOT NULL,
+                     trust TEXT NOT NULL DEFAULT 'System',
+                     last_used INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (scope, key, valid_from)
+                 );
+                 INSERT INTO facts (scope, key, valid_from, state, value_json, confidence, uses,
+                                    last_validated, prov_json, trust, last_used)
+                 VALUES ('global', 'user.name', 10, 'current', '\"Martin\"', 1.0, 3, 10,
+                         '{\"type\":\"Residual\"}', 'System', 10);",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let cur = store.facts("global", "user").await.unwrap();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].uses, 3, "the pre-M9 columns are untouched");
+        assert_eq!((cur[0].exposures, cur[0].credits), (0, 0));
+        // And the new columns are writable on the migrated table.
+        store
+            .set_fact_fitness("global", "user.name", 6, 2)
+            .await
+            .unwrap();
+        let cur = store.facts("global", "user").await.unwrap();
+        assert_eq!((cur[0].exposures, cur[0].credits), (6, 2));
     }
 
     /// The shared conformance suite lives in ns-engine's store module; this

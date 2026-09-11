@@ -43,6 +43,7 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
             EventKind::ReplyFailed { .. }
             | EventKind::ReplyFlagged { .. }
             | EventKind::ReplyEchoed { .. }
+            | EventKind::ReplyCited { .. }
             | EventKind::Summarized { .. }
             | EventKind::ModelCall { .. }
             | EventKind::Graded { .. } => None,
@@ -56,6 +57,7 @@ fn normalize_kind(kind: &EventKind) -> String {
         EventKind::ReplyFailed { .. }
         | EventKind::ReplyFlagged { .. }
         | EventKind::ReplyEchoed { .. }
+        | EventKind::ReplyCited { .. }
         | EventKind::Summarized { .. }
         | EventKind::ModelCall { .. }
         | EventKind::Graded { .. } => {

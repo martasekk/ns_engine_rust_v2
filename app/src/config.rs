@@ -356,6 +356,17 @@ pub struct MemorySection {
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
+    /// M9 T4.4: model calls a fact must have been rendered into before zero
+    /// credits count as evidence against it. Beside `fact_stale_days` because
+    /// it is the same kind of knob — when a fact stops earning its place —
+    /// and the evolution pass applies both.
+    #[serde(default = "default_fitness_min_exposures")]
+    pub fitness_min_exposures: u32,
+    /// Whether the fitness signal demotes to cold or only reports the set it
+    /// would demote. **Off**, and staying off for one release: the rule is
+    /// that fitness reports before it demotes (plan §P4).
+    #[serde(default)]
+    pub fitness_demote: bool,
     /// How many of a turn's own tool outcomes stay verbatim in the prompt
     /// (M7 T1.3). Older ones fold into one counted line; refusals never
     /// fold. 0 turns the fold off.
@@ -445,6 +456,14 @@ fn default_fact_stale_days() -> u64 {
     90
 }
 
+/// Eight calls. Enough that a fact has been in front of the model on more
+/// than one conversation, few enough that a real freeloader shows up inside
+/// a release. A guess with no corpus behind it, which is exactly why
+/// `fitness_demote` is off while the dry runs collect one.
+fn default_fitness_min_exposures() -> u32 {
+    8
+}
+
 /// Five outcomes. A desktop turn runs to twelve iterations and most of them
 /// are moves and clicks whose whole content is "it worked"; five keeps the
 /// recent screen reads, which are the ones with anything in them.
@@ -516,6 +535,8 @@ impl Default for MemorySection {
             obligation_check: false,
             guidance_max: default_guidance_max(),
             fact_stale_days: default_fact_stale_days(),
+            fitness_min_exposures: default_fitness_min_exposures(),
+            fitness_demote: false,
             trace_verbatim_lines: default_trace_verbatim_lines(),
             tool_result_max_chars: default_tool_result_max_chars(),
             prompt_budget_tokens: default_prompt_budget_tokens(),
@@ -991,12 +1012,17 @@ impl Default for EvolutionSection {
 }
 
 impl EvolutionSection {
+    /// `memory` rather than a loose `fact_stale_days`: M9 T4.4 needs the
+    /// pinned prefixes and the two fitness knobs as well, and three more
+    /// positional `u64`s at this call site would be three more chances to
+    /// pass them in the wrong order.
     pub fn pass_config(
         &self,
         dry_run: bool,
-        fact_stale_days: u64,
+        memory: &MemorySection,
         evaluate_budget_turns: u32,
     ) -> nsevolution::pass::PassConfig {
+        let fact_stale_days = memory.fact_stale_days;
         nsevolution::pass::PassConfig {
             regression_budget: self.regression_budget,
             probe_budget_turns: self.probe_budget_turns,
@@ -1017,6 +1043,9 @@ impl EvolutionSection {
             // calibrated against (T2.7), so they are what the gate believes
             // until a κ threshold says otherwise.
             authoritative_evaluator: "symbolic".into(),
+            fitness_min_exposures: memory.fitness_min_exposures,
+            fitness_demote: memory.fitness_demote,
+            pinned_prefixes: memory.pinned_prefixes.clone(),
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -1404,10 +1433,35 @@ mod tests {
         assert_eq!(cfg.models.evaluate_budget_turns, 7);
         let pc = cfg
             .evolution
-            .pass_config(true, 90, cfg.models.evaluate_budget_turns);
+            .pass_config(true, &cfg.memory, cfg.models.evaluate_budget_turns);
         assert_eq!(pc.evaluate.budget_turns, 7);
         // And the gate's default belief is the symbolic baseline.
         assert_eq!(pc.authoritative_evaluator, "symbolic");
+    }
+
+    /// M9 T4.4. The two fitness knobs sit beside `fact_stale_days` in
+    /// `[memory]` — they answer the same question, when a fact stops earning
+    /// its place — and they reach the pass together with the pinned prefixes,
+    /// which is what keeps the user's own name out of the demote set.
+    #[test]
+    fn fitness_knobs_parse_and_reach_the_pass() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.memory.fitness_min_exposures, 8);
+        assert!(!cfg.memory.fitness_demote, "reports before it demotes");
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, 40);
+        assert_eq!(pc.fitness_min_exposures, 8);
+        assert!(!pc.fitness_demote);
+        assert_eq!(pc.pinned_prefixes, vec!["user.".to_string()]);
+        assert_eq!(pc.fact_stale_days, 90);
+
+        let cfg = AppConfig::parse(
+            "[memory]\nfitness_min_exposures = 3\nfitness_demote = true\npinned_prefixes = [\"me.\"]\n",
+        )
+        .unwrap();
+        let pc = cfg.evolution.pass_config(false, &cfg.memory, 40);
+        assert_eq!(pc.fitness_min_exposures, 3);
+        assert!(pc.fitness_demote);
+        assert_eq!(pc.pinned_prefixes, vec!["me.".to_string()]);
     }
 
     #[test]
@@ -1503,8 +1557,13 @@ mod tests {
         let cfg =
             AppConfig::parse("[evolution]\nenabled = false\nprobe_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
-        assert_eq!(cfg.evolution.pass_config(true, 90, 40).probe_budget_turns, 7);
-        assert!(cfg.evolution.pass_config(true, 90, 40).dry_run);
+        assert_eq!(
+            cfg.evolution
+                .pass_config(true, &cfg.memory, 40)
+                .probe_budget_turns,
+            7
+        );
+        assert!(cfg.evolution.pass_config(true, &cfg.memory, 40).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
     }

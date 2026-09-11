@@ -1560,6 +1560,15 @@ impl Engine {
                         valid_to: None,
                         state: nscore::FactState::Current,
                         last_used: prev.last_used,
+                        // M9 T4.1: a new *value* is a new version, and it has
+                        // not been shown to anything yet. The counters stay
+                        // with the version whose exposures earned them —
+                        // inheriting them would credit "Peter" for the calls
+                        // that showed "Martin". The restatement arm above
+                        // keeps them, via `..prev`, because there the version
+                        // is the same one.
+                        exposures: 0,
+                        credits: 0,
                     },
                     None => nscore::Fact {
                         key: key.clone(),
@@ -2291,7 +2300,9 @@ impl Engine {
                     // the point of counting it is to know what the
                     // grounding check costs.
                     self.record_model_calls(usage, log, turn, &manifest);
-                    return regenerated.unwrap_or(draft);
+                    let final_reply = regenerated.unwrap_or(draft);
+                    Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                    return final_reply;
                 }
                 // M9 T2.1. The obligation interceptor, behind its own
                 // knob and *after* grounding: a draft that already had
@@ -2318,9 +2329,14 @@ impl Engine {
                             ))
                             .await;
                         self.record_model_calls(usage, log, turn, &manifest);
-                        regenerated.unwrap_or(draft)
+                        let final_reply = regenerated.unwrap_or(draft);
+                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                        final_reply
                     }
-                    None => draft,
+                    None => {
+                        Self::record_cited(log, turn, now(), &ctx, &draft);
+                        draft
+                    }
                 }
             }
             Ok(draft) => draft,
@@ -2339,6 +2355,25 @@ impl Engine {
                     explain_error(&e.to_string())
                 )
             }
+        }
+    }
+
+    /// M9 T4.2: record which reference parts the *final* reply drew on.
+    ///
+    /// The final draft, not the first: a flagged draft was regenerated, and
+    /// what the discarded one quoted is not what the user was told. Written
+    /// only when something was cited — an empty list is not a fact about the
+    /// turn, and the join downstream reads absence as "nothing cited".
+    fn record_cited(
+        log: &mut EventLog,
+        turn: u32,
+        at: nscore::Timestamp,
+        ctx: &ReplyContext,
+        reply: &str,
+    ) {
+        let sources = crate::ground::cited(ctx, reply);
+        if !sources.is_empty() {
+            log.append(turn, at, EventKind::ReplyCited { sources });
         }
     }
 

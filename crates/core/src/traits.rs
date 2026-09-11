@@ -307,6 +307,42 @@ pub trait MemoryStore: Send + Sync {
         out.truncate(k);
         Ok(out)
     }
+    /// Set the derived fitness counters on the *current* version of a fact
+    /// (M9 T4.3), without superseding it.
+    ///
+    /// Deliberately not `put_fact`: `put_fact` is the write path for a
+    /// *value*, and a value write ends one version and starts another. Fitness
+    /// is not a value — it is a number about the version already there, and a
+    /// pass that recomputes it every run would otherwise grow one version per
+    /// pass and lose the history the versioning exists for.
+    ///
+    /// The default body is correct for any store and spends one read and one
+    /// write; a store with an index overrides it with one UPDATE on the
+    /// primary key, the way `search_turns_in` is overridden. A store with no
+    /// current version for `(scope, key)` does nothing: a fact forgotten
+    /// between the calls that exposed it and the pass that scores them has no
+    /// version to score.
+    async fn set_fact_fitness(
+        &self,
+        scope: &str,
+        key: &str,
+        exposures: u32,
+        credits: u32,
+    ) -> Result<(), StoreError> {
+        let history = self.fact_history(scope, key).await?;
+        let Some(mut current) = history.into_iter().find(|f| {
+            matches!(
+                f.state,
+                crate::action::FactState::Current | crate::action::FactState::Cold
+            )
+        }) else {
+            return Ok(());
+        };
+        current.exposures = exposures;
+        current.credits = credits;
+        // `valid_from` is unchanged, so `put_fact` takes its in-place branch.
+        self.put_fact(current).await
+    }
     /// Write the digest of a closed session (M7 §8), **replacing** any
     /// digest that session already has. Idempotent by session id because a
     /// session is closed and re-digested on every consolidator run, and two

@@ -72,6 +72,20 @@ pub enum EventKind {
         span: String,
         ratio: f32,
     },
+    /// Which reference parts the final reply drew on (M9 T4.2): `persona`,
+    /// `trace`, `fact:<key>`, `summary`, `window:<turn>`, `guidance:<hash>`,
+    /// `obligations`. Written only when the list is non-empty.
+    ///
+    /// The backward arrow's second input. A grade says a turn went well; this
+    /// says *what was in the prompt when it did*, at the granularity the
+    /// forgetting decision needs — `ContextManifest` records what was shown,
+    /// and only the pair of them can tell a fact that earned its place from
+    /// one that merely occupied it. Infrastructure exactly like
+    /// [`EventKind::Graded`]: replay ignores it, the fold does not turn it
+    /// into a `did:` line, and no context ever contains it.
+    ReplyCited {
+        sources: Vec<String>,
+    },
     /// Rolling summary of the turns outside the window (M6 §5.1), written
     /// off the user's critical path. In the log because it is what the
     /// models were shown; excluded from replay diffs (derived prose whose

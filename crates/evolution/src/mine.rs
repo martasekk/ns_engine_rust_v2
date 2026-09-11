@@ -351,11 +351,15 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
         .filter(|e| {
             !matches!(
                 e.kind,
-                EventKind::ModelCall { .. } | EventKind::Graded { .. }
+                EventKind::ModelCall { .. }
+                    | EventKind::Graded { .. }
+                    | EventKind::ReplyCited { .. }
             )
         })
         .map(|e| match &e.kind {
-            EventKind::ModelCall { .. } | EventKind::Graded { .. } => {
+            EventKind::ModelCall { .. }
+            | EventKind::Graded { .. }
+            | EventKind::ReplyCited { .. } => {
                 unreachable!("filtered above")
             }
             EventKind::UserSaid { text } => format!("UserSaid: {text}"),

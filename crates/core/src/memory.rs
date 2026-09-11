@@ -322,11 +322,13 @@ impl Activation {
     }
 }
 
-/// The frequency column the prior reads. `uses` until M9 P4 lands
-/// `Fact.credits`, and then this one line switches recall from "how often it
-/// was shown" to "how often it helped".
+/// The frequency column the prior reads. Since M9 P4 it is `credits`, not
+/// `uses`: recall ranks by how often a fact *helped*, not by how often it was
+/// shown. `activation_weight` is 0.0 by default, so at today's config the
+/// column changes nothing observable — the switch matters only on the day
+/// T3.3's corpus moves the weight off zero.
 fn activation_freq(f: &crate::action::Fact) -> u32 {
-    f.uses
+    f.credits
 }
 
 /// Half-life of the recency term in `search_turns`, in turns (M9 T3.2).
@@ -692,10 +694,10 @@ mod tests {
     fn a_recently_credited_fact_outranks_an_equal_hit_count_at_weight_one() {
         let day = 86_400_000u64;
         let now = crate::event::Timestamp(100 * day);
-        let fact = |key: &str, uses: u32, used_days_ago: u64| crate::action::Fact {
+        let fact = |key: &str, credits: u32, used_days_ago: u64| crate::action::Fact {
             key: key.into(),
             value: serde_json::json!("x"),
-            uses,
+            credits,
             // Identical `last_validated`, so the only thing that can move
             // these two is the prior.
             last_validated: crate::event::Timestamp(7),
@@ -740,14 +742,14 @@ mod tests {
             crate::action::Fact {
                 key: "order.42.status".into(),
                 value: serde_json::json!("shipped"),
-                uses: 1000,
+                credits: 1000,
                 last_used: now,
                 ..Default::default()
             },
             crate::action::Fact {
                 key: "user.city".into(),
                 value: serde_json::json!("Brno"),
-                uses: 0,
+                credits: 0,
                 last_used: crate::event::Timestamp(0),
                 ..Default::default()
             },
@@ -772,11 +774,11 @@ mod tests {
     /// `last_validated` ties so the key tiebreak is exercised too.
     fn ranking_corpus() -> Vec<crate::action::Fact> {
         let day = 86_400_000u64;
-        let f = |key: &str, value: &str, validated: u64, uses: u32, used_days_ago: u64| {
+        let f = |key: &str, value: &str, validated: u64, credits: u32, used_days_ago: u64| {
             crate::action::Fact {
                 key: key.into(),
                 value: serde_json::json!(value),
-                uses,
+                credits,
                 last_validated: crate::event::Timestamp(validated),
                 last_used: crate::event::Timestamp(100 * day - used_days_ago * day),
                 ..Default::default()

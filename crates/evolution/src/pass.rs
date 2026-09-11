@@ -47,6 +47,14 @@ pub struct PassConfig {
     /// measurement, not something to average away, and the gate has to be
     /// able to say *whose* verdict it acted on.
     pub authoritative_evaluator: String,
+    /// M9 T4.4: exposures a fact needs before zero credits mean anything.
+    pub fitness_min_exposures: u32,
+    /// Whether the fitness signal demotes or only reports. Off for a release.
+    pub fitness_demote: bool,
+    /// Key prefixes the fitness signal never demotes (`[memory]
+    /// pinned_prefixes`). Threaded through the pass the way `fact_stale_days`
+    /// is: the knob belongs to memory, and the pass is where it is applied.
+    pub pinned_prefixes: Vec<String>,
 }
 
 impl Default for PassConfig {
@@ -61,6 +69,9 @@ impl Default for PassConfig {
             digest_scope: "global".into(),
             evaluate: EvaluateConfig::default(),
             authoritative_evaluator: "symbolic".into(),
+            fitness_min_exposures: 8,
+            fitness_demote: false,
+            pinned_prefixes: vec!["user.".into()],
         }
     }
 }
@@ -108,6 +119,8 @@ pub struct Report {
     pub written: bool,
     /// M6 §6.4 fact consolidation numbers.
     pub consolidation: crate::consolidate::ConsolidationReport,
+    /// M9 T4.3 fitness numbers, derived from the log on every run.
+    pub fitness: crate::fitness::FitnessReport,
 }
 
 impl std::fmt::Display for Report {
@@ -143,6 +156,30 @@ impl std::fmt::Display for Report {
         )?;
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
+        // M9 T4.5: the numbers this phase exists to make readable without
+        // opening SQLite. `exposures` without `credits` is the whole point —
+        // a fact in every prompt and in no answer is the one worth finding.
+        writeln!(
+            f,
+            "fitness: {} facts derived, {} with exposures, {} zero-credit",
+            self.fitness.facts.len(),
+            self.fitness.with_exposures(),
+            self.fitness.zero_credit()
+        )?;
+        for (key, exposures) in self.fitness.top_zero_credit(10) {
+            writeln!(f, "  {key}  {exposures}")?;
+        }
+        for session in &self.fitness.graded_sessions_with_zero_exposures {
+            writeln!(f, "alarm: graded session {session} exposes no fact")?;
+        }
+        for (hash, n) in &self.fitness.notes {
+            let lift = self.fitness.note_lifts.get(hash).copied().unwrap_or(0.0);
+            writeln!(
+                f,
+                "  note {hash}  lift {lift:.3}  {} exposures  {} credits",
+                n.exposures, n.credits
+            )?;
+        }
         writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
@@ -396,6 +433,31 @@ impl EvolutionPass {
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
 
+        // 4c. Fitness (M9 T4.3): the join from outcome back to selection.
+        //
+        // After grading, so this run's fresh verdicts count; before
+        // consolidation, so the demotion signal reads numbers derived from the
+        // log rather than whatever the last pass left in the columns. The
+        // numbers are *derived and set*, never incremented — running this
+        // twice over one log produces one answer.
+        report.fitness =
+            crate::fitness::derive(store, &sessions, &self.cfg.authoritative_evaluator).await?;
+        for note in &base.notes {
+            report
+                .fitness
+                .note_lifts
+                .insert(note.hash.clone(), note.lift);
+            report.fitness.notes.entry(note.hash.clone()).or_default();
+        }
+        if !self.cfg.dry_run {
+            for (scope, key, exposures, credits) in &report.fitness.facts {
+                store
+                    .set_fact_fitness(scope, key, *exposures, *credits)
+                    .await?;
+            }
+            ledger.fitness = report.fitness.notes.clone();
+        }
+
         // `working` accumulates this run's accepted candidates so later ones
         // are verified against base + everything accepted before them.
         let mut working = base.clone();
@@ -475,6 +537,15 @@ impl EvolutionPass {
             crate::consolidate::ConsolidateConfig {
                 stale_ms: self.cfg.fact_stale_days.saturating_mul(86_400_000),
                 dry_run: self.cfg.dry_run,
+                fitness_min_exposures: self.cfg.fitness_min_exposures,
+                fitness_demote: self.cfg.fitness_demote,
+                pinned_prefixes: self.cfg.pinned_prefixes.clone(),
+                fitness: report
+                    .fitness
+                    .facts
+                    .iter()
+                    .map(|(s, k, e, c)| ((s.clone(), k.clone()), (*e, *c)))
+                    .collect(),
             },
             Timestamp(now),
         )
@@ -1083,5 +1154,237 @@ mod tests {
         assert_eq!(dry.graded_turns, 1, "{dry}");
         let events = store2.load(&SessionId("a".into())).await.unwrap();
         assert!(graded_events(&events).is_empty(), "dry run wrote a grade");
+    }
+
+    /// M9 T4.5. The exit criterion for the whole phase is that the numbers are
+    /// readable without opening SQLite — a fact in every prompt and in no
+    /// answer has to be visible in the dry run, beside the notes and beside
+    /// the alarm that says the join matched nothing.
+    #[tokio::test]
+    async fn the_dry_run_prints_exposures_and_credits_per_fact_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        let note = Note::new("global", "prefer the shortest action", 0.25);
+        crate::files::save_rules_atomic(
+            &dir.path().join("learned.toml"),
+            &LearnedRules {
+                notes: vec![note.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in ["shop.promo", "shop.hours"] {
+            store
+                .put_fact(Fact {
+                    key: key.into(),
+                    value: serde_json::json!("x"),
+                    valid_from: Timestamp(1),
+                    last_validated: Timestamp(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // One session: two turns, both showing both facts and the note; the
+        // first graded good, the second graded bad and citing one fact.
+        let sid = SessionId("s".into());
+        let mut log = EventLog::new(sid.clone());
+        for (turn, ok) in [(1u32, true), (2, false)] {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::UserSaid {
+                    text: "what is the promo".into(),
+                },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::ModelCall {
+                    usage: usage(),
+                    manifest: ContextManifest {
+                        fact_keys: vec!["shop.promo".into(), "shop.hours".into()],
+                        guidance: 1,
+                        note_hashes: vec![note.hash.clone()],
+                        ..Default::default()
+                    },
+                },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Graded {
+                    turn,
+                    grade: Grade { ok, issues: vec![] },
+                    by: "symbolic".into(),
+                    revision: "r1".into(),
+                },
+            );
+        }
+        log.append(
+            2,
+            Timestamp(2),
+            EventKind::ReplyCited {
+                sources: vec!["fact:shop.hours".into()],
+            },
+        );
+        store.append(&sid, log.events()).await.unwrap();
+        // A second session that was graded and showed nothing: the alarm.
+        let blind = SessionId("blind".into());
+        let mut b = EventLog::new(blind.clone());
+        b.append(1, Timestamp(9), EventKind::UserSaid { text: "hi".into() });
+        b.append(
+            1,
+            Timestamp(9),
+            EventKind::ModelCall {
+                usage: usage(),
+                manifest: ContextManifest::default(),
+            },
+        );
+        b.append(
+            1,
+            Timestamp(9),
+            EventKind::Graded {
+                turn: 1,
+                grade: Grade {
+                    ok: true,
+                    issues: vec![],
+                },
+                by: "symbolic".into(),
+                revision: "r1".into(),
+            },
+        );
+        store.append(&blind, b.events()).await.unwrap();
+
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let p = EvolutionPass::new(
+            rules,
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                dry_run: true,
+                // Every recorded grade is read back, so the scorer is never
+                // asked and the numbers are the fixture's own.
+                fitness_min_exposures: 2,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123));
+        let report = p.run_report(&*store).await.unwrap();
+
+        // `shop.promo` was shown twice and credited once (the good turn);
+        // `shop.hours` twice and credited twice (good turn, then cited in the
+        // bad one). Neither is zero-credit, so the top-10 list is empty here
+        // and the demote set with it.
+        assert_eq!(
+            report.fitness.facts,
+            vec![
+                ("global".into(), "shop.hours".into(), 2, 2),
+                ("global".into(), "shop.promo".into(), 2, 1),
+            ]
+        );
+        let text = report.to_string();
+        assert!(
+            text.contains("fitness: 2 facts derived, 2 with exposures, 0 zero-credit"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "note {}  lift 0.250  2 exposures  1 credits",
+                note.hash
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("alarm: graded session blind exposes no fact"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fitness demote: 0 candidates, knob off"),
+            "{text}"
+        );
+
+        // Dry run: nothing reached the store.
+        let stored = store.facts("global", "shop").await.unwrap();
+        assert!(
+            stored.iter().all(|f| f.exposures == 0 && f.credits == 0),
+            "{stored:?}"
+        );
+        assert!(Ledger::load(&dir.path().join("ledger.json"))
+            .unwrap()
+            .fitness
+            .is_empty());
+
+        // And the same pass, not dry, writes exactly those numbers — then a
+        // third derivation over the same log reproduces them.
+        let p = EvolutionPass::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                fitness_min_exposures: 2,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123));
+        let wet = p.run_report(&*store).await.unwrap();
+        assert_eq!(wet.fitness.facts, report.fitness.facts);
+        let stored = store.facts("global", "shop").await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|f| (f.key.clone(), f.exposures, f.credits))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shop.hours".to_string(), 2, 2),
+                ("shop.promo".to_string(), 2, 1)
+            ]
+        );
+        assert_eq!(
+            Ledger::load(&dir.path().join("ledger.json"))
+                .unwrap()
+                .fitness
+                .get(&note.hash)
+                .copied(),
+            Some(crate::fitness::NoteFitness {
+                exposures: 2,
+                credits: 1
+            })
+        );
+        let again = p.run_report(&*store).await.unwrap();
+        assert_eq!(again.fitness.facts, wet.fitness.facts, "idempotent");
+        let stored_again = store.facts("global", "shop").await.unwrap();
+        assert_eq!(
+            stored_again
+                .iter()
+                .map(|f| (f.exposures, f.credits))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (2, 1)]
+        );
+        // No version was added by the rescoring.
+        assert_eq!(
+            store
+                .fact_history("global", "shop.promo")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            role: "emitter".into(),
+            model: "m".into(),
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            estimated: false,
+            attempts: 1,
+            latency_ms: 5,
+            tools_tokens: 0,
+            cached_tokens: 0,
+        }
     }
 }
