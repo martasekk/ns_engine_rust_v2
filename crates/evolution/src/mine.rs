@@ -816,6 +816,7 @@ mod tests {
             attempts: 1,
             latency_ms: 5,
             tools_tokens: 0,
+            cached_tokens: 0,
         }
     }
 

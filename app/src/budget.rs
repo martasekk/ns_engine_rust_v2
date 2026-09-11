@@ -27,6 +27,13 @@ struct Measured {
     summarizer_requests: u32,
     prompt: u64,
     completion: u64,
+    /// Prompt tokens the provider served from its cache, and the prompt
+    /// tokens it was measured over. Only calls with the provider's own
+    /// numbers count on either side: an estimated call has no cache split
+    /// to report, and folding its chars/4 prompt into the denominator would
+    /// report a real cache hit as a smaller one.
+    cached: u64,
+    cached_prompt: u64,
     peak_prompt: u32,
     /// At least one call's counts came from chars/4, not the provider.
     estimated: bool,
@@ -63,6 +70,10 @@ impl Measured {
         }
         self.prompt += u64::from(usage.prompt_tokens);
         self.completion += u64::from(usage.completion_tokens);
+        if !usage.estimated {
+            self.cached += u64::from(usage.cached_tokens);
+            self.cached_prompt += u64::from(usage.prompt_tokens);
+        }
         self.peak_prompt = self.peak_prompt.max(usage.prompt_tokens);
         self.estimated |= usage.estimated;
         self.schema_tokens += u64::from(usage.tools_tokens);
@@ -82,6 +93,8 @@ impl Measured {
         self.summarizer_requests += other.summarizer_requests;
         self.prompt += other.prompt;
         self.completion += other.completion;
+        self.cached += other.cached;
+        self.cached_prompt += other.cached_prompt;
         self.peak_prompt = self.peak_prompt.max(other.peak_prompt);
         self.estimated |= other.estimated;
         self.schema_tokens += other.schema_tokens;
@@ -102,6 +115,7 @@ impl Measured {
                 self.emitter_requests, self.replier_requests, self.summarizer_requests
             ),
             self.prompt.to_string(),
+            self.cached.to_string(),
             self.completion.to_string(),
             self.peak_prompt.to_string(),
             self.schema_tokens.to_string(),
@@ -153,6 +167,7 @@ const MEASURED_COLUMNS: &[(&str, usize)] = &[
     ("calls", 7),
     ("e/r/s", 9),
     ("prompt", 9),
+    ("cached", 8),
     ("compl", 8),
     ("peak", 8),
     ("schema", 8),
@@ -269,6 +284,19 @@ fn render_measured(events: &[Event]) -> String {
         total.schema_prompt,
         plural(total.schema_calls, "call"),
         percent(total.schema_tokens, total.schema_prompt)
+    ));
+    // What the provider says it did not have to re-read. Only the calls it
+    // reported numbers for are in either half, so this is a measurement and
+    // not a mixture of one with chars/4.
+    out.push_str(&format!(
+        "cached: {} of {} prompt tokens on measured calls ({})\n",
+        total.cached,
+        total.cached_prompt,
+        if total.cached_prompt == 0 {
+            "0.0%".to_string()
+        } else {
+            percent(total.cached, total.cached_prompt)
+        }
     ));
     out.push_str(&format!(
         "the free tier meters requests, not tokens: 50 a day on openrouter/free, {} spent here\n",
@@ -458,6 +486,14 @@ mod tests {
             attempts,
             latency_ms: 5,
             tools_tokens,
+            cached_tokens: 0,
+        }
+    }
+
+    fn cached(role: &str, prompt: u32, cached_tokens: u32) -> Usage {
+        Usage {
+            cached_tokens,
+            ..usage(role, 1, prompt, 0)
         }
     }
 
@@ -530,13 +566,13 @@ mod tests {
         assert_eq!(cells[2], "3", "3 calls: {row}");
         assert_eq!(cells[3], "4/1/0", "by role: {row}");
         assert_eq!(
-            cells[6], "1400",
+            cells[7], "1400",
             "peak prompt is the max, not the sum: {row}"
         );
         // Summed, not maxed: the same trace re-sent on the next iteration is
         // paid for again, and that is what phase 1 has to move.
-        assert_eq!(cells[9], "1840", "trace chars summed over calls: {row}");
-        assert_eq!(cells[10], "13000", "clipped chars summed: {row}");
+        assert_eq!(cells[10], "1840", "trace chars summed over calls: {row}");
+        assert_eq!(cells[11], "13000", "clipped chars summed: {row}");
         assert!(
             out.contains("5 requests (5.0 per turn)"),
             "requests per turn is the free-tier number: {out}"
@@ -572,6 +608,38 @@ mod tests {
         assert!(
             !out.contains("6.7%"),
             "the replier's prompt is not in it: {out}"
+        );
+    }
+
+    /// The cache share is a measurement or it is nothing: an estimated call
+    /// has no provider number to split, so neither its cached tokens nor its
+    /// chars/4 prompt may stand in the fraction.
+    #[test]
+    fn cached_column_sums_only_measured_calls() {
+        let mut log = log();
+        call(
+            &mut log,
+            1,
+            cached("emitter", 1_000, 100),
+            manifest(0, 0, 0),
+        );
+        call(
+            &mut log,
+            1,
+            cached("emitter", 1_000, 300),
+            manifest(0, 0, 0),
+        );
+        let mut guessed = cached("replier", 5_000, 999);
+        guessed.estimated = true;
+        call(&mut log, 1, guessed, manifest(0, 0, 0));
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+
+        let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cells[5], "400", "the estimated call's 999 is out: {row}");
+        assert!(
+            out.contains("cached: 400 of 2000 prompt tokens on measured calls (20.0%)"),
+            "the denominator is the two measured calls only: {out}"
         );
     }
 

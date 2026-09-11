@@ -44,6 +44,19 @@ pub struct Usage {
     /// design that is portable across all seven provider presets.
     #[serde(default)]
     pub tools_tokens: u32,
+    /// Prompt tokens the provider served out of its own prompt cache, as it
+    /// reported them: OpenRouter puts the number in
+    /// `usage.prompt_tokens_details.cached_tokens`. Part of `prompt_tokens`
+    /// rather than extra to it — the share of a prompt that was already
+    /// sitting on the provider's side, and the only evidence that a stable
+    /// prefix is being reused rather than merely intended.
+    ///
+    /// Zero when the provider sends no details block, and zero on an
+    /// estimated call, where there is no provider number to split. A zero
+    /// therefore means "not reported", which is why it is read from the
+    /// body rather than derived from anything here.
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 /// Four characters to the token.
@@ -166,6 +179,7 @@ mod tests {
             attempts: 1,
             latency_ms: 5,
             tools_tokens: 0,
+            cached_tokens: 0,
         }
     }
 

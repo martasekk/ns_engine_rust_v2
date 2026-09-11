@@ -3262,6 +3262,7 @@ impl Emitter for MeteredEmitter {
             attempts: 2,
             latency_ms: 11,
             tools_tokens: 300,
+            cached_tokens: 0,
         });
         proposed
     }
@@ -3589,6 +3590,7 @@ fn usage_tagged(role: &str, session: &str) -> Usage {
         attempts: 1,
         latency_ms: 1,
         tools_tokens: 0,
+        cached_tokens: 0,
     }
 }
 

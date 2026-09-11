@@ -224,6 +224,11 @@ impl OpenRouterClient {
             Some(tools) => nscore::estimate_tokens(tools.to_string().len()),
             None => 0,
         };
+        // The provider's own cache accounting, where it keeps it. Absent from
+        // every shim that omits the `usage` block, so a missing details
+        // object is zero rather than an error: nothing was reported, and
+        // nothing is claimed.
+        let cached_tokens = count(&usage["prompt_tokens_details"]["cached_tokens"]).unwrap_or(0);
         sink.record(nscore::Usage {
             role: self.role.clone(),
             model: request["model"].as_str().unwrap_or_default().to_string(),
@@ -233,6 +238,7 @@ impl OpenRouterClient {
             attempts,
             latency_ms: took.as_millis() as u32,
             tools_tokens,
+            cached_tokens,
         });
     }
 
@@ -316,6 +322,53 @@ mod tests {
             nscore::estimate_tokens(tools.to_string().len())
         );
         assert!(u.tools_tokens > 0 && u.tools_tokens < u.prompt_tokens);
+    }
+
+    /// The cache share, where OpenRouter reports it. It decides whether a
+    /// stable prefix is actually being reused, and no other number in the
+    /// body says so.
+    #[tokio::test]
+    async fn cached_tokens_is_read_from_prompt_tokens_details() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {
+                "prompt_tokens": 1234,
+                "completion_tokens": 56,
+                "prompt_tokens_details": {"cached_tokens": 2048}
+            }
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        c.chat(serde_json::json!({"model": "m", "messages": []}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        let u = &recorded[0];
+        assert_eq!(u.cached_tokens, 2048);
+        assert!(!u.estimated, "the provider reported these");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1234, 56));
+    }
+
+    /// Most providers send no details object at all. A zero says "not
+    /// reported" and leaves the counts that *were* reported alone.
+    #[tokio::test]
+    async fn a_usage_block_without_details_reports_zero_cached() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1234, "completion_tokens": 56}
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        c.chat(serde_json::json!({"model": "m", "messages": []}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        let u = &recorded[0];
+        assert_eq!(u.cached_tokens, 0, "nothing was reported");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1234, 56));
+        assert!(!u.estimated);
     }
 
     /// Several OpenAI-compatible shims send no `usage` block at all, and

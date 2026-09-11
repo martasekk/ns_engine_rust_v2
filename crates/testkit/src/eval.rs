@@ -250,6 +250,7 @@ fn spent(role: &'static str) -> Usage {
         attempts: 1,
         latency_ms: 0,
         tools_tokens: 0,
+        cached_tokens: 0,
     }
 }
 

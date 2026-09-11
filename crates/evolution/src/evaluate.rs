@@ -613,6 +613,7 @@ mod tests {
                     attempts: 1,
                     latency_ms: 1,
                     tools_tokens: 0,
+                    cached_tokens: 0,
                 },
                 manifest: nscore::ContextManifest {
                     tier: Some(tier),
