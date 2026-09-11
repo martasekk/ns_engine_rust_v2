@@ -50,6 +50,11 @@ pub struct EngineConfig {
     pub pinned_max: usize,
     /// M6 §6.5: facts lexically relevant to the current message.
     pub relevant_max: usize,
+    /// M9 T0.4: blank one context block after the fit, to measure what it
+    /// was worth. Set programmatically by the evaluation harness only —
+    /// there is deliberately no config key for it, because an ablated engine
+    /// answering a real user is a worse engine on purpose.
+    pub ablate: Option<nscore::Ablate>,
     /// M6 §5.1: summarize once this many turns have fallen out of the
     /// window since the last summary; 0 = no rolling summary.
     pub summary_every_turns: usize,
@@ -146,6 +151,7 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
+            ablate: None,
             summary_every_turns: 4,
             summary_rebuild_every: 3,
             summary_max_chars: 800,
@@ -1027,6 +1033,10 @@ impl Engine {
             };
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
+            // Notes and their hashes together, so the manifest can say which
+            // note sat in this prompt (M9 T0.3). The texts go into the
+            // context; the hashes are cut to whatever survived to be sent.
+            let guidance_notes = rules.guidance_notes_for(&legal_names);
             let mut ctx = nscore::EmitterContext {
                 facts,
                 summary: state.summary.clone(),
@@ -1036,7 +1046,7 @@ impl Engine {
                 trace_so_far,
                 pending_confirmation: active_pending.is_some(),
                 rejections_this_turn: rejections_this_turn.clone(),
-                guidance: rules.guidance_for(&legal_names),
+                guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
                 budget_line: None,
                 usage: Some(usage.clone()),
             };
@@ -1061,8 +1071,27 @@ impl Engine {
                     .collect();
                 ctx.budget_line = Some(budget.line(&clipped));
             }
-            let mut manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
+            // M9 T0.4. After the fit, so the budget report above still
+            // counts the block as it was composed and the ablation shows up
+            // only in what was rendered and in the manifest's keys.
+            match self.cfg.ablate {
+                Some(nscore::Ablate::Facts) => ctx.facts.clear(),
+                Some(nscore::Ablate::Summary) => ctx.summary = None,
+                Some(nscore::Ablate::Guidance) => ctx.guidance.clear(),
+                None => {}
+            }
+            // Cut to what survived: nothing drops guidance from the middle,
+            // so a prefix is exact, and it keeps `note_hashes.len() ==
+            // guidance` true whether the list was clamped or blanked.
+            let note_hashes: Vec<String> = guidance_notes
+                .iter()
+                .take(ctx.guidance.len())
+                .map(|(h, _)| h.clone())
+                .collect();
+            let mut manifest =
+                emitter_manifest(&ctx, legal.actions.len(), clipped_chars, note_hashes);
             manifest.budget = Some(budget);
+            manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
             manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose(ctx, &legal).await;
@@ -2116,7 +2145,8 @@ impl Engine {
         // M6 §4.3: the reply model gets the user's message, the
         // verbatim window and the summary — not a counter string.
         let window = state.window(self.cfg.window_turns);
-        let guidance = rules.guidance_for_reply();
+        let guidance_notes = rules.guidance_notes_for_reply();
+        let guidance: Vec<String> = guidance_notes.iter().map(|(_, t)| t.clone()).collect();
         let make_ctx =
             |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
                 persona: self.cfg.persona.clone(),
@@ -2143,8 +2173,22 @@ impl Engine {
             self.cfg.budget_mode,
             &self.cfg.pinned_prefixes,
         );
-        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
+        // M9 T0.4, as on the emitter path: after the fit, so only the
+        // rendered prompt and the manifest's keys change.
+        match self.cfg.ablate {
+            Some(nscore::Ablate::Facts) => budgeted.facts.clear(),
+            Some(nscore::Ablate::Summary) => budgeted.summary = None,
+            Some(nscore::Ablate::Guidance) => budgeted.guidance.clear(),
+            None => {}
+        }
+        let note_hashes: Vec<String> = guidance_notes
+            .iter()
+            .take(budgeted.guidance.len())
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
+        manifest.ablated = self.cfg.ablate;
         let drafted = self.parts.replier.reply(budgeted).await;
         self.record_model_calls(usage, log, turn, &manifest);
         match drafted {

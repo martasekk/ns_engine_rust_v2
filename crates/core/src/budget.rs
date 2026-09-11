@@ -112,20 +112,23 @@ fn chars(s: &str) -> usize {
     s.chars().count()
 }
 
-fn facts_chars(facts: &[crate::memory::FactView]) -> usize {
+/// The rendered size of each stable block, in characters. Public because
+/// the engine records them in the manifest after the fit, and a second
+/// measurement written there would be the one that drifts (M9 T0.5).
+pub fn facts_chars(facts: &[crate::memory::FactView]) -> usize {
     facts
         .iter()
         .map(|f| chars(&crate::memory::render_fact(f)) + 3)
         .sum()
 }
 
-fn summary_chars(summary: Option<&crate::memory::SessionSummary>) -> usize {
+pub fn summary_chars(summary: Option<&crate::memory::SessionSummary>) -> usize {
     summary
         .map(|s| chars(&crate::memory::render_summary(s)))
         .unwrap_or(0)
 }
 
-fn window_chars(window: &[crate::memory::TurnRecord], caps: &crate::memory::Caps) -> usize {
+pub fn window_chars(window: &[crate::memory::TurnRecord], caps: &crate::memory::Caps) -> usize {
     chars(&crate::memory::render_window(window, window.len(), caps))
 }
 

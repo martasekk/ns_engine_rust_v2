@@ -181,7 +181,11 @@ fn fold_descriptor(entry: &TraceEntry, max_chars: usize) -> String {
 /// entrainment plan §9 rules out: nothing here is a model's paraphrase.
 /// The fold is a count, produced deterministically, and the full trace is
 /// still in the log for `ns-app echo` to measure against.
-fn fold_older_steps(entries: Vec<TraceEntry>, verbatim: usize, max_chars: usize) -> Vec<TraceEntry> {
+fn fold_older_steps(
+    entries: Vec<TraceEntry>,
+    verbatim: usize,
+    max_chars: usize,
+) -> Vec<TraceEntry> {
     // The budget counts *outcomes*, not lines. Counting lines put five
     // `Proposed`/`Rejected` lines of churn in the verbatim window and folded
     // the turn's one real result away — and the result is what the replier
@@ -389,7 +393,11 @@ pub fn trace_for_prompt(
 ///
 /// Only `Ok` outcomes: an error's detail is already short and is never
 /// clipped, so there is nothing behind it to page through.
-pub(crate) fn result_text(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> Option<String> {
+pub(crate) fn result_text(
+    events: &[nscore::Event],
+    turn: u32,
+    id: nscore::EventId,
+) -> Option<String> {
     events
         .iter()
         .find(|e| e.id == id && e.turn == turn)
@@ -404,7 +412,11 @@ pub(crate) fn result_text(events: &[nscore::Event], turn: u32, id: nscore::Event
 
 /// The trust of the result behind a handle, so an inspected window carries
 /// the trust of the tool that produced it rather than `System` by default.
-pub(crate) fn result_trust(events: &[nscore::Event], turn: u32, id: nscore::EventId) -> nscore::Trust {
+pub(crate) fn result_trust(
+    events: &[nscore::Event],
+    turn: u32,
+    id: nscore::EventId,
+) -> nscore::Trust {
     events
         .iter()
         .find(|e| e.id == id && e.turn == turn)
@@ -424,7 +436,11 @@ pub(crate) fn result_trust(events: &[nscore::Event], turn: u32, id: nscore::Even
 /// Derived from this turn's own events, never from the store: legality that
 /// depends on stored state makes replay from a fresh store diverge, which is
 /// the rule M6 §15 records after `forget_all` was written that way once.
-pub(crate) fn clipped_results(events: &[nscore::Event], turn: u32, max_chars: usize) -> Vec<nscore::EventId> {
+pub(crate) fn clipped_results(
+    events: &[nscore::Event],
+    turn: u32,
+    max_chars: usize,
+) -> Vec<nscore::EventId> {
     trace_entries(events, turn)
         .into_iter()
         .filter(|entry| entry.line.chars().count() > max_chars)
@@ -446,6 +462,7 @@ pub(crate) fn emitter_manifest(
     ctx: &nscore::EmitterContext,
     tools: usize,
     clipped_chars: usize,
+    note_hashes: Vec<String>,
 ) -> nscore::ContextManifest {
     nscore::ContextManifest {
         fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
@@ -456,6 +473,14 @@ pub(crate) fn emitter_manifest(
         clipped_chars,
         tools,
         guidance: ctx.guidance.len(),
+        note_hashes,
+        // Measured with the budget's own render helpers, on the context as
+        // it stands after the fit — so the numbers are the sizes sent, not
+        // the sizes composed (M9 T0.5).
+        facts_chars: nscore::facts_chars(&ctx.facts),
+        summary_chars: nscore::summary_chars(ctx.summary.as_ref()),
+        window_chars: nscore::window_chars(&ctx.window, &ctx.caps),
+        ablated: None,
         tier: None,
         route_cues: Vec::new(),
         // Filled in by the caller, which is the only place that knows what
@@ -466,7 +491,11 @@ pub(crate) fn emitter_manifest(
 
 /// What the replier was shown. `tools` is zero: the reply model is given no
 /// action schema at all, which is half of why it is the cheaper of the two.
-pub(crate) fn reply_manifest(ctx: &nscore::ReplyContext, clipped_chars: usize) -> nscore::ContextManifest {
+pub(crate) fn reply_manifest(
+    ctx: &nscore::ReplyContext,
+    clipped_chars: usize,
+    note_hashes: Vec<String>,
+) -> nscore::ContextManifest {
     nscore::ContextManifest {
         fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
         summary_through: ctx.summary.as_ref().map(|s| s.through_turn),
@@ -476,6 +505,11 @@ pub(crate) fn reply_manifest(ctx: &nscore::ReplyContext, clipped_chars: usize) -
         clipped_chars,
         tools: 0,
         guidance: ctx.guidance.len(),
+        note_hashes,
+        facts_chars: nscore::facts_chars(&ctx.facts),
+        summary_chars: nscore::summary_chars(ctx.summary.as_ref()),
+        window_chars: nscore::window_chars(&ctx.window, &ctx.caps),
+        ablated: None,
         tier: None,
         route_cues: Vec::new(),
         budget: None,
@@ -492,7 +526,10 @@ mod tests {
     fn a_short_trace_line_is_left_alone() {
         let line = "ToolReturned(ok: moved to (960, 540))";
         let handle = Some(nscore::EventId(7));
-        assert_eq!(clip_trace_line(line, DEFAULT_TOOL_RESULT_MAX_CHARS, handle), line);
+        assert_eq!(
+            clip_trace_line(line, DEFAULT_TOOL_RESULT_MAX_CHARS, handle),
+            line
+        );
         assert_eq!(clip_trace_line("exactly ten", 11, handle), "exactly ten");
     }
 
@@ -715,5 +752,98 @@ mod tests {
             let clipped = clip_trace_line(line, max, Some(nscore::EventId(1)));
             assert!(clipped.chars().count() >= max, "max {max}: {clipped}");
         }
+    }
+
+    fn fact_view(key: &str, value: &str) -> nscore::FactView {
+        nscore::FactView {
+            key: key.into(),
+            value: serde_json::json!(value),
+            confidence: 1.0,
+            uses: 0,
+            state: nscore::FactState::Current,
+            previous: None,
+        }
+    }
+
+    fn record(turn: u32, user: &str, reply: &str) -> nscore::TurnRecord {
+        nscore::TurnRecord {
+            turn,
+            user: user.into(),
+            did: vec![],
+            reply: reply.into(),
+            trust: nscore::Trust::User,
+        }
+    }
+
+    fn emitter_ctx(
+        facts: Vec<nscore::FactView>,
+        summary: Option<nscore::SessionSummary>,
+        window: Vec<nscore::TurnRecord>,
+    ) -> nscore::EmitterContext {
+        nscore::EmitterContext {
+            facts,
+            summary,
+            window,
+            caps: nscore::Caps::default(),
+            user_text: "what did I say?".into(),
+            trace_so_far: vec![],
+            pending_confirmation: false,
+            rejections_this_turn: vec![],
+            guidance: vec![],
+            budget_line: None,
+            usage: None,
+        }
+    }
+
+    /// T0.5 needs the size of the stable prefix, and a prefix is a sum of
+    /// block sizes the keys cannot give back. The manifest records them with
+    /// the budget's own render helpers, so the number in the log and the
+    /// number the fit weighed are the same measurement.
+    #[test]
+    fn manifest_records_the_rendered_size_of_facts_summary_and_window() {
+        let summary = nscore::SessionSummary {
+            through_turn: 2,
+            topic: "the horse".into(),
+            established: vec!["it is called Ferda".into()],
+            open: vec![],
+            trust: nscore::Trust::User,
+            rebuilt_from: 1,
+        };
+        let facts = vec![
+            fact_view("user.name", "Martin"),
+            fact_view("user.city", "Brno"),
+        ];
+        let window = vec![record(1, "ahoj", "hello"), record(2, "who am I", "Martin")];
+        let ctx = emitter_ctx(facts.clone(), Some(summary.clone()), window.clone());
+        let m = emitter_manifest(&ctx, 3, 0, vec![]);
+        assert_eq!(m.facts_chars, nscore::facts_chars(&facts));
+        assert_eq!(m.summary_chars, nscore::summary_chars(Some(&summary)));
+        assert_eq!(
+            m.window_chars,
+            nscore::window_chars(&window, &nscore::Caps::default())
+        );
+        assert!(m.facts_chars > 0 && m.summary_chars > 0 && m.window_chars > 0);
+
+        // An empty context is three zeros, not three defaults that happen to
+        // look like one: nothing was sent, so nothing is charged to the
+        // prefix.
+        let empty = emitter_manifest(&emitter_ctx(vec![], None, vec![]), 0, 0, vec![]);
+        assert_eq!(
+            (empty.facts_chars, empty.summary_chars, empty.window_chars),
+            (0, 0, 0)
+        );
+    }
+
+    /// The invariant the hashes exist to keep: the count and the list are
+    /// filled from one render, so a join over the hashes covers exactly the
+    /// notes the count claims.
+    #[test]
+    fn the_manifest_carries_one_hash_per_guidance_note() {
+        let mut ctx = emitter_ctx(vec![], None, vec![]);
+        ctx.guidance = vec!["prefer echo".into(), "never wipe".into()];
+        let hashes = vec!["sha256:a".to_string(), "sha256:b".to_string()];
+        let m = emitter_manifest(&ctx, 0, 0, hashes.clone());
+        assert_eq!(m.guidance, 2);
+        assert_eq!(m.note_hashes, hashes);
     }
 }

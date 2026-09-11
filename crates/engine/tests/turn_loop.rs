@@ -4109,3 +4109,188 @@ async fn a_fact_remembered_in_one_scope_is_invisible_from_another() {
         "{reply_a}"
     );
 }
+
+/// Emitter double that meters like `MeteredEmitter` and keeps every context
+/// it was handed, so a test can assert on the prompt as sent *and* on the
+/// `ModelCall` the same call wrote.
+struct MeteredProbe(Arc<std::sync::Mutex<Vec<EmitterContext>>>);
+
+#[async_trait::async_trait]
+impl Emitter for MeteredProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let sink = ctx
+            .usage
+            .clone()
+            .expect("the engine hands every call a sink");
+        self.0.lock().unwrap().push(ctx);
+        sink.record(Usage {
+            role: "emitter".into(),
+            model: "test-model".into(),
+            prompt_tokens: 900,
+            completion_tokens: 20,
+            estimated: false,
+            attempts: 1,
+            latency_ms: 11,
+            tools_tokens: 300,
+            cached_tokens: 0,
+        });
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// The facts block exactly as `nsllm`'s `render_context` writes it — the
+/// engine crate cannot reach the renderer, so the shape is restated here and
+/// the assertion is about the header a blanked block must not produce.
+fn rendered_facts_block(ctx: &EmitterContext) -> String {
+    if ctx.facts.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("Facts:\n");
+    for f in &ctx.facts {
+        s.push_str(&format!("- {}\n", nscore::render_fact(f)));
+    }
+    s
+}
+
+/// One turn on a `MeteredProbe`, returning the contexts it saw and the
+/// `ModelCall` manifests the turn wrote.
+async fn probed_turn(
+    rules: LearnedRules,
+    ablate: Option<Ablate>,
+    facts: Vec<(&str, &str)>,
+) -> (Vec<EmitterContext>, Vec<ContextManifest>) {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("probe".into());
+    for (key, value) in facts {
+        store
+            .put_fact(Fact {
+                key: key.into(),
+                value: serde_json::json!(value),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let seen: Arc<std::sync::Mutex<Vec<EmitterContext>>> = Default::default();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredProbe(seen.clone())));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        max_echo_ratio: 1.1,
+        learned: rules_handle(rules),
+        ablate,
+        ..EngineConfig::default()
+    };
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what is my name".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    let manifests = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { manifest, .. } => Some(manifest.clone()),
+            _ => None,
+        })
+        .collect();
+    let contexts = std::mem::take(&mut *seen.lock().unwrap());
+    (contexts, manifests)
+}
+
+/// M9 T0.3. A count said how many notes were rendered; it could not say
+/// *which*, because `learned.toml` is rewritten by the evolution pass. The
+/// hash is stable across those rewrites, so a note in a prompt can be joined
+/// to that turn's grade afterwards — which is the whole backward arrow.
+#[tokio::test]
+async fn manifest_records_a_hash_per_rendered_guidance_note() {
+    let notes = vec![
+        Note::new("global", "prefer the shortest action", 0.0),
+        Note::new("global", "never guess a name", 0.0),
+    ];
+    let rules = LearnedRules {
+        notes: notes.clone(),
+        ..Default::default()
+    };
+    let (contexts, manifests) = probed_turn(rules, None, vec![]).await;
+    assert_eq!(contexts[0].guidance.len(), 2, "both notes were rendered");
+    let emitter = manifests
+        .first()
+        .expect("the emitter call was recorded")
+        .clone();
+    assert_eq!(emitter.guidance, 2);
+    assert_eq!(
+        emitter.note_hashes.len(),
+        emitter.guidance,
+        "the count and the list come from one render"
+    );
+    assert_eq!(
+        emitter.note_hashes,
+        notes.iter().map(|n| n.hash.clone()).collect::<Vec<_>>(),
+        "and the hashes are the notes' own, in render order"
+    );
+    assert!(
+        emitter.note_hashes[0].starts_with("sha256:"),
+        "{:?}",
+        emitter.note_hashes[0]
+    );
+}
+
+/// M9 T0.4. The knob exists to price a block, so it must remove the block
+/// from the prompt and say so in the manifest — while leaving the budget
+/// report measuring the context as it was *composed*, because the arm's
+/// question is what the block bought, not what it cost.
+#[tokio::test]
+async fn an_ablated_block_is_absent_from_the_prompt_and_the_manifest() {
+    let facts = vec![("user.name", "Martin"), ("user.city", "Brno")];
+    let (full_ctx, full) = probed_turn(LearnedRules::default(), None, facts.clone()).await;
+    let (ablated_ctx, ablated) =
+        probed_turn(LearnedRules::default(), Some(Ablate::Facts), facts).await;
+
+    // The control arm really did carry the facts.
+    assert_eq!(full[0].fact_keys.len(), 2, "{:?}", full[0].fact_keys);
+    let block = rendered_facts_block(&full_ctx[0]);
+    assert!(block.starts_with("Facts:\n"), "{block}");
+    assert!(block.contains("user.name"), "{block}");
+
+    // The ablated arm's prompt has no facts block at all.
+    assert_eq!(rendered_facts_block(&ablated_ctx[0]), "");
+    assert!(ablated_ctx[0].facts.is_empty());
+    assert!(
+        ablated[0].fact_keys.is_empty(),
+        "{:?}",
+        ablated[0].fact_keys
+    );
+    assert_eq!(
+        ablated[0].facts_chars, 0,
+        "nothing was sent, nothing counted"
+    );
+    assert_eq!(ablated[0].ablated, Some(Ablate::Facts));
+    assert_eq!(full[0].ablated, None);
+
+    // But the budget still weighed the context the selection produced: the
+    // blanking happens after the fit, so `before` is the same number in both
+    // arms and the drop is attributable to the block rather than to a
+    // differently budgeted prompt.
+    let (a, b) = (
+        full[0].budget.as_ref().expect("a budget report"),
+        ablated[0].budget.as_ref().expect("a budget report"),
+    );
+    assert_eq!(a.before, b.before, "the fit saw the same context");
+    assert!(a.before > 0);
+    assert_eq!(a.dropped, b.dropped);
+}

@@ -166,21 +166,42 @@ impl LearnedRules {
         }
     }
 
-    /// Global notes plus `action:<name>` notes for names in `legal`, in file order.
-    pub fn guidance_for(&self, legal: &[String]) -> Vec<String> {
+    /// Global notes plus `action:<name>` notes for names in `legal`, in file
+    /// order, each with its hash.
+    ///
+    /// The hash is what makes a rendered note identifiable afterwards: the
+    /// text lives in `learned.toml`, which the evolution pass rewrites, so
+    /// only the hash survives into the manifest (M9 T0.3).
+    pub fn guidance_notes_for(&self, legal: &[String]) -> Vec<(String, String)> {
         self.notes
             .iter()
             .filter(|n| n.applies_to(legal))
-            .map(|n| n.text.clone())
+            .map(|n| (n.hash.clone(), n.text.clone()))
+            .collect()
+    }
+
+    /// Notes scoped `reply` (M6 §8.5) with their hashes.
+    pub fn guidance_notes_for_reply(&self) -> Vec<(String, String)> {
+        self.notes
+            .iter()
+            .filter(|n| n.scope == "reply")
+            .map(|n| (n.hash.clone(), n.text.clone()))
+            .collect()
+    }
+
+    /// Global notes plus `action:<name>` notes for names in `legal`, in file order.
+    pub fn guidance_for(&self, legal: &[String]) -> Vec<String> {
+        self.guidance_notes_for(legal)
+            .into_iter()
+            .map(|(_, text)| text)
             .collect()
     }
 
     /// Notes scoped `reply` (M6 §8.5): rendered to the reply model only.
     pub fn guidance_for_reply(&self) -> Vec<String> {
-        self.notes
-            .iter()
-            .filter(|n| n.scope == "reply")
-            .map(|n| n.text.clone())
+        self.guidance_notes_for_reply()
+            .into_iter()
+            .map(|(_, text)| text)
             .collect()
     }
 }
