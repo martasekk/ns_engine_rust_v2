@@ -81,6 +81,15 @@ pub struct ModelsSection {
     /// Chosen the same way, on the same half.
     #[serde(default = "default_relevance_cut")]
     pub relevance_cut: f32,
+    /// Not-yet-graded turns one evolution pass may grade (M8 T2.8, M9 T1.3).
+    ///
+    /// It lives under `[models]` rather than in an `[eval]` section of its
+    /// own because that is what the budget is *about*: grading is only
+    /// expensive when a scorer is dialled, and the scorer is configured
+    /// here. A graded turn is remembered by its `Graded` event, so this pays
+    /// for new turns only — a second pass over the same log grades nothing.
+    #[serde(default = "default_evaluate_budget_turns")]
+    pub evaluate_budget_turns: u32,
 }
 
 impl Default for ModelsSection {
@@ -91,8 +100,15 @@ impl Default for ModelsSection {
             timeout_ms: default_models_timeout_ms(),
             reask_cosine: default_reask_cosine(),
             relevance_cut: default_relevance_cut(),
+            evaluate_budget_turns: default_evaluate_budget_turns(),
         }
     }
+}
+
+/// 40, the same number `probe_budget_turns` uses. One idle pass, one budget
+/// of the same order: the two lanes compete for the same wait.
+fn default_evaluate_budget_turns() -> u32 {
+    40
 }
 
 fn default_models_base_url() -> String {
@@ -931,6 +947,7 @@ impl EvolutionSection {
         &self,
         dry_run: bool,
         fact_stale_days: u64,
+        evaluate_budget_turns: u32,
     ) -> nsevolution::pass::PassConfig {
         nsevolution::pass::PassConfig {
             regression_budget: self.regression_budget,
@@ -945,8 +962,13 @@ impl EvolutionSection {
             digest_scope: "global".into(),
             evaluate: nsevolution::evaluate::EvaluateConfig {
                 reask_jaccard: self.reask_jaccard,
+                budget_turns: evaluate_budget_turns,
                 ..Default::default()
             },
+            // The symbolic checks are the baseline every other evaluator is
+            // calibrated against (T2.7), so they are what the gate believes
+            // until a κ threshold says otherwise.
+            authoritative_evaluator: "symbolic".into(),
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -1316,6 +1338,7 @@ mod tests {
         // Naming the section is not the same as switching it on.
         let cfg = AppConfig::parse("[models]\n").unwrap();
         assert!(!cfg.models.enabled);
+        assert_eq!(cfg.models.evaluate_budget_turns, 40);
 
         let cfg = AppConfig::parse(
             "[models]\nenabled = true\nbase_url = \"http://127.0.0.1:9999\"\ntimeout_ms = 500\n",
@@ -1324,6 +1347,19 @@ mod tests {
         assert!(cfg.models.enabled);
         assert_eq!(cfg.models.base_url, "http://127.0.0.1:9999");
         assert_eq!(cfg.models.timeout_ms, 500);
+    }
+
+    /// M9 T1.3. The grading budget is settable, and it reaches the pass.
+    #[test]
+    fn evaluate_budget_turns_parses_and_reaches_the_pass() {
+        let cfg = AppConfig::parse("[models]\nevaluate_budget_turns = 7\n").unwrap();
+        assert_eq!(cfg.models.evaluate_budget_turns, 7);
+        let pc = cfg
+            .evolution
+            .pass_config(true, 90, cfg.models.evaluate_budget_turns);
+        assert_eq!(pc.evaluate.budget_turns, 7);
+        // And the gate's default belief is the symbolic baseline.
+        assert_eq!(pc.authoritative_evaluator, "symbolic");
     }
 
     #[test]
@@ -1397,8 +1433,8 @@ mod tests {
         let cfg =
             AppConfig::parse("[evolution]\nenabled = false\nprobe_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
-        assert_eq!(cfg.evolution.pass_config(true, 90).probe_budget_turns, 7);
-        assert!(cfg.evolution.pass_config(true, 90).dry_run);
+        assert_eq!(cfg.evolution.pass_config(true, 90, 40).probe_budget_turns, 7);
+        assert!(cfg.evolution.pass_config(true, 90, 40).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
     }
@@ -1508,7 +1544,9 @@ mod tests {
             "[pointer]\naddr = \"10.0.0.5:7373\"\nmessages_addr = \"10.0.0.5:9999\"",
         )
         .unwrap();
-        let t = cfg.pointer_target(Some("192.168.1.40:7373".into())).unwrap();
+        let t = cfg
+            .pointer_target(Some("192.168.1.40:7373".into()))
+            .unwrap();
         assert_eq!(t.messages_target().as_deref(), Some("192.168.1.40:7374"));
     }
 

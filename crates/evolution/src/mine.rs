@@ -142,6 +142,30 @@ impl SignatureKind {
             _ => "note",
         }
     }
+
+    /// Is this a signature about the *reply*, rather than about what the
+    /// emitter emitted (M9 T1.2)?
+    ///
+    /// The four that [`crate::evaluate`] produces all are: a re-ask, an
+    /// ungrounded reply, an ignored question, an ignored request. They are
+    /// what the user had to do about a bad answer, and the notes gate cannot
+    /// measure a candidate for one of them without a recorded grade — the
+    /// probe runs a live emitter against a scripted replier, so nothing in
+    /// its own classification looks at reply quality at all.
+    ///
+    /// Everything mined from what the harness *did* — a malformed argument,
+    /// an illegal action near a tool, a guard denial — is false here and its
+    /// path through the gate is exactly what it was before M9.
+    pub fn from_grades(&self) -> bool {
+        matches!(
+            self,
+            SignatureKind::UserReask { .. }
+                | SignatureKind::UngroundedReply { .. }
+                | SignatureKind::IgnoredQuestion
+                | SignatureKind::IgnoredRequest
+        )
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             SignatureKind::MalformedArg { .. } => "MalformedArg",
@@ -324,9 +348,16 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
         .filter(|e| e.turn == turn)
         // What the turn cost is not something a note proposer can act on,
         // and this text is itself a prompt.
-        .filter(|e| !matches!(e.kind, EventKind::ModelCall { .. }))
+        .filter(|e| {
+            !matches!(
+                e.kind,
+                EventKind::ModelCall { .. } | EventKind::Graded { .. }
+            )
+        })
         .map(|e| match &e.kind {
-            EventKind::ModelCall { .. } => unreachable!("filtered above"),
+            EventKind::ModelCall { .. } | EventKind::Graded { .. } => {
+                unreachable!("filtered above")
+            }
             EventKind::UserSaid { text } => format!("UserSaid: {text}"),
             EventKind::Proposed { proposal } => {
                 format!("Proposed: {} {}", proposal.action, proposal.args)

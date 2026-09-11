@@ -201,6 +201,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::ReplyEchoed { .. } => "ReplyEchoed",
         EventKind::Summarized { .. } => "Summarized",
         EventKind::ModelCall { .. } => "ModelCall",
+        EventKind::Graded { .. } => "Graded",
     }
 }
 

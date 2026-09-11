@@ -304,7 +304,11 @@ fn build_pass(
         std::path::PathBuf::from(&cfg.evolution.learned_path),
         std::path::PathBuf::from(&cfg.evolution.ledger_path),
         cfg.evolution
-            .pass_config(dry_run, cfg.memory.fact_stale_days),
+            .pass_config(
+                dry_run,
+                cfg.memory.fact_stale_days,
+                cfg.models.evaluate_budget_turns,
+            ),
     );
     match emitter.key() {
         None => {

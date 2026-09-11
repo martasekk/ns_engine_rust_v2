@@ -44,7 +44,8 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
             | EventKind::ReplyFlagged { .. }
             | EventKind::ReplyEchoed { .. }
             | EventKind::Summarized { .. }
-            | EventKind::ModelCall { .. } => None,
+            | EventKind::ModelCall { .. }
+            | EventKind::Graded { .. } => None,
             other => Some(normalize_kind(other)),
         })
         .collect()
@@ -56,7 +57,8 @@ fn normalize_kind(kind: &EventKind) -> String {
         | EventKind::ReplyFlagged { .. }
         | EventKind::ReplyEchoed { .. }
         | EventKind::Summarized { .. }
-        | EventKind::ModelCall { .. } => {
+        | EventKind::ModelCall { .. }
+        | EventKind::Graded { .. } => {
             unreachable!("filtered by normalize")
         }
         EventKind::UserSaid { text } => format!("UserSaid {text}"),

@@ -87,6 +87,41 @@ pub enum EventKind {
         usage: crate::usage::Usage,
         manifest: crate::usage::ContextManifest,
     },
+    /// What an evaluator made of one turn (M8 T2.3a, M9 T1.1).
+    ///
+    /// A grade is a *recorded value*, the way Temporal records a
+    /// `SideEffect`: the pass computes it once, writes it here, and every
+    /// later reader — a second pass, the notes gate, a replay — reads the
+    /// record instead of asking a scorer again. Without that, replaying a
+    /// Rust session would need a Python service running, and a weight change
+    /// would silently rewrite history.
+    ///
+    /// `by` is the evaluator's id and `revision` its model or cut string, so
+    /// drift shows up as a diff instead of disappearing into a number — the
+    /// `MutableSideEffect` half. Infrastructure, exactly like
+    /// [`EventKind::ModelCall`]: replay ignores it, the fold does not turn it
+    /// into a `did:` line, and no context ever contains it — grading a turn
+    /// must not change it.
+    Graded {
+        turn: u32,
+        grade: Grade,
+        by: String,
+        revision: String,
+    },
+}
+
+/// One evaluator's verdict on one turn, in the only vocabulary the log keeps.
+///
+/// The issue kinds travel as strings on purpose: `nscore` sits underneath
+/// `nsevolution`, and a log format that named `nsevolution::Issue` would make
+/// the event schema a hostage of the lane's enum. A reader that wants the
+/// enum back parses the string; a reader that only wants "did this turn go
+/// wrong" reads `ok`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Grade {
+    pub ok: bool,
+    #[serde(default)]
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,5 +276,56 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    /// M9 T1.1. Events are hash-chained over their serialized JSON, so the
+    /// only safe way to add a grade is a new event appended after the ones
+    /// that exist. A log written before `Graded` did must therefore still
+    /// parse, unchanged, byte for byte.
+    #[test]
+    fn an_old_log_without_graded_events_still_parses() {
+        let json = r#"{"id":1,"parent":null,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","turn":3,"at":1756700000000,"kind":{"type":"UserSaid","text":"ahoj"}}"#;
+        let e: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(e.turn, 3);
+        assert!(matches!(e.kind, EventKind::UserSaid { .. }));
+        assert_eq!(serde_json::to_string(&e).unwrap(), json);
+    }
+
+    #[test]
+    fn a_graded_event_round_trips() {
+        let e = Event {
+            id: EventId(7),
+            parent: None,
+            prev_hash: [0u8; 32],
+            turn: 4,
+            at: Timestamp(1_756_700_000_000),
+            kind: EventKind::Graded {
+                turn: 4,
+                grade: Grade {
+                    ok: false,
+                    issues: vec!["ungrounded".into()],
+                },
+                by: "symbolic".into(),
+                revision: "n/a".into(),
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""type":"Graded""#), "{json}");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+        // Appending it leaves every earlier event's hash alone.
+        let mut log = EventLog::new(SessionId("s1".into()));
+        log.append(1, Timestamp(1), EventKind::UserSaid { text: "a".into() });
+        let before = log.events()[0].clone();
+        log.append(1, Timestamp(2), e.kind.clone());
+        assert_eq!(log.events()[0], before);
+        assert!(log.verify_chain().is_ok());
+    }
+
+    /// A grade written by an evaluator that recorded no issue list at all.
+    #[test]
+    fn a_grade_without_issues_defaults_to_empty() {
+        let g: Grade = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(g.ok && g.issues.is_empty());
     }
 }

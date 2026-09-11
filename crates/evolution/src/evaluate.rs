@@ -112,6 +112,15 @@ pub struct EvaluateConfig {
     /// is a key with a default rather than a constant with a claim, for the
     /// same reason `coarse_k` is.
     pub reask_jaccard: f32,
+    /// Not-yet-graded turns one pass may grade (M8 T2.8, M9 T1.3).
+    ///
+    /// The budget exists because a grade can cost a request to a scorer —
+    /// `LocalEvaluator` dials nsmodels once per turn — and a pass that graded
+    /// every turn of every session on every run would re-spend that for
+    /// nothing. It does not need to: a graded turn is remembered by its
+    /// [`nscore::EventKind::Graded`] event, so the budget only ever pays for
+    /// turns nothing has graded yet, newest first.
+    pub budget_turns: u32,
 }
 
 impl Default for EvaluateConfig {
@@ -119,6 +128,7 @@ impl Default for EvaluateConfig {
         Self {
             reask_lookback: 3,
             reask_jaccard: 0.6,
+            budget_turns: 40,
         }
     }
 }
@@ -218,6 +228,10 @@ struct SessionTurn {
     /// harness deciding to *act*, as distinct from deciding to answer.
     real_proposals: usize,
     flagged: Vec<(nscore::EventId, Vec<String>)>,
+    /// Recorded material of the turn: the user's own words and every tool
+    /// summary the turn got back. See [`recorded_turns`] for why it is not
+    /// the reply prompt.
+    shown: Vec<String>,
 }
 
 fn views(events: &[Event]) -> Vec<SessionTurn> {
@@ -236,6 +250,7 @@ fn views(events: &[Event]) -> Vec<SessionTurn> {
                 tool_calls: 0,
                 real_proposals: 0,
                 flagged: Vec::new(),
+                shown: vec![text.clone()],
             });
             continue;
         }
@@ -245,6 +260,11 @@ fn views(events: &[Event]) -> Vec<SessionTurn> {
         match &e.kind {
             EventKind::Replied { text } => v.reply = Some(text.clone()),
             EventKind::ToolCalled { .. } => v.tool_calls += 1,
+            EventKind::ToolReturned { outcome, .. } => {
+                if let nscore::ToolOutcome::Ok { output } = outcome {
+                    v.shown.push(output.summary.clone());
+                }
+            }
             EventKind::Proposed { proposal } => {
                 if !SYNTHETIC_ACTIONS.contains(&proposal.action.as_str()) {
                     v.real_proposals += 1;
@@ -260,6 +280,81 @@ fn views(events: &[Event]) -> Vec<SessionTurn> {
             }
             _ => {}
         }
+    }
+    out
+}
+
+/// One turn of a recorded session, owned, ready to be handed to an
+/// [`Evaluator`] as a [`TurnView`] (M9 T1.1).
+///
+/// **`shown` is recorded material, not the reply prompt.** Nothing in the log
+/// keeps the rendered replier context — `ModelCall` keeps the fact *keys* and
+/// the block sizes, not the text — and T2.3a's rule is that an evaluator
+/// judges against what was recorded rather than against a context rebuilt at
+/// grading time. So `shown` is exactly the two things the log does hold
+/// verbatim: the user's own message and the summary of every tool result the
+/// turn got back. A grounding check over it is therefore conservative — it
+/// can call a reply ungrounded that a fact in the prompt did support — and
+/// that is the direction to be wrong in for a signal that never gates.
+#[derive(Debug, Clone)]
+pub struct RecordedTurn {
+    pub turn: u32,
+    pub at: nscore::Timestamp,
+    pub user: String,
+    pub shown: Vec<String>,
+    pub acted: bool,
+    pub task_tier: bool,
+    pub reply: String,
+    pub next_user: Option<String>,
+}
+
+impl RecordedTurn {
+    /// Borrow this turn as the view an evaluator takes.
+    ///
+    /// The `Vec<&str>` has to be built by the caller and held alive across
+    /// the call, because [`TurnView`] borrows a slice of `&str`.
+    pub fn shown_refs(&self) -> Vec<&str> {
+        self.shown.iter().map(String::as_str).collect()
+    }
+    pub fn view<'a>(&'a self, shown: &'a [&'a str]) -> TurnView<'a> {
+        TurnView {
+            user: &self.user,
+            shown,
+            acted: self.acted,
+            task_tier: self.task_tier,
+            reply: &self.reply,
+            next_user: self.next_user.as_deref(),
+        }
+    }
+}
+
+/// Every turn of a session that has both a user message and a reply, in turn
+/// order. Turns that never got a reply are not gradeable and are skipped.
+pub fn recorded_turns(events: &[Event]) -> Vec<RecordedTurn> {
+    let views = views(events);
+    let at = |turn: u32| {
+        events
+            .iter()
+            .filter(|e| e.turn == turn)
+            .map(|e| e.at)
+            .max()
+            .unwrap_or(nscore::Timestamp(0))
+    };
+    let mut out = Vec::new();
+    for (i, v) in views.iter().enumerate() {
+        let Some(reply) = v.reply.clone() else {
+            continue;
+        };
+        out.push(RecordedTurn {
+            turn: v.turn,
+            at: at(v.turn),
+            user: v.user_text.clone(),
+            shown: v.shown.clone(),
+            acted: v.tool_calls > 0 || v.real_proposals > 0,
+            task_tier: v.tier == Some(Tier::Task),
+            reply,
+            next_user: views.get(i + 1).map(|n| n.user_text.clone()),
+        });
     }
     out
 }
@@ -482,7 +577,39 @@ pub enum GradeError {
 pub trait Evaluator: Send + Sync {
     /// Stable identity, recorded with every grade.
     fn id(&self) -> String;
+    /// The model or the cuts this scorer is currently running, recorded
+    /// beside the grade (M8 T2.3a's `MutableSideEffect` half).
+    ///
+    /// `"n/a"` is the honest answer for a scorer with nothing to drift — the
+    /// symbolic checks are code, and code is already in the diff.
+    fn revision(&self) -> String {
+        "n/a".into()
+    }
     async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError>;
+}
+
+/// What the log keeps of a grade (M9 T1.1).
+///
+/// Lossy on purpose. `TurnGrade` is the lane's working value; `nscore::Grade`
+/// is the recorded one, and it carries only what a later reader can act on
+/// without importing this crate's enums: did the turn go wrong, and under
+/// which names. `resolve`'s precedence means a single `issue` can hide a
+/// grounding failure behind a structural one, so `grounded` is written out as
+/// its own issue string rather than left to be inferred.
+impl From<&TurnGrade> for nscore::Grade {
+    fn from(g: &TurnGrade) -> Self {
+        let mut issues = Vec::new();
+        if g.issue.is_problem() {
+            issues.push(g.issue.as_str().to_string());
+        }
+        if !g.grounded && g.issue != Issue::Ungrounded {
+            issues.push(Issue::Ungrounded.as_str().to_string());
+        }
+        nscore::Grade {
+            ok: issues.is_empty(),
+            issues,
+        }
+    }
 }
 
 /// The checks of [`evaluate`], applied to one turn instead of a session.
@@ -550,7 +677,8 @@ impl Evaluator for SymbolicEvaluator {
         // say so: it needs the follow-up to *contradict* the reply, which is
         // an entailment judgement and not a lexical one. Producing it from a
         // heuristic would be inventing agreement.
-        let issue = SymbolicEvaluator::resolve(ignored_request, !spans.is_empty(), reask, ignored_q);
+        let issue =
+            SymbolicEvaluator::resolve(ignored_request, !spans.is_empty(), reask, ignored_q);
         Ok(TurnGrade {
             issue,
             answers_user: if ignored_q || ignored_request { 0 } else { 2 },
