@@ -192,6 +192,9 @@ show_budget_line = false
 enabled = true
 # recall_cues = ["before", "earlier", "last time", "co jsem", "minule"]
 # task_cues = ["click", "type", "open", "klikni", "otevři"]
+# The named cheap tools a chat turn may carry, each one only when its own cue fires
+# ("what time is it" reaches get_time without leaving the chat tier). [] = no tools on chat.
+chat_tools = ["get_time"]
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said

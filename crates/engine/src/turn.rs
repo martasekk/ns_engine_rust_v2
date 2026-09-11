@@ -1336,7 +1336,13 @@ impl Engine {
                 // would otherwise re-send on every iteration of a turn that
                 // was never going to click anything. The synthetic actions
                 // stay legal at every tier: they are how a turn ends.
-                let mut actions: Vec<_> = if tier.allows_tools() {
+                //
+                // M12 T2.1: unless the route selected some. A chat turn that
+                // asked the time carries exactly the tools its own cue named
+                // (`[router] chat_tools`) and nothing else — the selection is
+                // the whole allowance there, so the filter below narrows to
+                // it the same way, once per turn.
+                let mut actions: Vec<_> = if tier.allows_tools() || selected_tools.is_some() {
                     self.parts
                         .tools
                         .iter()

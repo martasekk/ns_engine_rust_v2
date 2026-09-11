@@ -269,6 +269,15 @@ pub struct RouterSection {
     /// the eval numbers say.
     #[serde(default)]
     pub depth: Option<String>,
+    /// M12 T2.1: the named cheap tools a `chat` turn may carry, each one only
+    /// when its own cue fires. An empty list is the off switch — no tools on
+    /// chat, which is how the tier behaved before this knob existed.
+    ///
+    /// Unlike the cue lists above, empty here means empty: the whole point of
+    /// writing `chat_tools = []` is to take the tools back off a chat turn,
+    /// and a "keep the built-in one" reading would make that impossible.
+    #[serde(default = "default_chat_tools")]
+    pub chat_tools: Vec<String>,
 }
 
 impl Default for RouterSection {
@@ -278,8 +287,16 @@ impl Default for RouterSection {
             recall_cues: Vec::new(),
             task_cues: Vec::new(),
             depth: None,
+            chat_tools: default_chat_tools(),
         }
     }
+}
+
+/// `get_time` and nothing else: the defect M11 recorded is the time question,
+/// the tool is one schema and it reads a clock. Anything that touches the
+/// desktop belongs to a tier that budgeted for it.
+fn default_chat_tools() -> Vec<String> {
+    vec!["get_time".to_string()]
 }
 
 impl RouterSection {
@@ -298,6 +315,8 @@ impl RouterSection {
         // composition root calls first; an unreadable value never gets this
         // far, and if it somehow did, the default is today's behaviour.
         r.depth = self.depth().unwrap_or_default();
+        // Taken as written, empty included: see `chat_tools`.
+        r.chat_tools = self.chat_tools.clone();
         r
     }
 
