@@ -374,6 +374,34 @@ environment (P0's exit criterion, live).
 - The stem rule's accepted bias is recorded (the verifier's example: `Marie` grounds on
   `Marek`); the P6 flag rate is therefore a floor.
 
+### Follow-up done, 2026-09-11 (M13 T1.1)
+
+The act-or-answer follow-up above is built: `schema::build_action_tools` compiles
+the array without `respond_directly`, and an act-or-answer call sends that array
+under a preamble (`SYSTEM_PREAMBLE_ANSWER`, `..._STRONG`) that names plain text
+where the two proposing preambles name the tool. Naming a tool the array does not
+carry was the other half of the defect: the model was told twice to choose it.
+
+A call whose legal set is empty now sends no `tools` key and no `tool_choice` at
+all, which is the state a cue-gated chat turn is usually in. That is new, and it
+is where the tokens are: 46% of the recorded turn-21 emitter prompt was schema.
+`Usage::tools_tokens` reads the request, so it prices the absence at zero without
+being told.
+
+Covered offline by `an_answering_call_is_never_offered_the_respond_directly_tool`,
+`an_answering_call_with_no_tools_sends_no_tool_array`,
+`a_proposing_call_still_carries_respond_directly` (the proposing array is byte for
+byte what it was) and the retargeted `a_chat_tier_request_offers_auto_tool_choice_
+and_carries_the_fence`, which now asserts the string `respond_directly` appears
+nowhere in the request. Workspace green, 745 tests, 0 failed. The scripted fixture
+corpus is unmoved by design: it drives `ScriptedEmitter`, and this change is in
+the request `CloudEmitter` builds.
+
+Not yet measured live. The number M12 asked for is requests per chat turn below
+2.00 against its 2.00, expected 1.67, and it needs a metered run
+(`--max-requests`) on the 20-message script to read it. `[llm] chat_act_or_answer`
+stays `false` by default until that run; it is on in the live `ns-run/config.toml`.
+
 ### Status after M12
 
 Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on

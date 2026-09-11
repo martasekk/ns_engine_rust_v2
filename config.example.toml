@@ -50,8 +50,12 @@ provider = "openrouter"
 # two. Off by default, and needs a router, because the tier decides it.
 # Measured 2026-09-11 on Luna (M12 P6): 2.10 requests per turn against 2.90
 # without it, 6 of 12 chat turns answered in one call, no flag on any emitted
-# answer; requests per chat turn read exactly 2.00, and the rule for moving
-# the default asks for less than 2.00, so it stays off for now.
+# answer; requests per chat turn read exactly 2.00, because on 4 of 12 turns
+# the model called the respond_directly tool instead of answering in text.
+# M13 T1.1 took that tool out of the array a call like this is offered, so
+# plain text is now the only way to say "no tool applies", and a chat turn
+# whose tier carries no tool sends no tool array at all. The default is
+# still off; the reading that would move it is below 2.00 on a live run.
 #   chat_act_or_answer = true
 
 # ── Per-role request shape ────────────────────────────────────────────────

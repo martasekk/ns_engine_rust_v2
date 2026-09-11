@@ -1,5 +1,5 @@
 use crate::client::{ApiError, OpenRouterClient};
-use crate::schema::build_tools;
+use crate::schema::{build_action_tools, build_tools};
 use async_trait::async_trait;
 use nscore::{EmitError, Emitter, EmitterContext, LegalActionSet, Proposal};
 
@@ -32,16 +32,37 @@ const SYSTEM_PREAMBLE_STRONG: &str = "You translate the user's latest message in
 action call from the provided tools. Choose respond_directly when no tool applies. Never invent \
 argument values the user did not supply. Never repeat an action the context lists as done. ";
 
-/// The one clause that turns a forced tool call into a choice (M12 T4.2).
-/// Appended, never substituted: what the task is has not changed, only what
-/// counts as finishing it.
-pub const ACT_OR_ANSWER_CLAUSE: &str = " Or, when no tool applies and the context already \
-answers, reply to the user in plain text instead of calling a tool.";
+/// The preambles for a call that may answer instead (M13 T1.1).
+///
+/// Not the two above with a clause appended, which is what M12 T4.2 sent.
+/// Those name `respond_directly` — twice, in the small variant — and an
+/// act-or-answer array no longer carries it, so the sentence would send the
+/// model after a tool that is not there. Same task, same repeat rule, with
+/// plain text standing exactly where the tool used to.
+const SYSTEM_PREAMBLE_ANSWER: &str = "You answer the user's latest message, or translate it \
+into exactly one action call from the provided tools. Reply in plain text when no tool \
+applies. Never invent argument values the user did not supply. The context lists actions \
+already performed this turn with their results; never repeat a completed action — when those \
+results answer the user, reply in plain text. A line marked done is such an action: proposing \
+it again is refused and costs a step. ";
+
+/// The same for a model that does not need the repeat gate explained: the
+/// strong preamble's counterpart, cut the same way.
+const SYSTEM_PREAMBLE_ANSWER_STRONG: &str = "You answer the user's latest message, or \
+translate it into exactly one action call from the provided tools. Reply in plain text when \
+no tool applies. Never invent argument values the user did not supply. Never repeat an action \
+the context lists as done. ";
 
 /// Assembled rather than written out so the rationale instruction has exactly
 /// one home in the workspace and the test can assert it appears once.
 fn system_prompt(capability: nscore::Capability) -> String {
     let preamble = capability.pick(SYSTEM_PREAMBLE, SYSTEM_PREAMBLE_STRONG);
+    format!("{preamble}{RATIONALE_INSTRUCTION}")
+}
+
+/// The same, for a call that was offered the answer (M13 T1.1).
+fn answering_system_prompt(capability: nscore::Capability) -> String {
+    let preamble = capability.pick(SYSTEM_PREAMBLE_ANSWER, SYSTEM_PREAMBLE_ANSWER_STRONG);
     format!("{preamble}{RATIONALE_INSTRUCTION}")
 }
 
@@ -295,22 +316,38 @@ impl CloudEmitter {
         };
         // `required` says the answer must be a tool call; `auto` is what
         // makes the choice real, and it is the whole mechanism.
-        let mut system = system_prompt(self.capability);
-        let tool_choice = if ctx.answer.is_some() {
-            system.push_str(ACT_OR_ANSWER_CLAUSE);
-            "auto"
+        //
+        // M13 T1.1: an act-or-answer call also drops `respond_directly` from
+        // the array. Plain text *is* that tool on this path, and a call
+        // offered both took the tool on 4 of 12 chat turns in M12's live run,
+        // buying a replier call the text would not have needed. With no real
+        // tool left the request carries no `tools` key at all — a chat turn's
+        // cheapest correct form, and the only one that spends nothing at all
+        // on schema.
+        let answering = ctx.answer.is_some();
+        let system = if answering {
+            answering_system_prompt(self.capability)
         } else {
-            "required"
+            system_prompt(self.capability)
         };
         let mut request = serde_json::json!({
             "model": self.model,
-            "tool_choice": tool_choice,
-            "tools": build_tools(legal),
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
         });
+        // An empty array is never sent: providers disagree on what one means,
+        // and there is nothing to choose from either way.
+        let tools = if answering {
+            build_action_tools(legal)
+        } else {
+            build_tools(legal)
+        };
+        if tools.as_array().is_some_and(|a| !a.is_empty()) {
+            request["tool_choice"] = if answering { "auto" } else { "required" }.into();
+            request["tools"] = tools;
+        }
         // `max_tokens`, `temperature` and the `reasoning` block — the only
         // keys that differ per model — are written in one place.
         self.shape.apply(&mut request);
@@ -617,6 +654,26 @@ mod tests {
         })
     }
 
+    /// A provider reply that is prose and no tool call — what an
+    /// act-or-answer call is asking for.
+    fn text_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "gen_1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": text}
+            }]
+        })
+    }
+
+    fn answer_blocks() -> nscore::AnswerBlocks {
+        nscore::AnswerBlocks {
+            persona: "You are Tomáš.".into(),
+            reply_guidance: vec!["keep it short".into()],
+            memory_silent: false,
+        }
+    }
+
     fn emitter(mock: std::sync::Arc<MockTransport>) -> CloudEmitter {
         let client = OpenRouterClient::new(mock, "k".into()).with_retry(1, 1);
         CloudEmitter::new(client, "anthropic/claude-haiku-4.5".into())
@@ -799,10 +856,7 @@ mod tests {
     /// material the answer would be drawn from.
     #[tokio::test]
     async fn a_chat_tier_request_offers_auto_tool_choice_and_carries_the_fence() {
-        let mock = MockTransport::ok(vec![tool_call_response(
-            "respond_directly",
-            serde_json::json!({"rationale": "chat"}),
-        )]);
+        let mock = MockTransport::ok(vec![text_response("hi there")]);
         let mut c = ctx();
         c.answer = Some(nscore::AnswerBlocks {
             persona: "You are Tomáš.".into(),
@@ -818,7 +872,24 @@ mod tests {
         let req = &reqs[0];
         assert_eq!(req["tool_choice"], "auto");
         let system = req["messages"][0]["content"].as_str().unwrap();
-        assert!(system.ends_with(ACT_OR_ANSWER_CLAUSE), "{system}");
+        // M13 T1.1: the choice now lives in the preamble, and the tool the
+        // array no longer carries is named nowhere in the request.
+        assert!(
+            system.contains("Reply in plain text when no tool applies."),
+            "{system}"
+        );
+        assert!(!system.contains("respond_directly"), "{system}");
+        assert!(
+            !req.to_string().contains("respond_directly"),
+            "the whole request: {req}"
+        );
+        let names: Vec<&str> = req["tools"]
+            .as_array()
+            .expect("one real tool")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["echo"]);
         let text = req["messages"][1]["content"].as_str().unwrap();
         let at = |needle: &str| {
             text.find(needle)
@@ -865,7 +936,9 @@ mod tests {
         assert_eq!(e.answer, None, "a tool call is never an answer");
         assert_eq!(e.proposal.action, "echo");
         assert!(
-            e.proposal.rationale.starts_with("model said: I will echo that for you."),
+            e.proposal
+                .rationale
+                .starts_with("model said: I will echo that for you."),
             "{}",
             e.proposal.rationale
         );
@@ -902,7 +975,10 @@ mod tests {
         );
         // and not the fallback prefix, which means a request that bought
         // nothing — this one bought the turn.
-        assert!(!e.proposal.rationale.starts_with(nscore::TEXT_FALLBACK_PREFIX));
+        assert!(!e
+            .proposal
+            .rationale
+            .starts_with(nscore::TEXT_FALLBACK_PREFIX));
     }
 
     #[tokio::test]
@@ -1111,5 +1187,68 @@ mod tests {
         );
         let system = req["messages"][0]["content"].as_str().unwrap();
         assert!(!system.contains("Guidance"));
+    }
+
+    /// M13 T1.1. The saving M12 measured and could not collect: with both on
+    /// offer the model calls `respond_directly` often enough to pay for a
+    /// replier call the plain text would have skipped. One offer, not two.
+    #[tokio::test]
+    async fn an_answering_call_is_never_offered_the_respond_directly_tool() {
+        let mock = MockTransport::ok(vec![text_response("hi there")]);
+        let mut c = ctx();
+        c.answer = Some(answer_blocks());
+        let e = emitter(mock.clone())
+            .propose_or_answer(c, &legal())
+            .await
+            .unwrap();
+        assert_eq!(e.answer.as_deref(), Some("hi there"));
+        // The loop still settles on the action it has always settled on D
+        // what changed is that the model did not have to name it.
+        assert_eq!(e.proposal.action, "respond_directly");
+        let reqs = mock.requests.lock().unwrap();
+        assert_eq!(reqs[0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(reqs[0]["tools"][0]["function"]["name"], "echo");
+    }
+
+    /// A proposing call is untouched: the array it has always sent, with the
+    /// always-legal tool on the end.
+    #[tokio::test]
+    async fn a_proposing_call_still_carries_respond_directly() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        emitter(mock.clone())
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+        let reqs = mock.requests.lock().unwrap();
+        let names: Vec<&str> = reqs[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["echo", "respond_directly"]);
+        assert_eq!(reqs[0]["tool_choice"], "required");
+    }
+
+    /// The cheapest chat turn there is: a tier that carries no tool, offered
+    /// the answer, sends no `tools` key at all and so spends nothing on
+    /// schema — which on the recorded turn 21 was 46% of the prompt.
+    #[tokio::test]
+    async fn an_answering_call_with_no_tools_sends_no_tool_array() {
+        let mock = MockTransport::ok(vec![text_response("ahoj")]);
+        let mut c = ctx();
+        c.answer = Some(answer_blocks());
+        let empty = LegalActionSet { actions: vec![] };
+        let e = emitter(mock.clone())
+            .propose_or_answer(c, &empty)
+            .await
+            .unwrap();
+        assert_eq!(e.answer.as_deref(), Some("ahoj"));
+        let reqs = mock.requests.lock().unwrap();
+        assert!(reqs[0].get("tools").is_none(), "{}", reqs[0]);
+        assert!(reqs[0].get("tool_choice").is_none(), "{}", reqs[0]);
     }
 }

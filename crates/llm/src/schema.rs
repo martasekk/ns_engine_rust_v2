@@ -65,6 +65,21 @@ pub fn build_tools(legal: &LegalActionSet) -> serde_json::Value {
     serde_json::Value::Array(tools)
 }
 
+/// The same array without `respond_directly` (M13 T1.1).
+///
+/// For an act-or-answer call only, where plain text *is* the way to say "no
+/// tool applies". Offering both is offering one choice twice, and M12's live
+/// run priced the duplicate: on 4 of 12 chat turns the model called the tool
+/// instead of answering, and each of those bought a replier call the text
+/// would not have needed (M12 P6, number 1).
+///
+/// May be empty. That is not a degenerate case to guard against - a chat
+/// turn whose tier carries no tool has nothing to offer, and a request with
+/// no `tools` key at all is the cheapest correct form of it.
+pub fn build_action_tools(legal: &LegalActionSet) -> serde_json::Value {
+    serde_json::Value::Array(legal.actions.iter().map(tool_schema).collect())
+}
+
 /// One spec compiled to the one element `build_tools` would put in the
 /// array. Split out of `build_tools` (M10 T0.1) so a report can price a
 /// single tool with the same bytes the request paid for: an apportionment
