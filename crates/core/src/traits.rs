@@ -57,6 +57,10 @@ pub struct EmitterContext {
     pub caps: crate::memory::Caps,
     /// The current user message.
     pub user_text: String,
+    /// What this turn owes the user, from
+    /// [`crate::memory::obligations_for`] (M9 T2.1). A pure function of
+    /// `user_text`, so it needs no event and no store column.
+    pub obligations: Vec<String>,
     /// This turn's actions so far, one line each with outcomes and refusals.
     pub trace_so_far: Vec<String>,
     /// A staged action awaits the user's yes/no.
@@ -130,6 +134,9 @@ pub struct ReplyContext {
     pub caps: crate::memory::Caps,
     /// The current user message — the one thing the reply must answer.
     pub user_text: String,
+    /// What this turn owes the user (M9 T2.1); see
+    /// [`EmitterContext::obligations`].
+    pub obligations: Vec<String>,
     /// Outcomes AND refusal reasons, human-readable lines.
     pub turn_trace: String,
     /// Reply-scoped learned notes (M6 §8.5).

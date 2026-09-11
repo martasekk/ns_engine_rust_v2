@@ -27,7 +27,28 @@ fn reference_parts(ctx: &ReplyContext) -> Vec<String> {
         &ctx.caps,
     ));
     parts.extend(ctx.guidance.iter().cloned());
+    // M9 T2.1: the obligations block is rendered, so it is material. A reply
+    // that names something only the obligation line named would otherwise be
+    // flagged for stating what it was shown.
+    parts.extend(ctx.obligations.iter().cloned());
     parts
+}
+
+/// The first `answer:` obligation the draft shows no sign of having
+/// addressed, if any (M9 T2.1).
+///
+/// Only `answer:` lines: whether a `do:` obligation was met is a question
+/// about the turn's actions, which the trace already answers structurally,
+/// and lexical overlap would be the wrong instrument for it. The predicate
+/// is [`nscore::addresses`] — the same one the offline `IgnoredQuestion`
+/// signature uses, and measured weak there, which is why the interceptor it
+/// gates is off by default and regenerates at most once.
+pub fn unaddressed(obligations: &[String], draft: &str) -> Option<String> {
+    obligations
+        .iter()
+        .filter_map(|o| o.strip_prefix("answer: "))
+        .find(|clause| !nscore::addresses(clause, draft))
+        .map(str::to_string)
 }
 
 /// What a reply may draw on but must not reproduce, for `echo::echoed`. The
@@ -323,6 +344,7 @@ mod tests {
             }],
             caps: Default::default(),
             user_text: "and my colleague Jana?".into(),
+            obligations: vec![],
             turn_trace: "Proposed(respond_directly)".into(),
             guidance: vec!["Mention Praha when relevant.".into()],
             do_not_state: vec![],
@@ -350,6 +372,7 @@ mod tests {
             window: vec![],
             caps: Default::default(),
             user_text: "what was my name before?".into(),
+            obligations: vec![],
             turn_trace: String::new(),
             guidance: vec![],
             do_not_state: vec![],

@@ -28,8 +28,9 @@ impl CloudEmitter {
     }
 }
 
-/// M6 §4.2/§4.4: facts → summary → verbatim window → current turn → this
-/// turn's actions → pending/rejections → guidance. Stable blocks first.
+/// M6 §4.2/§4.4: facts → summary → obligations → verbatim window → current
+/// turn → this turn's actions → pending/rejections → guidance. Stable blocks
+/// first.
 fn render_context(ctx: &EmitterContext) -> String {
     let mut s = String::new();
     if !ctx.facts.is_empty() {
@@ -41,6 +42,15 @@ fn render_context(ctx: &EmitterContext) -> String {
     if let Some(summary) = &ctx.summary {
         s.push_str(&nscore::render_summary(summary));
         s.push('\n');
+    }
+    // Directly above the window (M9 T2.1): after the stable blocks, so the
+    // cacheable prefix is unchanged, and before the transcript, so what the
+    // turn owes is read before what earlier turns said.
+    if !ctx.obligations.is_empty() {
+        s.push_str("Obligations this turn:\n");
+        for o in &ctx.obligations {
+            s.push_str(&format!("- {o}\n"));
+        }
     }
     if !ctx.window.is_empty() {
         s.push_str("Recent turns:\n");
@@ -241,6 +251,7 @@ mod tests {
             }],
             caps: Default::default(),
             user_text: "say hi".into(),
+            obligations: vec![],
             trace_so_far: vec!["ToolReturned(ok: echo: hi)".into()],
             pending_confirmation: false,
             rejections_this_turn: vec!["guard g: nope".into()],
@@ -444,6 +455,34 @@ mod tests {
         let mock = MockTransport::new(vec![Err(TransportError::Network("down".into()))]);
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
         assert!(matches!(err, nscore::EmitError::Transport(_)));
+    }
+
+    /// M9 T2.1. Position is the whole design: the block sits after the
+    /// stable facts and summary, so the cacheable prefix is unchanged, and
+    /// directly above the transcript, so what the turn owes is read before
+    /// what earlier turns said.
+    #[test]
+    fn obligations_render_above_the_recent_turns_block() {
+        let mut c = ctx();
+        c.obligations = nscore::obligations_for("where is my order? send me the invoice", 5);
+        let rendered = render_context(&c);
+        let block = rendered
+            .find("Obligations this turn:\n")
+            .expect("a block: {rendered}");
+        let window = rendered.find("Recent turns:").expect("a window");
+        let summary_end = rendered.find("Current turn:").expect("a current turn");
+        assert!(block < window, "above the window: {rendered}");
+        assert!(window < summary_end);
+        assert!(
+            rendered.contains("- answer: where is my order\n- do: send me the invoice\n"),
+            "{rendered}"
+        );
+        // Facts stay first, so the prefix in front of the block is the
+        // stable one.
+        assert!(rendered.find("Facts:").unwrap() < block, "{rendered}");
+        // No obligations, no block and no blank heading.
+        c.obligations.clear();
+        assert!(!render_context(&c).contains("Obligations"));
     }
 
     /// An HTTP status keeps its status. The engine decides recovery by class,

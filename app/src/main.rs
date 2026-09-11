@@ -697,6 +697,9 @@ async fn main() {
         pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
         pinned_max: cfg.memory.pinned_max,
         relevant_max: cfg.memory.relevant_max,
+        obligations_max: cfg.memory.obligations_max,
+        obligation_check: cfg.memory.obligation_check,
+        guidance_max: cfg.memory.guidance_max,
         // M9 T0.4 is an evaluation knob with no config key: the live harness
         // never ablates a block.
         ablate: None,

@@ -129,6 +129,12 @@ pub struct ContextManifest {
     pub guidance: usize,
     #[serde(default)]
     pub note_hashes: Vec<String>,
+    /// Obligation lines rendered (M9 T2.1). A count, not the text: the
+    /// clauses are the user's own words, which the `UserSaid` event of the
+    /// same turn already holds verbatim — `obligations_for` replays them
+    /// from it. Manifests written before M9 carry a zero.
+    #[serde(default)]
+    pub obligations: usize,
     /// The rendered size, in characters, of the three stable blocks *as
     /// sent* — measured after the fit with the same render functions the fit
     /// measures with (M9, for T0.5's stable-prefix estimate). A sum of block
@@ -261,6 +267,7 @@ mod tests {
             route_cues: vec!["click".into()],
             guidance: 1,
             note_hashes: vec!["sha256:beef".into()],
+            obligations: 2,
             facts_chars: 40,
             summary_chars: 200,
             window_chars: 300,

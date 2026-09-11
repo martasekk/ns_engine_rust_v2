@@ -474,6 +474,7 @@ pub(crate) fn emitter_manifest(
         tools,
         guidance: ctx.guidance.len(),
         note_hashes,
+        obligations: ctx.obligations.len(),
         // Measured with the budget's own render helpers, on the context as
         // it stands after the fit — so the numbers are the sizes sent, not
         // the sizes composed (M9 T0.5).
@@ -506,6 +507,7 @@ pub(crate) fn reply_manifest(
         tools: 0,
         guidance: ctx.guidance.len(),
         note_hashes,
+        obligations: ctx.obligations.len(),
         facts_chars: nscore::facts_chars(&ctx.facts),
         summary_chars: nscore::summary_chars(ctx.summary.as_ref()),
         window_chars: nscore::window_chars(&ctx.window, &ctx.caps),
@@ -786,6 +788,7 @@ mod tests {
             window,
             caps: nscore::Caps::default(),
             user_text: "what did I say?".into(),
+            obligations: vec![],
             trace_so_far: vec![],
             pending_confirmation: false,
             rejections_this_turn: vec![],

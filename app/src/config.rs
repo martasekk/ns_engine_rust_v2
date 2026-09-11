@@ -327,6 +327,18 @@ pub struct MemorySection {
     /// Facts lexically relevant to the current message (M6 §6.5).
     #[serde(default = "default_relevant_max")]
     pub relevant_max: usize,
+    /// Obligations extracted from one user message (M9 T2.1); 0 renders no
+    /// block.
+    #[serde(default = "default_obligations_max")]
+    pub obligations_max: usize,
+    /// Regenerate a reply once when an `answer:` obligation went
+    /// unaddressed (M9 T2.1). Off until T0.4's ablation arm has priced the
+    /// block: the block renders whatever this says.
+    #[serde(default)]
+    pub obligation_check: bool,
+    /// Guidance notes rendered into either context, at most (M9 T2.2).
+    #[serde(default = "default_guidance_max")]
+    pub guidance_max: usize,
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
@@ -395,6 +407,14 @@ fn default_pinned_prefixes() -> Vec<String> {
 fn default_pinned_max() -> usize {
     5
 }
+fn default_obligations_max() -> usize {
+    5
+}
+
+fn default_guidance_max() -> usize {
+    6
+}
+
 fn default_relevant_max() -> usize {
     5
 }
@@ -467,6 +487,9 @@ impl Default for MemorySection {
             pinned_prefixes: default_pinned_prefixes(),
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
+            obligations_max: default_obligations_max(),
+            obligation_check: false,
+            guidance_max: default_guidance_max(),
             fact_stale_days: default_fact_stale_days(),
             trace_verbatim_lines: default_trace_verbatim_lines(),
             tool_result_max_chars: default_tool_result_max_chars(),
@@ -1370,6 +1393,18 @@ mod tests {
         assert_eq!(cfg.memory.pinned_prefixes, vec!["user.".to_string()]);
         assert_eq!(cfg.memory.fact_stale_days, 90);
         assert_eq!(cfg.memory.caps(), nscore::Caps::default());
+        // M9 T2.1/T2.2: the block renders by default, the interceptor does
+        // not fire until T0.4's arm has priced it.
+        assert_eq!(cfg.memory.obligations_max, 5);
+        assert!(!cfg.memory.obligation_check);
+        assert_eq!(cfg.memory.guidance_max, 6);
+        let tuned = AppConfig::parse(
+            "[memory]\nobligations_max = 2\nobligation_check = true\nguidance_max = 3\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.memory.obligations_max, 2);
+        assert!(tuned.memory.obligation_check);
+        assert_eq!(tuned.memory.guidance_max, 3);
         let cfg = AppConfig::parse("[memory]\nwindow_turns = 2\nrecord_max_chars = 50\n").unwrap();
         assert_eq!(cfg.memory.window_turns, 2);
         assert_eq!(cfg.memory.caps().record_max_chars, 50);

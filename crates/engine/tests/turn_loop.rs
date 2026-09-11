@@ -4295,3 +4295,165 @@ async fn an_ablated_block_is_absent_from_the_prompt_and_the_manifest() {
     assert!(a.before > 0);
     assert_eq!(a.dropped, b.dropped);
 }
+
+/// M9 T2.1. The obligations block is worth more than a fact ranked fifth by
+/// lexical overlap and less than the immediately preceding turn, so it is a
+/// stage of its own between the two — not part of the exempt `fixed` block
+/// the user's message and the trace sit in.
+#[tokio::test]
+async fn obligations_drop_after_the_window_and_before_facts() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("oblig-budget".into());
+    for (key, value) in [
+        ("order.status", "the order is shipped"),
+        ("invoice.status", "the invoice is paid"),
+        ("delivery.status", "the delivery is late"),
+    ] {
+        store
+            .put_fact(Fact {
+                key: key.into(),
+                value: serde_json::json!(value),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredEmitter {
+        inner: ScriptedEmitter::new(vec![]),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            // Deliberately far too small: everything droppable drops, so the
+            // whole order is visible in one report.
+            prompt_budget_tokens: 20,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    for turn in 1..=3 {
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: format!("earlier message {turn}, long enough to fill a window record"),
+        })
+        .await
+        .unwrap();
+    }
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "where is my order? and what is the invoice status? show me the delivery".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let manifest = events
+        .iter()
+        .filter(|ev| ev.turn == 4)
+        .find_map(|ev| match &ev.kind {
+            EventKind::ModelCall { manifest, .. } => Some(manifest.clone()),
+            _ => None,
+        })
+        .expect("the emitter call was recorded");
+    assert_eq!(
+        manifest.obligations, 3,
+        "two questions and an imperative were rendered"
+    );
+    let budget = manifest.budget.as_ref().expect("a budget report");
+    let blocks: Vec<&str> = budget.dropped.iter().map(|d| d.block.as_str()).collect();
+    let first = |name: &str| blocks.iter().position(|b| *b == name);
+    let window = first("window").unwrap_or_else(|| panic!("window dropped: {blocks:?}"));
+    let obligations =
+        first("obligations").unwrap_or_else(|| panic!("obligations dropped: {blocks:?}"));
+    let facts = first("facts").unwrap_or_else(|| panic!("facts dropped: {blocks:?}"));
+    assert!(window < obligations, "window goes first: {blocks:?}");
+    assert!(
+        obligations < facts,
+        "then obligations, then facts: {blocks:?}"
+    );
+    assert!(
+        blocks[..obligations].iter().all(|b| *b == "window"),
+        "every window record goes before the first obligation: {blocks:?}"
+    );
+}
+
+/// The first draft answers nothing the user asked. Counts its calls and
+/// records the guidance each one carried.
+struct ObligationBlindReplier {
+    calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+#[async_trait::async_trait]
+impl Replier for ObligationBlindReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(ctx.guidance.clone());
+        if calls.len() == 1 {
+            // No content word in common with "where is my order".
+            Ok("Nothing to report just now.".into())
+        } else {
+            Ok("Your order left the warehouse.".into())
+        }
+    }
+}
+
+/// M9 T2.1. The interceptor reuses the `ReplyFlagged` path's mechanics — one
+/// regeneration, the manifest re-recorded, no new event kind — with a
+/// distinct guidance line. It fires at most once, and only when its knob is
+/// on: the extraction is measured weak, and the cost of a false positive is
+/// a second billed call.
+#[tokio::test]
+async fn a_reply_leaving_an_obligation_unaddressed_regenerates_once() {
+    async fn run(obligation_check: bool) -> (Vec<Vec<String>>, String) {
+        let store = Arc::new(InMemoryStore::new());
+        let calls: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+        b.set_replier(Box::new(ObligationBlindReplier {
+            calls: calls.clone(),
+        }));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig {
+                max_echo_ratio: 1.1,
+                obligation_check,
+                ..EngineConfig::default()
+            },
+            Box::new(|| Timestamp(42)),
+        );
+        let reply = e
+            .run_turn(Incoming {
+                session: SessionId("oblig".into()),
+                text: "where is my order?".into(),
+            })
+            .await
+            .unwrap();
+        let seen = calls.lock().unwrap().clone();
+        (seen, reply)
+    }
+
+    let (seen, reply) = run(true).await;
+    assert_eq!(seen.len(), 2, "exactly one regeneration: {seen:?}");
+    assert!(seen[0].is_empty(), "the first draft is asked plainly");
+    assert_eq!(
+        seen[1],
+        vec!["Not yet addressed: where is my order".to_string()],
+        "the second carries the unmet obligation as guidance"
+    );
+    assert_eq!(reply, "Your order left the warehouse.");
+
+    // Off by default, and off means one call and the first draft sent.
+    let (seen, reply) = run(false).await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(reply, "Nothing to report just now.");
+}

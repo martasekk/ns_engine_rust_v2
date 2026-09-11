@@ -200,13 +200,13 @@ pub fn reask_band(first: &str, again: &str, min_jaccard: f32) -> Option<ReaskBan
 /// I5: the user asked something and the reply shares no content word with it.
 ///
 /// Weak, and measured weak — see [`SignatureKind::IgnoredQuestion`].
+/// The overlap half moved down to `nscore::addresses` in M9 T2.1, so the
+/// in-turn obligation interceptor and this signature share one definition
+/// instead of two that drift; what stays here is the question mark, which
+/// this check tests for and the interceptor's caller has already tested for
+/// when it built the `answer:` obligation.
 pub fn ignores_question(user: &str, reply: &str) -> bool {
-    if !user.contains('?') {
-        return false;
-    }
-    let asked = content_tokens(user);
-    let answered: HashSet<String> = content_tokens(reply).into_iter().collect();
-    !asked.is_empty() && !answered.is_empty() && !asked.iter().any(|t| answered.contains(t))
+    user.contains('?') && !nscore::addresses(user, reply)
 }
 
 /// One user turn of a session log, reduced to what the checks compare.

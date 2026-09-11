@@ -87,6 +87,14 @@ fn render_task(ctx: &ReplyContext) -> String {
         }
     }
     s.push_str("</did>\n");
+    // M9 T2.1: what the turn owes, ahead of the guidance notes, because a
+    // note is advice and an obligation is the task.
+    if !ctx.obligations.is_empty() {
+        s.push_str("\nObligations this turn:\n");
+        for o in &ctx.obligations {
+            s.push_str(&format!("- {o}\n"));
+        }
+    }
     if !ctx.guidance.is_empty() {
         s.push_str("\nGuidance:\n");
         for g in &ctx.guidance {
@@ -211,6 +219,7 @@ mod tests {
             }],
             caps: Default::default(),
             user_text: "say hi".into(),
+            obligations: vec![],
             turn_trace: "Proposed(echo)\nToolReturned(ok: echo: hi)".into(),
             guidance: vec![],
             do_not_state: vec![],

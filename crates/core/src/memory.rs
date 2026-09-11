@@ -131,6 +131,146 @@ pub fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Verbs that open an imperative clause, Czech and English.
+///
+/// Deliberately a short closed list rather than a parser. The recorded risk
+/// for M9 T2.1 is over-firing on cs+en mixed text, and the cost of a missed
+/// obligation is one line absent from a prompt while the cost of a wrong one
+/// is a regenerated reply. The list grows only when a real session shows a
+/// request it missed.
+const IMPERATIVE_OPENERS: &[&str] = &[
+    // English
+    "add",
+    "call",
+    "check",
+    "close",
+    "create",
+    "delete",
+    "explain",
+    "find",
+    "fix",
+    "give",
+    "list",
+    "make",
+    "open",
+    "read",
+    "remove",
+    "run",
+    "search",
+    "send",
+    "set",
+    "show",
+    "start",
+    "stop",
+    "tell",
+    "translate",
+    "update",
+    "write",
+    // Czech — both spellings, because both occur live
+    "dej",
+    "najdi",
+    "napis",
+    "napiš",
+    "nastav",
+    "oprav",
+    "otevri",
+    "otevři",
+    "posli",
+    "pošli",
+    "preloz",
+    "přelož",
+    "pridej",
+    "přidej",
+    "rekni",
+    "řekni",
+    "smaz",
+    "smaž",
+    "spust",
+    "spusť",
+    "udelej",
+    "udělej",
+    "ukaz",
+    "ukaž",
+    "vysvetli",
+    "vysvětli",
+    "vytvor",
+    "vytvoř",
+    "zavolej",
+    "zavri",
+    "zavři",
+    "zjisti",
+    "zkontroluj",
+];
+
+/// What this turn owes the user, as a pure function of their message
+/// (M9 T2.1).
+///
+/// Each clause ending in `?` becomes `answer: <clause>`; each clause opening
+/// with one of [`IMPERATIVE_OPENERS`] becomes `do: <clause>`. Nothing else
+/// becomes anything, so small talk yields an empty list. Deterministic and
+/// capped at `max`.
+///
+/// Symbolic on purpose: obligations are checkable without a model, which is
+/// why they are not `SessionSummary.open` — that is model-written prose the
+/// summarizer rebuilds. Clauses split on `?`, `.`, `!`, `;` and newlines; a
+/// clause with no content token (`query_tokens`) is dropped, so a bare "?"
+/// owes nothing.
+pub fn obligations_for(user_text: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut clause = String::new();
+    for ch in user_text.chars() {
+        match ch {
+            '?' | '.' | '!' | ';' | '\n' => {
+                push_obligation(&mut out, &clause, ch == '?', max);
+                clause.clear();
+            }
+            _ => clause.push(ch),
+        }
+    }
+    push_obligation(&mut out, &clause, false, max);
+    out
+}
+
+fn push_obligation(out: &mut Vec<String>, clause: &str, asked: bool, max: usize) {
+    if out.len() >= max {
+        return;
+    }
+    let clause = clause.trim();
+    if clause.is_empty() || query_tokens(clause).is_empty() {
+        return;
+    }
+    if asked {
+        out.push(format!("answer: {clause}"));
+        return;
+    }
+    let opener: String = clause
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if IMPERATIVE_OPENERS.contains(&opener.as_str()) {
+        out.push(format!("do: {clause}"));
+    }
+}
+
+/// Whether `reply` shares a content word with `asked`.
+///
+/// The ignored-question predicate, moved down here from
+/// `nsevolution::evaluate::ignores_question` (M9 T2.1) so that the in-turn
+/// obligation interceptor and the offline signature share one definition
+/// instead of two that drift. Weak by construction — a reply that answers in
+/// other words looks like one that ignored the question — which is why the
+/// interceptor it gates is off by default and regenerates at most once.
+pub fn addresses(asked: &str, reply: &str) -> bool {
+    let asked: Vec<String> = query_tokens(asked);
+    let answered: std::collections::HashSet<String> = query_tokens(reply).into_iter().collect();
+    asked.is_empty() || answered.is_empty() || asked.iter().any(|t| answered.contains(t))
+}
+
 /// Lexical relevance of current facts to a query (M6 §6.5 "query-relevant"):
 /// number of query tokens found in the key (dots and underscores read as
 /// spaces) or the value; zero-score facts are dropped; ties go to the most
@@ -453,5 +593,57 @@ mod tests {
             render_summary(&minimal),
             "Conversation so far (turns 1–2): t"
         );
+    }
+
+    /// M9 T2.1. Two questions in one message are two things owed, and the
+    /// clause is carried verbatim so the check downstream compares against
+    /// the user's own words.
+    #[test]
+    fn two_questions_yield_two_answer_obligations() {
+        assert_eq!(
+            obligations_for("where is my order? and what did it cost?", 5),
+            vec![
+                "answer: where is my order".to_string(),
+                "answer: and what did it cost".to_string()
+            ]
+        );
+        // Czech, and an imperative beside a question.
+        assert_eq!(
+            obligations_for("kolik je hodin? pošli mi ten report", 5),
+            vec![
+                "answer: kolik je hodin".to_string(),
+                "do: pošli mi ten report".to_string()
+            ]
+        );
+    }
+
+    /// The recorded risk is over-firing. A greeting, a thank-you and a bare
+    /// question mark owe nothing, and neither does a statement.
+    #[test]
+    fn small_talk_yields_no_obligations() {
+        for text in ["hi", "díky!", "?", "ok.", "my name is Martin", ""] {
+            assert!(
+                obligations_for(text, 5).is_empty(),
+                "{text:?} should owe nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn obligations_are_capped_at_max() {
+        let text = "a co tohle? a tohle? a tamto? a jeste tohle? a posledni? a uplne posledni?";
+        assert_eq!(obligations_for(text, 3).len(), 3);
+        assert_eq!(obligations_for(text, 6).len(), 6);
+        assert!(obligations_for(text, 0).is_empty());
+    }
+
+    #[test]
+    fn addresses_is_lexical_overlap_and_abstains_when_it_cannot_tell() {
+        assert!(addresses("where is my order", "your order shipped"));
+        assert!(!addresses("where is my order", "nothing to report"));
+        // No content token on either side: the predicate abstains rather
+        // than accusing.
+        assert!(addresses("hi", "hello"));
+        assert!(addresses("where is my order", "ok"));
     }
 }

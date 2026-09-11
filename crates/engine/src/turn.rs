@@ -50,6 +50,18 @@ pub struct EngineConfig {
     pub pinned_max: usize,
     /// M6 §6.5: facts lexically relevant to the current message.
     pub relevant_max: usize,
+    /// M9 T2.1: how many obligations `obligations_for` may extract from one
+    /// user message. 0 renders no block at all.
+    pub obligations_max: usize,
+    /// M9 T2.1: check the drafted reply against this turn's `answer:`
+    /// obligations and regenerate once if one went unaddressed. Off until
+    /// T0.4's ablation arm has priced the block — the extraction over-fires
+    /// on cs+en mixed text, and the cost of a false positive is a second
+    /// billed call.
+    pub obligation_check: bool,
+    /// M9 T2.2: guidance notes rendered into either context, at most. The
+    /// tail is dropped and reported; file order is the priority order.
+    pub guidance_max: usize,
     /// M9 T0.4: blank one context block after the fit, to measure what it
     /// was worth. Set programmatically by the evaluation harness only —
     /// there is deliberately no config key for it, because an ablated engine
@@ -151,6 +163,9 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
+            obligations_max: 5,
+            obligation_check: false,
+            guidance_max: 6,
             ablate: None,
             summary_every_turns: 4,
             summary_rebuild_every: 3,
@@ -1043,6 +1058,10 @@ impl Engine {
                 window: state.window(self.cfg.window_turns),
                 caps: self.cfg.caps,
                 user_text: incoming.text.clone(),
+                // M9 T2.1: a pure function of the message, recomputed each
+                // iteration rather than carried, for the same reason the
+                // trace is — nothing per-turn is persisted as a column.
+                obligations: nscore::obligations_for(&incoming.text, self.cfg.obligations_max),
                 trace_so_far,
                 pending_confirmation: active_pending.is_some(),
                 rejections_this_turn: rejections_this_turn.clone(),
@@ -1062,6 +1081,7 @@ impl Engine {
                 tier.budget(self.cfg.prompt_budget_tokens),
                 self.cfg.budget_mode,
                 &self.cfg.pinned_prefixes,
+                self.cfg.guidance_max,
             );
             if self.cfg.show_budget_line {
                 let clipped: Vec<String> =
@@ -2147,31 +2167,44 @@ impl Engine {
         let window = state.window(self.cfg.window_turns);
         let guidance_notes = rules.guidance_notes_for_reply();
         let guidance: Vec<String> = guidance_notes.iter().map(|(_, t)| t.clone()).collect();
-        let make_ctx =
-            |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
+        // M9 T2.1: the same pure function the emitter path calls, on the
+        // same message.
+        let obligations = nscore::obligations_for(user_text, self.cfg.obligations_max);
+        // `extra_guidance` is how the obligation interceptor speaks to the
+        // second draft: one added note, the shape `do_not_state` already has
+        // on the grounding path.
+        let make_ctx = |do_not_state: Vec<String>,
+                        do_not_repeat: Vec<String>,
+                        extra_guidance: Vec<String>| {
+            let mut notes = guidance.clone();
+            notes.extend(extra_guidance);
+            ReplyContext {
                 persona: self.cfg.persona.clone(),
                 facts: facts.clone(),
                 summary: state.summary.clone(),
                 window: window.clone(),
                 caps: self.cfg.caps,
                 user_text: user_text.to_string(),
+                obligations: obligations.clone(),
                 turn_trace: trace.clone(),
-                guidance: guidance.clone(),
+                guidance: notes,
                 do_not_state,
                 do_not_repeat,
                 usage: Some(usage.clone()),
-            };
+            }
+        };
         // The reply context is fitted too, and reported on the same
         // way. Its `turn_trace` is exempt: it is the material the
         // reply narrates from, and the grounding interceptor flags a
         // reply for stating anything absent from it — trimming it
         // would manufacture the fabrications the interceptor catches.
-        let mut budgeted = make_ctx(vec![], vec![]);
+        let mut budgeted = make_ctx(vec![], vec![], vec![]);
         let budget = nscore::fit_reply(
             &mut budgeted,
             self.cfg.prompt_budget_tokens,
             self.cfg.budget_mode,
             &self.cfg.pinned_prefixes,
+            self.cfg.guidance_max,
         );
         // M9 T0.4, as on the emitter path: after the fit, so only the
         // rendered prompt and the manifest's keys change.
@@ -2212,7 +2245,7 @@ impl Engine {
                 // more conservative thresholds. So it is logged, and
                 // nothing is regenerated on it: the observability is
                 // what found all of this, and it is free.
-                let ctx = make_ctx(vec![], vec![]);
+                let ctx = make_ctx(vec![], vec![], vec![]);
                 let echo_material = crate::ground::echo_material(&ctx);
                 if let Some(span) =
                     crate::echo::echoed(&draft, &echo_material, self.cfg.max_echo_ratio)
@@ -2229,9 +2262,7 @@ impl Engine {
                 }
                 let material = crate::ground::Material::from_context(&ctx);
                 let spans = crate::ground::ungrounded(&draft, &material);
-                if spans.is_empty() {
-                    draft
-                } else {
+                if !spans.is_empty() {
                     log.append(
                         turn,
                         now(),
@@ -2241,12 +2272,41 @@ impl Engine {
                         },
                     );
                     let regenerated =
-                        self.parts.replier.reply(make_ctx(spans, vec![])).await;
+                        self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
                     // The regeneration is a second billed call, and
                     // the point of counting it is to know what the
                     // grounding check costs.
                     self.record_model_calls(usage, log, turn, &manifest);
-                    regenerated.unwrap_or(draft)
+                    return regenerated.unwrap_or(draft);
+                }
+                // M9 T2.1. The obligation interceptor, behind its own
+                // knob and *after* grounding: a draft that already had
+                // to be regenerated has spent this turn's one spare
+                // call. No new event kind — the mechanics are the
+                // `ReplyFlagged` path's, with a distinct guidance
+                // line, because the extraction is measured weak and a
+                // signature written from it would be counted as if it
+                // were not.
+                match self
+                    .cfg
+                    .obligation_check
+                    .then(|| crate::ground::unaddressed(&obligations, &draft))
+                    .flatten()
+                {
+                    Some(clause) => {
+                        let regenerated = self
+                            .parts
+                            .replier
+                            .reply(make_ctx(
+                                vec![],
+                                vec![],
+                                vec![format!("Not yet addressed: {clause}")],
+                            ))
+                            .await;
+                        self.record_model_calls(usage, log, turn, &manifest);
+                        regenerated.unwrap_or(draft)
+                    }
+                    None => draft,
                 }
             }
             Ok(draft) => draft,
