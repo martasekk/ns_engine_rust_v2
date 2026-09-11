@@ -342,11 +342,27 @@ pub fn addresses(asked: &str, reply: &str) -> bool {
     let answered: Vec<String> = query_tokens(reply);
     // M12 T1.5: a pair overlaps when the words share a stem, so a reply that
     // declines the asked word still counts as addressing it.
+    //
+    // Stems only on words of five characters or more. `stem_match` accepts a
+    // three-character common prefix with up to three characters differing on
+    // each side, which on short words is not inflection but coincidence:
+    // "order" and "arrive" are safe, but the four-letter tail of an English
+    // question matches half the dictionary, and a false overlap here is an
+    // obligation silently reported as met. Five is where the rule stops
+    // buying anything on Czech inflection ("vysyp"/"vysypání" survives it)
+    // and starts costing precision.
+    let overlaps = |t: &String, a: &String| {
+        if t.chars().count() >= 5 && a.chars().count() >= 5 {
+            stem_match(t, a)
+        } else {
+            fold_diacritics(t).to_lowercase() == fold_diacritics(a).to_lowercase()
+        }
+    };
     asked.is_empty()
         || answered.is_empty()
         || asked
             .iter()
-            .any(|t| answered.iter().any(|a| stem_match(t, a)))
+            .any(|t| answered.iter().any(|a| overlaps(t, a)))
 }
 
 /// The activation prior's knobs (M9 T3.1).
@@ -1090,6 +1106,10 @@ mod tests {
         // M12 T1.5: an inflected Czech form of the asked word counts as
         // overlap, which is what the exact-set version missed.
         assert!(addresses("kdy je vysyp", "vysypání je ve čtvrtek"));
+        // And the stem rule is off below five characters, where a
+        // three-character prefix is coincidence rather than inflection:
+        // "order" against "arrive" must not read as an answer.
+        assert!(!addresses("where is my order", "when will it arrive"));
     }
 
     /// M12 T1.5. Czech inflects the words a reply is checked against, so

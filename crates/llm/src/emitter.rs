@@ -198,9 +198,20 @@ fn render_context_split(ctx: &EmitterContext) -> (String, String) {
             s.push_str(&format!("- {g}\n"));
         }
     }
-    s.push_str("Propose the next action.");
+    s.push_str(PROPOSE_LINE);
     (stable, s)
 }
+
+/// How every emitter message has always closed.
+const PROPOSE_LINE: &str = "Propose the next action.";
+
+/// How an act-or-answer message closes instead (M12 T4.2).
+///
+/// *Instead*, not *as well*: two closing instructions is two tasks, and the
+/// second one a model reads is the one it follows. This says both options in
+/// one sentence, which is what the choice actually is.
+const ACT_OR_ANSWER_CLOSING: &str = "Propose the next action, or, if the context already \
+answers and no tool applies, answer the user in plain text.";
 
 /// The chat-tier act-or-answer user message (M12 T4.2).
 ///
@@ -208,11 +219,15 @@ fn render_context_split(ctx: &EmitterContext) -> (String, String) {
 /// because this call may produce the reply and a reply drafted from an
 /// untagged transcript is the failure `reference.rs` documents. Everything
 /// live — the current turn, the trace, the budget line, what was refused,
-/// the emitter's own guidance — is the string the emitter has always sent;
-/// what follows it is the reply side: the persona, the reply-scoped notes,
-/// the silence line and the instruction the replier closes with.
+/// the emitter's own guidance — is the string the emitter has always sent,
+/// minus its closing line; what follows it is the reply side: the persona,
+/// the reply-scoped notes, the silence line, and the one closing instruction
+/// that names both options.
 fn render_act_or_answer(ctx: &EmitterContext, answer: &nscore::AnswerBlocks) -> String {
     let (_, live) = render_context_split(ctx);
+    // The live half ends with the line that says "call a tool"; on this path
+    // that is half the instruction, and it is replaced rather than repeated.
+    let live = live.strip_suffix(PROPOSE_LINE).unwrap_or(&live);
     let mut s = crate::reference::render_reference(
         &ctx.facts,
         ctx.summary.as_ref(),
@@ -232,9 +247,9 @@ fn render_act_or_answer(ctx: &EmitterContext, answer: &nscore::AnswerBlocks) -> 
             s.push_str(&format!("- {o}\n"));
         }
     }
-    s.push_str(&live);
+    s.push_str(live);
     if !answer.reply_guidance.is_empty() {
-        s.push_str("\n\nGuidance for the answer:\n");
+        s.push_str("\nGuidance for the answer:\n");
         for g in &answer.reply_guidance {
             s.push_str(&format!("- {g}\n"));
         }
@@ -245,7 +260,7 @@ fn render_act_or_answer(ctx: &EmitterContext, answer: &nscore::AnswerBlocks) -> 
         s.push('\n');
     }
     s.push('\n');
-    s.push_str(crate::reference::ANSWER_INSTRUCTION);
+    s.push_str(ACT_OR_ANSWER_CLOSING);
     s
 }
 
@@ -342,7 +357,9 @@ impl CloudEmitter {
                     // M12 T1.3: the prefix is `nscore`'s so the counter that
                     // reads the log and the line that writes it cannot drift.
                     let mut rationale = format!("{} {text}", nscore::TEXT_FALLBACK_PREFIX);
-                    rationale.truncate(300);
+                    // Chars, not bytes: this deployment's traffic is Czech,
+                    // and a 300-byte cut lands mid-codepoint and panics.
+                    truncate_chars(&mut rationale, 300);
                     return Ok(nscore::Emission {
                         proposal: Proposal {
                             rationale,
@@ -815,7 +832,16 @@ mod tests {
         assert!(at("</reference>") < at("You are Tomáš."));
         assert!(at("You are Tomáš.") < at("Current turn:\nuser: say hi"));
         assert!(at("This turn so far:\n- ToolReturned(ok: echo: hi)") < at("keep it short"));
-        assert!(text.ends_with(crate::reference::ANSWER_INSTRUCTION), "{text}");
+        // Exactly one closing instruction, naming both options. Two would be
+        // two tasks, and the emitter's own "Propose the next action." is
+        // half of this one — it must not also be in there on its own.
+        assert!(text.ends_with(ACT_OR_ANSWER_CLOSING), "{text}");
+        assert_eq!(text.matches(ACT_OR_ANSWER_CLOSING).count(), 1, "{text}");
+        assert!(!text.contains(PROPOSE_LINE), "{text}");
+        assert!(
+            !text.contains(crate::reference::ANSWER_INSTRUCTION),
+            "{text}"
+        );
         // The silence line is the replier's, and this context has facts.
         assert!(!text.contains(crate::reference::MEMORY_SILENCE), "{text}");
     }
@@ -894,6 +920,28 @@ mod tests {
         let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
         assert_eq!(p.action, "respond_directly");
         assert!(p.rationale.contains("The time is noon."));
+    }
+
+    /// The rationale is cut to 300, and a byte cut through a Czech letter
+    /// panics. Seen as a class, not as an accident: every letter in
+    /// `ěščřžýáíé` is two bytes, so a long Czech fallback is the ordinary
+    /// case here rather than the exotic one.
+    #[tokio::test]
+    async fn a_long_czech_text_fallback_does_not_panic() {
+        let long: String = "ěščřžýáíé".chars().cycle().take(400).collect();
+        assert_eq!(long.chars().count(), 400);
+        assert!(long.len() > 400, "the text has to be multi-byte to test it");
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "id": "gen_1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": long}
+            }]
+        })]);
+        let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
+        assert_eq!(p.action, "respond_directly");
+        assert!(p.rationale.starts_with(nscore::TEXT_FALLBACK_PREFIX));
+        assert_eq!(p.rationale.chars().count(), 300);
     }
 
     fn empty_message() -> Vec<serde_json::Value> {

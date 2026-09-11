@@ -191,6 +191,17 @@ fn parse_repl_args(
     Ok((max_requests, session.unwrap_or_else(|| "cli".into())))
 }
 
+/// Whether driver B — the idle evolution pass — may be installed.
+///
+/// It may not on a metered run. `--max-requests` is enforced inside the turn
+/// loop (`EngineConfig::max_requests`), and the idle pass runs *between*
+/// turns, on its own timer, spending real requests that the cap never sees.
+/// A run told to spend at most N would quietly spend more than N, and the
+/// whole point of the flag is that the number it prints is the number.
+fn idle_pass_allowed(max_requests: Option<u32>, enabled: bool) -> bool {
+    enabled && max_requests.is_none()
+}
+
 /// One throttle per endpoint: roles sharing a base URL share the pacing,
 /// so the provider sees one paced stream (seen live: Mistral 429s on
 /// bursts). Roles on different providers are paced independently.
@@ -910,7 +921,7 @@ async fn main() {
             ),
         }
     }
-    if cfg.evolution.enabled {
+    if idle_pass_allowed(max_requests, cfg.evolution.enabled) {
         // Driver B: the idle timer runs this pass during quiet periods.
         // Driver B is not a dry run, so it spends by the same rule it
         // always did: `spend` only ever gates a dry run.
@@ -923,6 +934,9 @@ async fn main() {
             true,
         )));
     } else {
+        if let (Some(cap), true) = (max_requests, cfg.evolution.enabled) {
+            println!("metered run: the idle evolution pass is off (cap {cap})");
+        }
         b.set_consolidator(Box::new(NoopConsolidator));
     }
     for t in &tools {
@@ -1188,6 +1202,19 @@ mod tests {
         assert_eq!(arg(&["--spend", "--dry-run"]), Ok((true, true)));
         assert!(arg(&["--wat"]).is_err());
         assert!(arg(&["--dry-run", "--dry-run"]).is_err());
+    }
+
+    /// A cap the idle pass never sees is not a cap. Driver B runs between
+    /// turns on its own timer and spends real requests, so a metered run
+    /// turns it off entirely rather than hoping the quiet never comes.
+    #[test]
+    fn a_metered_run_installs_no_idle_evolution_pass() {
+        assert!(idle_pass_allowed(None, true), "the unmetered run keeps it");
+        assert!(!idle_pass_allowed(Some(60), true));
+        assert!(!idle_pass_allowed(Some(0), true));
+        // And evolution being off still wins, metered or not.
+        assert!(!idle_pass_allowed(None, false));
+        assert!(!idle_pass_allowed(Some(60), false));
     }
 
     /// M12 T6.1: the two flags a metered live session is run with.
