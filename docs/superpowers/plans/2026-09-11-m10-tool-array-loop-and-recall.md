@@ -275,3 +275,23 @@ turn; meaning and ledger row unchanged.
 
 T4.2 (`repeat_gate` per 100 on live sessions vs 7.4) and T1.6 (`slim`'s Malformed/Illegal
 rates vs 11.1 per 100) are live monitoring and stay open until sessions are run.
+
+### P3 — done (commit `ba4fe3e`), 0 requests, service up for the measurement
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T3.1 | backfill twice → 0 the second time; a turn never embeds | met: `embeddings (kind, owner, row_id, model, dim, vector)` with the **model in the primary key**, backfilled by the pass in bounded batches (`[evolution] embed_backfill_batch(es)`), `a_turn_never_calls_embed_on_the_shipped_default` |
+| T3.2 | service down → exactly today's bm25 list | met byte-for-byte, with and without an encoder; RRF k = 5 in core (`rrf_fuse`, rank never score) |
+| T3.3 | a Chat turn issues no `/embed` | met (`a_chat_tier_turn_issues_no_embed_call`, and Deep does) |
+| T3.4 | paraphrase miss < 20%, verbatim not regressed | **sqlite hybrid (bge-m3, coarse 10 → rerank): 11/12, 8% miss; verbatim 12/12, 0%** — against in-memory 75% and bm25 83%. M8 §6's 8% reproduced exactly; the one miss is `cs/name` |
+| T3.5 | over-budget recall falls back to lexical | met (`[recall] coarse_k` 10, `rerank_budget_ms` 800, scripted slow transport) |
+| T3.6 | exemplars as a `ToolReturned`, default 0 | met: `nearest_digests` by cosine over digest vectors written at digest time; `[memory] exemplars_max = 0`; `exemplars_enter_as_a_tool_returned_not_as_a_context_block` |
+
+`[recall] hybrid` defaults to today's behaviour (off); the arm is added to `ns-app eval
+--paraphrase` only when the service answers, and prints `NOT MEASURED` otherwise so M6
+§12.8's "stay lexical" verdict is never read off a non-lexical arm. The `TextEncoder`
+trait lives in core; the local evaluator's transport is its one implementation, with the
+same retry table and disable-after-two rule. Note: the measurement ran against an nsmodels
+instance already listening on 7374, which the agent then stopped; restart it before the
+next idle pass (`cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model
+quality --rerank`).
