@@ -324,3 +324,23 @@ pre-existing format diffs.
 Deviation recorded: the replay test lives in `crates/evolution/src/pass.rs` (there is no
 `crates/engine/tests/replay.rs`, and the test needs `ScriptedEvaluator` and
 `EvolutionPass`, which sit above the engine).
+
+### P2 — done 2026-09-11 (commit `1d6db32` + this record), **4 requests** (the smoke turn)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T2.1 | interceptor fires at most once; block dropped after the window, before facts; no new event, no migration | met: `obligations_for` (en+cs, 26+32 imperative openers, question clauses), block above `Recent turns:`, `ContextManifest.obligations`, grounding material; `obligation_check` default **false**; the overlap predicate moved down from the evaluator into `nscore::addresses` (one definition) |
+| T2.2 | 12 notes → 6 rendered, the rest reported dropped | met: `clamp_guidance` runs first in both fits, guidance now counts toward the total. **Only under `budget_mode = enforce`**; in the default `report` mode the clamp is reported, not made — the crate's report-before-enforce rule |
+| T2.3 | breakpoint only if the stable prefix ≥ 1,024 tokens | **not applicable on this config**: emitter prefix 538 tokens (facts+summary+window), replier 225 tokens (persona+facts+summary). No breakpoint moved; `cached: 0 of 5696` confirms the persona-only breakpoint hits nothing. Caching stays a lever for a paid tier with a bigger window, as §3.6 said |
+| T2.4 | one live turn, then `ns-app budget cli` | turn 21 on the live `cli` session, question "what did we talk about last time, and what is my name?": **4 requests** (emitter 2, replier 2 — the second replier call is one grounding regeneration), prompt 5,696 tokens, peak 1,601, completion 1,441, trace 2,238 chars sent, 0 clipped. **Tool schemas: 1,462 of 3,186 prompt tokens on the two emitter calls — 45.9%**, against the composition doc's 13–20% estimate. The pointer agent was down, so the legal set was the chat set; with desktop tools registered the share is higher still |
+
+**The number that reorders the rest of the plan:** nearly half of every emitter prompt on
+this box is tool schema. Slimming the schemas (`2026-09-08-tool-loading` §1.5) is the
+largest context lever measured so far and is not an M9 task; it goes on the follow-up list
+ahead of any retrieval work. HiAgent's trace boundary stays measure-first: 2,238 trace chars
+on a two-iteration chat turn says nothing about a twelve-iteration desktop turn.
+
+Follow-ups recorded, not built: schema slimming with `tools_tokens` as the before/after;
+fixtures carrying a summary and notes so `--ablate summary|guidance` can read anything;
+the reply regeneration cost (a second replier request on a plain chat turn) as a signature
+for the pass to count.
