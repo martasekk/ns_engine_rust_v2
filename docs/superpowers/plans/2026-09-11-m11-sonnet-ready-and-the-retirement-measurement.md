@@ -1,0 +1,179 @@
+# M11 — Sonnet-ready request shaping, three memory deltas, and the measurement that decides the retirements
+
+Date: 2026-09-11 · Approved 2026-09-11 · Branch `worktree-m11-sonnet-ready` from `worktree-m10-tool-array` @ `20587b9` · Scope fixed by
+the user's answers below · Evidence: the repo scaffold audit (every component's recorded
+rationale and off-switch), the Sonnet 5 prompting and migration guides, Scaffold Effect
+(arXiv 2607.22585), Capacity Not Format (2606.09410), few-shot on reasoning models
+(2509.13196), MemStrata (2606.26511), memory-use boundaries (2606.06055), long-context vs
+memory (2605.18421), the Czech lexical ceiling (2605.24556), and the Anthropic prompt-audit
+keep list. When executed this becomes
+`docs/superpowers/plans/2026-09-11-m11-sonnet-ready-and-the-retirement-measurement.md`.
+
+## Decisions taken with the user (2026-09-11)
+
+1. **First strong model: Claude Sonnet 5 via OpenRouter** (`anthropic/claude-sonnet-5`). It
+   already works as the replier (`replier.rs` sends no sampling params and is tested against
+   that id); it fails as the emitter and summarizer because both send `temperature: 0`, which
+   Sonnet 5 rejects with a 400.
+2. **Retirements: hard errors only.** Nothing a strong model merely "does not need" is
+   switched off in M11. The redundancy table is the record; the retirements become the next
+   plan once a live Sonnet session has produced the numbers M11 collects.
+3. **The measurement run is approved** once the shaping is green: 40 chat turns on Sonnet 5
+   under today's scaffolding, about 110 requests, roughly $1 to $1.60.
+
+Standing constraints: desktop line parked; chat and personal memory first; a paid tier is
+coming; the chat single-call path is measure only; no model in the guard chain or the fold;
+replay and provenance untouched; a knob moves only on a non-regressing arm.
+
+## Context
+
+Every scaffold in the engine was built against a small model, and the repo records why each
+exists. Read against Sonnet 5, three of them are hard errors or dead code, most are
+structural and stay, and a handful are redundant only on the field's evidence, not yet on
+this engine's numbers. The user chose to trust the engine's numbers: M11 makes Sonnet 5 a
+legal target for every role, adds the memory work a strong model makes worth doing, and runs
+one measured session that reads exactly the four numbers the retirement decision needs.
+
+## What becomes redundant, per model — the record
+
+Common column: all three of Sonnet 5, Gemini 3.8 (Flash and Pro), Qwen3.8-27B. Per-model
+column: deltas only. **Nothing in this table is removed by M11 except the hard errors.**
+
+| Scaffold | Anchor | Recorded reason | Common verdict | Per-model delta |
+|---|---|---|---|---|
+| emitter/replier split | spec 2026-09-01 §2 principle 5, §5 | compliance-by-construction + cost; echo 0.598 → 0.104 came from prompt shape | **keep** | — |
+| `tool_choice: required` + `respond_directly` | `emitter.rs:173`, `core/router.rs:72` | legality by generation constraint | **keep** | — |
+| `temperature: 0` | `emitter.rs:172`, `summarizer.rs:~104` | pinned determinism for a small emitter | keep on Gemini/Qwen | **Sonnet 5: hard 400** → per-role `sampling = none` |
+| manual thinking budget / sampling params | none sent | — | — | Sonnet 5 rejects budgets; `effort` replaces them |
+| `max_tokens: 4096` hardcoded | `emitter.rs:43`, `replier.rs:20` | reasoning models spend output on reasoning first | keep as floor, make per-role | Sonnet: emitter 2048 at effort low is enough |
+| text-fallback branch (model ignores `tool_choice`) | `emitter.rs:196-208` | free-tier models that ignore forced tools | redundant on a compliant caller | Qwen via a local shim: keep as monitor |
+| grounding **flag** + `ReplyCited` | `ground.rs`, `turn.rs` | zero-cost symbolic check; feeds `UngroundedReply` and the fitness join | **keep** | — |
+| grounding **regeneration** | `turn.rs` (the `ReplyFlagged` path) | hallucination scaffolding; 1 flag / 21 turns, a cs/en false positive, +1 request | redundant on the field's evidence (Sonnet runs its own verification; self-refine can inject errors) | decided by M11's measurement |
+| echo ratio | `engine/src/echo.rs` | entrainment **grows with model size** (2604.13275); demoted to monitor: 21 flags, 0 true positives | **keep as monitor** | matters more on Sonnet |
+| `obligation_check` | `turn.rs`, default false | +7.7% replier requests, 0 graded gain (M10 T5.4) | redundant, already off | Qwen: keep the knob |
+| `<reference>` fence | `replier.rs:47` | spotlighting (injection hygiene), ~20 tokens | **keep** | — |
+| summarizer JSON forced by prompt | `summarizer.rs` | fixed fields = cost projection; prompt-forcing = weak-writer enforcement | keep the fields; mechanism can move to `response_format` | strong models pay ~0 for format (2606.09410) |
+| argument examples on two tools (M10 T1.5) | `pointer_tool.rs` | malformed args measured on the recorded log | redundant on reasoning models (few-shot −26 pp worst case) | Qwen 27B: keep |
+| per-iteration reminder text | `emitter.rs:15-26` | small-model retention | trim under a strong profile | Gemini 3: trim hardest |
+| `learned.toml` notes | `core/learned.rs`, evolution §10 | model-specific by design | archive on model change | the one note today is desktop-only |
+| symbolic router, tiers | `core/router.rs` | request budget + replay determinism | **keep** | — |
+| context caps, fit, 6,000 budget | `budget.rs`, `config.rs` | cost and precision, not capability | **keep**; a strong profile may raise them if the arms pay | cost decides (2605.18421) |
+| `budget_line` | `show_budget_line = false` | — | keep off (countdowns in context are harmful) | — |
+| `respond_directly` on cue-less chat | `turn.rs` | "an LLM executor for a deterministic plan" | measure only (M10 decision 1) | — |
+| notes lane, Succeeded lane, fitness, κ, residual, versioning, digests, hybrid recall | evolution and memory specs | structural or memory hygiene | **keep** | — |
+| replay, fold, hash chain, manifests | M6 §2 principle 2 | structural | **keep** | — |
+
+## What does not change
+
+Everything marked keep above, plus: no Anthropic-direct preset (OpenRouter is the only preset
+that forwards `cache_control`, and it forwards it to Anthropic; the emitter prefix with a
+stable tool array is ~1,300 tokens on turn 21, above Anthropic's 1,024 floor; the replier's
+225 never will be); today's requests byte-for-byte for any model that is not Sonnet 5; the
+chat single-call path; every M9 and M10 default.
+
+## Concepts adopted
+
+| Concept | Source | Form here |
+|---|---|---|
+| Per-role request shape | Sonnet 5 migration guide (sampling and budgets rejected; `effort` replaces them) | four optional fields on `[llm.<role>]`, all unset = today |
+| Provider detection as a safety net | the hard 400 | Sonnet ids default `sampling = none` with one logged coercion |
+| Structured output where it is free | Capacity Not Format | summarizer `response_format` json_schema where the preset advertises it; fence parser kept |
+| Lexical retrieval is the ceiling in Czech | 2605.24556 | hybrid `search_facts` behind `[recall] hybrid` — the gap M10 P3 left |
+| Abstain when memory is silent | 2606.06055 | one line in the reply task when every reference block is empty; measured by the abstention arm |
+| A stronger offline judge | SCM 2604.20943, M8's blind spot (corrections) | `ClientEvaluator` on the strong model, idle pass only, κ-gated, off by default |
+| Already built in different clothes | MemStrata, PGMem, memory-as-tools, proactive memory | a register, not code |
+| The harness is the variable | Scaffold Effect (40× tokens, 0–8 pp) | the measurement run reads cost and flags on today's scaffolding before anything is retired |
+
+## Phases
+
+Order: **P0 → P2** is the critical path (the measurement needs the shaping). P1 is independent
+and zero-request.
+
+### P0 — Sonnet-ready request shaping (0 requests, ~1 day)
+
+| id | change | files / functions | test | exit criterion |
+|---|---|---|---|---|
+| T0.1 | `RoleSection` gains `reasoning: Option<String>` (`low\|medium\|high`), `max_tokens: Option<u32>`, `sampling: Option<String>` (`default\|none`), `thinking: Option<bool>`; unset = today | `app/src/config.rs` (`RoleSection`, ~:793) | `config.rs` `role_shaping_fields_default_to_none` | a bare `[llm.emitter]` produces today's request byte-for-byte |
+| T0.2 | `RequestShape` in `crates/llm/src/provider.rs`, applied at the three `json!` sites: omit `temperature` when `sampling = none`; `"reasoning": {"effort": …}` when set; `"reasoning": {"enabled": false}` when `thinking = false`; `max_tokens` from the role | `emitter.rs:169-173`, `replier.rs:~155`, `summarizer.rs:~102` | `emitter.rs` `sampling_none_omits_temperature_entirely`; `replier.rs` `effort_rides_as_a_reasoning_block`; `summarizer.rs` `the_summarizer_takes_the_same_shape` | a shaped request has no `temperature` key at all; `request_carries_schema_context_and_forced_tool_choice` still passes for the default shape |
+| T0.3 | safety net: a resolved model id matching `anthropic/claude-sonnet-5*` with `sampling` unset defaults to `none`, logged once at startup | `provider.rs` (`sampling_default_for`), `app/src/main.rs` (~:659-676 where targets resolve) | `provider.rs` `sonnet_five_never_receives_a_sampling_param` | the 400 is unreachable from a default config naming Sonnet in any role |
+| T0.4 | recommended shapes in `config.example.toml`, not hardcoded: emitter `reasoning = "low"`, `max_tokens = 2048`; replier `reasoning = "medium"`, `max_tokens = 4096`; summarizer `reasoning = "low"`, `max_tokens = 1024`; a commented Qwen block with `thinking = false` on the emitter | `config.example.toml` | the example parses in the existing config doc test | round-trips |
+| T0.5 | summarizer structured output: when `Provider.structured_output` is true (OpenRouter: yes), send `response_format: {type: json_schema, json_schema: {name: summary, strict: true, schema: <topic, established[], open[]>}}`; `strip_fence` stays as the fallback parser | `summarizer.rs:~102`, `provider.rs:17` (new bool column) | `summarizer.rs` `structured_output_is_sent_only_where_the_preset_advertises_it`, `a_fenced_reply_still_parses` | identical `SummaryDraft` from both paths |
+
+Note: Anthropic's native `output_config.format` is a Messages-API field; OpenRouter speaks
+chat completions, so `response_format` is the portable form and T0.5 is one field, not a
+second client.
+
+### P1 — Memory deltas (0 requests, ~1½ days, independent)
+
+| id | change | files / functions | test | exit criterion |
+|---|---|---|---|---|
+| T1.1 | hybrid `search_facts`: embed `key + " " + value` at write time into the existing `embeddings` table (`kind = "fact"`, owner = scope, model in the PK), fuse bm25 and cosine candidates with `rrf_fuse` (core, k = 5), rerank; behind `[recall] hybrid`; service down = `lexical_rank` byte-for-byte | `crates/memory-sqlite/src/lib.rs` (`search_facts`), `crates/evolution/src/pass.rs` (backfill batch), `crates/core/src/memory.rs` untouched | `memory-sqlite` `hybrid_search_facts_equals_lexical_with_the_service_down`; a `--paraphrase --facts` arm in `crates/testkit/src/paraphrase.rs` | the `cs/name` miss (M10 T3.4's one miss) closes with the verbatim arm not regressed, or revert and record |
+| T1.2 | memory-silence line: when `ctx.facts` is empty, no summary exists and no recall fired this turn, `render_task` adds one sentence, "Nothing in memory bears on this; say so rather than guessing." | `crates/llm/src/replier.rs` (`render_task`, ~:79) | `replier.rs` `the_silence_line_appears_only_when_every_reference_block_is_empty` | M10's abstention arm stays 30/30 and the answerable arm stays 30/30 |
+| T1.3 | paid judge: `ClientEvaluator` implementing `Evaluator` over `OpenRouterClient` on `[models] judge_model` (default unset = not constructed), wired by `with_evaluator` in the idle pass only, κ-printed and `evaluator_min_kappa`-gated like `LocalEvaluator`, its requests counted in the pass report; never in a turn, never in the guard chain | new `crates/evolution/src/client_eval.rs` beside `local.rs`, `app/src/main.rs` (`build_pass`), `pass.rs` | `client_eval.rs` `a_paid_evaluator_below_kappa_yields_observations_only`, `it_is_never_constructed_without_a_judge_model` | κ(client, symbolic) prints on the recorded copy when configured; zero requests when not |
+| T1.4 | the register, in §Results: **[DONE]** MemStrata bi-temporal supersession = keyed facts with validity intervals (`consolidate.rs:103`, `memory-sqlite`); PGMem provenance = `Fact.prov` (`action.rs:206`); memory-as-tools = `remember_fact` / `recall` / `forget_*`; proactive memory = the idle pass. **[LATER]** time-aware recall, trigger: the tie corpus separating on time rather than credits | — | — | recorded |
+
+### P2 — The measurement run on Sonnet 5 (≈110 requests, ≈ $1.00–1.60, after P0 is green)
+
+| id | change | files / functions | test | exit criterion |
+|---|---|---|---|---|
+| T2.1 | a scripted set of 20 chat messages (cs and en, drawn from the fixtures' seeds: a stated fact, a paraphrased recall, a knowledge update, an unanswerable question, small talk) run live twice on `openrouter:anthropic/claude-sonnet-5` in all three roles under today's scaffolding: arm A with `reasoning` unset (provider default), arm B with the T0.4 shapes; `ns-app budget` after each | the REPL on stdin suffices; a `--live <file>` runner in `app/src/eval.rs` is optional | — | four numbers per arm in §Results: requests per turn, grounding-flag rate with each flag classified true/false positive by hand, `cached_tokens` share, completion tokens (and dollars actually spent) |
+| T2.2 | the retirement decision, written into §Results and carried into the next plan: for each candidate row of the table (regeneration, text fallback, reminder text, argument examples, note archiving, strong context profile) the number that decides it | plan doc only | — | each row has a number or "not observed in 40 turns" |
+
+Cost basis: the measured 5,696 prompt and 1,441 completion tokens per turn at $2 / $10 per
+MTok is $0.0258 per turn, $1.03 for 40; reasoning on the replier can triple its completion,
+so the ceiling is about $1.60. Requests 2–3 per turn, at most 110. Nothing else in M11
+spends a request.
+
+## Deferred to the next plan, with the evidence that will decide them
+
+The `capability = strong` knob and its retirements (grounding regeneration off, text fallback
+off, trimmed preamble, examples off), `learned.toml` notes archived per model (`Note.learned_on`,
+absent at default), the strong context profile (`window_turns` 6 → 10, `facts_in_context`
+10 → 16, cost-decided), and the chat single-call path (needs the M10 P4 counter). Each waits
+for a P2 number.
+
+## Minimal cut (one day)
+
+T0.1–T0.3 (Sonnet becomes a legal emitter and summarizer) and T1.2 (the silence line). Cut
+T0.4, T0.5, T1.1, T1.3 and the measurement. That removes the hard error and nothing else.
+
+## Risks and where each is caught
+
+- **A shaped request changes behaviour on Gemini.** Every shaping field is unset by default;
+  the existing emitter and replier request tests pin today's bytes.
+- **OpenRouter drops `reasoning` or `response_format` for a model.** The fence parser stays for
+  the summarizer; `ns-app budget`'s completion column shows whether effort took.
+- **Hybrid facts over-retrieve on short keys.** The `--paraphrase --facts` arm gates it;
+  service down is byte-identical to today.
+- **The silence line makes the replier decline when it should answer.** The answerable arm
+  (30/30) is the guard; the line renders only when every reference block is empty.
+- **The paid judge spends the budget.** Not constructed without `judge_model`; idle pass
+  only; κ-gated; its own counter in the report.
+- **The measurement run writes to the live log.** It is meant to: 40 turns on the `cli`
+  session, exactly as the M9 smoke turn did; copies for every pass afterwards.
+- **A new struct field changes serialized bytes.** `RoleSection` is config, not an event;
+  no manifest or event field is added in M11.
+
+## Verification
+
+| Phase | Checks |
+|---|---|
+| P0 | `cargo test -p ns-llm -p ns-app -p ns-core`; a Sonnet-named role produces a request without `temperature`; a bare config produces today's bytes; the example config parses |
+| P1 | `cargo test -p ns-memory-sqlite -p ns-evolution -p ns-llm -p ns-testkit`; `ns-app eval --paraphrase --facts` with nsmodels up and down; `--ablate` arms unchanged; `ns-app evolve --dry-run` with and without `judge_model` |
+| P2 | `ns-app budget cli` after each arm; the four numbers and the dollars in §Results |
+| all | `cargo test --workspace`; box notes as in M10: cargo on the Git Bash PATH, test output to a file, `rustfmt` only changed files, `turn.rs`/`config.rs`/`budget.rs` hand-edited, never a non-dry pass on `ns-run/ns.sqlite`, restart nsmodels before P1 (`cd ~/models && ./.venv/Scripts/python.exe -m nsmodels serve --model quality --rerank`) |
+
+## How to execute
+
+Branch `worktree-m11-sonnet-ready` from `worktree-m10-tool-array`. One Opus agent per phase
+at medium effort, test first, one commit per phase, each exit criterion pasted into §Results
+with its number. P0 first, P1 in parallel with it (disjoint files: P0 touches `llm`,
+`config.rs`, `main.rs`; P1 touches `memory-sqlite`, `evolution`, `replier.rs`'s `render_task`;
+hand `replier.rs` to P0 and let P1's silence line land after P0 commits). P2 last, with the
+OpenRouter key from the run script and the live `ns-run` directory, spending only the
+approved budget. After the branch lands: `graphify <root> --update`; the redundancy table and
+the P2 numbers go into the findings doc as §9.
+
+## Results
+
+*(empty until execution)*
