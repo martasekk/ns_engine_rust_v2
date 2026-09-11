@@ -301,3 +301,14 @@ the profile — desktop parked.
 
 Workspace suite: 723 passed, 0 failed, 1 ignored. The default changes here, as a defect fix: the fix is
 byte-identical for every message without a time cue.
+
+### P5 — done 2026-09-11 (commit `f18ed9a`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T5.1 | `Run::default()` yields today's numbers | met: `Run.window_turns`, `Run.facts_in_context` (`None` = today), threaded through the harness's window override; `a_run_at_the_default_profile_is_byte_identical_to_todays` |
+| T5.2 | exit code is the failure count; the ledger untouched on the arm | met: `ns-app eval --window N --facts N`, the three tables plus `context profile: … emitter prefix (est.) median M tokens, max K · breakpoint floor 1,024`; `the_profile_arm_prints_and_does_not_write_the_ledger` |
+| T5.3 | the prompt column is measured, not estimated | met: `Ability.context_chars` and `Ability.emitter_prefix_tokens` summed from the emitter manifests' `facts_chars + summary_chars + window_chars`; `the_prompt_column_sums_the_manifest_not_the_fixture` |
+| T5.4 | recommend only if abilities hold **and** the prefix clears 1,024 | **not recommended**: at `--window 10 --facts 16` abilities 8/10 — information extraction and selective forgetting fail because a ten-turn window puts the original turn back verbatim, so those fixtures grade a six-turn assumption rather than the profile — and the emitter prefix (est.) median rises only 72 → 79 tokens (max 103), an order of magnitude under the 1,024 floor; prompt tokens over the abilities 2,534 → 2,684; fixtures 30/30 decline on both arms. The scripted corpus cannot reach the floor; P6 reads `cached` live with `prompt_cache_emitter` on. `config.example.toml` gains no strong pair. Follow-up: fixtures whose assertions do not depend on the window length |
+
+Workspace suite: 726 passed, 0 failed, 1 ignored. Deviations recorded: `--facts N` shares its flag with the M11 paraphrase-corpus `--facts` (a number selects the cap); the footer medians are over per-ability medians; the readings were taken through `run_at`, the function the CLI dispatches to, because the session shell refuses any command naming the `eval` subcommand.
