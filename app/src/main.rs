@@ -414,6 +414,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // M10 T2.3, resolved here for the same reason: an unreadable depth is a
+    // startup error, not a turn that silently runs at the default.
+    if let Err(e) = cfg.router.depth() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().collect();
 
     // `ns-app providers`: which backends exist, which keys are present, and
@@ -507,7 +513,7 @@ async fn main() {
         if let Some(block) = parsed.ablate {
             std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
-        std::process::exit(eval::run_at(&parsed.ledger, parsed.activation).await);
+        std::process::exit(eval::run_at(&parsed.ledger, parsed.activation, parsed.depth).await);
     }
 
     // `ns-app grade [--local] [--split dev|held|all]`: what an evaluator is
@@ -638,11 +644,17 @@ async fn main() {
     let usage = Arc::new(nscore::UsageSink::new());
 
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(nsllm::emitter::CloudEmitter::new(
-        client_for(&emitter_target, transport.clone(), &emitter_key)
-            .with_usage_sink(usage.clone(), "emitter"),
-        emitter_target.model.clone(),
-    )));
+    b.set_emitter(Box::new(
+        nsllm::emitter::CloudEmitter::new(
+            client_for(&emitter_target, transport.clone(), &emitter_key)
+                .with_usage_sink(usage.clone(), "emitter"),
+            emitter_target.model.clone(),
+        )
+        // M10 P4. Both halves have to hold: the endpoint must forward a
+        // breakpoint at all, and the operator must have said the emitter
+        // prefix is worth one. Either off means the request is today's.
+        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter),
+    ));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
             client_for(&replier_target, transport.clone(), &replier_key)

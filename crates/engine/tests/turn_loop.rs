@@ -4694,3 +4694,305 @@ async fn recall_is_offered_on_turn_one_when_an_earlier_session_exists() {
     let names = offered(store, cfg, "new2", "what was the cat called").await;
     assert!(!names.contains(&"recall".to_string()), "{names:?}");
 }
+
+// ---------------------------------------------------------------------------
+// M10 P2/P4 — adaptive depth, the stable array, the done marker.
+// ---------------------------------------------------------------------------
+
+/// A pointer-shaped tool double. Only the *name* matters here: the cue table
+/// maps words to tool names, so a fixture that used `echo` would be testing
+/// the fallback and nothing else.
+struct NamedTool(ActionSpec);
+impl NamedTool {
+    fn new(name: &str) -> Self {
+        NamedTool(ActionSpec {
+            name: name.into(),
+            description: format!("{name}, for the depth fixtures"),
+            args_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"q": {"type": "string"}}
+            }),
+            side_effect: SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        })
+    }
+}
+#[async_trait::async_trait]
+impl Tool for NamedTool {
+    fn spec(&self) -> &ActionSpec {
+        &self.0
+    }
+    async fn call(&self, a: &serde_json::Value, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            summary: format!(
+                "{} ran with {}",
+                self.0.name,
+                a.get("q").and_then(|v| v.as_str()).unwrap_or("-")
+            ),
+            artifact: None,
+            trust: Trust::System,
+        })
+    }
+}
+
+fn pointer_proposal(action: &str, q: &str) -> Proposal {
+    Proposal {
+        rationale: "the user asked".into(),
+        action: action.into(),
+        args: serde_json::json!({"q": q}),
+    }
+}
+
+/// Records the `tools` array *as bytes* — the serialized specs, not their
+/// names. Names being equal is not the claim P2 makes; the claim is that a
+/// provider cache sees the same prefix, and that is a claim about bytes.
+struct ArrayProbe {
+    inner: ScriptedEmitter,
+    arrays: Arc<std::sync::Mutex<Vec<String>>>,
+    traces: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for ArrayProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        self.arrays
+            .lock()
+            .expect("arrays")
+            .push(serde_json::to_string(&legal.actions).expect("specs serialize"));
+        self.traces
+            .lock()
+            .expect("traces")
+            .push(ctx.trace_so_far.clone());
+        // A scripted emitter records no cost, and no cost means no
+        // `ModelCall` and therefore no manifest — which is the thing T2.2
+        // says has to grow. One nominal record per call is enough to put the
+        // manifest in the log.
+        if let Some(sink) = ctx.usage.as_deref() {
+            sink.record(Usage {
+                role: "emitter".into(),
+                model: "probe".into(),
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                estimated: true,
+                attempts: 1,
+                latency_ms: 0,
+                tools_tokens: 1,
+                cached_tokens: 0,
+            });
+        }
+        self.inner.propose(ctx, legal).await
+    }
+}
+
+struct DepthRun {
+    arrays: Vec<String>,
+    traces: Vec<Vec<String>>,
+    events: Vec<Event>,
+}
+
+/// A desktop-shaped harness at one depth, with the scripted proposals given.
+async fn depth_run(depth: nscore::Depth, text: &str, proposals: Vec<Proposal>) -> DepthRun {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId(format!("depth-{}", depth.as_str()));
+    let arrays = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let traces = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ArrayProbe {
+        inner: ScriptedEmitter::new(proposals),
+        arrays: Arc::clone(&arrays),
+        traces: Arc::clone(&traces),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    for name in [
+        "pointer_ui_read",
+        "pointer_ui_find",
+        "pointer_click",
+        "pointer_scroll",
+    ] {
+        b.add_tool(Arc::new(NamedTool::new(name)));
+    }
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            reply_grounding_check: false,
+            max_iterations: 8,
+            trace_verbatim_lines: 1,
+            router: Some(Arc::new(nsengine::router::KeywordRouter {
+                depth,
+                ..nsengine::router::KeywordRouter::default()
+            })),
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: text.into(),
+    })
+    .await
+    .unwrap();
+    // Taken before the await: a `MutexGuard` held across one is not `Send`.
+    let taken_arrays = arrays.lock().expect("arrays").clone();
+    let taken_traces = traces.lock().expect("traces").clone();
+    DepthRun {
+        arrays: taken_arrays,
+        traces: taken_traces,
+        events: store.load(&sid).await.unwrap(),
+    }
+}
+
+fn manifest_tool_names(events: &[Event]) -> Vec<Vec<String>> {
+    events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { usage, manifest } if usage.role == "emitter" => {
+                Some(manifest.tool_names.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// M10 P2, decision 2(a). The tool array is the biggest single block of an
+/// emitter prompt and the one a prefix cache would hold; a set recomputed
+/// per iteration would move it for nothing, since nothing between two
+/// iterations of one turn changes what the *message* asked for.
+///
+/// Bytes, not names: the claim is about what a provider hashes.
+#[tokio::test]
+async fn the_tools_array_is_byte_stable_across_a_turns_iterations() {
+    for depth in [nscore::Depth::Adaptive, nscore::Depth::Full] {
+        let run = depth_run(
+            depth,
+            "klikni na Save v panelu",
+            vec![
+                pointer_proposal("pointer_ui_read", "save"),
+                pointer_proposal("pointer_click", "save"),
+            ],
+        )
+        .await;
+        assert!(
+            run.arrays.len() >= 3,
+            "{depth:?}: two tool calls and a settle, got {}",
+            run.arrays.len()
+        );
+        let first = &run.arrays[0];
+        for (i, a) in run.arrays.iter().enumerate() {
+            assert_eq!(a, first, "{depth:?}: iteration {i} sent a different array");
+        }
+        // And what the manifest recorded is the array that rode.
+        let recorded = manifest_tool_names(&run.events);
+        let head = recorded.first().cloned().unwrap_or_default();
+        for names in &recorded {
+            assert_eq!(names, &head, "{depth:?}: the manifest moved too");
+        }
+    }
+
+    // Adaptive actually narrowed — otherwise the stability above would be
+    // the stability of the full set and would prove nothing about P2.
+    let adaptive = depth_run(
+        nscore::Depth::Adaptive,
+        "klikni na Save v panelu",
+        vec![pointer_proposal("pointer_click", "save")],
+    )
+    .await;
+    let names = manifest_tool_names(&adaptive.events)
+        .into_iter()
+        .next()
+        .expect("an emitter call");
+    assert!(names.contains(&"pointer_click".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"pointer_scroll".to_string()),
+        "the click cue does not ask for the scroll tool: {names:?}"
+    );
+}
+
+/// M10 T2.2. The cue table is a guess about the message; a proposal naming a
+/// real tool is the model saying the guess was wrong. One widening is the
+/// honest price of that, and it is recorded — an escalation is a request
+/// already spent, and the rate is what `depth = adaptive` ships on.
+#[tokio::test]
+async fn a_withheld_tool_is_admitted_after_one_illegal_action_and_the_manifest_records_it() {
+    let run = depth_run(
+        nscore::Depth::Adaptive,
+        "klikni na Save v panelu",
+        vec![
+            // The cue selected the ui group; this one is not in it.
+            pointer_proposal("pointer_scroll", "down"),
+            pointer_proposal("pointer_scroll", "down"),
+        ],
+    )
+    .await;
+    let recorded = manifest_tool_names(&run.events);
+    assert!(recorded.len() >= 2, "{recorded:?}");
+    assert!(
+        !recorded[0].contains(&"pointer_scroll".to_string()),
+        "withheld on the first call: {:?}",
+        recorded[0]
+    );
+    assert!(
+        recorded[1].contains(&"pointer_scroll".to_string()),
+        "and admitted on the next: {:?}",
+        recorded[1]
+    );
+    // The whole set, not one name: a task that needed the scroll needs
+    // whatever comes after it too.
+    assert!(recorded[1].contains(&"pointer_ui_find".to_string()));
+
+    // Counted, so T0.2's buckets can price it.
+    let tally = nscore::tally_rejections(&run.events);
+    assert_eq!(
+        tally.by_reason.get("IllegalAction").copied(),
+        Some(1),
+        "one escalation, counted once and for the rest of the turn: {}",
+        tally.line()
+    );
+    // And the action ran.
+    assert!(
+        run.events.iter().any(
+            |ev| matches!(&ev.kind, EventKind::ToolCalled { action, .. } if action == "pointer_scroll")
+        ),
+        "the widened set let it through"
+    );
+}
+
+/// M10 T4.1. The marker has to survive the fold, because the fold is what a
+/// long turn's earlier steps become — and a long turn is exactly where a
+/// completed call gets proposed again.
+#[tokio::test]
+async fn the_marker_survives_folding() {
+    let run = depth_run(
+        nscore::Depth::Full,
+        "klikni na Save v panelu",
+        vec![
+            pointer_proposal("pointer_ui_read", "a"),
+            pointer_proposal("pointer_ui_find", "b"),
+            pointer_proposal("pointer_click", "c"),
+        ],
+    )
+    .await;
+    let last = run.traces.last().expect("a trace was rendered").join("\n");
+    assert!(
+        last.contains("earlier this turn"),
+        "one verbatim outcome, so the rest folded: {last}"
+    );
+    // The fold's short form, on the folded steps.
+    assert!(
+        last.contains("pointer_ui_read ok done"),
+        "the folded call keeps the marker: {last}"
+    );
+    // And the verbatim one keeps the long form.
+    assert!(
+        last.contains("[done; an identical call is denied]"),
+        "the verbatim call keeps the marker: {last}"
+    );
+}

@@ -839,6 +839,13 @@ pub struct Run {
     /// value into every fixture, and the names are literals at every call
     /// site anyway.
     pub withhold: &'static [&'static str],
+    /// `[router] depth` for this arm (M10 T2.1/T2.3). `Full` is the default
+    /// and is the engine's behaviour before adaptive depth existed.
+    ///
+    /// Only the desktop fixtures feel it: the memory abilities register one
+    /// tool and run with no router, and an arm that changed their numbers
+    /// would be reporting a narrowing nothing narrowed.
+    pub depth: nscore::Depth,
 }
 
 impl Harness {
@@ -1013,7 +1020,12 @@ impl Harness {
                 // The real router, not a stub. `tier` is one of the columns,
                 // and a fixture that decided the tier itself would report a
                 // routing nothing routed.
-                router: Some(Arc::new(KeywordRouter::default())),
+                router: Some(Arc::new(KeywordRouter {
+                    // M10 T2.1. `Full` on every existing run, so the ten
+                    // abilities' rows are the ones they have always been.
+                    depth: self.run.depth,
+                    ..KeywordRouter::default()
+                })),
                 ..common
             }
         } else {

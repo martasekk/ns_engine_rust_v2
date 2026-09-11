@@ -170,6 +170,16 @@ pub struct RouterSection {
     /// Words that mean something is to be done, so the tools must be legal.
     #[serde(default)]
     pub task_cues: Vec<String>,
+    /// M10 T2.1/T2.3: `"full"` (the default) or `"adaptive"`. `full` sends
+    /// every registered tool the tier allows, exactly as before this knob
+    /// existed; `adaptive` sends the tool groups the message's own cues name
+    /// and lets an `IllegalAction` widen the set for the rest of the turn.
+    ///
+    /// Default stays `full` until the live escalation rate holds under 5 per
+    /// 100 proposals (`ns-app budget`'s `rejections by reason`), whatever
+    /// the eval numbers say.
+    #[serde(default)]
+    pub depth: Option<String>,
 }
 
 impl Default for RouterSection {
@@ -178,6 +188,7 @@ impl Default for RouterSection {
             enabled: true,
             recall_cues: Vec::new(),
             task_cues: Vec::new(),
+            depth: None,
         }
     }
 }
@@ -194,7 +205,20 @@ impl RouterSection {
         if !self.task_cues.is_empty() {
             r.task_cues = self.task_cues.clone();
         }
+        // Resolved and reported at startup by `depth()`, which is what the
+        // composition root calls first; an unreadable value never gets this
+        // far, and if it somehow did, the default is today's behaviour.
+        r.depth = self.depth().unwrap_or_default();
         r
+    }
+
+    /// `[router] depth`, resolved. Err carries the message a startup error
+    /// should print, the same shape `[llm] schema_profile` uses.
+    pub fn depth(&self) -> Result<nscore::Depth, String> {
+        match self.depth.as_deref() {
+            None => Ok(nscore::Depth::Full),
+            Some(s) => nscore::Depth::parse(s).map_err(|e| format!("[router] {e}")),
+        }
     }
 }
 
@@ -716,6 +740,18 @@ pub struct LlmConfig {
     /// Send Anthropic cache breakpoints. Unset: the provider's own value.
     #[serde(default)]
     pub prompt_cache: Option<bool>,
+    /// M10 P4 (decision 2b): give the *emitter* a breakpoint too, after its
+    /// window block. Default **false**, and false is the request the emitter
+    /// has always sent, byte for byte.
+    ///
+    /// Separate from `prompt_cache` because the two are gated on different
+    /// facts. `prompt_cache` says whether breakpoints survive the hop to the
+    /// provider — a property of the endpoint. This says whether an emitter
+    /// prefix is worth one, which needs the tool array to be stable inside a
+    /// turn (M10 P2's rule) and the prefix to clear the provider's
+    /// 1,024-token floor. It has no effect unless `prompt_cache` is on.
+    #[serde(default)]
+    pub prompt_cache_emitter: bool,
     /// M10 T1.3: `"full"` (the default) or `"slim"` — which spelling of
     /// every tool description rides on each emitter call. `slim` is the
     /// same tool set with shorter text; it never removes a parameter.
@@ -1171,6 +1207,36 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
+    }
+
+    /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an
+    /// unknown depth is a startup error rather than a silent `full` — a
+    /// deployment that asked for `adaptive` and got `full` would read its
+    /// own escalation rate as a success.
+    #[test]
+    fn depth_and_the_emitter_cache_knob_default_to_todays_behaviour() {
+        let plain = AppConfig::parse("").unwrap();
+        assert_eq!(plain.router.depth().unwrap(), nscore::Depth::Full);
+        assert_eq!(plain.router.router().depth, nscore::Depth::Full);
+        assert!(!plain.llm.prompt_cache_emitter);
+
+        let on = AppConfig::parse(
+            "[router]\ndepth = \"adaptive\"\n[llm]\nprompt_cache_emitter = true\n",
+        )
+        .unwrap();
+        assert_eq!(on.router.depth().unwrap(), nscore::Depth::Adaptive);
+        assert_eq!(on.router.router().depth, nscore::Depth::Adaptive);
+        assert!(on.llm.prompt_cache_emitter);
+        // The cue lists are untouched by the depth knob.
+        assert!(!on.router.router().task_cues.is_empty());
+
+        let err = AppConfig::parse("[router]\ndepth = \"shallow\"")
+            .unwrap()
+            .router
+            .depth()
+            .unwrap_err();
+        assert!(err.starts_with("[router] "), "{err}");
+        assert!(err.contains("full, adaptive"), "{err}");
     }
 
     /// M10 T1.3. The knob defaults to today's behaviour, the way every knob

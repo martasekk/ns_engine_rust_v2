@@ -280,7 +280,62 @@ pub fn render_budget(
         "rejections by reason: {}\n",
         nscore::tally_rejections(events).line()
     ));
+    out.push_str(&chat_counter_line(events));
     out
+}
+
+/// How often a chat-tier turn never reached for a tool (M10, decision 1).
+///
+/// The decision it exists to inform is whether the plain-chat path keeps the
+/// emitter-first shape at all: if a chat turn's only proposal is
+/// `respond_directly`, the emitter call that produced it bought one word,
+/// and a single-call path would have bought the same word for half the
+/// requests. The decision is deferred until this number is read on real
+/// sessions, which is why the counter lands before the change does.
+///
+/// Read from the manifest's `tier` (M7) and the log's `Proposed` events, so
+/// it is the tier the turn actually ran at rather than what the router would
+/// say about the message today.
+fn chat_counter_line(events: &[Event]) -> String {
+    let mut chat_turns: Vec<u32> = Vec::new();
+    for e in events {
+        if let EventKind::ModelCall { manifest, .. } = &e.kind {
+            if manifest.tier == Some(nscore::Tier::Chat) && !chat_turns.contains(&e.turn) {
+                chat_turns.push(e.turn);
+            }
+        }
+    }
+    if chat_turns.is_empty() {
+        return "chat turns answered without a tool: no chat-tier turns in this log \
+                (the tier is recorded only when a router is configured)\n"
+            .to_string();
+    }
+    let answered = chat_turns
+        .iter()
+        .filter(|turn| {
+            let mut proposals = events.iter().filter(|e| e.turn == **turn).filter_map(|e| {
+                match &e.kind {
+                    EventKind::Proposed { proposal } => Some(proposal.action.as_str()),
+                    _ => None,
+                }
+            });
+            // "Only `respond_directly`" means at least one proposal and
+            // nothing else. A turn that proposed nothing at all answered
+            // through a fallback, and counting it here would flatter the
+            // number the single-call path is waiting on.
+            let mut any = false;
+            let all = proposals.all(|a| {
+                any = true;
+                a == nsllm::schema::RESPOND_DIRECTLY
+            });
+            any && all
+        })
+        .count();
+    format!(
+        "chat turns answered without a tool: {answered} of {} chat-tier turns proposed only \
+         respond_directly\n",
+        chat_turns.len()
+    )
 }
 
 fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::ActionSpec]) -> String {
@@ -1282,6 +1337,67 @@ mod tests {
         assert!(!tally.by_reason.contains_key("GuardDenied"));
         assert_eq!(tally.rejections(), 9);
         assert!((tally.per_hundred().unwrap() - 11.111).abs() < 0.01);
+    }
+
+    /// M10, decision 1 — measure the chat path before changing it. A chat
+    /// turn whose only proposal was `respond_directly` spent an emitter
+    /// request to be told to answer; the single-call path is decided on how
+    /// often that happens, and this is the counter that says.
+    #[test]
+    fn the_chat_counter_counts_turns_whose_only_proposal_was_respond_directly() {
+        fn proposed(log: &mut EventLog, turn: u32, action: &str) {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: action.into(),
+                        args: serde_json::json!({}),
+                        rationale: String::new(),
+                    },
+                },
+            );
+        }
+        fn tiered(tier: nscore::Tier) -> ContextManifest {
+            ContextManifest {
+                tier: Some(tier),
+                ..Default::default()
+            }
+        }
+
+        let mut log = log();
+        // Turn 1: chat, answered outright.
+        call(&mut log, 1, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+        proposed(&mut log, 1, "respond_directly");
+        // Turn 2: chat, but it reached for a tool first — the case the
+        // single-call path would have to keep working.
+        call(&mut log, 2, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+        proposed(&mut log, 2, "get_time");
+        proposed(&mut log, 2, "respond_directly");
+        // Turn 3: a task turn. Not in either half of the fraction.
+        call(&mut log, 3, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Task));
+        proposed(&mut log, 3, "respond_directly");
+        // Turn 4: chat, no proposal at all — a fallback answered it, and
+        // counting that as "answered without a tool" would flatter the
+        // number the decision is waiting on.
+        call(&mut log, 4, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("chat turns answered without a tool"))
+            .expect("a chat counter line");
+        assert_eq!(
+            line,
+            "chat turns answered without a tool: 1 of 3 chat-tier turns proposed only respond_directly"
+        );
+
+        // A log with no router behind it has no tiers, and a printed
+        // "0 of 0" would read as a chat path that always reached for a tool.
+        let mut plain = EventLog::new(SessionId("b".into()));
+        said(&mut plain, 1, "ahoj");
+        let out = render_budget(plain.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        assert!(out.contains("no chat-tier turns in this log"), "{out}");
     }
 
     /// A log with no proposals has no rate, and a printed `0.0 per 100`

@@ -761,6 +761,9 @@ impl Engine {
             return crate::router::Route {
                 tier: nscore::Tier::Task,
                 cues: Vec::new(),
+                // No router, no narrowing: the full set, which is what every
+                // scripted double and every replay has always been sent.
+                tools: None,
             };
         };
         let state = fold(events);
@@ -988,6 +991,16 @@ impl Engine {
         // model call, from the message and this turn's own history only.
         let routed = self.route_turn(&incoming.text, log.events(), turn);
         let mut tier = routed.tier;
+        // M10 T2.1: which registered tools ride this turn, chosen once here
+        // and held across every iteration. `None` is the full set.
+        //
+        // Once per turn rather than once per iteration is the whole rule: a
+        // set recomputed each pass would change the `tools` array under a
+        // provider prefix cache and buy nothing, since nothing between two
+        // iterations of one turn changes what the *message* asked for
+        // (decision 2, 2026-09-11). Escalation below is the one thing
+        // allowed to move it, and it only ever widens.
+        let mut selected_tools = routed.tools.clone();
         // `Deep` runs the recall itself rather than waiting to be asked for
         // it. That is the saving: on a fifty-request day an emitter iteration
         // spent proposing `recall` is a request that bought no progress, and
@@ -1099,6 +1112,16 @@ impl Engine {
                         .iter()
                         .map(|t| t.spec().clone())
                         .filter(|s| !denied_this_turn.contains(&s.name))
+                        // M10 T2.1. A *turn*-level decision consulted here
+                        // rather than re-taken here: `selected_tools` is
+                        // fixed for the loop except when escalation widens
+                        // it, so this filter yields the same names on every
+                        // iteration and the array's bytes do not move.
+                        .filter(|s| {
+                            selected_tools
+                                .as_ref()
+                                .map_or(true, |sel| sel.contains(&s.name))
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -1333,14 +1356,67 @@ impl Engine {
                 // guess about the message (MemFlow's validator-retries, with
                 // no second model). The tier only ever rises, so this cannot
                 // loop.
-                let tiered_out = tier < nscore::Tier::Task
-                    && self
-                        .parts
-                        .tools
-                        .iter()
-                        .any(|t| t.spec().name == proposal.action);
-                if tiered_out {
-                    tier = nscore::Tier::Task;
+                let registered = self
+                    .parts
+                    .tools
+                    .iter()
+                    .any(|t| t.spec().name == proposal.action);
+                let tiered_out = tier < nscore::Tier::Task && registered;
+                // M10 T2.2: escalation is adaptive depth's discovery path,
+                // and the same argument as the tier's. The cue table is a
+                // guess about the message; a proposal naming a real tool is
+                // the model telling us the guess was wrong, and one widening
+                // is cheaper than a turn that cannot reach the action at
+                // all. It widens to the *full* set for the rest of the turn
+                // rather than adding one name, because a task that needed
+                // `pointer_scroll` needs whatever comes after it too — and
+                // it is the one legitimate mid-turn change to the `tools`
+                // array, so it happens once and never again.
+                //
+                // A tool already refused this turn is excluded: widening
+                // would not make it legal, and the loop would spin.
+                let withheld = registered
+                    && !denied_this_turn.contains(&proposal.action)
+                    && selected_tools
+                        .as_ref()
+                        .is_some_and(|sel| !sel.contains(&proposal.action));
+                if tiered_out || withheld {
+                    if tiered_out {
+                        tier = nscore::Tier::Task;
+                    }
+                    if withheld {
+                        selected_tools = None;
+                        // Recorded, because an escalation is a request
+                        // already spent and T0.2's `rejections by reason` is
+                        // where that is read — the rate this depth is gated
+                        // on (under 5 per 100 proposals) has to come from
+                        // the log rather than from a counter nothing
+                        // persists.
+                        //
+                        // Recorded but *not* denied: `denied_this_turn`
+                        // would keep the tool illegal for the rest of the
+                        // turn, which is exactly what the widening just
+                        // undid. It differs from the tier's escalation
+                        // (which records nothing) for one reason — the tier
+                        // is bounded and self-announcing, while the cue
+                        // table is a guess whose error rate is the number
+                        // `depth = adaptive` ships on, and a guess nobody
+                        // counts is a guess nobody can retire. The line
+                        // reaches the emitter through the trace, and it is
+                        // true: that proposal was refused on that
+                        // iteration. It is left out of
+                        // `rejections_this_turn` so it is said once.
+                        log.append(
+                            turn,
+                            now(),
+                            EventKind::Rejected {
+                                proposal_of: pid,
+                                reason: RejectReason::IllegalAction {
+                                    action: proposal.action.clone(),
+                                },
+                            },
+                        );
+                    }
                     continue;
                 }
                 let reason = RejectReason::IllegalAction {

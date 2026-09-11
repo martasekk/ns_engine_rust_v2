@@ -16,7 +16,8 @@ const SYSTEM_PREAMBLE: &str = "You translate the user's latest message into exac
 call from the provided tools. Choose respond_directly when no tool applies. Never invent \
 argument values the user did not supply. The context lists actions already performed this turn \
 with their results; never repeat a completed action — when those results answer the user, \
-choose respond_directly. ";
+choose respond_directly. A line marked done is such an action: proposing it again is refused \
+and costs a step. ";
 
 /// Assembled rather than written out so the rationale instruction has exactly
 /// one home in the workspace and the test can assert it appears once.
@@ -28,6 +29,7 @@ pub struct CloudEmitter {
     client: OpenRouterClient,
     model: String,
     max_tokens: u32,
+    prompt_cache: bool,
 }
 
 impl CloudEmitter {
@@ -39,7 +41,25 @@ impl CloudEmitter {
             client,
             model,
             max_tokens: 4096,
+            prompt_cache: false,
         }
+    }
+
+    /// `[llm] prompt_cache_emitter` (M10 P4, decision 2b). Off by default,
+    /// and off is byte-identical to the request this emitter has always
+    /// sent.
+    ///
+    /// Worth turning on only where the two conditions hold together: the
+    /// provider forwards cache breakpoints (the OpenRouter preset), and the
+    /// `tools` array is stable across the turn's iterations, which is P2's
+    /// rule. On the recorded turn 21 the array (731 tokens) plus
+    /// facts+summary+window (538) clears the 1,024-token floor a breakpoint
+    /// needs; the replier's prefix (225) does not, which is why only this
+    /// one is behind a knob. Verified by `cached_tokens` on a paid-tier
+    /// session, never by reading this code.
+    pub fn with_prompt_cache(mut self, on: bool) -> Self {
+        self.prompt_cache = on;
+        self
     }
 }
 
@@ -47,6 +67,21 @@ impl CloudEmitter {
 /// turn → this turn's actions → pending/rejections → guidance. Stable blocks
 /// first.
 fn render_context(ctx: &EmitterContext) -> String {
+    let (stable, rest) = render_context_split(ctx);
+    format!("{stable}{rest}")
+}
+
+/// The same text, cut where a cache breakpoint belongs (M10 P4, decision
+/// 2b): everything through the verbatim window, then everything from the
+/// current turn on.
+///
+/// The cut is not arbitrary. Above it is the run of blocks that does not
+/// change between two iterations of one turn — facts, summary, obligations,
+/// window — and below it is the trace, which is the thing that *does* change
+/// on every iteration and is why the emitter prefix is worth caching at all.
+/// Concatenated, the two halves are the string `render_context` has always
+/// produced, which is what makes the knob's off position byte-identical.
+fn render_context_split(ctx: &EmitterContext) -> (String, String) {
     let mut s = String::new();
     if !ctx.facts.is_empty() {
         s.push_str("Facts:\n");
@@ -76,6 +111,8 @@ fn render_context(ctx: &EmitterContext) -> String {
         ));
         s.push('\n');
     }
+    // ---- breakpoint ----
+    let stable = std::mem::take(&mut s);
     s.push_str(&format!("Current turn:\nuser: {}\n", ctx.user_text));
     if !ctx.trace_so_far.is_empty() {
         s.push_str("This turn so far:\n");
@@ -104,7 +141,7 @@ fn render_context(ctx: &EmitterContext) -> String {
         }
     }
     s.push_str("Propose the next action.");
-    s
+    (stable, s)
 }
 
 #[async_trait]
@@ -114,6 +151,21 @@ impl Emitter for CloudEmitter {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
+        // Content-parts only when the knob is on, and the same form the
+        // replier already uses: one `cache_control` breakpoint on the part
+        // that ends the window block, so what the provider is asked to keep
+        // is the tool array plus the blocks that do not move inside a turn.
+        // Off, this is `serde_json::Value::String` and the request is the
+        // one this emitter has always sent, byte for byte.
+        let user_content = if self.prompt_cache {
+            let (stable, rest) = render_context_split(&ctx);
+            serde_json::json!([
+                {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": rest},
+            ])
+        } else {
+            serde_json::Value::String(render_context(&ctx))
+        };
         let request = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -122,7 +174,7 @@ impl Emitter for CloudEmitter {
             "tools": build_tools(legal),
             "messages": [
                 {"role": "system", "content": system_prompt()},
-                {"role": "user", "content": render_context(&ctx)},
+                {"role": "user", "content": user_content},
             ],
         });
         let body = self
@@ -346,6 +398,57 @@ mod tests {
         assert_eq!(recorded.len(), 1, "the turn's sink took the call");
         assert_eq!(recorded[0].role, "emitter");
         assert!(own.drain().is_empty(), "the client's own sink was not used");
+    }
+
+    /// M10 P4 (decision 2b). The breakpoint ends the window block, because
+    /// that is the last thing in an emitter prompt that does not change
+    /// between two iterations of one turn — the trace below it changes on
+    /// every one. And off is not "nearly the same request": it is the same
+    /// string, in the same shape, which is what lets this ship default off
+    /// and be turned on by one line of config.
+    #[tokio::test]
+    async fn the_emitter_breakpoint_falls_after_the_window_block_and_is_absent_when_off() {
+        let on = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        emitter(on.clone())
+            .with_prompt_cache(true)
+            .propose(ctx(), &legal())
+            .await
+            .unwrap();
+        let reqs = on.requests.lock().unwrap();
+        let parts = reqs[0]["messages"][1]["content"]
+            .as_array()
+            .expect("content-parts form");
+        assert_eq!(parts.len(), 2);
+        let head = parts[0]["text"].as_str().unwrap();
+        let tail = parts[1]["text"].as_str().unwrap();
+        assert_eq!(
+            parts[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "the breakpoint is on the part that ends the window"
+        );
+        assert!(parts[1].get("cache_control").is_none());
+        assert!(head.contains("Facts:"), "{head}");
+        assert!(head.contains("Recent turns:"), "{head}");
+        assert!(head.ends_with("\n"), "the window block ends it: {head:?}");
+        assert!(!head.contains("Current turn:"), "{head}");
+        assert!(tail.starts_with("Current turn:"), "{tail}");
+        assert!(tail.contains("This turn so far:"), "{tail}");
+        let joined = format!("{head}{tail}");
+        drop(reqs);
+
+        let off = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        emitter(off.clone()).propose(ctx(), &legal()).await.unwrap();
+        let reqs = off.requests.lock().unwrap();
+        let plain = reqs[0]["messages"][1]["content"]
+            .as_str()
+            .expect("a plain string, as it has always been");
+        assert_eq!(plain, joined, "the two halves are the one prompt");
     }
 
     #[tokio::test]

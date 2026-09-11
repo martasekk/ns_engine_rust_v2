@@ -312,20 +312,33 @@ pub struct Args {
     /// harness's `EngineConfig` **and** to the stores it searches — the
     /// prior lives on the store.
     pub activation: f32,
+    /// `[router] depth` for this run (M10 T2.1), without editing the config.
+    ///
+    /// Mirrors `--activation` for the same reason: the question is whether
+    /// BoR on the desktop abilities and the hard-query fixture survive the
+    /// narrowing, and that is two runs of the same set, not two configs.
+    pub depth: nscore::Depth,
 }
 
 const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase] \
-     [--ablate facts|summary|guidance] [--activation <weight>]";
+     [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
     let mut paraphrase = false;
     let mut ablate = None;
     let mut activation = 0.0f32;
+    let mut depth = nscore::Depth::Full;
     let mut rest = args.iter();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--depth" => {
+                let d = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--depth needs full or adaptive)"))?;
+                depth = nscore::Depth::parse(d).map_err(|e| format!("{USAGE} ({e})"))?;
+            }
             "--activation" => {
                 let w = rest
                     .next()
@@ -361,6 +374,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         paraphrase,
         ablate,
         activation,
+        depth,
     })
 }
 
@@ -521,13 +535,17 @@ fn now_ms() -> u64 {
 /// The tie corpus is the arm built to move, and printing the two together is
 /// what makes the difference attributable — a run whose abilities held and
 /// whose ties changed is the reading the knob needs.
-pub async fn run_at(ledger_path: &Path, activation: f32) -> i32 {
+pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
     let abilities = run_all_for(Run {
         activation_weight: activation,
+        depth,
         ..Run::default()
     })
     .await;
-    let code = report(&abilities, ledger_path, activation);
+    if depth != nscore::Depth::Full {
+        println!("router depth: {} (M10 T2.1)", depth.as_str());
+    }
+    let code = report(&abilities, ledger_path, activation, depth);
     print!(
         "{}",
         nstestkit::ties::render(&nstestkit::ties::measure(activation).await)
@@ -539,10 +557,22 @@ pub async fn run_at(ledger_path: &Path, activation: f32) -> i32 {
 /// without one. The six abilities pass, which is exactly why the non-zero
 /// path needs its own test: an exit code nothing exercises is a gate nobody
 /// has checked.
-fn report(abilities: &[Ability], ledger_path: &Path, activation: f32) -> i32 {
+fn report(abilities: &[Ability], ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
     print!("{}", render_table(abilities));
 
     let current = Row::build(harness_hash(Path::new(".")), now_ms(), abilities);
+    // Same rule as the activation arm, and for the same reason: a run at
+    // `depth = adaptive` is a different arm, and recording it would make the
+    // next diff read as a harness change.
+    if depth != nscore::Depth::Full {
+        println!(
+            "ledger: not written — this run is the depth = {} arm, \
+             not the default one the ledger diffs.",
+            depth.as_str()
+        );
+        let failed = abilities.iter().filter(|a| !a.passed).count();
+        return i32::from(failed > 0);
+    }
     // A row is the *default* arm's numbers, and the ledger's whole job is to
     // let two runs be diffed position by position. A run at a non-default
     // `activation_weight` is a different arm; recording it would make the
@@ -835,9 +865,22 @@ mod tests {
     fn a_failing_ability_exits_non_zero_and_still_records_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
-        assert_eq!(report(&[ability("abstention", true, 7)], &path, 0.0), 0);
         assert_eq!(
-            report(&[ability("abstention", false, 7)], &path, 0.0),
+            report(
+                &[ability("abstention", true, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            0
+        );
+        assert_eq!(
+            report(
+                &[ability("abstention", false, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
             1,
             "a failed ability has to reach the exit code"
         );
@@ -859,13 +902,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
         std::fs::write(&path, "{ this is not json").unwrap();
-        assert_eq!(report(&[ability("abstention", true, 7)], &path, 0.0), 0);
+        assert_eq!(
+            report(
+                &[ability("abstention", true, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            0
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{ this is not json",
             "the operator's file is untouched"
         );
-        assert_eq!(report(&[ability("abstention", false, 7)], &path, 0.0), 1);
+        assert_eq!(
+            report(
+                &[ability("abstention", false, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full
+            ),
+            1
+        );
     }
 
     #[test]
@@ -921,6 +980,22 @@ mod tests {
         let with_block = a(vec!["--ablate", "facts", "--activation", "1.0"]).unwrap();
         assert_eq!(with_block.activation, 1.0);
         assert_eq!(with_block.ablate, Some(nscore::Ablate::Facts));
+
+        // M10 T2.1, mirroring `--activation`: a second arm of the same set,
+        // not a second config.
+        assert_eq!(a(vec![]).unwrap().depth, nscore::Depth::Full);
+        assert_eq!(
+            a(vec!["--depth", "adaptive"]).unwrap().depth,
+            nscore::Depth::Adaptive
+        );
+        assert_eq!(
+            a(vec!["--depth", "full", "--activation", "0.5"])
+                .unwrap()
+                .depth,
+            nscore::Depth::Full
+        );
+        assert!(a(vec!["--depth"]).is_err(), "the depth is required");
+        assert!(a(vec!["--depth", "shallow"]).is_err(), "and it is checked");
 
         assert!(a(vec!["--activation"]).is_err(), "the weight is required");
         assert!(a(vec!["--activation", "-1"]).is_err(), "no negative weight");
