@@ -48,13 +48,13 @@
 //! The doubles it needs (`script`, `store`) were already public for the same
 //! reason.
 
+use nscore::*;
 use nsengine::router::KeywordRouter;
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{
     Engine, EngineConfig, ASK_CLARIFICATION, FORGET_FACT, INSPECT_RESULT, RECALL, REMEMBER_FACT,
 };
-use nscore::*;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -688,10 +688,18 @@ struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
+    /// The context block this run blanks, or `None` for the full arm (M9
+    /// T0.4). Passed straight into every `EngineConfig` the fixture builds,
+    /// so every turn of an ablated arm runs with the block gone — an arm
+    /// that ablated only the graded turn would measure a harness nobody
+    /// runs.
+    ablate: Option<Ablate>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    /// The full arm passes `None`; `ns-app eval --ablate <block>` passes the
+    /// block, and every engine this fixture builds is configured with it.
+    fn ablating(ablate: Option<Ablate>) -> Self {
         Self {
             store: Arc::new(InMemoryStore::new()),
             shown: Arc::new(Mutex::new(Vec::new())),
@@ -699,14 +707,15 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
+            ablate,
         }
     }
 
     /// The same harness with a desktop wired into it.
-    fn desktop() -> Self {
+    fn desktop_ablating(ablate: Option<Ablate>) -> Self {
         Self {
             desktop: true,
-            ..Self::new()
+            ..Self::ablating(ablate)
         }
     }
 
@@ -782,6 +791,9 @@ impl Harness {
         // fixture grades.
         let common = EngineConfig {
             max_echo_ratio: 1.1,
+            // M9 T0.4. `None` on every existing run, so the suite's numbers
+            // are the ones they have always been.
+            ablate: self.ablate,
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {
@@ -1220,8 +1232,8 @@ pub fn render_table(rows: &[Ability]) -> String {
 /// window does *not* carry "Martin" while the context does. The values are
 /// there because they were pinned, which is why no `recall` is needed — the
 /// pass condition in the Phase 7 table.
-async fn information_extraction() -> Ability {
-    let h = Harness::new();
+async fn information_extraction(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::ablating(ablate);
     let sid = SessionId("eval-extraction".into());
     h.turn(
         &sid,
@@ -1289,8 +1301,8 @@ async fn information_extraction() -> Ability {
 /// crossed through the transcript, because `search_turns` is per session by
 /// construction. Only the scoped fact crossed. The failure this excludes is
 /// the recorded one — asking the user again for something already stored.
-async fn multi_session_reasoning() -> Ability {
-    let h = Harness::new();
+async fn multi_session_reasoning(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::ablating(ablate);
     let first = SessionId("eval-multi-a".into());
     let second = SessionId("eval-multi-b".into());
     h.turn(
@@ -1340,8 +1352,8 @@ async fn multi_session_reasoning() -> Ability {
 /// two sources and "Martin" has exactly one: the superseded marker. The graded
 /// check is that the window is clean of "Martin" — otherwise the fixture would
 /// pass on the transcript and say nothing about fact versioning.
-async fn temporal_reasoning() -> Ability {
-    let h = Harness::new();
+async fn temporal_reasoning(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::ablating(ablate);
     let sid = SessionId("eval-temporal".into());
     h.turn(
         &sid,
@@ -1398,8 +1410,8 @@ async fn temporal_reasoning() -> Ability {
 /// exactly one `user.age` line whose *value* is the new age. The old age is
 /// legitimate material, but only behind the `(was …)` marker, which is why
 /// the check splits the line there instead of searching the whole of it.
-async fn knowledge_updates() -> Ability {
-    let h = Harness::new();
+async fn knowledge_updates(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::ablating(ablate);
     let sid = SessionId("eval-updates".into());
     h.turn(&sid, "i am 17", vec![remember("user.age", "17")])
         .await;
@@ -1488,11 +1500,11 @@ async fn knowledge_updates() -> Ability {
 /// The memory is not empty: `user.name` is stored first, so what is being
 /// graded is a missing key, not a missing store (F4's junk keys with values
 /// the user never said are the same failure from the other side).
-async fn abstention() -> Ability {
+async fn abstention(ablate: Option<Ablate>) -> Ability {
     const INVENTED: &str = "Ostrava";
     const INVENTING_DRAFT: &str = "You live in Ostrava.";
 
-    let h = Harness::new();
+    let h = Harness::ablating(ablate);
     let sid = SessionId("eval-abstention".into());
     h.turn(
         &sid,
@@ -1577,8 +1589,8 @@ async fn abstention() -> Ability {
 /// out of the six-turn window by turn 8, which is what makes the "after"
 /// check mean anything; the turn-9 trace line is `forget_fact -> ok: forgot
 /// user.name`, which names the key and never the value.
-async fn selective_forgetting() -> Ability {
-    let h = Harness::new();
+async fn selective_forgetting(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::ablating(ablate);
     let sid = SessionId("eval-forgetting".into());
     h.turn(
         &sid,
@@ -1667,8 +1679,8 @@ const TRACE_CEILING: usize = 6_500;
 /// first proposal is a misroute — the tier widens, no refusal is recorded,
 /// and one iteration is the price. That path is a request on a fifty-request
 /// day, so it is counted rather than assumed free.
-async fn desktop_open_and_search() -> Ability {
-    let h = Harness::desktop();
+async fn desktop_open_and_search(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::desktop_ablating(ablate);
     let sid = SessionId("eval-desktop-open".into());
     let shown = h
         .desktop_turn(
@@ -1774,8 +1786,8 @@ async fn desktop_open_and_search() -> Ability {
 /// to avoid `ui_read`: one action produced 98% of the tool text in that
 /// session, and the advice was to not look at the screen. The point of the
 /// cap is that looking at the screen stops costing that.
-async fn desktop_find_and_click() -> Ability {
-    let h = Harness::desktop();
+async fn desktop_find_and_click(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::desktop_ablating(ablate);
     let sid = SessionId("eval-desktop-find".into());
     let shown = h
         .desktop_turn(
@@ -1859,8 +1871,8 @@ async fn desktop_find_and_click() -> Ability {
 /// If this task can pass with no `inspect_result` call then the target was
 /// not past the cap and the fixture is measuring nothing — which is exactly
 /// what raising the cap does to it.
-async fn desktop_clipped_tail() -> Ability {
-    let h = Harness::desktop();
+async fn desktop_clipped_tail(ablate: Option<Ablate>) -> Ability {
+    let h = Harness::desktop_ablating(ablate);
     let sid = SessionId("eval-desktop-tail".into());
     let shown = h
         .desktop_turn(
@@ -1938,16 +1950,26 @@ async fn desktop_clipped_tail() -> Ability {
 /// the numbers a release is compared on and a concurrent run would let the
 /// scheduler into them. It takes under a second; there is nothing to buy.
 pub async fn run_all() -> Vec<Ability> {
+    run_all_ablating(None).await
+}
+
+/// The same set with one context block blanked on every model call of every
+/// fixture (M9 T0.4), or the full set when `ablate` is `None`.
+///
+/// A parameter rather than a switch the fixtures read off a global: the two
+/// arms are built one after the other in the same process, and `cargo test`
+/// runs this file's own tests beside them.
+pub async fn run_all_ablating(ablate: Option<Ablate>) -> Vec<Ability> {
     vec![
-        information_extraction().await,
-        multi_session_reasoning().await,
-        temporal_reasoning().await,
-        knowledge_updates().await,
-        abstention().await,
-        selective_forgetting().await,
-        desktop_open_and_search().await,
-        desktop_find_and_click().await,
-        desktop_clipped_tail().await,
+        information_extraction(ablate).await,
+        multi_session_reasoning(ablate).await,
+        temporal_reasoning(ablate).await,
+        knowledge_updates(ablate).await,
+        abstention(ablate).await,
+        selective_forgetting(ablate).await,
+        desktop_open_and_search(ablate).await,
+        desktop_find_and_click(ablate).await,
+        desktop_clipped_tail(ablate).await,
     ]
 }
 

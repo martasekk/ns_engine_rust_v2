@@ -421,6 +421,7 @@ async fn main() {
                 cfg.memory.caps(),
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
+                cfg.persona.text.len(),
             )
         );
         return;
@@ -441,6 +442,10 @@ async fn main() {
         };
         if parsed.paraphrase {
             std::process::exit(eval::run_paraphrase().await);
+        }
+        // M9 T0.4. A report, not a gate: exits 0 whatever the delta.
+        if let Some(block) = parsed.ablate {
+            std::process::exit(eval::run_ablate(block).await);
         }
         std::process::exit(eval::run(&parsed.ledger).await);
     }

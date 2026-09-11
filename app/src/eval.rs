@@ -264,28 +264,68 @@ pub struct Args {
     /// would make a fired trigger look like a regression, which it is not —
     /// it is the trigger doing its job.
     pub paraphrase: bool,
+    /// Run the ability set twice with this block blanked instead of once
+    /// whole (M9 T0.4).
+    ///
+    /// A third mode for the same reason `--paraphrase` is a second one: it
+    /// grades a *block*, not the harness, and the ablated arm is meant to
+    /// fail. Folded into the gate it would read as a regression, which is
+    /// the opposite of what a working ablation means.
+    pub ablate: Option<nscore::Ablate>,
 }
+
+const USAGE: &str =
+    "usage: ns-app eval [<ledger-path>] [--paraphrase] [--ablate facts|summary|guidance]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
     let mut paraphrase = false;
-    for a in args {
+    let mut ablate = None;
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--ablate" => {
+                let block = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--ablate needs a block)"))?;
+                ablate = Some(
+                    nstestkit::ablate::parse_block(block)
+                        .ok_or_else(|| format!("{USAGE} (got {block:?})"))?,
+                );
+            }
             path if !path.starts_with('-') && ledger.is_none() => {
                 ledger = Some(PathBuf::from(path))
             }
-            other => {
-                return Err(format!(
-                    "usage: ns-app eval [<ledger-path>] [--paraphrase] (got {other:?})"
-                ))
-            }
+            other => return Err(format!("{USAGE} (got {other:?})")),
         }
     }
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
+        ablate,
     })
+}
+
+/// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
+/// T0.4).
+///
+/// Exits 0 whatever the delta is. The ablated arm failing is the measurement
+/// succeeding: it says the block was carrying those abilities. A zero delta
+/// is equally a result — either the block is not earning its tokens, or this
+/// scripted suite cannot see what it earns — and neither is a release
+/// failure, so neither may turn the exit code red.
+pub async fn run_ablate(block: nscore::Ablate) -> i32 {
+    use nstestkit::ablate;
+
+    let report = ablate::measure(block).await;
+    print!("{}", ablate::render(&report));
+    println!(
+        "  both arms are the same {} fixtures against the same scripted doubles; \
+         nothing here spends a request.",
+        report.full.len()
+    );
+    0
 }
 
 /// `ns-app eval --paraphrase` — the M6 §12.8 measurement, against both
@@ -715,5 +755,40 @@ mod tests {
 
         assert!(parse_args(&["--live".to_string()]).is_err());
         assert!(parse_args(&["--paraphrases".to_string()]).is_err());
+    }
+
+    /// `--ablate` takes a block name in the next argument, composes with a
+    /// ledger path either way round, and refuses anything that is not one of
+    /// the three blocks — including `obligations`, which the plan lists but
+    /// which has no block to blank yet.
+    #[test]
+    fn the_ablate_arm_takes_a_block_and_refuses_anything_else() {
+        let a =
+            |args: Vec<&str>| parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(a(vec![]).unwrap().ablate, None);
+        assert_eq!(
+            a(vec!["--ablate", "facts"]).unwrap().ablate,
+            Some(nscore::Ablate::Facts)
+        );
+        assert_eq!(
+            a(vec!["--ablate", "summary"]).unwrap().ablate,
+            Some(nscore::Ablate::Summary)
+        );
+        for args in [
+            vec!["runs.json", "--ablate", "guidance"],
+            vec!["--ablate", "guidance", "runs.json"],
+        ] {
+            let parsed = a(args).unwrap();
+            assert_eq!(parsed.ablate, Some(nscore::Ablate::Guidance));
+            assert_eq!(parsed.ledger, PathBuf::from("runs.json"));
+        }
+
+        assert!(
+            a(vec!["--ablate"]).is_err(),
+            "a bare --ablate names no block"
+        );
+        assert!(a(vec!["--ablate", "obligations"]).is_err());
+        assert!(a(vec!["--ablate", "runs.json"]).is_err());
     }
 }
