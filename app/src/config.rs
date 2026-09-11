@@ -106,6 +106,24 @@ pub struct ModelsSection {
     /// falls under it has moved.
     #[serde(default = "default_evaluator_min_kappa")]
     pub evaluator_min_kappa: f64,
+    /// The paid offline judge (M11 T1.3): a model id for
+    /// `nsevolution::client_eval::ClientEvaluator`, or unset.
+    ///
+    /// **Unset is not a disabled feature, it is the absence of one.** With no
+    /// id here `ClientEvaluator::for_model` returns `None` and nothing is
+    /// constructed, so the idle pass spends exactly the requests it spent
+    /// before — zero. Set it and one request is spent per newly-graded turn,
+    /// capped by `evaluate_budget_turns` and paid once per turn ever, because
+    /// a graded turn is remembered by its `Graded` event.
+    ///
+    /// It is under `[models]` beside `evaluate_budget_turns` and
+    /// `evaluator_min_kappa` rather than under `[llm]` with the roles,
+    /// because it is not a role: it never runs in a turn, never enters the
+    /// guard chain, and its output is κ-gated like every other evaluator's.
+    /// The endpoint and key it dials are the emitter's, so naming a judge
+    /// needs no second provider block.
+    #[serde(default)]
+    pub judge_model: Option<String>,
 }
 
 impl Default for ModelsSection {
@@ -118,6 +136,7 @@ impl Default for ModelsSection {
             relevance_cut: default_relevance_cut(),
             evaluate_budget_turns: default_evaluate_budget_turns(),
             evaluator_min_kappa: default_evaluator_min_kappa(),
+            judge_model: None,
         }
     }
 }

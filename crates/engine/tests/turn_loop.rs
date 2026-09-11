@@ -5006,6 +5006,11 @@ async fn the_marker_survives_folding() {
 /// `/embed` increments it and a turn that does not cannot.
 struct CountingEncoder {
     embeds: Arc<std::sync::atomic::AtomicUsize>,
+    /// Every document any rerank was asked about, in order. A count says
+    /// *that* the service was dialled; these say **which retriever** dialled
+    /// it, which is the only way to tell a fact search from a turn search
+    /// when both run in one turn (M11 T1.1 follow-up).
+    reranked: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 const EXEMPLAR_CONCEPTS: &[&[&str]] = &[
@@ -5052,6 +5057,7 @@ impl TextEncoder for CountingEncoder {
         docs: &[String],
         k: usize,
     ) -> Result<Vec<(usize, f32)>, StoreError> {
+        self.reranked.lock().unwrap().extend(docs.iter().cloned());
         let q = Self::vector(query);
         let mut scored: Vec<(usize, f32)> = docs
             .iter()
@@ -5104,13 +5110,28 @@ fn hybrid_store(
     Arc<nsmemory_sqlite::SqliteStore>,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (store, embeds, _docs) = watching_hybrid_store(dir);
+    (store, embeds)
+}
+
+/// [`hybrid_store`] plus the rerank documents, for the tests that have to
+/// tell which retriever made the call.
+fn watching_hybrid_store(
+    dir: &tempfile::TempDir,
+) -> (
+    Arc<nsmemory_sqlite::SqliteStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
     let embeds: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let reranked: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let store = nsmemory_sqlite::SqliteStore::open(&dir.path().join("h.sqlite"))
         .unwrap()
         .with_encoder(Arc::new(CountingEncoder {
             embeds: embeds.clone(),
+            reranked: reranked.clone(),
         }));
-    (Arc::new(store), embeds)
+    (Arc::new(store), embeds, reranked)
 }
 
 /// M8 T3.1: the backfill lives in the idle pass, so a turn — on the shipped
@@ -5303,5 +5324,264 @@ async fn a_chat_tier_turn_retrieves_no_exemplars() {
             .any(|e| matches!(&e.kind, EventKind::ToolCalled { action, .. }
                 if action == "exemplars")),
         "no exemplars step on the chat tier"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11 T1.1 follow-up: the *fact* path takes the same gate the turn path
+// already took. T1.1 landed `search_facts_hybrid` in the store and left every
+// caller on `search_facts`; `select_facts` now dials it when
+// `[recall] hybrid` is on **and** the turn's tier is above `Chat`.
+//
+// Probed through the encoder's rerank, not through a call count: a `Deep`
+// turn's recall reaches `/embed` and `/rerank` on its own, so a count cannot
+// say which retriever asked. A *fact* document can — `fact_text` renders
+// `user.city` as "user city", which no turn line in these fixtures contains.
+
+/// [`hybrid_engine`] with an emitter that answers directly instead of
+/// calling a tool.
+///
+/// Load-bearing, and the first version of these tests got it wrong: a turn
+/// whose emitter proposes a registered tool is *upgraded* to `Task`
+/// mid-loop (`turn.rs`, the tiered-out branch), so a `Chat`-routed turn that
+/// calls `echo` is legitimately no longer a `Chat` turn by the time the
+/// reply is drafted. To ask what the `Chat` tier does, the turn has to stay
+/// in it.
+fn fact_engine(store: Arc<nsmemory_sqlite::SqliteStore>, tier: Tier, cfg: EngineConfig) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+        rationale: "".into(),
+        action: "respond_directly".into(),
+        args: serde_json::json!({}),
+    }])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            router: Some(Arc::new(FixedRouter(tier))),
+            ..cfg
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+/// Whether any rerank this encoder answered was over fact documents.
+fn saw_fact_docs(docs: &std::sync::Mutex<Vec<String>>, needle: &str) -> bool {
+    docs.lock().unwrap().iter().any(|d| d.contains(needle))
+}
+
+async fn store_with_a_fact(
+    store: &nsmemory_sqlite::SqliteStore,
+    sid: &SessionId,
+) -> Result<(), StoreError> {
+    store
+        .put_fact(Fact {
+            scope: "global".into(),
+            key: "user.city".into(),
+            value: serde_json::json!("Praha"),
+            prov: nscore::Provenance::UserInput {
+                turn: 1,
+                start: 0,
+                end: 5,
+            },
+            trust: Trust::User,
+            confidence: 1.0,
+            state: nscore::FactState::Current,
+            valid_from: Timestamp(1),
+            valid_to: None,
+            last_validated: Timestamp(1),
+            uses: 0,
+            last_used: Timestamp(0),
+            exposures: 0,
+            credits: 0,
+        })
+        .await?;
+    // One turn of history, so the window and the recall path have something
+    // that is not a fact to work on.
+    let mut log = EventLog::new(sid.clone());
+    log.append(
+        1,
+        Timestamp(1),
+        EventKind::UserSaid {
+            text: "the invoice window is titled Faktury".into(),
+        },
+    );
+    store.append(sid, log.events()).await?;
+    store.backfill_embeddings(100).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chat_turn_selects_facts_lexically_even_with_hybrid_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds, docs) = watching_hybrid_store(&dir);
+    let sid = SessionId("chat".into());
+    store_with_a_fact(&store, &sid).await.unwrap();
+    docs.lock().unwrap().clear();
+
+    let e = fact_engine(
+        store.clone(),
+        Tier::Chat,
+        EngineConfig {
+            recall_hybrid: true,
+            ..EngineConfig::default()
+        },
+    );
+    // A query the lexical retriever can serve on its own — the whole claim is
+    // that a Chat turn still gets its facts, just without the round trip.
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what is my city".into(),
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !saw_fact_docs(&docs, "user city"),
+        "a Chat turn's facts stay lexical however the knob is set: {:?}",
+        docs.lock().unwrap()
+    );
+    // And not because the facts were skipped altogether: the reply path bumps
+    // `uses` on every fact it selected, so a 1 here is the lexical retriever
+    // having done the work. Without it the assertion above would also pass on
+    // a turn that showed no facts at all.
+    let after = store.facts("global", "user.city").await.unwrap();
+    assert_eq!(
+        after.first().map(|f| f.uses),
+        Some(1),
+        "the fact was still selected, by the lexical path"
+    );
+}
+
+#[tokio::test]
+async fn a_deep_turn_selects_facts_hybrid_when_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _embeds, docs) = watching_hybrid_store(&dir);
+    let sid = SessionId("deep".into());
+    store_with_a_fact(&store, &sid).await.unwrap();
+    docs.lock().unwrap().clear();
+
+    let off = fact_engine(store.clone(), Tier::Deep, EngineConfig::default());
+    off.run_turn(Incoming {
+        session: sid.clone(),
+        text: "kde bydlím?".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !saw_fact_docs(&docs, "user city"),
+        "with the knob off the fact path is `search_facts`, as it always was"
+    );
+
+    docs.lock().unwrap().clear();
+    let on = fact_engine(
+        store.clone(),
+        Tier::Deep,
+        EngineConfig {
+            recall_hybrid: true,
+            ..EngineConfig::default()
+        },
+    );
+    on.run_turn(Incoming {
+        session: sid,
+        text: "kde bydlím?".into(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        saw_fact_docs(&docs, "user city"),
+        "a Deep turn with [recall] hybrid on reranks fact documents: {:?}",
+        docs.lock().unwrap()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M11 T1.5: a due summary must complete even when the next inbound message is
+// already queued.
+//
+// The M11 measurement run found `Summarized` 0 times in 40 live turns at
+// `summary_every_turns = 4`. The cause is the biased `select!` in
+// `dispatch.rs`: the mailbox is polled first, so input that is already there
+// — or a channel that has already closed — wins before the summary future is
+// polled once, and the summary is dropped mid-flight at every boundary.
+// "The next boundary recomputes it" is only true if some boundary finds the
+// mailbox empty, and a user typing ahead never gives it one.
+
+/// Hands over every queued message as fast as it is asked for, then closes.
+/// Nothing here ever waits: that is the condition that starved the summary.
+struct BurstChannel(std::sync::Mutex<std::collections::VecDeque<&'static str>>);
+
+#[async_trait::async_trait]
+impl Channel for BurstChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        match self.0.lock().unwrap().pop_front() {
+            Some(t) => Ok(Incoming {
+                session: SessionId("burst".into()),
+                text: t.into(),
+            }),
+            None => Err(ChannelError::Closed),
+        }
+    }
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_due_summary_completes_when_the_next_message_is_already_queued() {
+    let store = Arc::new(InMemoryStore::new());
+    let calls: Arc<std::sync::Mutex<Vec<(bool, u32, u32)>>> = Default::default();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(BurstChannel(std::sync::Mutex::new(
+        ["one", "two", "three", "four", "five"].into(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.set_summarizer(Box::new(ScriptedSummarizer {
+        calls: calls.clone(),
+        fail_with: None,
+    }));
+    // window 1, every 4: turn 5 is the first boundary at which four turns
+    // have fallen out of the window, and by then the five messages are spent
+    // and the channel is closing — the case the old biased branch lost.
+    let cfg = EngineConfig {
+        window_turns: 1,
+        summary_every_turns: 4,
+        ..EngineConfig::default()
+    };
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    tokio::time::timeout(std::time::Duration::from_secs(10), e.run())
+        .await
+        .expect("the run must finish")
+        .unwrap();
+
+    let events = store.load(&SessionId("burst".into())).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::UserSaid { .. }))
+            .count(),
+        5,
+        "all five messages ran as turns"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Summarized { .. }))
+            .count(),
+        1,
+        "a due summary is finished, not dropped, when input is already queued"
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[(false, 1, 4)],
+        "and it folded exactly the turns that had fallen out of the window"
     );
 }

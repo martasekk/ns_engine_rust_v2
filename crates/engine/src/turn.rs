@@ -611,14 +611,31 @@ impl Engine {
         pinned
     }
 
-    async fn select_facts(&self, scope: &str, user_text: &str) -> Vec<nscore::Fact> {
+    /// The pinned core plus the query-relevant slice.
+    ///
+    /// `hybrid` is the caller's decision, never this function's: M11 T1.1
+    /// landed `search_facts_hybrid` in the store and left every caller on
+    /// `search_facts`, and the follow-up is that the fact path takes the same
+    /// gate the turn path already takes at `recall_outcome` —
+    /// `cfg.recall_hybrid` **and** a tier above `Chat`. A `Chat` turn is the
+    /// cheap one by construction (it is already denied the query-relevant
+    /// facts on the emitter side and every registered tool), and paying a
+    /// round trip to `/embed` and `/rerank` on it would spend the tier's whole
+    /// saving on its reply prompt. With `hybrid` false this is byte-for-byte
+    /// what it always was, and with no encoder `search_facts_hybrid` is
+    /// `search_facts` anyway — the knob can only ever add.
+    async fn select_facts(&self, scope: &str, user_text: &str, hybrid: bool) -> Vec<nscore::Fact> {
         let pinned = self.pinned_facts(scope).await;
-        let relevant = self
-            .parts
-            .memory
-            .search_facts(scope, user_text, self.cfg.relevant_max + pinned.len())
-            .await
-            .unwrap_or_default();
+        let k = self.cfg.relevant_max + pinned.len();
+        let relevant = if hybrid {
+            self.parts
+                .memory
+                .search_facts_hybrid(scope, user_text, k)
+                .await
+        } else {
+            self.parts.memory.search_facts(scope, user_text, k).await
+        }
+        .unwrap_or_default();
         let mut out = pinned;
         for f in relevant {
             if out.len() >= self.cfg.facts_in_context
@@ -678,7 +695,11 @@ impl Engine {
         };
         let rebuilt_from = first.turn;
         let scope = (self.cfg.scope_for)(sid);
-        let selected = self.select_facts(&scope, "").await;
+        // Never hybrid: the query is the empty string, so there is nothing
+        // for a cosine arm to be near, and the summary runs off the user's
+        // critical path precisely so it costs no round trips it does not
+        // need.
+        let selected = self.select_facts(&scope, "", false).await;
         let facts = self.fact_views(&scope, &selected).await;
         let previous = if rebuild {
             None
@@ -1371,7 +1392,16 @@ impl Engine {
             // emitter asking again for a name it already has (M6 F2). The
             // query-relevant slice is what a `Chat` turn does without.
             let selected = if tier.allows_relevant_facts() {
-                self.select_facts(&scope, &incoming.text).await
+                // M11 T1.1 follow-up: the same gate `recall_outcome` takes.
+                // Read here rather than bound once above because `tier` is
+                // still mutable at this point — a tool-cued turn is upgraded
+                // to `Task` mid-loop, and the next iteration must see it.
+                self.select_facts(
+                    &scope,
+                    &incoming.text,
+                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                )
+                .await
             } else {
                 self.pinned_facts(&scope).await
             };
@@ -2506,8 +2536,16 @@ impl Engine {
                 None => format!("[{id}] {vars}"),
             },
             ReplyPolicy::Generate => {
-                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn, &usage)
-                    .await
+                self.generate_reply(
+                    &scope,
+                    &incoming.text,
+                    &rules,
+                    &mut log,
+                    turn,
+                    &usage,
+                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                )
+                .await
             }
         };
 
@@ -2535,6 +2573,10 @@ impl Engine {
         log: &mut EventLog,
         turn: u32,
         usage: &std::sync::Arc<nscore::UsageSink>,
+        // Whether this turn's tier and config allow the hybrid fact path
+        // (M11 T1.1 follow-up). Passed in rather than re-derived: the tier
+        // is the caller's, and it may have been upgraded mid-turn.
+        hybrid_facts: bool,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2554,7 +2596,7 @@ impl Engine {
         // Implicit recall (spec §5): standing facts enter the reply
         // context; each recall bumps `uses` (lifecycle metadata for
         // the future consolidation pass).
-        let mut selected = self.select_facts(scope, user_text).await;
+        let mut selected = self.select_facts(scope, user_text, hybrid_facts).await;
         for f in selected.iter_mut() {
             f.uses += 1;
             f.last_used = now();

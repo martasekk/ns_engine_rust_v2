@@ -207,6 +207,11 @@ pub struct Report {
     pub grades_unavailable: usize,
     /// M10 T5.3: one entry per evaluator beside the symbolic baseline.
     pub agreement: Vec<EvaluatorAgreement>,
+    /// M11 T1.3: requests each evaluator spent this pass, for the ones that
+    /// spend any. Absent for the free lanes rather than zero — "this scorer
+    /// costs nothing" and "this scorer was asked nothing" are different
+    /// facts, and only the second is a number.
+    pub evaluator_requests: BTreeMap<String, u32>,
     /// The evaluator the notes gate actually believed this run, after the κ
     /// threshold had its say — which is not always the configured one.
     pub authoritative_evaluator: String,
@@ -269,6 +274,11 @@ impl std::fmt::Display for Report {
         )?;
         for a in &self.agreement {
             writeln!(f, "{a}")?;
+        }
+        // Printed next to κ deliberately: for a paid judge the two numbers
+        // are one sentence — what the agreement cost.
+        for (id, n) in &self.evaluator_requests {
+            writeln!(f, "requests spent: {id} {n}")?;
         }
         write!(
             f,
@@ -671,6 +681,15 @@ impl EvolutionPass {
         // chain is extended, never rewritten.
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
+        // M11 T1.3. Read off the evaluators rather than counted here: only
+        // the scorer knows what it dialled, retries included, and a tally
+        // kept beside `grade_sessions` would count grade *attempts*, which
+        // is a different number from requests the moment anything retries.
+        for ev in &self.evaluators {
+            if let Some(n) = ev.requests() {
+                report.evaluator_requests.insert(ev.id(), n);
+            }
+        }
 
         // 4b°. The embeddings backfill (M8 T3.1).
         //

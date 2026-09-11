@@ -378,7 +378,9 @@ fn build_pass(
                 // checks rather than re-deriving it: I6 is two logged facts
                 // and grounding is span attribution, and an embedding
                 // improves on neither.
-                nsevolution::evaluate::SymbolicEvaluator { cfg: evaluate_cfg },
+                nsevolution::evaluate::SymbolicEvaluator {
+                    cfg: evaluate_cfg.clone(),
+                },
             ),
         ));
     }
@@ -393,6 +395,38 @@ fn build_pass(
         Some(key) => {
             let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
             let model = emitter.model.clone();
+            // M11 T1.3: the paid judge, and only when `[models] judge_model`
+            // names one. `for_model` is the gate — `None` in, `None` out —
+            // so an unset id cannot reach a request, and `pass` is handed
+            // back unchanged. It rides the emitter's endpoint, key and
+            // throttle because it is the same provider account; what makes
+            // it not a role is that it is added here, to the idle pass, and
+            // nowhere a turn can see it.
+            let mut pass = pass;
+            if let Some(judge) = nsevolution::client_eval::ClientEvaluator::for_model(
+                cfg.models.judge_model.as_deref(),
+                client_for(emitter, transport.clone(), &key),
+                |c| nsevolution::client_eval::JudgeConfig {
+                    // Sonnet 5's shape, and harmless on anything else: no
+                    // sampling key at all, one short reasoning block, a
+                    // 1,024-token cap on a two-field answer.
+                    unsampled: true,
+                    structured_output: nsllm::provider::for_base_url(
+                        emitter.base_url_or_default(),
+                    )
+                    .is_some_and(|p| p.structured_output),
+                    ..c
+                },
+                nsevolution::evaluate::SymbolicEvaluator { cfg: evaluate_cfg },
+            ) {
+                eprintln!(
+                    "judge: {} grades up to {} turns per idle pass, κ-gated at {:.2}.",
+                    cfg.models.judge_model.as_deref().unwrap_or_default(),
+                    cfg.models.evaluate_budget_turns,
+                    cfg.models.evaluator_min_kappa
+                );
+                pass = pass.with_evaluator(std::sync::Arc::new(judge));
+            }
             // The probe builds a fresh emitter per run, on the same target.
             let factory_target = emitter.clone();
             let factory_transport = transport.clone();
@@ -533,7 +567,7 @@ async fn main() {
             }
         };
         if parsed.paraphrase {
-            std::process::exit(eval::run_paraphrase(parsed.activation).await);
+            std::process::exit(eval::run_paraphrase(parsed.activation, parsed.facts).await);
         }
         // M10 T5.4. The same shape: a report, not a gate.
         if parsed.obligations {

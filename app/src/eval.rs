@@ -337,16 +337,6 @@ pub struct Args {
     pub facts: bool,
 }
 
-/// Where `--facts` reaches [`run_paraphrase`] from.
-///
-/// The M10 T5.2 note above records this pattern and its retirement: a flag
-/// whose call site in `main.rs` belongs to another task travels through a
-/// cell until that task lands, and then becomes a parameter like every other
-/// argument. `main.rs` is M11 P0's file while this is written, so the one
-/// follow-up line is `run_paraphrase(parsed.activation, parsed.facts)` and
-/// this cell goes with it.
-static FACTS_ARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase [--facts]] \
      [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive] \
      [--obligations] [--guidelines]";
@@ -406,7 +396,6 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     if facts && !paraphrase {
         return Err(format!("{USAGE} (--facts is a modifier on --paraphrase)"));
     }
-    FACTS_ARM.store(facts, std::sync::atomic::Ordering::Relaxed);
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
@@ -477,10 +466,15 @@ pub async fn run_ablate(block: nscore::Ablate, activation: f32) -> i32 {
 /// Exits 0 whatever the number is. A fired trigger is not a failure — it is
 /// permission to build something, and a gate that went red on it would make
 /// the measurement something to avoid taking.
-pub async fn run_paraphrase(activation: f32) -> i32 {
+pub async fn run_paraphrase(activation: f32, facts: bool) -> i32 {
     use nstestkit::paraphrase;
 
-    if FACTS_ARM.load(std::sync::atomic::Ordering::Relaxed) {
+    // M11 T1.1 follow-up: `--facts` used to reach here through a static
+    // cell, because `main.rs` belonged to another task while T1.1 was
+    // written. It is a parameter now, like every other argument — the arm
+    // is chosen by the caller, so two runs in one process cannot see each
+    // other's flag.
+    if facts {
         return run_paraphrase_facts(activation).await;
     }
     let k = nsengine::turn::EngineConfig::default().recall_top_k;
@@ -1207,6 +1201,15 @@ mod tests {
 
         assert!(parse_args(&["--live".to_string()]).is_err());
         assert!(parse_args(&["--paraphrases".to_string()]).is_err());
+
+        // M11 T1.1's modifier, and its follow-up: the flag is carried on
+        // `Args` and handed to `run_paraphrase` as a parameter, so parsing
+        // it sets nothing outside the value returned here. `--facts` alone
+        // is still refused.
+        assert!(!arm.facts, "a bare --paraphrase is the turns corpus");
+        let both = parse_args(&["--paraphrase".to_string(), "--facts".to_string()]).unwrap();
+        assert!(both.paraphrase && both.facts);
+        assert!(parse_args(&["--facts".to_string()]).is_err());
     }
 
     /// `--ablate` takes a block name in the next argument, composes with a

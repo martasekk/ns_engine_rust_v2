@@ -355,14 +355,38 @@ async fn session_task(
                 // The mailbox is polled first (biased), as `recv` was when
                 // the serial loop did this, so the prompt appears before the
                 // summary starts; the summary then runs while the user reads
-                // the reply and types. If the user gets there first the
-                // summary is dropped mid-flight — it is recomputed from the
-                // store at the next boundary, and its input range is capped
-                // by summary_input_max_chars, so an abandoned summary cannot
-                // make the next one unbounded.
+                // the reply and types.
+                //
+                // M11 T1.5. What the *other* branch does is the fix. The
+                // original dropped the summary mid-flight whenever the user
+                // got there first, on the reasoning that the next boundary
+                // would recompute it — but `biased` means a message already
+                // in the mailbox wins before the summary future is polled
+                // even once, and after that turn the summary is due again
+                // and loses again. The M11 measurement is the evidence: 40
+                // turns under `serve` at `summary_every_turns = 4`, zero
+                // `Summarized` events. Anyone typing faster than the
+                // summarizer never gets a summary at all, which is
+                // starvation, not deferral.
+                //
+                // So a due summary is now *finished* rather than abandoned:
+                // the message is held and `maybe_summarize` is awaited to
+                // completion before the turn it belongs to runs. Awaited
+                // here rather than spawned deliberately — a spawned summary
+                // would read and append to the same session's log while
+                // `run_turn` is folding it, and one-turn-at-a-time per
+                // session is the property the whole session task exists to
+                // hold. The cost is the summarizer's latency in front of a
+                // fast user's next reply, which is exactly the case that
+                // previously bought a summary that never happened.
                 tokio::select! {
                     biased;
-                    next = &mut pending => next,
+                    next = &mut pending => {
+                        if let Err(e) = engine.maybe_summarize(&session).await {
+                            eprintln!("summary: {e}");
+                        }
+                        next
+                    }
                     summarized = engine.maybe_summarize(&session) => {
                         if let Err(e) = summarized {
                             eprintln!("summary: {e}");
