@@ -268,3 +268,13 @@ _(filled per phase as each lands)_
 Workspace suite: 709 passed, 0 failed, 1 ignored. The `fitness_demote` release clock starts
 at this commit. Not built, as planned: raising the judge's `max_tokens` before T0.4's
 reasons are read on a live pass.
+
+### P3 — done 2026-09-11 (commit `874bd26`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T3.1 | a pre-M12 `learned.toml` round-trips byte-for-byte; two notes differing only in `learned_on` share a hash | met: `Note.learned_on: Option<String>`, absent from the TOML when `None`, outside `hash_of`; `Note::new_learned_on` used by the proposer with its own model id; `an_old_note_parses_without_a_model_and_serializes_without_one`, `a_note_hash_ignores_the_learning_model` |
+| T3.2 | at the default nothing is filtered; the example parses | met: `[memory] archive_foreign_notes = false`, `EngineConfig.archive_foreign_notes` and `learning_model` (the resolved emitter model); the engine routes both guidance lookups (emitter notes and reply notes) through `guidance_notes_for_model` / `guidance_notes_for_reply_model` only when the knob is on; `a_foreign_note_is_archived_only_when_the_knob_is_on`, `archive_foreign_notes_defaults_to_off_and_round_trips` |
+
+Workspace suite: 713 passed, 0 failed, 1 ignored. Not built, as planned: archiving the one existing note — it is
+desktop-only and the line is parked; the knob waits for the first chat note.
