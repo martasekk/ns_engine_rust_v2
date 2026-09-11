@@ -14,5 +14,7 @@
 //! `ns-evolution`'s `verify_patch` gate.
 pub mod ablate;
 pub mod eval;
+pub mod fixtures;
 pub mod grading;
 pub mod paraphrase;
+pub mod ties;

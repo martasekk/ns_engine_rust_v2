@@ -21,9 +21,10 @@
 //! ledger already uses, and a run killed mid-write must leave the previous
 //! rows intact rather than half a file.
 
-use nstestkit::eval::{render_table, run_all, Ability};
+use nstestkit::eval::{render_table, run_all_for, Ability, Run};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Beside `learned.toml` and `learned-ledger.json` in the working directory,
 /// which is where every other file this binary owns already lives.
@@ -351,6 +352,13 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             other => return Err(format!("{USAGE} (got {other:?})")),
         }
     }
+    // M10 T5.2. `main.rs` calls `run(&parsed.ledger)` with no weight, and
+    // `main.rs` belongs to another task of this milestone, so the flag
+    // reaches the default mode through this cell instead of through a
+    // parameter. [`run_at`] is the real entry point and takes the weight;
+    // the day `main.rs` passes `parsed.activation` to it, the cell and
+    // [`run`] go away together.
+    ACTIVATION.store(activation.to_bits(), Ordering::SeqCst);
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
@@ -358,6 +366,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         activation,
     })
 }
+
+/// `--activation <w>` for the default mode, as bits of an `f32`. See
+/// [`parse_args`].
+static ACTIVATION: AtomicU32 = AtomicU32::new(0);
 
 /// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
 /// T0.4).
@@ -509,17 +521,56 @@ fn now_ms() -> u64 {
 /// Runs the set, prints the table and the ledger diff, returns the process
 /// exit code: 0 when every ability passed, 1 otherwise.
 pub async fn run(ledger_path: &Path) -> i32 {
-    report(&run_all().await, ledger_path)
+    run_at(
+        ledger_path,
+        f32::from_bits(ACTIVATION.load(Ordering::SeqCst)),
+    )
+    .await
+}
+
+/// The same, at one `[memory] activation_weight` (M9 T3.3, M10 T5.2).
+///
+/// The ability set **and** the tie-heavy recall corpus, because the ability
+/// set alone is what M9 T3.3 already tried: *"suites insensitive … identical
+/// lists at every weight"*. Nothing there ties, so nothing there can move.
+/// The tie corpus is the arm built to move, and printing the two together is
+/// what makes the difference attributable — a run whose abilities held and
+/// whose ties changed is the reading the knob needs.
+pub async fn run_at(ledger_path: &Path, activation: f32) -> i32 {
+    let abilities = run_all_for(Run {
+        activation_weight: activation,
+        ..Run::default()
+    })
+    .await;
+    let code = report(&abilities, ledger_path, activation);
+    print!(
+        "{}",
+        nstestkit::ties::render(&nstestkit::ties::measure(activation).await)
+    );
+    code
 }
 
 /// The gate, separated from the run so that a failing set can be tested
 /// without one. The six abilities pass, which is exactly why the non-zero
 /// path needs its own test: an exit code nothing exercises is a gate nobody
 /// has checked.
-fn report(abilities: &[Ability], ledger_path: &Path) -> i32 {
+fn report(abilities: &[Ability], ledger_path: &Path, activation: f32) -> i32 {
     print!("{}", render_table(abilities));
 
     let current = Row::build(harness_hash(Path::new(".")), now_ms(), abilities);
+    // A row is the *default* arm's numbers, and the ledger's whole job is to
+    // let two runs be diffed position by position. A run at a non-default
+    // `activation_weight` is a different arm; recording it would make the
+    // next diff read as a harness change. So it prints and is not recorded,
+    // and says so rather than leaving a gap.
+    if activation != 0.0 {
+        println!(
+            "ledger: not written — this run is the activation_weight = {activation} arm, \
+             not the default one the ledger diffs."
+        );
+        let failed = abilities.iter().filter(|a| !a.passed).count();
+        return i32::from(failed > 0);
+    }
     println!(
         "ledger: {} · harness {}",
         ledger_path.display(),
@@ -799,9 +850,9 @@ mod tests {
     fn a_failing_ability_exits_non_zero_and_still_records_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
-        assert_eq!(report(&[ability("abstention", true, 7)], &path), 0);
+        assert_eq!(report(&[ability("abstention", true, 7)], &path, 0.0), 0);
         assert_eq!(
-            report(&[ability("abstention", false, 7)], &path),
+            report(&[ability("abstention", false, 7)], &path, 0.0),
             1,
             "a failed ability has to reach the exit code"
         );
@@ -823,13 +874,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_LEDGER);
         std::fs::write(&path, "{ this is not json").unwrap();
-        assert_eq!(report(&[ability("abstention", true, 7)], &path), 0);
+        assert_eq!(report(&[ability("abstention", true, 7)], &path, 0.0), 0);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{ this is not json",
             "the operator's file is untouched"
         );
-        assert_eq!(report(&[ability("abstention", false, 7)], &path), 1);
+        assert_eq!(report(&[ability("abstention", false, 7)], &path, 0.0), 1);
     }
 
     #[test]

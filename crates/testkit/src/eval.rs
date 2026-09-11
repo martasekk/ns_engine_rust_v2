@@ -59,7 +59,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-struct NullChannel;
+pub(crate) struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
     async fn recv(&self) -> Result<Incoming, ChannelError> {
@@ -119,16 +119,27 @@ fn render_prompt(ctx: &ReplyContext) -> String {
 /// row — a missing row would read as "not run" rather than "failed" — so it
 /// grades the empty one and says why.
 #[derive(Clone, Default)]
-struct Shown {
+pub(crate) struct Shown {
     /// One `render_fact` line per fact, exactly as the prompt carries it —
     /// including the `(was "Martin" until 17:35 UTC)` marker, which is how a
     /// superseded value reaches the model at all.
-    facts: Vec<String>,
-    fact_keys: Vec<String>,
-    window: String,
-    trace: String,
-    do_not_state: Vec<String>,
-    prompt: String,
+    pub(crate) facts: Vec<String>,
+    pub(crate) fact_keys: Vec<String>,
+    pub(crate) window: String,
+    pub(crate) trace: String,
+    pub(crate) do_not_state: Vec<String>,
+    pub(crate) prompt: String,
+    /// The rolling summary block exactly as the prompt carries it, or `None`
+    /// when the engine had no summary to show (M10 T5.1).
+    ///
+    /// Captured as its own field rather than inferred from `prompt`: the
+    /// point of the fixtures module is to be able to say *this session
+    /// carried a summary of n characters and the graded turn still failed*,
+    /// and a substring search over the prompt cannot tell an absent block
+    /// apart from a present one the question did not need.
+    pub(crate) summary: Option<String>,
+    /// The guidance notes rendered into this context, one per note (M10 T5.1).
+    pub(crate) guidance: Vec<String>,
 }
 
 impl Shown {
@@ -140,10 +151,12 @@ impl Shown {
             trace: ctx.turn_trace.clone(),
             do_not_state: ctx.do_not_state.clone(),
             prompt: render_prompt(ctx),
+            summary: ctx.summary.as_ref().map(render_summary),
+            guidance: ctx.guidance.clone(),
         }
     }
 
-    fn chars(&self) -> usize {
+    pub(crate) fn chars(&self) -> usize {
         self.prompt.chars().count()
     }
 
@@ -151,11 +164,11 @@ impl Shown {
     /// substring, which is the same test the grounding interceptor applies in
     /// `ground::Material::contains` — a fixture must not hold the harness to a
     /// stricter standard than the harness holds a reply to.
-    fn shows(&self, value: &str) -> bool {
+    pub(crate) fn shows(&self, value: &str) -> bool {
         self.prompt.to_lowercase().contains(&value.to_lowercase())
     }
 
-    fn fact_line(&self, key: &str) -> Option<&str> {
+    pub(crate) fn fact_line(&self, key: &str) -> Option<&str> {
         let prefix = format!("{key}: ");
         self.facts
             .iter()
@@ -163,7 +176,7 @@ impl Shown {
             .map(String::as_str)
     }
 
-    fn rows_for(&self, key: &str) -> usize {
+    pub(crate) fn rows_for(&self, key: &str) -> usize {
         self.fact_keys.iter().filter(|k| *k == key).count()
     }
 }
@@ -175,10 +188,10 @@ impl Shown {
 /// nowhere, so the abstention fixture can grade the grounding interceptor
 /// (M6 §4.5) — which is harness, not model — instead of the double's manners.
 /// The regeneration falls back to the inert marker.
-struct Probe {
-    shown: Arc<Mutex<Vec<Shown>>>,
-    first_draft: Option<&'static str>,
-    drafts: AtomicU32,
+pub(crate) struct Probe {
+    pub(crate) shown: Arc<Mutex<Vec<Shown>>>,
+    pub(crate) first_draft: Option<&'static str>,
+    pub(crate) drafts: AtomicU32,
 }
 
 /// Deliberately claim-free: no digits, no mid-sentence capitals, no quotes,
@@ -212,8 +225,8 @@ impl Replier for Probe {
 /// A number a fixture computes for itself drifts from what the harness did,
 /// and then the set measures the test; the same argument
 /// [`Harness::counters`] is built on.
-struct MeteredEmitter {
-    inner: Box<dyn Emitter>,
+pub(crate) struct MeteredEmitter {
+    pub(crate) inner: Box<dyn Emitter>,
 }
 
 #[async_trait::async_trait]
@@ -748,12 +761,12 @@ impl Emitter for DesktopEmitter {
 /// `valid_to` as wall-clock time. Under a frozen clock every "what was it
 /// before" marker reads `until 00:00 UTC`, which is exactly the rendering a
 /// small model has to make sense of, so it should be real.
-fn clock(ticks: Arc<AtomicU64>) -> Box<dyn Fn() -> Timestamp + Send + Sync> {
+pub(crate) fn clock(ticks: Arc<AtomicU64>) -> Box<dyn Fn() -> Timestamp + Send + Sync> {
     const BASE_MS: u64 = 1_788_370_524_628;
     Box::new(move || Timestamp(BASE_MS + ticks.fetch_add(1, Ordering::SeqCst) * 1_000))
 }
 
-struct Harness {
+pub(crate) struct Harness {
     store: Arc<InMemoryStore>,
     shown: Arc<Mutex<Vec<Shown>>>,
     /// What the *emitter* was shown, one entry per iteration: this turn's
@@ -768,6 +781,21 @@ struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
+    /// M10 T5.1: the learned rules this fixture hands the engine, which is
+    /// where the guidance block comes from. Empty on the ten abilities, so
+    /// their rows are the numbers they have always been.
+    learned: std::sync::Arc<arc_swap::ArcSwap<LearnedRules>>,
+    /// M10 T5.1: the persona the seed authored, in front of the reply model
+    /// exactly as `[persona]` would be on the live path. Empty on the ten
+    /// abilities.
+    persona: String,
+    /// M10 T5.1: run the engine's own summarizer path at every turn
+    /// boundary, so `state.summary` is non-empty when a graded turn runs.
+    ///
+    /// Off on the ten abilities for the same reason: `maybe_summarize` is a
+    /// model call, and turning it on for them would change `requests` on
+    /// every row of the ledger.
+    summaries: bool,
     /// What this arm does differently: the blanked block (M9 T0.4) and the
     /// activation weight (M9 T3.3). Passed straight into every
     /// `EngineConfig` the fixture builds, so every turn of an arm runs with
@@ -806,7 +834,7 @@ impl Harness {
     /// The full arm passes `Run::default()`; `ns-app eval --ablate <block>`
     /// and `--activation <w>` fill it in, and every engine and every store
     /// this fixture builds is configured from it.
-    fn for_run(run: Run) -> Self {
+    pub(crate) fn for_run(run: Run) -> Self {
         Self {
             store: Arc::new(
                 InMemoryStore::new().with_activation(run.activation_weight, ACTIVATION_HALF_LIFE),
@@ -816,7 +844,25 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
+            learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
+            summaries: false,
+            persona: String::new(),
             run,
+        }
+    }
+
+    /// M10 T5.1: the same harness with notes in front of both models and the
+    /// summarizer running between turns.
+    ///
+    /// Two flags rather than two harnesses because the fixtures module grades
+    /// what the ten abilities grade — the [`ReplyContext`] the engine built —
+    /// and a second harness would be a second definition of that.
+    pub(crate) fn for_fixture(run: Run, rules: LearnedRules, persona: &str) -> Self {
+        Self {
+            learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(rules)),
+            summaries: true,
+            persona: persona.to_string(),
+            ..Self::for_run(run)
         }
     }
 
@@ -828,11 +874,16 @@ impl Harness {
         }
     }
 
-    async fn turn(&self, session: &SessionId, text: &str, script: Vec<Proposal>) -> Vec<Shown> {
+    pub(crate) async fn turn(
+        &self,
+        session: &SessionId,
+        text: &str,
+        script: Vec<Proposal>,
+    ) -> Vec<Shown> {
         self.turn_drafting(session, text, script, None).await
     }
 
-    async fn turn_drafting(
+    pub(crate) async fn turn_drafting(
         &self,
         session: &SessionId,
         text: &str,
@@ -898,8 +949,15 @@ impl Harness {
         // `turn_loop.rs` turns it off on its own doubles for the same reason.
         // The grounding check stays on: it is the interceptor the abstention
         // fixture grades.
+        if self.summaries {
+            b.set_summarizer(Box::new(ScriptedSummarizer::default()));
+        }
         let common = EngineConfig {
             max_echo_ratio: 1.1,
+            persona: self.persona.clone(),
+            // M10 T5.1. The default is an empty rule set, so the ten
+            // abilities render no guidance and their rows do not move.
+            learned: self.learned.clone(),
             // M9 T0.4. `None` on every existing run, so the suite's numbers
             // are the ones they have always been.
             ablate: self.run.ablate,
@@ -955,12 +1013,18 @@ impl Harness {
             })
             .await
             .unwrap();
+        // M10 T5.1. The dispatcher, not `run_turn`, is what calls this on the
+        // live path (`dispatch.rs`), so a fixture that wants a summary has to
+        // call it too — at the same place, after the reply is sent.
+        if self.summaries {
+            engine.maybe_summarize(session).await.unwrap();
+        }
         self.shown.lock().unwrap()[before..].to_vec()
     }
 
     /// Reply-model calls over the whole fixture: one per captured context, so
     /// a regeneration counts, which is the point of counting it.
-    fn reply_calls(&self) -> usize {
+    pub(crate) fn reply_calls(&self) -> usize {
         self.shown.lock().unwrap().len()
     }
 
@@ -1016,11 +1080,17 @@ impl Harness {
             .unwrap_or(0)
     }
 
+    /// The store this fixture built, so a caller can seed and read facts
+    /// through the same rows the engine ranks (M10 T5.2).
+    pub(crate) fn store(&self) -> Arc<InMemoryStore> {
+        self.store.clone()
+    }
+
     /// The plan's per-run numbers, read back off the event log of every
     /// session the fixture touched. Read back rather than counted by hand: a
     /// number a fixture computes for itself drifts from what the harness did,
     /// and then the regression set is measuring the test.
-    async fn counters(&self) -> Counters {
+    pub(crate) async fn counters(&self) -> Counters {
         let sessions = self.sessions.lock().unwrap().clone();
         let mut c = Counters::default();
         for sid in sessions {
@@ -1111,14 +1181,14 @@ impl Harness {
 }
 
 #[derive(Default)]
-struct Counters {
-    turns: usize,
-    emitter_calls: usize,
-    tool_calls: usize,
-    recall_calls: usize,
-    recall_hits: usize,
-    flags: usize,
-    clarifications: usize,
+pub(crate) struct Counters {
+    pub(crate) turns: usize,
+    pub(crate) emitter_calls: usize,
+    pub(crate) tool_calls: usize,
+    pub(crate) recall_calls: usize,
+    pub(crate) recall_hits: usize,
+    pub(crate) flags: usize,
+    pub(crate) clarifications: usize,
     /// The four M7 numbers, summed over every model call the fixture made.
     clipped_chars: usize,
     inspections: usize,
@@ -1180,7 +1250,7 @@ pub fn bits_over_random(chosen: bool, legal_set_size: usize) -> f64 {
     }
 }
 
-fn remember(key: &str, value: &str) -> Proposal {
+pub(crate) fn remember(key: &str, value: &str) -> Proposal {
     Proposal {
         rationale: "durable".into(),
         action: REMEMBER_FACT.into(),
@@ -1188,7 +1258,7 @@ fn remember(key: &str, value: &str) -> Proposal {
     }
 }
 
-fn forget(key: &str) -> Proposal {
+pub(crate) fn forget(key: &str) -> Proposal {
     Proposal {
         rationale: "the user asked".into(),
         action: FORGET_FACT.into(),
@@ -1199,7 +1269,7 @@ fn forget(key: &str) -> Proposal {
 /// The query is a span of the user's own words, so provenance classifies it
 /// `UserInput` rather than `Residual` — a recall query the model invented is
 /// a different failure and would muddy this one.
-fn recall_for(query: &str) -> Proposal {
+pub(crate) fn recall_for(query: &str) -> Proposal {
     Proposal {
         rationale: "not in the window".into(),
         action: RECALL.into(),
@@ -1325,7 +1395,7 @@ impl Ability {
 /// One graded condition. Collected rather than asserted: a run has to report
 /// every condition that failed, across all six abilities, or the first broken
 /// one hides the rest and the next run rediscovers them one at a time.
-fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
+pub(crate) fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> String) {
     if !ok {
         fails.push(why());
     }
