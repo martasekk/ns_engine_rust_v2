@@ -254,7 +254,7 @@ non-dry pass on `ns-run/ns.sqlite`.
 
 ## Results
 
-_(filled per phase as each lands)_
+
 
 ### P0 — done 2026-09-11 (commit `d8ecc23`), 0 requests
 
@@ -326,3 +326,84 @@ Workspace suite: 726 passed, 0 failed, 1 ignored. Deviations recorded: `--facts 
 Workspace suite: 738 passed, 0 failed, 1 ignored. Decision rule status: the offline gates (fixtures, abilities, echo
 count) are read above; the live gates (requests per chat turn < 2.00, flag rate on emitted
 answers) are P6's. The knob stays `false` until both halves hold.
+
+### P6 — the live Luna run, done 2026-09-11 (T6.1 in `f0b2ce5`, the verifier's fixes in `c6cc25a`), **49 requests, ≈ $0.015** (ceiling 60 / $0.05)
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T6.1 | a metered run is one repeatable command | met, in a simpler form than planned: the REPL already takes a message file on stdin (the way M11 ran), so the runner is `EngineConfig.max_requests` — every model call counted, the run ending with `RequestCap { spent, cap }` before the turn that would cross it — plus `ns-app --max-requests N --session ID`; `the_engine_stops_at_the_request_cap`, `repl_args_accept_max_requests_and_session`. The verifier then found that the idle evolution pass ran outside the cap; a metered run now installs no idle pass (`a_metered_run_installs_no_idle_evolution_pass`) |
+| T6.2 | the four numbers | met: session `m12-live`, 20 turns, **42 requests (2.10 per turn; M11's Luna arm: 58, 2.90)**, emitter 25 / replier 14 / summarizer 3; then on a copy of the store `evolve --dry-run` → `skipped (dry run): judge, notes proposer, probes` and `requests spent: … total 0`; `evolve --spend --dry-run` → `requests spent: judge 5, proposer 2, probes 0, total 7`. Total 49 |
+| T6.3 | each number has a value or "not observed" | see below |
+
+**The run.** M11's own 20-message script (cs and en: a stated fact, paraphrased recalls,
+two updates, an unanswerable question, a time question, a summary request, small talk),
+under `capability = "strong"`, `chat_act_or_answer = true`, `prompt_cache_emitter = true`,
+`openai/gpt-5.6-luna` in all three roles, `[evolution] enabled = false` for the metered
+session, on the live store; no task-tier turns — the desktop line is parked, and the same
+script as M11 makes the reading comparable with its Luna arm. Dollars are estimated from the
+token counts (34,383 prompt + 2,544 completion at $0.20 / $1.20 per MTok ≈ $0.010, plus the
+seven pass calls), not read off OpenRouter.
+
+**The four numbers.**
+
+| # | Number | Reading |
+|---|---|---|
+| 1 | requests per chat turn | **2.00** over 12 chat-tier turns; **6 of 12 answered in the emitter call** (turns 4, 6, 7, 13, 14, 18 — turn 18 acted first, `get_time`, then answered in the same loop). On turns 5, 9, 17 and 20 the model called the `respond_directly` tool instead of answering in text and paid the replier call; turns 1 and 15 stored a fact first (3 calls). `chat turns answered without a tool: 8 of 12` |
+| 2 | grounding flag rate | **3 of 20**, all on replier drafts, **0 of 6 on emitted answers**; classified by hand: turn 9 `Austrálie`/`Canberra` — the knowledge answer, correctly flagged as not in the material and, under `strong`, **left standing** ("Hlavním městem Austrálie je Canberra.") where M11 regenerated it into a refusal; turn 15 `ll remember that your sister` and turn 20 `Martin—take` — two false positives from the claim extractor (an apostrophe split, an em-dash join). **No Czech inflection among them** (M11's Luna arm: `Brna`, `Praze`); `remember_fact` 8 of 8 as in M11, `ReplyEchoed` 2 (monitor), `Rejected` 0, text fallbacks 0 |
+| 3 | `cached` share | **0 of 34,383 prompt tokens — not observed.** The estimated emitter prefix sits at median 276 / max 363 tokens (facts+summary+window) plus 86 tokens of system prompt plus a tool array of 481–1,320 tokens, so tool-carrying calls do cross 1,024 — yet OpenAI reported nothing cached. Cause undiagnosed: either OpenRouter does not relay `prompt_tokens_details.cached_tokens` for Luna, or no byte-identical ≥ 1,024-token prefix recurs because the cue-gated chat tool set and the facts block change from turn to turn. Follow-up: a two-identical-request probe (2 requests) settles which |
+| 4 | judge unavailable rate | **0 of 5** (Sonnet's 5-of-10 did not reproduce on Luna, as in M11's Luna wave); κ Luna vs symbolic 0.00 over 5 turns (rate 0.60 vs 1.00, observations only) — five turns cannot resolve the gate |
+
+Read for free: `get_time` fired at tier Chat on turn 18 and the reply was the time (P2);
+`text fallbacks: 0` in the session and 2 over the whole store (older sessions);
+`fitness demote: 0 candidates, knob off`; the dry run spent exactly nothing with a key in the
+environment (P0's exit criterion, live).
+
+**Decisions from the numbers.**
+- `capability = "strong"` stays the recommended profile for Luna and Sonnet
+  (`config.example.toml`): the retirement kept a correct answer that M11 lost, and the
+  matcher removed every inflection flag.
+- `chat_act_or_answer` **stays `false`**: the rule asked for requests per chat turn below
+  2.00 and read exactly 2.00; the flag half holds (0/6 vs 3/14) and the session as a whole
+  fell from 2.90 to 2.10 requests per turn. The saving is capped by the model choosing the
+  `respond_directly` tool on 4 of 12 chat turns. Follow-up, before re-measuring: with the
+  knob on, drop `respond_directly` from the chat-tier legal set so the choice is "a real tool
+  or plain text"; the expected reading is 1.67.
+- `prompt_cache_emitter` stays a lever without a reading; the probe above is the next step.
+- The claim extractor gets two follow-ups from the FPs: split on em-dashes, and do not cut a
+  quoted span at an apostrophe.
+- The stem rule's accepted bias is recorded (the verifier's example: `Marie` grounds on
+  `Marek`); the P6 flag rate is therefore a floor.
+
+### Status after M12
+
+Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on
+`worktree-m12-act-or-answer` (cut from the M11 tip plus M9 follow-up 7) by one Opus
+implementer per phase, sequentially, with a verifier pass before the live run; 49 requests
+spent, all in P6, against the 60 approved. Every knob defaults to today's behaviour except
+`[router] chat_tools = ["get_time"]`, the cue-gated defect fix: `capability = "small"`,
+`chat_act_or_answer = false`, `archive_foreign_notes = false`, `reply_regenerate = true`,
+`max_requests` unset. What a user of an old config sees: a time question on a chat turn
+reaches the time tool; `ns-app evolve --dry-run` spends nothing and says which lanes it
+skipped, `--spend` buys them back; `requests spent` per lane; judge failures by reason;
+`text fallbacks` and the emitter's two preamble weights in `ns-app budget`; the chat
+counter's second sentence; `ns-app eval --window N --facts N`; `ns-app --max-requests N
+--session ID`; new notes carry the model they were learned on.
+
+Deviations from the plan, recorded where they happened: the stem rule loosened from
+"prefix ≥ 5" to a 3-char prefix with bounded remainders and then scoped to capitalized
+material tokens (P1); `--facts N` shares its flag with the paraphrase corpus (P5); T5.3's
+"within 5%" criterion was arithmetically impossible and became "prefix ≤ prompt and > 0";
+T6.1 shipped as a cap and a session flag on the stdin REPL rather than an `eval --live` mode;
+the live run had no task-tier turns (desktop parked) and reused M11's script for
+comparability; the act-or-answer request carries one closing instruction, so the replier's
+grounding paragraph reaches an emitted answer only through the fence's own rule and the
+grounding interceptor (verifier note 5).
+
+Follow-ups, in the order the numbers rank them: (1) drop `respond_directly` from the
+chat-tier legal set under act-or-answer and re-measure (expected 1.67 requests per chat
+turn); (2) the two-request cache probe on Luna, then the emitter breakpoint decision; (3) the
+claim extractor's em-dash and apostrophe fixes; (4) fixtures whose assertions do not depend
+on the window length, so the strong context profile can be decided; (5) the
+`fitness_demote` release clock, now running on dry runs that spend nothing; (6) `Marie` /
+`Marek`: a small Czech given-name lemma table if a live flag reading shows a real miss;
+(7) `generate_reply` has nine arguments — a `ReplyInputs` struct when it is next touched.

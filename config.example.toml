@@ -48,6 +48,10 @@ provider = "openrouter"
 # On a chat-tier turn only, let the one emitter call either act or answer,
 # and take its answer as the reply — a chat turn for one request instead of
 # two. Off by default, and needs a router, because the tier decides it.
+# Measured 2026-09-11 on Luna (M12 P6): 2.10 requests per turn against 2.90
+# without it, 6 of 12 chat turns answered in one call, no flag on any emitted
+# answer; requests per chat turn read exactly 2.00, and the rule for moving
+# the default asks for less than 2.00, so it stays off for now.
 #   chat_act_or_answer = true
 
 # ── Per-role request shape ────────────────────────────────────────────────
