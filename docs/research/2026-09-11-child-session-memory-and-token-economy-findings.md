@@ -522,6 +522,19 @@ the M8 evaluation lane and cannot be measured without it. Rank 6 needs nothing. 
 only the idle pass. Building M8 Phase 2 is therefore the efficiency lever, before any of the
 architectures above.
 
+**Measured the same day, by M9** (`docs/superpowers/plans/2026-09-11-m9-memory-that-earns-its-context.md`
+§Results, branch `worktree-m9-memory`): the instruments in rank 6 exist and the first live
+reading corrects two estimates in this document. Tool schemas are **45.9%** of the emitter
+prompt on the live box (§2 and §7.1 item 06 carried the docs' 13–20% estimate), which makes
+schema slimming the largest context lever measured, ahead of every rank above. The stable
+prefix is **538 tokens** for the emitter and **225** for the replier, under every provider's
+1,024-token floor, so §5 R3's breakpoint move is not applicable on this config and `cached`
+is 0; caching stays a paid-tier lever. Without the facts block 5 of 9 eval abilities fail;
+summary and guidance are unmeasurable in the scripted suite. The activation prior (rank 1)
+ships at weight 0 because the suites return identical numbers at 0, 0.5 and 1.0. Rank 3's
+fitness loop is built and its first derivation reports that the live store holds no facts at
+all, which is why the smoke reply could not name the user.
+
 ## 8. Sources
 
 Repo: `docs/research/2026-09-02-memory-findings.md`, `2026-09-04-entrainment-findings.md`,

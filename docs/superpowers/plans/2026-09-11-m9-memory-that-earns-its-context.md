@@ -354,3 +354,36 @@ for the pass to count.
 | T3.3 | `w` moves off 0 only if the verbatim arm holds | **suites insensitive**: at `w ∈ {0, 0.5, 1.0}` paraphrase verbatim miss 0%/0%, paraphrase-arm miss 75% (in-mem) / 83% (SQLite), ablate-facts 9/9 → 4/9 — identical lists at every weight. The verbatim arm does not regress, and nothing is evidence *for* moving. **Default stays 0.0.** A corpus where recall targets tie on hits is the follow-up before this knob can be decided |
 
 `ns-app eval --activation <w>` exists for that day.
+
+### P4 — done 2026-09-11, 0 requests
+
+Two decisions taken at build time, both stricter than the plan text: **counters are derived,
+never incremented** — each pass recomputes `exposures` and `credits` for every current fact
+and note from the whole store and *sets* them, so the join is idempotent and auditable and
+pre-M9 sessions contribute zero; and **setting a counter never supersedes a version** — a
+`set_fact_fitness` trait method with a default body updates the current version in place
+(one UPDATE on the primary key in SQLite). A new-value fact version starts at 0/0; the
+restatement arm keeps the counters (inheriting would credit "Peter" for calls that showed
+"Martin"). Per-note counters live in a `fitness` map in the ledger, not in `numbers`, because
+hand-written notes have no entry.
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T4.1 | a pre-M9 `.sqlite` opens and reports 0/0 | met (`a_pre_m9_database_opens_and_reports_zero_exposures_and_credits`); `ALTER TABLE … ADD COLUMN` via the `table_info` sniff; `activation_freq` flipped to `credits` |
+| T4.2 | `sources` names the fact key | met: `reference_parts` → `(id, text)` with `persona`, `trace`, `fact:<key>`, `summary`, `window:<turn>`, `guidance:<hash>`, `obligations`; `Material` text byte-identical; `ReplyCited` emitted on the final draft of all three grounding exits, infrastructure everywhere `Graded` is |
+| T4.3 | counters match a hand-computed fixture; `Σ exposures == 0` on a graded session is an alarm | met (`crates/evolution/src/fitness.rs`, six tests incl. idempotence and the alarm) |
+| T4.4 | knob off → reported, store unchanged; pinned never demoted | met: `[memory] fitness_min_exposures = 8`, `fitness_demote = false`; pinned prefixes threaded into `PassConfig` and excluded before the branch |
+| T4.5 | numbers readable without opening SQLite | met: `fitness: N facts derived, M with exposures, Z zero-credit`, top-10 zero-credit, would-demote count + knob state, the alarm line, per-note `hash lift exposures credits` |
+
+**First reading, on a copy of the live log (21 turns):** `fitness: 0 facts derived … alarm:
+graded session cli exposes no fact` — true, not a bug: turn 21's four manifests carry
+`fact_keys: []` because **the live store holds no facts at all** (which is also why the
+smoke reply said it did not know the user's name). The one note, `sha256:contextmenu`,
+scores **2 exposures, 2 credits** (turn 21 graded ok by `symbolic`); a non-dry pass persists
+`"fitness": {"sha256:contextmenu": {"exposures": 2, "credits": 2}}` and a following dry run
+re-derives it identically with `0 newly graded, 21 read back`.
+
+Caveat recorded: the manifest carries no scope, so counters are keyed by fact key and applied
+to whichever scope's current version holds it — exact on this deployment (every session maps
+to `global`); a multi-scope channel needs the scope in the manifest before `fitness_demote`
+may be turned on there.
