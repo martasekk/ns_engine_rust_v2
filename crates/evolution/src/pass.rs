@@ -47,6 +47,17 @@ pub struct PassConfig {
     /// measurement, not something to average away, and the gate has to be
     /// able to say *whose* verdict it acted on.
     pub authoritative_evaluator: String,
+    /// M8 T2.7 / M10 T5.3: the κ an evaluator must reach against the symbolic
+    /// proxies before the notes gate will believe it.
+    ///
+    /// Below it — or on a table too small to estimate κ from at all — the
+    /// evaluator still grades, and every grade is still recorded as a
+    /// `Graded` event (T2.3a). What it loses is authority: the gate falls
+    /// back to the symbolic checks, so the evaluator contributes
+    /// observations and no candidates. That is the same treatment a paid
+    /// judge below threshold gets, which is the whole argument for admitting
+    /// a local scorer here at all.
+    pub evaluator_min_kappa: f64,
     /// M9 T4.4: exposures a fact needs before zero credits mean anything.
     pub fitness_min_exposures: u32,
     /// Whether the fitness signal demotes or only reports. Off for a release.
@@ -69,6 +80,7 @@ impl Default for PassConfig {
             digest_scope: "global".into(),
             evaluate: EvaluateConfig::default(),
             authoritative_evaluator: "symbolic".into(),
+            evaluator_min_kappa: 0.4,
             fitness_min_exposures: 8,
             fitness_demote: false,
             pinned_prefixes: vec!["user.".into()],
@@ -82,6 +94,67 @@ pub enum PassError {
     Store(#[from] StoreError),
     #[error("file: {0}")]
     File(#[from] FileError),
+}
+
+/// The evaluator every other one is calibrated against (M8 T2.7).
+///
+/// Not `authoritative_evaluator`: that knob says whose verdict the gate acts
+/// on, and it is the thing κ decides. The reference has to be the scorer that
+/// costs nothing, never fails and is already in the diff — otherwise a scorer
+/// could be promoted by agreeing with itself.
+const KAPPA_REFERENCE: &str = "symbolic";
+
+/// `n` a ±0.2 interval on κ needs (Donner–Eliasziw, see `kappa.rs`), and the
+/// positives below which the estimate is resting on a handful of turns.
+const KAPPA_MIN_N: u32 = 96;
+const KAPPA_MIN_POSITIVES: u32 = 10;
+
+/// How one evaluator agreed with the reference, over the turns both graded.
+///
+/// M10 T5.3. The whole table travels rather than κ alone, because κ alone is
+/// unreadable at this lane's prevalence — see the module docs of
+/// [`crate::kappa`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatorAgreement {
+    pub evaluator: String,
+    pub reference: String,
+    /// `None` when the two never graded the same turn — which, for a scorer
+    /// that reports `Unavailable` on every call, is what a service being
+    /// down looks like from here.
+    pub scores: Option<crate::kappa::Scores>,
+    /// Whether the table is big enough for its κ to be worth reading.
+    pub decisive: bool,
+    /// Whether the notes gate acted on this evaluator's grades this run.
+    pub authoritative: bool,
+    /// Why it did not, empty when it did.
+    pub caveat: String,
+}
+
+impl EvaluatorAgreement {
+    /// May the gate believe this evaluator? Only with a κ at or above the
+    /// threshold *and* a table decisive enough to have measured it. An
+    /// indecisive κ is treated as below threshold, never as absent.
+    pub fn trusted(&self, min_kappa: f64) -> bool {
+        self.decisive && self.scores.as_ref().is_some_and(|s| s.kappa >= min_kappa)
+    }
+}
+
+impl std::fmt::Display for EvaluatorAgreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "κ {} vs {}: ", self.evaluator, self.reference)?;
+        match &self.scores {
+            None => write!(f, "unavailable (service down)")?,
+            Some(s) => write!(
+                f,
+                "{:.2} [{:.2}, {:.2}] over {} turns (ac1 {:.2}, rate {:.2} vs {:.2})",
+                s.kappa, s.kappa_lo, s.kappa_hi, s.n, s.ac1, s.a_rate, s.b_rate
+            )?,
+        }
+        if !self.caveat.is_empty() {
+            write!(f, " — {}", self.caveat)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +188,14 @@ pub struct Report {
     /// Grade attempts the scorer could not answer. Not a failure of a turn
     /// and not counted against anything — the service was down.
     pub grades_unavailable: usize,
+    /// M10 T5.3: one entry per evaluator beside the symbolic baseline.
+    pub agreement: Vec<EvaluatorAgreement>,
+    /// The evaluator the notes gate actually believed this run, after the κ
+    /// threshold had its say — which is not always the configured one.
+    pub authoritative_evaluator: String,
+    /// Set when the configured authoritative evaluator was demoted, to the
+    /// name it was demoted from.
+    pub demoted_from: Option<String>,
     pub facts_written: usize,
     pub written: bool,
     /// M6 §6.4 fact consolidation numbers.
@@ -160,6 +241,21 @@ impl std::fmt::Display for Report {
             "graded turns: {} newly graded, {} read back from the log, {} unavailable",
             self.graded_turns, self.grades_reused, self.grades_unavailable
         )?;
+        for a in &self.agreement {
+            writeln!(f, "{a}")?;
+        }
+        write!(
+            f,
+            "authoritative evaluator: {}",
+            self.authoritative_evaluator
+        )?;
+        match &self.demoted_from {
+            Some(from) => writeln!(
+                f,
+                " (configured {from:?} demoted: observations only, no candidates)"
+            )?,
+            None => writeln!(f)?,
+        }
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
         // M9 T4.5: the numbers this phase exists to make readable without
@@ -386,6 +482,105 @@ impl EvolutionPass {
         Ok(())
     }
 
+    /// Step 4b': κ of every evaluator beside the reference (M8 T2.7, M10 T5.3).
+    ///
+    /// Read out of the *log*, not out of this run's grades. A pass that
+    /// regraded nothing still reports κ, because the grades it is computed
+    /// from are recorded values — which is the same property T2.3a buys for
+    /// replay, applied to calibration.
+    ///
+    /// Only turns *both* graded enter the table. A turn the local scorer
+    /// could not answer is absent rather than counted as agreement, so a
+    /// service that is half up cannot inflate its own κ by staying silent on
+    /// the turns it would have got wrong.
+    fn agreement(&self, sessions: &[Recorded]) -> Vec<EvaluatorAgreement> {
+        // evaluator id -> (session, turn) -> did it see a problem here.
+        // `BTreeMap` twice so the two label streams are aligned by key and
+        // the order is the same on every run.
+        let mut labels: BTreeMap<String, BTreeMap<(usize, u32), bool>> = BTreeMap::new();
+        for (si, (_, events)) in sessions.iter().enumerate() {
+            for e in events {
+                if let nscore::EventKind::Graded {
+                    turn, grade, by, ..
+                } = &e.kind
+                {
+                    labels
+                        .entry(by.clone())
+                        .or_default()
+                        .insert((si, *turn), !grade.ok);
+                }
+            }
+        }
+        let empty = BTreeMap::new();
+        let reference = labels.get(KAPPA_REFERENCE).unwrap_or(&empty);
+
+        let mut out = Vec::new();
+        for ev in &self.evaluators {
+            let id = ev.id();
+            if id == KAPPA_REFERENCE {
+                continue;
+            }
+            let mut under_test = Vec::new();
+            let mut against = Vec::new();
+            if let Some(mine) = labels.get(&id) {
+                for (key, v) in mine {
+                    if let Some(r) = reference.get(key) {
+                        under_test.push(*v);
+                        against.push(*r);
+                    }
+                }
+            }
+            let (scores, decisive) = if under_test.is_empty() {
+                (None, false)
+            } else {
+                let table = crate::kappa::Agreement::tally(&under_test, &against);
+                let d = table.decisive(KAPPA_MIN_N, KAPPA_MIN_POSITIVES);
+                (Some(table.scores()), d)
+            };
+            let caveat = match &scores {
+                None => "no turn was graded by both; observations only".to_string(),
+                Some(sc) if sc.kappa < self.cfg.evaluator_min_kappa => format!(
+                    "κ below evaluator_min_kappa {:.2}: observations only, no candidates",
+                    self.cfg.evaluator_min_kappa
+                ),
+                Some(sc) if !decisive => format!(
+                    "not decisive (n={} needs {KAPPA_MIN_N}, positives={} needs                      {KAPPA_MIN_POSITIVES}): observations only, no candidates",
+                    sc.n, sc.positives
+                ),
+                Some(_) => String::new(),
+            };
+            out.push(EvaluatorAgreement {
+                evaluator: id,
+                reference: KAPPA_REFERENCE.to_string(),
+                scores,
+                decisive,
+                authoritative: false,
+                caveat,
+            });
+        }
+        out
+    }
+
+    /// Whose grades the notes gate believes this run.
+    ///
+    /// The configured name, unless κ says it has not earned it — and then the
+    /// reference, which needs no calibration because it *is* the
+    /// calibration. Demotion is the conservative direction by construction:
+    /// the grades are all still in the log, so nothing is lost but authority.
+    fn effective_authoritative(
+        &self,
+        agreement: &[EvaluatorAgreement],
+    ) -> (String, Option<String>) {
+        let want = self.cfg.authoritative_evaluator.clone();
+        if want == KAPPA_REFERENCE {
+            return (want, None);
+        }
+        match agreement.iter().find(|a| a.evaluator == want) {
+            Some(a) if a.trusted(self.cfg.evaluator_min_kappa) => (want, None),
+            _ => (KAPPA_REFERENCE.to_string(), Some(want)),
+        }
+    }
+
     pub async fn run_report(&self, store: &dyn MemoryStore) -> Result<Report, PassError> {
         // 1–2. An unparsable learned.toml aborts before anything is proposed.
         let base = load_rules(&self.learned_path)?;
@@ -441,7 +636,19 @@ impl EvolutionPass {
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
 
-        // 4b'. Mine the success lane (M9 T5.1).
+        // 4b′. Calibration (M8 T2.7, M10 T5.3), before anything downstream
+        // asks whose verdict to believe. It has to run here and not at
+        // report time: `authoritative` is an input to the success lane, to
+        // fitness and to the notes gate, and all three are below.
+        report.agreement = self.agreement(&sessions);
+        let (authoritative, demoted_from) = self.effective_authoritative(&report.agreement);
+        for a in &mut report.agreement {
+            a.authoritative = a.evaluator == authoritative;
+        }
+        report.authoritative_evaluator = authoritative.clone();
+        report.demoted_from = demoted_from;
+
+        // 4b''. Mine the success lane (M9 T5.1).
         //
         // A third source, and the only one that reads every session at once:
         // `Succeeded` is a route two graded-good turns both took, and no
@@ -450,10 +657,7 @@ impl EvolutionPass {
         // run's fresh verdicts into `sessions` — mining first would mean a
         // session could never yield a strategy until a second pass, which is
         // the sort of silence that reads as "nothing found".
-        sigs.extend(crate::mine::mine_succeeded(
-            &sessions,
-            &self.cfg.authoritative_evaluator,
-        ));
+        sigs.extend(crate::mine::mine_succeeded(&sessions, &authoritative));
         for s in &sigs {
             *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
             let turns = report.signature_turns.entry(s.kind.name()).or_default();
@@ -472,8 +676,7 @@ impl EvolutionPass {
         // log rather than whatever the last pass left in the columns. The
         // numbers are *derived and set*, never incremented — running this
         // twice over one log produces one answer.
-        report.fitness =
-            crate::fitness::derive(store, &sessions, &self.cfg.authoritative_evaluator).await?;
+        report.fitness = crate::fitness::derive(store, &sessions, &authoritative).await?;
         for note in &base.notes {
             report
                 .fitness
@@ -652,7 +855,7 @@ impl EvolutionPass {
                     // one keeps the path it had.
                     &crate::notes::NoteGate {
                         require_graded: s.kind.from_grades(),
-                        authoritative: self.cfg.authoritative_evaluator.clone(),
+                        authoritative: authoritative.clone(),
                     },
                 )
                 .await;
@@ -777,6 +980,51 @@ mod tests {
         e.run_turn(Incoming {
             session: SessionId(name.into()),
             text: "go".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A reply that answers in the user's own words — and, when the user
+    /// asks for "details", invents some.
+    ///
+    /// A κ table whose reference never changes its mind is the prevalence
+    /// paradox rather than a measurement, so the fixture has to be able to
+    /// make the symbolic checks say *yes* on some turns and *no* on others.
+    /// `ScriptedReplier` cannot: it echoes the whole turn trace, which the
+    /// grounding check reads as a page of unsupported claims on every turn.
+    /// The three invented claims below are what `ground::ungrounded` is
+    /// built to catch — a name, a number and a place nothing showed it.
+    struct PlainReplier;
+    #[async_trait::async_trait]
+    impl nscore::Replier for PlainReplier {
+        async fn reply(&self, ctx: nscore::ReplyContext) -> Result<String, nscore::ReplyError> {
+            let mut r = format!("sure, about {}: done", ctx.user_text);
+            if ctx.user_text.contains("details") {
+                r.push_str(", Martin has 42 orders in Oslo");
+            }
+            Ok(r)
+        }
+    }
+
+    /// `record_into` with the user's words under the harness's control, so a
+    /// scorer can be scripted per turn without a session id it cannot see.
+    async fn record_asking(store: Arc<InMemoryStore>, name: &str, text: &str, p: Vec<Proposal>) {
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(p)));
+        b.set_replier(Box::new(PlainReplier));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(Closed));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig::default(),
+            Box::new(|| Timestamp(1)),
+        );
+        e.run_turn(Incoming {
+            session: SessionId(name.into()),
+            text: text.into(),
         })
         .await
         .unwrap();
@@ -1426,5 +1674,179 @@ mod tests {
             tools_tokens: 0,
             cached_tokens: 0,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M8 T2.7 / M10 T5.3 — κ per evaluator, and what a low one costs
+    // -----------------------------------------------------------------
+
+    /// A second scorer that *is* the symbolic one, disagreeing on exactly the
+    /// turns it is told to.
+    ///
+    /// Nothing weaker gives a test control of a κ table. The reference's own
+    /// labels are whatever the checks make of the recorded turns, so a fixed
+    /// script would agree or disagree by accident and the table would be
+    /// measuring the fixture rather than the arithmetic. Mirroring and
+    /// flipping makes the off-diagonal exactly `flip_on.len()`.
+    struct MirrorEvaluator {
+        flip_on: Vec<String>,
+        inner: crate::evaluate::SymbolicEvaluator,
+    }
+    #[async_trait::async_trait]
+    impl Evaluator for MirrorEvaluator {
+        fn id(&self) -> String {
+            "scripted".into()
+        }
+        async fn grade(
+            &self,
+            view: &crate::evaluate::TurnView<'_>,
+        ) -> Result<crate::evaluate::TurnGrade, crate::evaluate::GradeError> {
+            use crate::evaluate::Issue;
+            let mut g = self.inner.grade(view).await?;
+            if self.flip_on.iter().any(|t| t == view.user) {
+                // The binary κ is computed over is `!grade.ok`, and `ok` is
+                // false when *either* the issue or the grounding flag says
+                // so — so both have to move together for the flip to land.
+                if g.issue.is_problem() || !g.grounded {
+                    g.issue = Issue::None;
+                    g.grounded = true;
+                } else {
+                    g.issue = Issue::Reask;
+                }
+            }
+            g.scorer = self.id();
+            Ok(g)
+        }
+    }
+
+    /// Ten one-turn sessions, five of which the symbolic checks call a
+    /// problem. Half and half on purpose: κ at a degenerate prevalence is
+    /// zero however well two raters agree, and a fixture that could not be
+    /// read is not a test of the arithmetic.
+    async fn ten_turns(store: &Arc<InMemoryStore>) {
+        for i in 0..10 {
+            let text = if i % 2 == 0 {
+                format!("ask {i}")
+            } else {
+                format!("ask {i} with details")
+            };
+            record_asking(store.clone(), &format!("s{i}"), &text, vec![good()]).await;
+        }
+    }
+
+    fn mirror(flip: &[&str]) -> Arc<MirrorEvaluator> {
+        Arc::new(MirrorEvaluator {
+            flip_on: flip.iter().map(|s| s.to_string()).collect(),
+            inner: crate::evaluate::SymbolicEvaluator::default(),
+        })
+    }
+
+    /// T5.3's first exit line: a second evaluator that agrees on 8 of 10
+    /// turns gets a κ against the symbolic baseline, and the number is in
+    /// the report a dry run prints rather than only in a struct.
+    #[tokio::test]
+    async fn a_second_evaluator_prints_kappa_against_the_symbolic_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        ten_turns(&store).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        let report = pass(dir.path(), rules, true)
+            .with_evaluator(mirror(&["ask 0", "ask 3 with details"]))
+            .run_report(&*store)
+            .await
+            .unwrap();
+
+        assert_eq!(report.agreement.len(), 1, "{report}");
+        let a = &report.agreement[0];
+        assert_eq!(
+            (a.evaluator.as_str(), a.reference.as_str()),
+            ("scripted", "symbolic")
+        );
+        let sc = a
+            .scores
+            .as_ref()
+            .expect("both scorers graded all ten turns");
+        assert_eq!(sc.n, 10, "{a}");
+        // Two flips, so the off-diagonal is exactly two: raw agreement 0.8.
+        assert!((sc.observed - 0.8).abs() < 1e-9, "{a}");
+        // Five replies invented a name, a number and a place, so the
+        // reference calls half of them a problem — which is what makes κ
+        // readable here: (0.80 − 0.50) / (1 − 0.50).
+        assert!((sc.b_rate - 0.5).abs() < 1e-9, "{a}");
+        assert!((sc.kappa - 0.6).abs() < 1e-9, "κ was not computed: {a}");
+        // … and it is printed, which is the half of the task a struct field
+        // does not satisfy.
+        let printed = report.to_string();
+        assert!(
+            printed.contains("κ scripted vs symbolic:") && printed.contains("over 10 turns"),
+            "{printed}"
+        );
+        // Ten turns cannot resolve the gate, and the line says so rather
+        // than letting a small-sample κ pass for a measurement.
+        assert!(!a.decisive, "{a}");
+    }
+
+    /// T5.3's second: below the threshold an evaluator still grades and its
+    /// grades are still recorded — what it loses is the gate.
+    #[tokio::test]
+    async fn an_evaluator_below_min_kappa_is_reported_but_not_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        ten_turns(&store).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        // Disagrees on half the turns, and is nonetheless configured as the
+        // scorer the gate should believe.
+        let p = EvolutionPass::new(
+            rules,
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                authoritative_evaluator: "scripted".into(),
+                evaluator_min_kappa: 0.4,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123))
+        .with_evaluator(mirror(&[
+            "ask 0",
+            "ask 1 with details",
+            "ask 2",
+            "ask 3 with details",
+            "ask 4",
+        ]));
+        let report = p.run_report(&*store).await.unwrap();
+
+        let a = &report.agreement[0];
+        let sc = a.scores.as_ref().expect("it graded every turn");
+        assert!(
+            sc.kappa < 0.4,
+            "the fixture has to land under the gate: {a}"
+        );
+        assert!(!a.trusted(0.4) && !a.authoritative, "{a}");
+        assert_eq!(report.authoritative_evaluator, "symbolic", "{report}");
+        assert_eq!(report.demoted_from.as_deref(), Some("scripted"), "{report}");
+        let printed = report.to_string();
+        assert!(
+            printed.contains("below evaluator_min_kappa")
+                && printed.contains("observations only, no candidates")
+                && printed.contains("demoted"),
+            "{printed}"
+        );
+
+        // Observations only — but observations, not silence: every grade it
+        // produced is in the log under its own name (T2.3a).
+        let events = store.load(&SessionId("s0".into())).await.unwrap();
+        let recorded: Vec<String> = graded_events(&events)
+            .iter()
+            .map(|e| serde_json::to_string(&e.kind).unwrap())
+            .collect();
+        assert!(
+            recorded.iter().any(|j| j.contains(r#""by":"scripted""#)),
+            "{recorded:?}"
+        );
+        assert!(recorded.iter().any(|j| j.contains(r#""by":"symbolic""#)));
     }
 }

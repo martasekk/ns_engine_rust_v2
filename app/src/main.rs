@@ -315,14 +315,43 @@ fn build_pass(
     dry_run: bool,
 ) -> nsevolution::pass::EvolutionPass {
     let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
-    let pass = nsevolution::pass::EvolutionPass::new(
+    let pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
+    let evaluate_cfg = pass_cfg.evaluate.clone();
+    let mut pass = nsevolution::pass::EvolutionPass::new(
         rules,
         specs.clone(),
         std::path::PathBuf::from(&cfg.evolution.learned_path),
         std::path::PathBuf::from(&cfg.evolution.ledger_path),
-        cfg.evolution
-            .pass_config(dry_run, &cfg.memory, cfg.models.evaluate_budget_turns),
+        pass_cfg,
     );
+    // M10 T5.3: the local scorer joins the always-present symbolic one when
+    // `[models] enabled`, and only then. It needs no key — that is the whole
+    // point of it — so it is added before the notes lane's key check, and a
+    // pass with no API key still grades with it.
+    //
+    // Nothing here checks whether the service is up. It should not: the lane
+    // disables itself after two unreachable calls and reports every signal
+    // `Unavailable`, so a service that is down costs two timeouts and prints
+    // `unavailable (service down)` beside its κ. A reachability probe at
+    // startup would only be a third way to learn the same thing, one pass
+    // earlier.
+    if cfg.models.enabled {
+        pass = pass.with_evaluator(std::sync::Arc::new(
+            nsevolution::local::LocalEvaluator::new(
+                nsevolution::local::LocalConfig {
+                    base_url: cfg.models.base_url.clone(),
+                    timeout_ms: cfg.models.timeout_ms,
+                    reask_cosine: cfg.models.reask_cosine,
+                    relevance_cut: cfg.models.relevance_cut,
+                },
+                // The local scorer keeps the structural half of the symbolic
+                // checks rather than re-deriving it: I6 is two logged facts
+                // and grounding is span attribution, and an embedding
+                // improves on neither.
+                nsevolution::evaluate::SymbolicEvaluator { cfg: evaluate_cfg },
+            ),
+        ));
+    }
     match emitter.key() {
         None => {
             eprintln!(

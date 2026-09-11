@@ -90,6 +90,18 @@ pub struct ModelsSection {
     /// for new turns only — a second pass over the same log grades nothing.
     #[serde(default = "default_evaluate_budget_turns")]
     pub evaluate_budget_turns: u32,
+    /// Cohen's κ an evaluator must reach against the symbolic proxies before
+    /// the notes gate will act on its grades (M8 T2.7, M10 T5.3).
+    ///
+    /// Under it the scorer still runs and every grade it produces is still
+    /// recorded — it contributes observations and no candidates, which is
+    /// exactly what a paid judge below threshold gets. 0.4 is the bottom of
+    /// Landis–Koch's "moderate" band, and it is a floor rather than a
+    /// target: the lane's own held-out numbers (M8 §Results: symbolic 0.501,
+    /// local 0.628, local-vs-symbolic 0.466) sit above it, so a scorer that
+    /// falls under it has moved.
+    #[serde(default = "default_evaluator_min_kappa")]
+    pub evaluator_min_kappa: f64,
 }
 
 impl Default for ModelsSection {
@@ -101,6 +113,7 @@ impl Default for ModelsSection {
             reask_cosine: default_reask_cosine(),
             relevance_cut: default_relevance_cut(),
             evaluate_budget_turns: default_evaluate_budget_turns(),
+            evaluator_min_kappa: default_evaluator_min_kappa(),
         }
     }
 }
@@ -109,6 +122,12 @@ impl Default for ModelsSection {
 /// of the same order: the two lanes compete for the same wait.
 fn default_evaluate_budget_turns() -> u32 {
     40
+}
+
+/// The bottom of Landis–Koch's "moderate" band. See
+/// [`ModelsSection::evaluator_min_kappa`].
+fn default_evaluator_min_kappa() -> f64 {
+    0.4
 }
 
 fn default_models_base_url() -> String {
@@ -1030,7 +1049,7 @@ impl EvolutionSection {
         &self,
         dry_run: bool,
         memory: &MemorySection,
-        evaluate_budget_turns: u32,
+        models: &ModelsSection,
     ) -> nsevolution::pass::PassConfig {
         let fact_stale_days = memory.fact_stale_days;
         nsevolution::pass::PassConfig {
@@ -1046,13 +1065,14 @@ impl EvolutionSection {
             digest_scope: "global".into(),
             evaluate: nsevolution::evaluate::EvaluateConfig {
                 reask_jaccard: self.reask_jaccard,
-                budget_turns: evaluate_budget_turns,
+                budget_turns: models.evaluate_budget_turns,
                 ..Default::default()
             },
             // The symbolic checks are the baseline every other evaluator is
             // calibrated against (T2.7), so they are what the gate believes
             // until a κ threshold says otherwise.
             authoritative_evaluator: "symbolic".into(),
+            evaluator_min_kappa: models.evaluator_min_kappa,
             fitness_min_exposures: memory.fitness_min_exposures,
             fitness_demote: memory.fitness_demote,
             pinned_prefixes: memory.pinned_prefixes.clone(),
@@ -1460,12 +1480,31 @@ mod tests {
     fn evaluate_budget_turns_parses_and_reaches_the_pass() {
         let cfg = AppConfig::parse("[models]\nevaluate_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.models.evaluate_budget_turns, 7);
-        let pc = cfg
-            .evolution
-            .pass_config(true, &cfg.memory, cfg.models.evaluate_budget_turns);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
         assert_eq!(pc.evaluate.budget_turns, 7);
         // And the gate's default belief is the symbolic baseline.
         assert_eq!(pc.authoritative_evaluator, "symbolic");
+    }
+
+    /// M10 T5.3. The κ threshold is a key with a default, and it reaches the
+    /// pass — the two halves of "honoured" that a config test can settle.
+    #[test]
+    fn evaluator_min_kappa_defaults_to_four_tenths_and_reaches_the_pass() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!((cfg.models.evaluator_min_kappa - 0.4).abs() < 1e-12);
+        assert!(
+            (cfg.evolution
+                .pass_config(true, &cfg.memory, &cfg.models)
+                .evaluator_min_kappa
+                - 0.4)
+                .abs()
+                < 1e-12
+        );
+
+        let cfg = AppConfig::parse("[models]\nevaluator_min_kappa = 0.62\n").unwrap();
+        assert!((cfg.models.evaluator_min_kappa - 0.62).abs() < 1e-12);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
+        assert!((pc.evaluator_min_kappa - 0.62).abs() < 1e-12);
     }
 
     /// M9 T4.4. The two fitness knobs sit beside `fact_stale_days` in
@@ -1477,7 +1516,7 @@ mod tests {
         let cfg = AppConfig::parse("").unwrap();
         assert_eq!(cfg.memory.fitness_min_exposures, 8);
         assert!(!cfg.memory.fitness_demote, "reports before it demotes");
-        let pc = cfg.evolution.pass_config(true, &cfg.memory, 40);
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, &cfg.models);
         assert_eq!(pc.fitness_min_exposures, 8);
         assert!(!pc.fitness_demote);
         assert_eq!(pc.pinned_prefixes, vec!["user.".to_string()]);
@@ -1487,7 +1526,7 @@ mod tests {
             "[memory]\nfitness_min_exposures = 3\nfitness_demote = true\npinned_prefixes = [\"me.\"]\n",
         )
         .unwrap();
-        let pc = cfg.evolution.pass_config(false, &cfg.memory, 40);
+        let pc = cfg.evolution.pass_config(false, &cfg.memory, &cfg.models);
         assert_eq!(pc.fitness_min_exposures, 3);
         assert!(pc.fitness_demote);
         assert_eq!(pc.pinned_prefixes, vec!["me.".to_string()]);
@@ -1588,11 +1627,15 @@ mod tests {
         assert_eq!(cfg.evolution.idle_after(), None);
         assert_eq!(
             cfg.evolution
-                .pass_config(true, &cfg.memory, 40)
+                .pass_config(true, &cfg.memory, &cfg.models)
                 .probe_budget_turns,
             7
         );
-        assert!(cfg.evolution.pass_config(true, &cfg.memory, 40).dry_run);
+        assert!(
+            cfg.evolution
+                .pass_config(true, &cfg.memory, &cfg.models)
+                .dry_run
+        );
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
     }
