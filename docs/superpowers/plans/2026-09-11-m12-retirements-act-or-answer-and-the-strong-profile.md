@@ -292,3 +292,12 @@ desktop-only and the line is parked; the knob waits for the first chat note.
 Workspace suite: 720 passed, 0 failed, 1 ignored. The replay of M11's nine flagged turns is P6's reading (the
 log is on the live box, not in the tree). Not built, as planned: argument examples behind
 the profile — desktop parked.
+
+### P2 — done 2026-09-11 (commit `98a25a1`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T2.1 | a time question reaches `get_time` at tier Chat with a one-tool array; every other chat message carries zero tools | met: `[router] chat_tools = ["get_time"]`, cue-gated in `Route::route` through the depth table's own cue groups (`time`, `clock`, `čas`, `hodin`), the tier unchanged; `turn.rs` admits the route's selection on a Chat turn through the same once-per-turn `selected_tools` path; `a_time_question_carries_get_time_and_stays_on_the_chat_tier` (en and cs; empty list carries nothing), `a_time_question_on_the_chat_tier_carries_exactly_get_time` (the registered part of `tool_names`; a following "thanks!" carries none); the M10 chat-tier tests unchanged |
+
+Workspace suite: 723 passed, 0 failed, 1 ignored. The default changes here, as a defect fix: the fix is
+byte-identical for every message without a time cue.
