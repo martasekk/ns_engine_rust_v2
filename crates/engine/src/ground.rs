@@ -167,16 +167,29 @@ pub fn echo_material(ctx: &ReplyContext) -> String {
 /// Everything the reply model was shown, lowercased, for substring checks.
 pub struct Material {
     text: String,
+    /// The material's *names*: the tokens `nscore::query_tokens` yields,
+    /// kept only where the source text capitalized them, folded and
+    /// lowercased for comparison. Cached so the stem fallback does not
+    /// retokenize the whole material per claim.
+    ///
+    /// Capitalized only, because every claim that reaches the fallback is
+    /// one of `extract_claims`' capitalized names, and a name may be
+    /// grounded by a name and by nothing else. Against all the tokens,
+    /// `Turku` was grounded by the word `turns` in the rendered summary
+    /// header — scaffolding, not evidence.
+    names: Vec<String>,
 }
 
 impl Material {
     pub fn from_parts(parts: &[&str]) -> Self {
+        let source = parts.join("\n");
         let text = parts
             .iter()
             .map(|p| p.to_lowercase())
             .collect::<Vec<_>>()
             .join("\n");
-        Self { text }
+        let names = capitalized_tokens(&source);
+        Self { text, names }
     }
 
     /// Exactly the blocks `CloudReplier` renders, plus the persona.
@@ -192,8 +205,33 @@ impl Material {
 
     pub fn contains(&self, claim: &str) -> bool {
         let needle = claim.to_lowercase();
-        !needle.is_empty() && self.text.contains(&needle)
+        if needle.is_empty() {
+            return false;
+        }
+        if self.text.contains(&needle) {
+            return true;
+        }
+        // M12 T1.5. One word may be the inflected form of a name the
+        // material states in another case; a multi-word claim is quoted
+        // text and keeps exact semantics, because loosening a whole phrase
+        // would let a rewritten quote pass as the original.
+        !needle.contains(char::is_whitespace)
+            && self.names.iter().any(|t| nscore::stem_match(&needle, t))
     }
+}
+
+/// The material's capitalized content words, folded and lowercased.
+///
+/// Split the way `nscore::query_tokens` splits — runs of alphanumerics, at
+/// least three characters — but selected on the *source* case, before
+/// anything is lowercased, so `Praha` is kept and `turns` is not.
+fn capitalized_tokens(source: &str) -> Vec<String> {
+    source
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 3)
+        .filter(|t| t.chars().next().map(char::is_uppercase).unwrap_or(false))
+        .map(|t| nscore::fold_diacritics(t).to_lowercase())
+        .collect()
 }
 
 /// Capitalized words that start clauses or are conversational filler, not
@@ -417,6 +455,47 @@ mod tests {
         assert_eq!(
             ungrounded("You said \"tell me a joke\".", &m),
             vec!["tell me a joke"]
+        );
+    }
+
+    /// M12 T1.5. A Czech reply declines the names its material states in the
+    /// nominative, and the exact-substring check read every one of those as
+    /// a fabrication. The stem fallback is single-word only and keeps the
+    /// tight rule, so a different name that merely opens the same way is
+    /// still ungrounded.
+    #[test]
+    fn a_czech_inflected_name_is_grounded_by_its_stem() {
+        let m = Material::from_parts(&[
+            "user.city: \"Praha\"",
+            "[t3] user: kde bydlim\n      did:  recall -> ok: Praha",
+        ]);
+        assert_eq!(
+            ungrounded("Bydlite v Praze, jak jste rekl.", &m),
+            Vec::<String>::new()
+        );
+        let m = Material::from_parts(&["user.country: \"Canada\""]);
+        assert_eq!(
+            ungrounded("You live in Canberra, you said.", &m),
+            vec!["Canberra"]
+        );
+    }
+
+    /// M12 T1.5. The stem fallback reaches only the material's *names*. A
+    /// lowercase prose word — and in particular the engine's own rendering
+    /// scaffolding, `Conversation so far (turns 1-8)` — shares a stem with
+    /// plenty of invented places, and grounding a name on one would turn the
+    /// interceptor off exactly where it earns its keep.
+    #[test]
+    fn a_lowercase_prose_word_never_grounds_a_name_by_stem() {
+        let m = Material::from_parts(&["Conversation so far (turns 1-8): the user lives in Praha"]);
+        assert_eq!(
+            ungrounded("Your card is from Turku.", &m),
+            vec!["Turku"],
+            "`turns` is scaffolding, not a name"
+        );
+        assert_eq!(
+            ungrounded("You live in Praze, you said.", &m),
+            Vec::<String>::new()
         );
     }
 

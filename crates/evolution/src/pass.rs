@@ -258,6 +258,10 @@ pub struct Report {
     /// at once — which is what makes the rate comparable between runs, and
     /// what makes it the instrument M10's prompt-side loop fix is graded on.
     pub rejections: nscore::RejectionTally,
+    /// Proposals the emitter built out of plain text because the model
+    /// ignored `tool_choice` (M12 T1.3), summed over the same sessions as
+    /// `rejections`. Read together: both are requests that bought no action.
+    pub text_fallbacks: u32,
     /// Rows the embeddings backfill embedded this run (M8 T3.1). 0 on a
     /// store with no encoder, and 0 on a second pass over the same log —
     /// that second 0 is the resumability property, reported rather than
@@ -399,6 +403,7 @@ impl std::fmt::Display for Report {
         // wrong, this says how much of the day's request budget the harness
         // spent finding out.
         writeln!(f, "rejections by reason: {}", self.rejections.line())?;
+        writeln!(f, "text fallbacks: {}", self.text_fallbacks)?;
         writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
@@ -776,6 +781,9 @@ impl EvolutionPass {
             for (reason, n) in t.by_reason {
                 *report.rejections.by_reason.entry(reason).or_default() += n;
             }
+            // M12 T1.3, summed the same way and for the same cost: one more
+            // read of events already in memory.
+            report.text_fallbacks += nscore::text_fallbacks(events);
         }
         // 4b. Grade (M8 T2.3a, M9 T1.1/T1.3).
         //

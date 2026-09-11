@@ -34,6 +34,12 @@ pub struct EngineConfig {
     /// copies its own prompt instead of answering. Off in replay and probes,
     /// where recorded doubles stand in for the replier.
     pub reply_grounding_check: bool,
+    /// M12 T1.2: whether a flagged draft is regenerated, split out of
+    /// `reply_grounding_check` so the observation and the billed second call
+    /// can be decided apart. On by default, which is today's behaviour;
+    /// `main.rs` turns it off under `Capability::Strong`, where the draft
+    /// is still flagged and still logged but stands as written.
+    pub reply_regenerate: bool,
     /// Reporting threshold, not a gate: a draft at or over this fraction of
     /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
     /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
@@ -135,6 +141,9 @@ pub struct EngineConfig {
     /// M10 T1.3: which spelling of every tool description the emitter is
     /// shown. `Full` — the default — is today's text unchanged.
     pub schema_profile: nscore::SchemaProfile,
+    /// M12 T1.1: which class of model this deployment drives. `Small` — the
+    /// default — is today's behaviour in every place that reads it.
+    pub capability: nscore::Capability,
     /// M10 T1.4: whether the synthetic tools that cannot apply are left out
     /// of the legal set. On by default, and **off under replay**.
     ///
@@ -219,6 +228,7 @@ impl Default for EngineConfig {
             caps: nscore::Caps::default(),
             facts_in_context: 10,
             reply_grounding_check: true,
+            reply_regenerate: true,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
@@ -244,6 +254,7 @@ impl Default for EngineConfig {
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
             schema_profile: nscore::SchemaProfile::Full,
+            capability: nscore::Capability::Small,
             prune_inapplicable: true,
             router: None,
             prompt_budget_tokens: 6000,
@@ -2734,15 +2745,22 @@ impl Engine {
                             spans: spans.clone(),
                         },
                     );
-                    let regenerated =
-                        self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
-                    // The regeneration is a second billed call, and
-                    // the point of counting it is to know what the
-                    // grounding check costs.
-                    self.record_model_calls(usage, log, turn, &manifest);
-                    let final_reply = regenerated.unwrap_or(draft);
-                    Self::record_cited(log, turn, now(), &ctx, &final_reply);
-                    return final_reply;
+                    // M12 T1.2: the flag above is free and always written;
+                    // the call below is billed and exists to talk a weak
+                    // model out of its fabrication. Where the model is not
+                    // weak, the draft stands and falls through to the same
+                    // obligations and citation path any draft takes.
+                    if self.cfg.reply_regenerate {
+                        let regenerated =
+                            self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
+                        // The regeneration is a second billed call, and
+                        // the point of counting it is to know what the
+                        // grounding check costs.
+                        self.record_model_calls(usage, log, turn, &manifest);
+                        let final_reply = regenerated.unwrap_or(draft);
+                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                        return final_reply;
+                    }
                 }
                 // M9 T2.1. The obligation interceptor, behind its own
                 // knob and *after* grounding: a draft that already had

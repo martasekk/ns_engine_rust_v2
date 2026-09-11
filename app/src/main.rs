@@ -510,6 +510,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // M12 T1.1, resolved beside it: the emitter's preamble, the engine and
+    // the reply path all read the same one fact about the model in play.
+    let capability = match cfg.llm.capability() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
     // M10 T2.3, resolved here for the same reason: an unreadable depth is a
     // startup error, not a turn that silently runs at the default.
     if let Err(e) = cfg.router.depth() {
@@ -770,7 +779,9 @@ async fn main() {
         // M10 P4. Both halves have to hold: the endpoint must forward a
         // breakpoint at all, and the operator must have said the emitter
         // prefix is worth one. Either off means the request is today's.
-        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter),
+        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter)
+        // M12 T1.1.
+        .with_capability(capability),
     ));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
@@ -893,6 +904,9 @@ async fn main() {
         caps: cfg.memory.caps(),
         facts_in_context: cfg.memory.facts_in_context,
         reply_grounding_check: cfg.memory.reply_grounding_check,
+        // M12 T1.2: a strong model is flagged and logged, never regenerated
+        // at — the second call buys nothing it did not already do.
+        reply_regenerate: capability != nscore::Capability::Strong,
         max_echo_ratio: cfg.memory.max_echo_ratio,
         scope_for,
         remember_residual,
@@ -920,6 +934,7 @@ async fn main() {
         tool_result_max_chars: cfg.memory.tool_result_max_chars,
         recall_sessions: cfg.memory.recall_sessions,
         schema_profile,
+        capability,
         prune_inapplicable: true,
         router: cfg
             .router

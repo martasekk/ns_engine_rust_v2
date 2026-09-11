@@ -889,6 +889,12 @@ pub struct LlmConfig {
     /// M10 T1.6 say `slim` holds.
     #[serde(default)]
     pub schema_profile: Option<String>,
+    /// M12 T1.1: `"small"` (the default) or `"strong"` — which class of
+    /// model this deployment drives. `small` is today's behaviour byte for
+    /// byte; `strong` stands down the scaffolding that exists to compensate
+    /// for a weak emitter, and never adds any.
+    #[serde(default)]
+    pub capability: Option<String>,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -919,6 +925,15 @@ impl LlmConfig {
         match self.schema_profile.as_deref() {
             None => Ok(nscore::SchemaProfile::Full),
             Some(s) => nscore::SchemaProfile::parse(s).map_err(|e| format!("[llm] {e}")),
+        }
+    }
+
+    /// `[llm] capability`, resolved. Err carries the message a startup
+    /// error should print; unset is [`nscore::Capability::Small`].
+    pub fn capability(&self) -> Result<nscore::Capability, String> {
+        match self.capability.as_deref() {
+            None => Ok(nscore::Capability::Small),
+            Some(s) => nscore::Capability::parse(s).map_err(|e| format!("[llm] {e}")),
         }
     }
 
@@ -1473,6 +1488,33 @@ mod tests {
             .schema_profile()
             .unwrap_err();
         assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
+    }
+
+    /// M12 T1.1. Which class of model is driving decides how much scaffolding
+    /// the engine spends on it. `small` is today's behaviour byte for byte,
+    /// and an unknown spelling is a startup error rather than a silent
+    /// fallback: a deployment that asked for `strong` and got `small` would
+    /// pay for the regeneration it thought it had turned off.
+    #[test]
+    fn capability_defaults_to_small_and_rejects_an_unknown_name() {
+        assert_eq!(
+            AppConfig::parse("").unwrap().llm.capability().unwrap(),
+            nscore::Capability::Small
+        );
+        assert_eq!(
+            AppConfig::parse("[llm]\ncapability = \"strong\"")
+                .unwrap()
+                .llm
+                .capability()
+                .unwrap(),
+            nscore::Capability::Strong
+        );
+        let err = AppConfig::parse("[llm]\ncapability = \"huge\"")
+            .unwrap()
+            .llm
+            .capability()
+            .unwrap_err();
+        assert!(err.contains("huge") && err.contains("small, strong"), "{err}");
     }
 
     #[test]

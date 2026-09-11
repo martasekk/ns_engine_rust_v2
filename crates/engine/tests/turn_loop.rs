@@ -267,6 +267,84 @@ async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
         .unwrap();
 }
 
+/// M12 T1.2. On a strong model the flag stays and the second call goes: the
+/// observation is what the log is graded on and it is free, while the
+/// regeneration is a billed request that exists to talk a weak model out of
+/// a fabrication. The first draft is what the user is told, and it flows
+/// down the same citation path any unflagged draft does.
+#[tokio::test]
+async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("ground_strong".into());
+    // A fact the draft states, so the draft has something to cite while
+    // still inventing the count.
+    store
+        .put_fact(Fact {
+            key: "user.city".into(),
+            value: serde_json::json!("Oslo"),
+            confidence: 1.0,
+            last_validated: Timestamp(1),
+            prov: Provenance::Constant,
+            valid_from: Timestamp(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let replier = Arc::new(InventingReplier(Default::default()));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
+    b.set_replier(Box::new(CountingReplier(replier.clone())));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            reply_regenerate: false,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "anything new?".into(),
+        })
+        .await
+        .unwrap();
+    // The first draft, verbatim.
+    assert_eq!(reply, "You have 42 orders waiting in Oslo.");
+    assert_eq!(
+        replier.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one replier request, not two"
+    );
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert!(kinds.contains(&"ReplyFlagged"), "{kinds:?}");
+    assert!(kinds.contains(&"ReplyCited"), "{kinds:?}");
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ReplyFlagged { draft, spans }
+            if draft == "You have 42 orders waiting in Oslo." && spans == &["42"]
+    )));
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Replied { text } if text == "You have 42 orders waiting in Oslo."
+    )));
+}
+
+/// Hands every reply to the inner double so a test can count the calls the
+/// engine made without owning the double.
+struct CountingReplier(Arc<InventingReplier>);
+#[async_trait::async_trait]
+impl Replier for CountingReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        self.0.reply(ctx).await
+    }
+}
+
 /// The live failure, as a double: a draft that copies a line out of the turn
 /// trace instead of answering.
 struct ParrotingReplier(std::sync::atomic::AtomicU32);

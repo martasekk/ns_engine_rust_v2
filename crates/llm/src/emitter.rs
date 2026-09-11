@@ -19,10 +19,33 @@ with their results; never repeat a completed action — when those results answe
 choose respond_directly. A line marked done is such an action: proposing it again is refused \
 and costs a step. ";
 
+/// The same preamble for a model that does not need the repeat gate
+/// explained to it (M12 T1.4).
+///
+/// First two sentences verbatim — they say what the task is, and that is not
+/// a small-model concession. What goes is the narration that follows: three
+/// clauses telling a weak emitter what a `done` line means and what happens
+/// if it proposes one anyway, kept as the one clause that is actually a
+/// rule. Sent on every emitter call and every iteration of every turn, which
+/// is why a few dozen tokens are worth the second string.
+const SYSTEM_PREAMBLE_STRONG: &str = "You translate the user's latest message into exactly one \
+action call from the provided tools. Choose respond_directly when no tool applies. Never invent \
+argument values the user did not supply. Never repeat an action the context lists as done. ";
+
 /// Assembled rather than written out so the rationale instruction has exactly
 /// one home in the workspace and the test can assert it appears once.
-fn system_prompt() -> String {
-    format!("{SYSTEM_PREAMBLE}{RATIONALE_INSTRUCTION}")
+fn system_prompt(capability: nscore::Capability) -> String {
+    let preamble = capability.pick(SYSTEM_PREAMBLE, SYSTEM_PREAMBLE_STRONG);
+    format!("{preamble}{RATIONALE_INSTRUCTION}")
+}
+
+/// The two system prompts, for the cost report that prices them
+/// (`ns-app budget`). Nothing else needs them: the emitter renders its own.
+pub fn system_prompts() -> (String, String) {
+    (
+        system_prompt(nscore::Capability::Small),
+        system_prompt(nscore::Capability::Strong),
+    )
 }
 
 /// 4096, not 1024: reasoning models spend output tokens on reasoning before
@@ -44,6 +67,7 @@ pub struct CloudEmitter {
     model: String,
     shape: crate::provider::RequestShape,
     prompt_cache: bool,
+    capability: nscore::Capability,
 }
 
 impl CloudEmitter {
@@ -53,6 +77,7 @@ impl CloudEmitter {
             model,
             shape: default_shape(),
             prompt_cache: false,
+            capability: nscore::Capability::Small,
         }
     }
 
@@ -78,6 +103,14 @@ impl CloudEmitter {
     /// session, never by reading this code.
     pub fn with_prompt_cache(mut self, on: bool) -> Self {
         self.prompt_cache = on;
+        self
+    }
+
+    /// `[llm] capability` (M12 T1.1). `Small` is the default and is the
+    /// request this emitter has always sent; `Strong` only shortens the
+    /// system preamble (T1.4).
+    pub fn with_capability(mut self, capability: nscore::Capability) -> Self {
+        self.capability = capability;
         self
     }
 }
@@ -190,7 +223,7 @@ impl Emitter for CloudEmitter {
             "tool_choice": "required",
             "tools": build_tools(legal),
             "messages": [
-                {"role": "system", "content": system_prompt()},
+                {"role": "system", "content": system_prompt(self.capability)},
                 {"role": "user", "content": user_content},
             ],
         });
@@ -218,7 +251,9 @@ impl Emitter for CloudEmitter {
                 // control, and the replier narrates from the trace as usual.
                 let text = message["content"].as_str().unwrap_or_default().trim();
                 if !text.is_empty() {
-                    let mut rationale = format!("model answered in text: {text}");
+                    // M12 T1.3: the prefix is `nscore`'s so the counter that
+                    // reads the log and the line that writes it cannot drift.
+                    let mut rationale = format!("{} {text}", nscore::TEXT_FALLBACK_PREFIX);
                     rationale.truncate(300);
                     return Ok(Proposal {
                         rationale,
@@ -301,25 +336,55 @@ mod tests {
     /// a missing one.
     #[test]
     fn the_system_prompt_carries_the_rationale_instruction_once() {
-        let prompt = system_prompt();
-        assert_eq!(
-            prompt.matches(RATIONALE_INSTRUCTION).count(),
-            1,
-            "the rationale instruction is not in the system prompt exactly once: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("_rationale"),
-            "the instruction must name the field the schema injects"
-        );
-        assert_eq!(
-            prompt.matches("_rationale").count(),
-            1,
-            "one mention, not a restatement per paragraph"
-        );
+        // M12 T1.4: both profiles, because the trimmed one is a different
+        // string and a dropped instruction would be invisible otherwise.
+        for capability in [nscore::Capability::Small, nscore::Capability::Strong] {
+            let prompt = system_prompt(capability);
+            assert_eq!(
+                prompt.matches(RATIONALE_INSTRUCTION).count(),
+                1,
+                "the rationale instruction is not in the {} system prompt exactly once: {prompt:?}",
+                capability.as_str()
+            );
+            assert!(
+                prompt.contains("_rationale"),
+                "the instruction must name the field the schema injects"
+            );
+            assert_eq!(
+                prompt.matches("_rationale").count(),
+                1,
+                "one mention, not a restatement per paragraph"
+            );
+        }
         // And the schema is now the short label, not this sentence.
         assert!(
             !crate::schema::RATIONALE_HINT.contains("grounded"),
             "the per-tool property is still carrying the instruction"
+        );
+    }
+
+    /// M12 T1.4. The preamble's third sentence explains the repeat gate to a
+    /// model that needs it explained; a strong model needs the rule, not the
+    /// explanation. The saving is per emitter call and per iteration, so the
+    /// test prints it rather than merely asserting an inequality - the
+    /// number is the point.
+    #[test]
+    fn the_strong_preamble_is_shorter_and_says_by_how_much() {
+        let small = nscore::estimate_tokens(system_prompt(nscore::Capability::Small).len());
+        let strong = nscore::estimate_tokens(system_prompt(nscore::Capability::Strong).len());
+        assert!(
+            strong < small,
+            "strong preamble is not shorter: small {small} tokens, strong {strong} tokens"
+        );
+        // The rule it keeps, in one clause.
+        let prompt = system_prompt(nscore::Capability::Strong);
+        assert!(
+            prompt.contains("Never repeat an action the context lists as done."),
+            "the strong preamble dropped the repeat-gate rule: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains("costs a step"),
+            "the strong preamble kept the narration: {prompt:?}"
         );
     }
     use crate::client::OpenRouterClient;

@@ -280,6 +280,13 @@ pub fn render_budget(
         "rejections by reason: {}\n",
         nscore::tally_rejections(events).line()
     ));
+    // M12 T1.3, on the same two paths and for the same reason: a call the
+    // model answered in prose bought no tool call, and until now nothing
+    // counted how often the emitter had to rescue one.
+    out.push_str(&format!(
+        "text fallbacks: {}\n",
+        nscore::text_fallbacks(events)
+    ));
     out.push_str(&chat_counter_line(events));
     out
 }
@@ -426,6 +433,16 @@ fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::Acti
         "stable prefix (est.): emitter {} (facts+summary+window) \u{b7}          replier {} (persona+facts+summary) \u{b7} breakpoint floor 1,024\n",
         prefix_summary(&total.emitter_prefix),
         prefix_summary(&total.replier_prefix),
+    ));
+    // M12 T1.4. The system prompt rides every emitter call and every
+    // iteration of every turn, so what the trimmed preamble saves is read
+    // per call, not per session — which is why both numbers are printed and
+    // neither is multiplied out here.
+    let (small, strong) = nsllm::emitter::system_prompts();
+    out.push_str(&format!(
+        "emitter system prompt (est.): small {} tokens \u{b7} strong {} tokens\n",
+        nscore::estimate_tokens(small.len()),
+        nscore::estimate_tokens(strong.len()),
     ));
     out.push_str(&render_tool_table(events, specs));
     out.push_str(&format!(
@@ -1337,6 +1354,41 @@ mod tests {
         assert!(!tally.by_reason.contains_key("GuardDenied"));
         assert_eq!(tally.rejections(), 9);
         assert!((tally.per_hundred().unwrap() - 11.111).abs() < 0.01);
+    }
+
+    /// M12 T1.3. A text fallback is a request that bought no tool call, the
+    /// same kind of waste as a rejection, so it is printed on the same
+    /// screen and right under it.
+    #[test]
+    fn text_fallbacks_are_counted_next_to_the_rejections_line() {
+        let mut log = log();
+        for (i, rationale) in [
+            format!("{} the time is 10:41", nscore::TEXT_FALLBACK_PREFIX),
+            "the user asked for the time".to_string(),
+            format!("{} nothing to do", nscore::TEXT_FALLBACK_PREFIX),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            log.append(
+                1,
+                Timestamp(i as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: "respond_directly".into(),
+                        args: serde_json::json!({}),
+                        rationale,
+                    },
+                },
+            );
+        }
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("rejections by reason"))
+            .expect("a rejections line");
+        assert_eq!(lines[at + 1], "text fallbacks: 2", "{out}");
     }
 
     /// M10, decision 1 — measure the chat path before changing it. A chat

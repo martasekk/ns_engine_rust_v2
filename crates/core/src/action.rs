@@ -62,6 +62,53 @@ impl SchemaProfile {
     }
 }
 
+/// Which class of model is driving this deployment (M12 T1.1).
+///
+/// Not a quality score and not a router: one operator-set fact that the
+/// scaffolding built for small models reads, so the parts that exist to
+/// compensate for a weak emitter can stand down when the emitter is not
+/// weak. Every default is [`Capability::Small`], which is today's behaviour
+/// byte for byte; `Strong` only ever removes work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Capability {
+    /// The models this engine was built around: local 7-8B and the free
+    /// tier. The default until an operator says otherwise.
+    #[default]
+    Small,
+    /// A frontier model that follows a long instruction and does not need
+    /// the reply regenerated at it.
+    Strong,
+}
+
+impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Small => "small",
+            Capability::Strong => "strong",
+        }
+    }
+
+    /// Config spelling → capability. `Err` carries the message a config
+    /// error should print.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "small" => Ok(Capability::Small),
+            "strong" => Ok(Capability::Strong),
+            other => Err(format!(
+                "capability {other:?} is unknown — known capabilities: small, strong"
+            )),
+        }
+    }
+
+    /// Pick between the two spellings of one piece of text.
+    pub fn pick<T>(self, small: T, strong: T) -> T {
+        match self {
+            Capability::Small => small,
+            Capability::Strong => strong,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResidualRule {
     Allowed,

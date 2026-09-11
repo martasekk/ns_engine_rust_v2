@@ -38,6 +38,14 @@ provider = "openrouter"
 # [llm.replier]
 # model = "openrouter/free"
 
+# ── Capability profile (M12) ──────────────────────────────────────────────
+# "small" (the default) keeps every scaffold built for a small caller.
+# "strong" retires the grounding *regeneration* (the flag and its events
+# stay), trims the emitter's per-iteration preamble (138 → 86 estimated
+# tokens) and leaves the text fallback as a counter. Recommended with
+# Sonnet 5 or Luna; measured in the M11/M12 plans.
+#   capability = "strong"
+
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the
 # request this engine has always sent.
