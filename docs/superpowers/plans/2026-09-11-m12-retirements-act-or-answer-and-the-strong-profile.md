@@ -255,3 +255,16 @@ non-dry pass on `ns-run/ns.sqlite`.
 ## Results
 
 _(filled per phase as each lands)_
+
+### P0 — done 2026-09-11 (commit `d8ecc23`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T0.1 | a dry run with `[models] enabled` and a key present spends 0 | met: `Evaluator::paid()` (default false, `ClientEvaluator` true); `grade_sessions` skips paid evaluators and the notes lane skips the proposer and the probes when `dry_run && !spend`; the report prints `skipped (dry run): judge, notes proposer, probes`; `a_dry_run_enters_no_paid_lane` |
+| T0.2 | `--spend --dry-run` runs the lanes and writes nothing; bare `--dry-run` spends nothing | met: `PassConfig.spend`, `parse_evolve_args` returns `(dry_run, spend)`; `ns-app evolve --dry-run` says the judge, the proposer and the probes are skipped and that `--spend` buys them; `evolve_args_accept_dry_run_and_spend` |
+| T0.3 | `requests spent: judge N, proposer N, probes N, total N` | met: three `UsageSink`s built in `build_pass` and attached to the judge client, the proposer client and the probe's emitter-factory client; `with_lane_sinks`; `every_paid_lane_reports_its_own_requests`. The 56-versus-5 reading on a real pass is P6's |
+| T0.4 | a truncated verdict says `length`, not "not json" | met: `finish_reason` read before the parse; reasons `length`, `content_filter`, `transport`, `no content`, `not json`, `no ok field`, `no issues array`, `issue not a string`, `contradiction`; `GradeError::reason()`; `grades unavailable: N (reason k, …)`; `a_truncated_verdict_says_length_not_not_json` |
+
+Workspace suite: 709 passed, 0 failed, 1 ignored. The `fitness_demote` release clock starts
+at this commit. Not built, as planned: raising the judge's `max_tokens` before T0.4's
+reasons are read on a live pass.
