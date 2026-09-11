@@ -176,4 +176,77 @@ the P2 numbers go into the findings doc as §9.
 
 ## Results
 
-*(empty until execution)*
+### P0 + T1.2 — done (commit `96e19c2`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T0.1–T0.3 | a Sonnet-named role sends no `temperature`; a bare config is byte-identical | met: `RoleShaping` / `RequestShape::apply` is the one place `max_tokens`, `temperature` and the reasoning block are written; the safety net coerces `anthropic/claude-sonnet-5*` to `sampling = none` and prints it once. A Sonnet emitter request carries `model, tools, tool_choice, messages, max_tokens, reasoning` and nothing Sonnet rejects |
+| T0.4 | example parses | met; Sonnet shapes and a Qwen `thinking = false` block, commented |
+| T0.5 | identical `SummaryDraft` from both paths | met: `Provider.structured_output` (openrouter, openai); strict `json_schema` `response_format`; fence parser kept |
+| T1.2 | abstention and answerable arms unmoved | met: 30/30 and 30/30; the line renders only when facts, summary and recall are all empty |
+
+### T1.1 — done (commit `7387736`), 0 requests
+
+Facts embedded at write time and by the idle backfill (kind `fact`, owner scope, rowid, model
+in the PK); `search_facts_hybrid` = lexical ∪ cosine by RRF rank, reranked, equal to
+`lexical_rank` whenever the encoder is absent or refuses (byte-for-byte, tested). **12-fact
+cs/en corpus: paraphrase miss 100% lexical → 0% hybrid, verbatim 0% on both**, NOT MEASURED
+with the service down. Two follow-up lines for wave B: `select_facts` in `turn.rs` gated on
+`[recall] hybrid` **and** a non-Chat tier; retire the `FACTS_ARM` static via `main.rs`.
+
+### P2 — the measurement (T2.1), done: **106 requests, $0.475**, under the approved 110 / $1.60
+
+Arm A = turns 22–41 of the live `cli` session (reasoning unset), arm B = turns 42–61 (the
+T0.4 shapes). Same 20 messages, cs and en: stated facts, paraphrased recalls, a knowledge
+update, an unanswerable question, small talk.
+
+| | requests | per turn | emitter / replier / summarizer | prompt tok | completion tok | cached | $ |
+|---|---|---|---|---|---|---|---|
+| A unset | 53 | 2.65 | 29 / 24 / 0 | 103,333 | 4,378 | 0 | 0.250 |
+| B shaped | 53 | 2.65 | 28 / 25 / 0 | 96,039 | 3,238 | 0 | 0.225 |
+
+B is strictly cheaper at equal request count and equal correctness: completion **−26%**,
+prompt −7%, $0.0112 per turn against the plan's $0.0258 estimate. Cached 0% in both arms:
+the emitter prefix is 451–472 tokens and the replier's 267–294, under the 1,024 floor.
+Tool schemas are **23.5%** of emitter prompt tokens, down from M9's 45.9%: M10's work paid.
+
+**Memory behaved.** Eight `remember_fact` calls per arm, all persisted: name, city (Brno →
+Prague), language, sister's birthday (14 → 15 March), colleague, response-style preference.
+"Kdy má sestra narozeniny, přesně?" → "15. března" in both arms. The unanswerable question
+was declined correctly in both arms. Zero `Rejected` events in the 40 turns.
+
+**Grounding flags: 9 of 40 turns, 8 false positives, the 1 true positive harmful.**
+
+| turn | spans | verdict |
+|---|---|---|
+| A t22 / B t42 | `Martine` | FP — vocative of the name stated that turn |
+| A t27, A t40, B t47, B t60 | `Praze`, `Prahy` | FP — locative/genitive of the stored Prague fact |
+| B t54 | `Tomáše` | FP — accusative of the colleague stated that turn |
+| A t30 / B t50 | `Canberra`, `Sydney`, `Melbourne` | TP by the letter (world knowledge, not in memory) — **the regeneration replaced a correct "Canberra" with "I don't know for sure, look it up", in both arms** |
+
+Nine extra replier requests, 17% of all replier calls, for a net loss of correctness.
+
+**Two defects the run exposed, neither a Sonnet finding:**
+- **The summarizer never ran in 40 turns.** `dispatch.rs:363` runs `maybe_summarize` in a
+  biased `select!` against the next inbound message; with input already queued the next turn
+  wins every time and the summary is dropped mid-flight. Any fast user under `serve` hits the
+  same starvation. Fixed in wave B (T1.5).
+- **"What time is it right now?" never reached `get_time`.** The router put the turn in the
+  Chat tier, which withholds every registered tool, so the model answered that it has no clock
+  although the tool was registered. A router cue for time is the fix; recorded, not built
+  (tool line).
+
+Also seen: `recall` fired once in 40 turns; `ReplyEchoed` 0 in A, 2 in B, both on correct
+one-line answers (monitor false positives, as the entrainment plan already recorded).
+
+### T2.2 — the retirement decision, from this engine's numbers
+
+| Candidate | Number | Decision for the next plan |
+|---|---|---|
+| grounding regeneration | 9/40 flags, 8 FP on Czech inflection, 1 TP harmful; 9 requests | **retire the regeneration; keep the flag**; make the matcher inflection-aware (lemma or prefix match ≥ 5 chars) so the flag stops firing on `Praze`/`Martine` |
+| text fallback | 0 in 106 requests | redundant on Sonnet; keep only as a monitor for local shims |
+| argument examples | 0 `Malformed` in 106 | redundant on Sonnet; keep for Qwen |
+| reminder text | not isolated; 10 of 19 chat-tier turns proposed only `respond_directly` | trim under a strong profile; the chat single-call counter now has its first reading |
+| note archiving | not observed (the one note is desktop-only) | build when a chat note exists |
+| strong context profile | prompt 4,800–5,200 tok/turn at $0.011/turn, prefix 451–472 tok, cached 0 | affordable; raising the window also pushes the prefix toward the caching floor; decide on the ablation arms |
+| T0.4 shapes | −26% completion at equal correctness | recommend as the Sonnet default in `config.example.toml` (done); not hardcoded |
