@@ -688,34 +688,53 @@ struct Harness {
     /// Whether this fixture is a desktop one. Set by [`Harness::desktop`];
     /// decides the tools, the router and the iteration budget below.
     desktop: bool,
-    /// The context block this run blanks, or `None` for the full arm (M9
-    /// T0.4). Passed straight into every `EngineConfig` the fixture builds,
-    /// so every turn of an ablated arm runs with the block gone — an arm
-    /// that ablated only the graded turn would measure a harness nobody
-    /// runs.
-    ablate: Option<Ablate>,
+    /// What this arm does differently: the blanked block (M9 T0.4) and the
+    /// activation weight (M9 T3.3). Passed straight into every
+    /// `EngineConfig` the fixture builds, so every turn of an arm runs with
+    /// it — an arm that ablated only the graded turn would measure a harness
+    /// nobody runs.
+    run: Run,
+}
+
+/// What one arm of the suite is configured to do differently (M9 T0.4, T3.3).
+///
+/// One struct rather than two parameters threaded through nine fixtures: the
+/// list will grow — every M9 knob that ships off has to be measurable at the
+/// value it might ship on — and a fixture signature is not the place to keep
+/// that list.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Run {
+    /// The context block this arm blanks, or `None` for the full arm.
+    pub ablate: Option<Ablate>,
+    /// `[memory] activation_weight` for this arm (M9 T3.1/T3.2), applied to
+    /// the store the fixtures search and mirrored into `EngineConfig`.
+    /// `0.0` is the default and is pre-M9 ranking.
+    pub activation_weight: f32,
 }
 
 impl Harness {
-    /// The full arm passes `None`; `ns-app eval --ablate <block>` passes the
-    /// block, and every engine this fixture builds is configured with it.
-    fn ablating(ablate: Option<Ablate>) -> Self {
+    /// The full arm passes `Run::default()`; `ns-app eval --ablate <block>`
+    /// and `--activation <w>` fill it in, and every engine and every store
+    /// this fixture builds is configured from it.
+    fn for_run(run: Run) -> Self {
         Self {
-            store: Arc::new(InMemoryStore::new()),
+            store: Arc::new(
+                InMemoryStore::new().with_activation(run.activation_weight, ACTIVATION_HALF_LIFE),
+            ),
             shown: Arc::new(Mutex::new(Vec::new())),
             traces: Arc::new(Mutex::new(Vec::new())),
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
-            ablate,
+            run,
         }
     }
 
     /// The same harness with a desktop wired into it.
-    fn desktop_ablating(ablate: Option<Ablate>) -> Self {
+    fn desktop_for_run(run: Run) -> Self {
         Self {
             desktop: true,
-            ..Self::ablating(ablate)
+            ..Self::for_run(run)
         }
     }
 
@@ -793,7 +812,12 @@ impl Harness {
             max_echo_ratio: 1.1,
             // M9 T0.4. `None` on every existing run, so the suite's numbers
             // are the ones they have always been.
-            ablate: self.ablate,
+            ablate: self.run.ablate,
+            // M9 T3.3. The store is where the prior is applied; these two
+            // are the config mirror, so a fixture that reads the engine's
+            // configuration sees the weight the arm is actually running at.
+            activation_weight: self.run.activation_weight,
+            activation_half_life_days: ACTIVATION_HALF_LIFE,
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {
@@ -1232,8 +1256,8 @@ pub fn render_table(rows: &[Ability]) -> String {
 /// window does *not* carry "Martin" while the context does. The values are
 /// there because they were pinned, which is why no `recall` is needed — the
 /// pass condition in the Phase 7 table.
-async fn information_extraction(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::ablating(ablate);
+async fn information_extraction(run: Run) -> Ability {
+    let h = Harness::for_run(run);
     let sid = SessionId("eval-extraction".into());
     h.turn(
         &sid,
@@ -1301,8 +1325,8 @@ async fn information_extraction(ablate: Option<Ablate>) -> Ability {
 /// crossed through the transcript, because `search_turns` is per session by
 /// construction. Only the scoped fact crossed. The failure this excludes is
 /// the recorded one — asking the user again for something already stored.
-async fn multi_session_reasoning(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::ablating(ablate);
+async fn multi_session_reasoning(run: Run) -> Ability {
+    let h = Harness::for_run(run);
     let first = SessionId("eval-multi-a".into());
     let second = SessionId("eval-multi-b".into());
     h.turn(
@@ -1352,8 +1376,8 @@ async fn multi_session_reasoning(ablate: Option<Ablate>) -> Ability {
 /// two sources and "Martin" has exactly one: the superseded marker. The graded
 /// check is that the window is clean of "Martin" — otherwise the fixture would
 /// pass on the transcript and say nothing about fact versioning.
-async fn temporal_reasoning(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::ablating(ablate);
+async fn temporal_reasoning(run: Run) -> Ability {
+    let h = Harness::for_run(run);
     let sid = SessionId("eval-temporal".into());
     h.turn(
         &sid,
@@ -1410,8 +1434,8 @@ async fn temporal_reasoning(ablate: Option<Ablate>) -> Ability {
 /// exactly one `user.age` line whose *value* is the new age. The old age is
 /// legitimate material, but only behind the `(was …)` marker, which is why
 /// the check splits the line there instead of searching the whole of it.
-async fn knowledge_updates(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::ablating(ablate);
+async fn knowledge_updates(run: Run) -> Ability {
+    let h = Harness::for_run(run);
     let sid = SessionId("eval-updates".into());
     h.turn(&sid, "i am 17", vec![remember("user.age", "17")])
         .await;
@@ -1500,11 +1524,11 @@ async fn knowledge_updates(ablate: Option<Ablate>) -> Ability {
 /// The memory is not empty: `user.name` is stored first, so what is being
 /// graded is a missing key, not a missing store (F4's junk keys with values
 /// the user never said are the same failure from the other side).
-async fn abstention(ablate: Option<Ablate>) -> Ability {
+async fn abstention(run: Run) -> Ability {
     const INVENTED: &str = "Ostrava";
     const INVENTING_DRAFT: &str = "You live in Ostrava.";
 
-    let h = Harness::ablating(ablate);
+    let h = Harness::for_run(run);
     let sid = SessionId("eval-abstention".into());
     h.turn(
         &sid,
@@ -1589,8 +1613,8 @@ async fn abstention(ablate: Option<Ablate>) -> Ability {
 /// out of the six-turn window by turn 8, which is what makes the "after"
 /// check mean anything; the turn-9 trace line is `forget_fact -> ok: forgot
 /// user.name`, which names the key and never the value.
-async fn selective_forgetting(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::ablating(ablate);
+async fn selective_forgetting(run: Run) -> Ability {
+    let h = Harness::for_run(run);
     let sid = SessionId("eval-forgetting".into());
     h.turn(
         &sid,
@@ -1679,8 +1703,8 @@ const TRACE_CEILING: usize = 6_500;
 /// first proposal is a misroute — the tier widens, no refusal is recorded,
 /// and one iteration is the price. That path is a request on a fifty-request
 /// day, so it is counted rather than assumed free.
-async fn desktop_open_and_search(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::desktop_ablating(ablate);
+async fn desktop_open_and_search(run: Run) -> Ability {
+    let h = Harness::desktop_for_run(run);
     let sid = SessionId("eval-desktop-open".into());
     let shown = h
         .desktop_turn(
@@ -1786,8 +1810,8 @@ async fn desktop_open_and_search(ablate: Option<Ablate>) -> Ability {
 /// to avoid `ui_read`: one action produced 98% of the tool text in that
 /// session, and the advice was to not look at the screen. The point of the
 /// cap is that looking at the screen stops costing that.
-async fn desktop_find_and_click(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::desktop_ablating(ablate);
+async fn desktop_find_and_click(run: Run) -> Ability {
+    let h = Harness::desktop_for_run(run);
     let sid = SessionId("eval-desktop-find".into());
     let shown = h
         .desktop_turn(
@@ -1871,8 +1895,8 @@ async fn desktop_find_and_click(ablate: Option<Ablate>) -> Ability {
 /// If this task can pass with no `inspect_result` call then the target was
 /// not past the cap and the fixture is measuring nothing — which is exactly
 /// what raising the cap does to it.
-async fn desktop_clipped_tail(ablate: Option<Ablate>) -> Ability {
-    let h = Harness::desktop_ablating(ablate);
+async fn desktop_clipped_tail(run: Run) -> Ability {
+    let h = Harness::desktop_for_run(run);
     let sid = SessionId("eval-desktop-tail".into());
     let shown = h
         .desktop_turn(
@@ -1950,8 +1974,12 @@ async fn desktop_clipped_tail(ablate: Option<Ablate>) -> Ability {
 /// the numbers a release is compared on and a concurrent run would let the
 /// scheduler into them. It takes under a second; there is nothing to buy.
 pub async fn run_all() -> Vec<Ability> {
-    run_all_ablating(None).await
+    run_all_for(Run::default()).await
 }
+
+/// `ns-app eval`'s own default: the plan's default half-life, so an arm run
+/// at a non-zero weight decays the way the shipped config would.
+const ACTIVATION_HALF_LIFE: f32 = 7.0;
 
 /// The same set with one context block blanked on every model call of every
 /// fixture (M9 T0.4), or the full set when `ablate` is `None`.
@@ -1960,16 +1988,25 @@ pub async fn run_all() -> Vec<Ability> {
 /// arms are built one after the other in the same process, and `cargo test`
 /// runs this file's own tests beside them.
 pub async fn run_all_ablating(ablate: Option<Ablate>) -> Vec<Ability> {
+    run_all_for(Run {
+        ablate,
+        ..Run::default()
+    })
+    .await
+}
+
+/// The set under one arm's configuration (M9 T3.3).
+pub async fn run_all_for(run: Run) -> Vec<Ability> {
     vec![
-        information_extraction(ablate).await,
-        multi_session_reasoning(ablate).await,
-        temporal_reasoning(ablate).await,
-        knowledge_updates(ablate).await,
-        abstention(ablate).await,
-        selective_forgetting(ablate).await,
-        desktop_open_and_search(ablate).await,
-        desktop_find_and_click(ablate).await,
-        desktop_clipped_tail(ablate).await,
+        information_extraction(run).await,
+        multi_session_reasoning(run).await,
+        temporal_reasoning(run).await,
+        knowledge_updates(run).await,
+        abstention(run).await,
+        selective_forgetting(run).await,
+        desktop_open_and_search(run).await,
+        desktop_find_and_click(run).await,
+        desktop_clipped_tail(run).await,
     ]
 }
 

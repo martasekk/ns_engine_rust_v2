@@ -15,7 +15,7 @@
 //! permission to drop it, or a sign the scripted suite cannot see it — and a
 //! red exit code would make the measurement something to avoid taking.
 
-use crate::eval::{run_all_ablating, Ability};
+use crate::eval::{run_all_for, Ability, Run};
 use nscore::Ablate;
 
 /// One arm's result over the whole ability set.
@@ -77,7 +77,7 @@ impl Report {
 
     /// Abilities the ablation cost, i.e. passing whole and failing blanked.
     ///
-    /// Positional, not by name: [`run_all_ablating`] returns a fixed order
+    /// Positional, not by name: [`run_all_for`] returns a fixed order
     /// and `crates/testkit/src/eval.rs` has a test that guards it, so the two
     /// arms line up row by row.
     pub fn lost(&self) -> Vec<&'static str> {
@@ -118,13 +118,17 @@ pub fn parse_block(name: &str) -> Option<Ablate> {
 
 /// Run the ability set twice: whole, then with `block` blanked.
 ///
-/// Sequential, and for [`run_all_ablating`]'s own reason — every fixture
+/// Sequential, and for [`run_all_for`]'s own reason — every fixture
 /// builds its own store and engines, but `requests` and `peak_chars` are the
 /// columns a release is compared on and a concurrent run would let the
 /// scheduler into them.
-pub async fn measure(block: Ablate) -> Report {
-    let full = run_all_ablating(None).await;
-    let ablated = run_all_ablating(Some(block)).await;
+pub async fn measure(block: Ablate, activation_weight: f32) -> Report {
+    let arm = |ablate| Run {
+        ablate,
+        activation_weight,
+    };
+    let full = run_all_for(arm(None)).await;
+    let ablated = run_all_for(arm(Some(block))).await;
     Report {
         block,
         full,
@@ -203,7 +207,7 @@ mod tests {
     /// tell the two apart.
     #[tokio::test]
     async fn blanking_facts_lowers_the_fact_dependent_abilities_only() {
-        let r = measure(Ablate::Facts).await;
+        let r = measure(Ablate::Facts, 0.0).await;
         assert_eq!(
             r.full_arm().failed,
             Vec::<String>::new(),

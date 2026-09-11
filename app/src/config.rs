@@ -327,6 +327,20 @@ pub struct MemorySection {
     /// Facts lexically relevant to the current message (M6 §6.5).
     #[serde(default = "default_relevant_max")]
     pub relevant_max: usize,
+    /// M9 T3.1 — the activation prior's weight `w` in
+    /// `hits + w · ln(1 + uses) · exp(−Δdays / half_life)`, and the same `w`
+    /// on `search_turns`' recency term.
+    ///
+    /// **Default 0.0, which is pre-M9 ranking exactly.** vstash's negative
+    /// result on BEIR is why a recency×frequency prior ships off; T3.3's
+    /// suites at `w ∈ {0, 0.5, 1}` are what may move it, not taste.
+    #[serde(default = "default_activation_weight")]
+    pub activation_weight: f32,
+    /// Days for the fact term to halve (M9 T3.1). The turn term's half-life
+    /// is a constant in turns (`nscore::RECENCY_HALF_LIFE_TURNS`): a turn
+    /// number is not a clock.
+    #[serde(default = "default_activation_half_life_days")]
+    pub activation_half_life_days: f32,
     /// Obligations extracted from one user message (M9 T2.1); 0 renders no
     /// block.
     #[serde(default = "default_obligations_max")]
@@ -418,6 +432,15 @@ fn default_guidance_max() -> usize {
 fn default_relevant_max() -> usize {
     5
 }
+
+/// Off. The prior ships inert and a measurement turns it on (M9 T3.1).
+fn default_activation_weight() -> f32 {
+    0.0
+}
+
+fn default_activation_half_life_days() -> f32 {
+    7.0
+}
 fn default_fact_stale_days() -> u64 {
     90
 }
@@ -487,6 +510,8 @@ impl Default for MemorySection {
             pinned_prefixes: default_pinned_prefixes(),
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
+            activation_weight: default_activation_weight(),
+            activation_half_life_days: default_activation_half_life_days(),
             obligations_max: default_obligations_max(),
             obligation_check: false,
             guidance_max: default_guidance_max(),
@@ -1405,6 +1430,16 @@ mod tests {
         assert_eq!(tuned.memory.obligations_max, 2);
         assert!(tuned.memory.obligation_check);
         assert_eq!(tuned.memory.guidance_max, 3);
+        // M9 T3.1: the activation prior ships inert. A config that never
+        // heard of it must rank exactly as it did before M9.
+        assert_eq!(cfg.memory.activation_weight, 0.0);
+        assert_eq!(cfg.memory.activation_half_life_days, 7.0);
+        let prior = AppConfig::parse(
+            "[memory]\nactivation_weight = 0.5\nactivation_half_life_days = 14.0\n",
+        )
+        .unwrap();
+        assert_eq!(prior.memory.activation_weight, 0.5);
+        assert_eq!(prior.memory.activation_half_life_days, 14.0);
         let cfg = AppConfig::parse("[memory]\nwindow_turns = 2\nrecord_max_chars = 50\n").unwrap();
         assert_eq!(cfg.memory.window_turns, 2);
         assert_eq!(cfg.memory.caps().record_max_chars, 50);

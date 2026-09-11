@@ -445,11 +445,11 @@ async fn main() {
             }
         };
         if parsed.paraphrase {
-            std::process::exit(eval::run_paraphrase().await);
+            std::process::exit(eval::run_paraphrase(parsed.activation).await);
         }
         // M9 T0.4. A report, not a gate: exits 0 whatever the delta.
         if let Some(block) = parsed.ablate {
-            std::process::exit(eval::run_ablate(block).await);
+            std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
         std::process::exit(eval::run(&parsed.ledger).await);
     }
@@ -597,7 +597,15 @@ async fn main() {
     ));
     b.set_memory(Arc::new(
         nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store"),
+            .expect("open sqlite store")
+            // M9 T3.1/T3.2. The composition root is where the `[memory]`
+            // knobs meet the store; `EngineConfig` carries the same two
+            // numbers for anything that reads the config as one object.
+            // Both default to today's ranking.
+            .with_activation(
+                cfg.memory.activation_weight,
+                cfg.memory.activation_half_life_days,
+            ),
     ));
     // Says whether the local model service is answering, when one is asked
     // for. Before the channel so the line lands with the other startup
@@ -697,6 +705,8 @@ async fn main() {
         pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
         pinned_max: cfg.memory.pinned_max,
         relevant_max: cfg.memory.relevant_max,
+        activation_weight: cfg.memory.activation_weight,
+        activation_half_life_days: cfg.memory.activation_half_life_days,
         obligations_max: cfg.memory.obligations_max,
         obligation_check: cfg.memory.obligation_check,
         guidance_max: cfg.memory.guidance_max,

@@ -15,11 +15,29 @@ pub struct InMemoryStore {
     /// the trait says writes are idempotent, so the map cannot hold the
     /// duplicate a re-digested session would otherwise create.
     digests: Mutex<HashMap<SessionId, nscore::SessionDigest>>,
+    /// M9 T3.1/T3.2: the activation prior's knobs, off by default.
+    ///
+    /// On the struct rather than on the trait method because the trait has
+    /// four implementors and two of them are test doubles that have no
+    /// opinion about ranking. A builder keeps every existing `new()` call
+    /// site — and both conformance suites — exactly as it was.
+    activation: nscore::Activation,
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// M9 T3.1/T3.2: rank with the activation prior at this weight.
+    ///
+    /// `half_life_days` decays the fact term; the turn term's half-life is
+    /// [`nscore::RECENCY_HALF_LIFE_TURNS`], a constant, because turns are not
+    /// days. `weight = 0.0` is the default and is today's behaviour exactly.
+    pub fn with_activation(mut self, weight: f32, half_life_days: f32) -> Self {
+        self.activation.weight = weight;
+        self.activation.half_life_days = half_life_days;
+        self
     }
 }
 
@@ -85,7 +103,11 @@ impl MemoryStore for InMemoryStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.turn.cmp(&a.turn))
         });
-        hits.truncate(k);
+        // M9 T3.2: the lexical top candidates, rescored by recency, then cut
+        // to `k`. At weight 0 `rescore_by_recency` only truncates, so this is
+        // the same list in the same order it has always been.
+        hits.truncate(nscore::recency_candidates(k));
+        nscore::rescore_by_recency(&mut hits, self.activation.weight, k);
         Ok(hits)
     }
 
@@ -224,7 +246,15 @@ impl MemoryStore for InMemoryStore {
         k: usize,
     ) -> Result<Vec<Fact>, StoreError> {
         let current = self.facts(scope, "").await?;
-        Ok(nscore::lexical_rank(&current, query, k))
+        Ok(nscore::lexical_rank(
+            &current,
+            query,
+            k,
+            nscore::Activation {
+                now: Timestamp(nscore::now_ms()),
+                ..self.activation
+            },
+        ))
     }
 
     async fn scopes(&self) -> Result<Vec<String>, StoreError> {
@@ -386,6 +416,88 @@ mod tests {
             store.load(&SessionId("other".into())).await.unwrap(),
             vec![]
         );
+    }
+
+    /// The corpus of [`search_turns_ranks_by_token_hits_newest_first`], in a
+    /// store built however `build` says.
+    async fn turn_corpus(
+        build: impl Fn(InMemoryStore) -> InMemoryStore,
+    ) -> (InMemoryStore, SessionId) {
+        let store = build(InMemoryStore::new());
+        let sid = SessionId("s".into());
+        let mut log = EventLog::new(sid.clone());
+        for (turn, user, bot) in [
+            (1u32, "what time is it", "It is noon."),
+            (2, "remember my name is Martin", "Got it."),
+            (3, "and the time again?", "Still noon."),
+        ] {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::UserSaid { text: user.into() },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Replied { text: bot.into() },
+            );
+        }
+        store.append(&sid, log.events()).await.unwrap();
+        (store, sid)
+    }
+
+    /// M9 T3.2, the twin of the SQLite test: at weight 0 the rescoring pass
+    /// is not a pass — same hits, same order, same scores as a store built
+    /// without the builder at all.
+    #[tokio::test]
+    async fn search_turns_order_is_unchanged_at_weight_zero() {
+        let (plain, sid) = turn_corpus(|s| s).await;
+        let (zero, _) = turn_corpus(|s| s.with_activation(0.0, 7.0)).await;
+        for q in ["noon", "time", "what time", "martin"] {
+            for k in [1usize, 5] {
+                let a = plain.search_turns(&sid, q, k).await.unwrap();
+                let b = zero.search_turns(&sid, q, k).await.unwrap();
+                assert_eq!(a, b, "{q:?} k={k}");
+            }
+        }
+    }
+
+    /// Turn 1 and turn 3 each say "time" once, so the token-hit score ties
+    /// and only the newest-first tiebreak separates them.
+    ///
+    /// Which is why this arm reads the *score*, not just the order: this
+    /// store's scores are whole token counts, so a fractional recency term
+    /// can never outrank a real extra hit here — it can only confirm a tie
+    /// that already resolved the same way. The term bites where scores are
+    /// fractional, i.e. against bm25 (`memory-sqlite`, where the twin of this
+    /// test does reverse an order). Recorded rather than hidden: the
+    /// in-memory retriever is a test double, and T3.3's numbers come from
+    /// both.
+    #[tokio::test]
+    async fn a_recent_turn_outranks_an_older_equal_match_at_weight_one() {
+        let (off, sid) = turn_corpus(|s| s).await;
+        let (on, _) = turn_corpus(|s| s.with_activation(1.0, 7.0)).await;
+
+        let tied = off.search_turns(&sid, "time", 5).await.unwrap();
+        assert_eq!(tied.len(), 2);
+        assert_eq!(tied[0].score, tied[1].score, "a true tie on token hits");
+
+        let hits = on.search_turns(&sid, "time", 5).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.turn).collect::<Vec<_>>(),
+            vec![3, 1],
+            "the newer line first"
+        );
+        assert!(
+            hits[0].score > hits[1].score,
+            "and now by score, not by tiebreak: {hits:?}"
+        );
+        // Reorders, never admits.
+        assert!(on
+            .search_turns(&sid, "invoice", 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

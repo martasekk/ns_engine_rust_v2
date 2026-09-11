@@ -50,6 +50,18 @@ pub struct EngineConfig {
     pub pinned_max: usize,
     /// M6 §6.5: facts lexically relevant to the current message.
     pub relevant_max: usize,
+    /// M9 T3.1: the activation prior's weight, and the half-life of its
+    /// fact term in days. Default 0.0 — pre-M9 ranking exactly.
+    ///
+    /// Carried here because `[memory]` is this struct's mirror and every
+    /// knob in that section has to be readable from one place, but *applied*
+    /// on the store: `lexical_rank` and `search_turns` live behind
+    /// `MemoryStore`, whose four implementors include two test doubles that
+    /// have no ranking to knob. The composition root reads these two and
+    /// hands them to `with_activation` on the store it opens; the engine
+    /// itself never consults them.
+    pub activation_weight: f32,
+    pub activation_half_life_days: f32,
     /// M9 T2.1: how many obligations `obligations_for` may extract from one
     /// user message. 0 renders no block at all.
     pub obligations_max: usize,
@@ -163,6 +175,8 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
+            activation_weight: 0.0,
+            activation_half_life_days: 7.0,
             obligations_max: 5,
             obligation_check: false,
             guidance_max: 6,
