@@ -598,6 +598,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "ns-channel-cli",
+ "ns-channel-tcp",
  "ns-components-std",
  "ns-core",
  "ns-engine",
@@ -619,6 +620,18 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ns-core",
+ "tokio",
+]
+
+[[package]]
+name = "ns-channel-tcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ns-core",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
 ]
 

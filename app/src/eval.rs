@@ -264,28 +264,90 @@ pub struct Args {
     /// would make a fired trigger look like a regression, which it is not —
     /// it is the trigger doing its job.
     pub paraphrase: bool,
+    /// Run the ability set twice with this block blanked instead of once
+    /// whole (M9 T0.4).
+    ///
+    /// A third mode for the same reason `--paraphrase` is a second one: it
+    /// grades a *block*, not the harness, and the ablated arm is meant to
+    /// fail. Folded into the gate it would read as a regression, which is
+    /// the opposite of what a working ablation means.
+    pub ablate: Option<nscore::Ablate>,
+    /// `[memory] activation_weight` for this run (M9 T3.3), without editing
+    /// the config.
+    ///
+    /// A flag rather than a config edit because the decision it serves is a
+    /// sweep: the plan runs `--paraphrase` and `--ablate facts` at three
+    /// weights and compares, and a sweep that needed three edits to
+    /// `ns-run/ns.toml` would be a sweep nobody reran. Applied to the
+    /// harness's `EngineConfig` **and** to the stores it searches — the
+    /// prior lives on the store.
+    pub activation: f32,
 }
+
+const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase] \
+     [--ablate facts|summary|guidance] [--activation <weight>]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
     let mut paraphrase = false;
-    for a in args {
+    let mut ablate = None;
+    let mut activation = 0.0f32;
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
+            "--activation" => {
+                let w = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--activation needs a weight)"))?;
+                activation = w
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|w| w.is_finite() && *w >= 0.0)
+                    .ok_or_else(|| format!("{USAGE} (got {w:?})"))?;
+            }
+            "--ablate" => {
+                let block = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--ablate needs a block)"))?;
+                ablate = Some(
+                    nstestkit::ablate::parse_block(block)
+                        .ok_or_else(|| format!("{USAGE} (got {block:?})"))?,
+                );
+            }
             path if !path.starts_with('-') && ledger.is_none() => {
                 ledger = Some(PathBuf::from(path))
             }
-            other => {
-                return Err(format!(
-                    "usage: ns-app eval [<ledger-path>] [--paraphrase] (got {other:?})"
-                ))
-            }
+            other => return Err(format!("{USAGE} (got {other:?})")),
         }
     }
     Ok(Args {
         ledger: ledger.unwrap_or_else(|| PathBuf::from(DEFAULT_LEDGER)),
         paraphrase,
+        ablate,
+        activation,
     })
+}
+
+/// `ns-app eval --ablate <block>` — one context block's marginal effect (M9
+/// T0.4).
+///
+/// Exits 0 whatever the delta is. The ablated arm failing is the measurement
+/// succeeding: it says the block was carrying those abilities. A zero delta
+/// is equally a result — either the block is not earning its tokens, or this
+/// scripted suite cannot see what it earns — and neither is a release
+/// failure, so neither may turn the exit code red.
+pub async fn run_ablate(block: nscore::Ablate, activation: f32) -> i32 {
+    use nstestkit::ablate;
+
+    let report = ablate::measure(block, activation).await;
+    print!("{}", ablate::render(&report));
+    println!(
+        "  both arms are the same {} fixtures against the same scripted doubles at \
+         activation_weight = {activation}; nothing here spends a request.",
+        report.full.len()
+    );
+    0
 }
 
 /// `ns-app eval --paraphrase` — the M6 §12.8 measurement, against both
@@ -300,13 +362,16 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
 /// Exits 0 whatever the number is. A fired trigger is not a failure — it is
 /// permission to build something, and a gate that went red on it would make
 /// the measurement something to avoid taking.
-pub async fn run_paraphrase() -> i32 {
+pub async fn run_paraphrase(activation: f32) -> i32 {
     use nstestkit::paraphrase;
 
     let k = nsengine::turn::EngineConfig::default().recall_top_k;
+    // M9 T3.3: the same half-life the shipped config defaults to, so a
+    // sweep over `--activation` measures the knob and not a second one.
+    let half_life = nsengine::turn::EngineConfig::default().activation_half_life_days;
     let mut reports = Vec::new();
 
-    let memory = nsengine::store::InMemoryStore::new();
+    let memory = nsengine::store::InMemoryStore::new().with_activation(activation, half_life);
     reports.push(paraphrase::measure(&memory, "in-memory (token hits)", k).await);
 
     // A throwaway database rather than the live one: the corpus writes
@@ -321,6 +386,7 @@ pub async fn run_paraphrase() -> i32 {
     };
     match nsmemory_sqlite::SqliteStore::open(&dir.path().join("paraphrase.sqlite")) {
         Ok(sqlite) => {
+            let sqlite = sqlite.with_activation(activation, half_life);
             reports.push(paraphrase::measure(&sqlite, "sqlite (fts5 bm25)", k).await);
         }
         Err(e) => eprintln!("paraphrase: the sqlite arm did not run ({e})"),
@@ -328,7 +394,8 @@ pub async fn run_paraphrase() -> i32 {
 
     print!("{}", paraphrase::render(&reports));
     println!(
-        "  k = {k} (recall_top_k), {} cases, no model calls and no requests spent.",
+        "  k = {k} (recall_top_k), activation_weight = {activation}, {} cases, \
+         no model calls and no requests spent.",
         paraphrase::corpus().len()
     );
     0
@@ -715,5 +782,65 @@ mod tests {
 
         assert!(parse_args(&["--live".to_string()]).is_err());
         assert!(parse_args(&["--paraphrases".to_string()]).is_err());
+    }
+
+    /// `--ablate` takes a block name in the next argument, composes with a
+    /// M9 T3.3: the weight parses like `--ablate` does, defaults to the
+    /// shipped 0.0, composes with the other two arms, and refuses anything
+    /// that is not a finite non-negative number — a negative weight would
+    /// rank a fact *down* for having been useful, which is not a sweep point
+    /// but a sign error.
+    #[test]
+    fn the_activation_flag_takes_a_weight_and_defaults_to_zero() {
+        let a =
+            |args: Vec<&str>| parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(a(vec![]).unwrap().activation, 0.0);
+        assert_eq!(a(vec!["--activation", "0.5"]).unwrap().activation, 0.5);
+        let both = a(vec!["--paraphrase", "--activation", "1"]).unwrap();
+        assert_eq!(both.activation, 1.0);
+        assert!(both.paraphrase);
+        let with_block = a(vec!["--ablate", "facts", "--activation", "1.0"]).unwrap();
+        assert_eq!(with_block.activation, 1.0);
+        assert_eq!(with_block.ablate, Some(nscore::Ablate::Facts));
+
+        assert!(a(vec!["--activation"]).is_err(), "the weight is required");
+        assert!(a(vec!["--activation", "-1"]).is_err(), "no negative weight");
+        assert!(a(vec!["--activation", "nan"]).is_err());
+        assert!(a(vec!["--activation", "heavy"]).is_err());
+    }
+
+    /// ledger path either way round, and refuses anything that is not one of
+    /// the three blocks — including `obligations`, which the plan lists but
+    /// which has no block to blank yet.
+    #[test]
+    fn the_ablate_arm_takes_a_block_and_refuses_anything_else() {
+        let a =
+            |args: Vec<&str>| parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(a(vec![]).unwrap().ablate, None);
+        assert_eq!(
+            a(vec!["--ablate", "facts"]).unwrap().ablate,
+            Some(nscore::Ablate::Facts)
+        );
+        assert_eq!(
+            a(vec!["--ablate", "summary"]).unwrap().ablate,
+            Some(nscore::Ablate::Summary)
+        );
+        for args in [
+            vec!["runs.json", "--ablate", "guidance"],
+            vec!["--ablate", "guidance", "runs.json"],
+        ] {
+            let parsed = a(args).unwrap();
+            assert_eq!(parsed.ablate, Some(nscore::Ablate::Guidance));
+            assert_eq!(parsed.ledger, PathBuf::from("runs.json"));
+        }
+
+        assert!(
+            a(vec!["--ablate"]).is_err(),
+            "a bare --ablate names no block"
+        );
+        assert!(a(vec!["--ablate", "obligations"]).is_err());
+        assert!(a(vec!["--ablate", "runs.json"]).is_err());
     }
 }

@@ -13,21 +13,143 @@ use nscore::ReplyContext;
 /// legitimate material (seen live: "Your name was Martin." flagged against a
 /// bare `key: value`). One function so the two interceptors can never drift
 /// from each other or from the prompt.
-fn reference_parts(ctx: &ReplyContext) -> Vec<String> {
-    let mut parts: Vec<String> = vec![ctx.persona.clone(), ctx.turn_trace.clone()];
+/// Each part carries the id a `ReplyCited` event would name it by (M9 T4.2):
+/// `persona`, `trace`, `fact:<key>`, `summary`, `window:<turn>`,
+/// `guidance:<hash>`, `obligations`. The ids are new; the *texts*, in this
+/// order, are exactly what they were, which is what keeps `echo_material` and
+/// `Material::from_context` byte-identical to the pre-M9 material.
+pub fn reference_parts(ctx: &ReplyContext) -> Vec<(String, String)> {
+    let mut parts: Vec<(String, String)> = vec![
+        ("persona".to_string(), ctx.persona.clone()),
+        ("trace".to_string(), ctx.turn_trace.clone()),
+    ];
     for f in &ctx.facts {
-        parts.push(nscore::render_fact(f));
+        parts.push((format!("fact:{}", f.key), nscore::render_fact(f)));
     }
     if let Some(s) = &ctx.summary {
-        parts.push(nscore::render_summary(s));
+        parts.push(("summary".to_string(), nscore::render_summary(s)));
     }
-    parts.push(nscore::render_window(
-        &ctx.window,
-        ctx.window.len(),
-        &ctx.caps,
-    ));
-    parts.extend(ctx.guidance.iter().cloned());
+    // One part per record rather than one rendered block: `render_window`
+    // with `k = len` is exactly these renders joined by a newline, so the
+    // flattened text is unchanged, and a citation can now name the turn it
+    // came from. An empty window keeps its one empty part for the same
+    // reason — it is what `render_window` returned.
+    if ctx.window.is_empty() {
+        parts.push(("window".to_string(), String::new()));
+    } else {
+        for r in &ctx.window {
+            parts.push((
+                format!("window:{}", r.turn),
+                nscore::render_record(r, &ctx.caps),
+            ));
+        }
+    }
+    // Reply guidance is the `reply`-scoped notes, so the hash `learned.toml`
+    // and the manifest know a note by is recoverable from its text alone —
+    // `ReplyContext` carries texts, and adding a hash to it would put a
+    // `learned.toml` detail into every reply context in the engine.
+    for text in &ctx.guidance {
+        parts.push((
+            format!("guidance:{}", nscore::Note::hash_of("reply", text)),
+            text.clone(),
+        ));
+    }
+    // M9 T2.1: the obligations block is rendered, so it is material. A reply
+    // that names something only the obligation line named would otherwise be
+    // flagged for stating what it was shown.
+    for o in &ctx.obligations {
+        parts.push(("obligations".to_string(), o.clone()));
+    }
     parts
+}
+
+/// Which reference parts this reply drew on (M9 T4.2).
+///
+/// Two rules, because the parts are two kinds of thing. A **fact** is a
+/// key and a value, and the value is short, so the test is direct: the
+/// rendered value appears in the reply. A **summary** or a **window record**
+/// is prose, and no single span of it is the thing being used, so the test
+/// runs the other way — a claim the grounding check already extracted from
+/// the reply appears in that part. Guidance is prose too, but prose the model
+/// was told to *follow*, not to repeat, so a note counts as cited only when a
+/// distinctive run of it — three or more consecutive words — is echoed
+/// verbatim; that is deliberately strict, and a note that shaped a reply
+/// without being quoted scores nothing.
+///
+/// Everything is lowercased, and a fact value under three characters is
+/// skipped: `"17"` matches too much English to mean anything.
+///
+/// The result is evidence, not proof. A reply that says "Brno" because the
+/// user just said "Brno" credits the fact too. The number it feeds is a
+/// fitness signal read beside grades, and it is offline, so a wrong credit
+/// costs a rank position rather than a wrong answer.
+pub fn cited(ctx: &ReplyContext, reply: &str) -> Vec<String> {
+    let lower = reply.to_lowercase();
+    let claims = extract_claims(reply);
+    let mut out: Vec<String> = Vec::new();
+    for (id, text) in reference_parts(ctx) {
+        let hit = if id.starts_with("fact:") {
+            let value = ctx
+                .facts
+                .iter()
+                .find(|f| id == format!("fact:{}", f.key))
+                .map(|f| value_string(&f.value))
+                .unwrap_or_default()
+                .to_lowercase();
+            value.chars().count() >= 3 && lower.contains(&value)
+        } else if id == "summary" || id.starts_with("window:") {
+            let part = text.to_lowercase();
+            claims
+                .iter()
+                .any(|c| !c.is_empty() && part.contains(&c.to_lowercase()))
+        } else if id.starts_with("guidance:") {
+            let part = text.to_lowercase();
+            distinctive_spans(&part)
+                .into_iter()
+                .any(|span| lower.contains(&span))
+        } else {
+            false
+        };
+        if hit && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// A fact value as the reply would have to say it: a JSON string without its
+/// quotes, anything else as it serializes. The same rule `turn.rs` renders
+/// values with, so what is searched for is what was shown.
+fn value_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Every run of three consecutive words in `text`.
+fn distinctive_spans(text: &str) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    (0..words.len().saturating_sub(2))
+        .map(|i| words[i..i + 3].join(" "))
+        .collect()
+}
+
+/// The first `answer:` obligation the draft shows no sign of having
+/// addressed, if any (M9 T2.1).
+///
+/// Only `answer:` lines: whether a `do:` obligation was met is a question
+/// about the turn's actions, which the trace already answers structurally,
+/// and lexical overlap would be the wrong instrument for it. The predicate
+/// is [`nscore::addresses`] — the same one the offline `IgnoredQuestion`
+/// signature uses, and measured weak there, which is why the interceptor it
+/// gates is off by default and regenerates at most once.
+pub fn unaddressed(obligations: &[String], draft: &str) -> Option<String> {
+    obligations
+        .iter()
+        .filter_map(|o| o.strip_prefix("answer: "))
+        .find(|clause| !nscore::addresses(clause, draft))
+        .map(str::to_string)
 }
 
 /// What a reply may draw on but must not reproduce, for `echo::echoed`. The
@@ -35,7 +157,11 @@ fn reference_parts(ctx: &ReplyContext) -> Vec<String> {
 /// different failure with a different fix (plan §4), and counting it here
 /// would flag every reply that quotes the question it answers.
 pub fn echo_material(ctx: &ReplyContext) -> String {
-    reference_parts(ctx).join("\n")
+    reference_parts(ctx)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Everything the reply model was shown, lowercased, for substring checks.
@@ -55,7 +181,10 @@ impl Material {
 
     /// Exactly the blocks `CloudReplier` renders, plus the persona.
     pub fn from_context(ctx: &ReplyContext) -> Self {
-        let mut parts = reference_parts(ctx);
+        let mut parts: Vec<String> = reference_parts(ctx)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
         parts.push(ctx.user_text.clone());
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         Self::from_parts(&refs)
@@ -294,6 +423,7 @@ mod tests {
     #[test]
     fn context_material_covers_every_rendered_block_and_the_persona() {
         let ctx = ReplyContext {
+            usage: None,
             persona: "You are Tomáš, a sales assistant.".into(),
             facts: vec![nscore::Fact {
                 key: "user.city".into(),
@@ -322,6 +452,7 @@ mod tests {
             }],
             caps: Default::default(),
             user_text: "and my colleague Jana?".into(),
+            obligations: vec![],
             turn_trace: "Proposed(respond_directly)".into(),
             guidance: vec!["Mention Praha when relevant.".into()],
             do_not_state: vec![],
@@ -342,12 +473,14 @@ mod tests {
         .into();
         view.previous = Some((serde_json::json!("Martin"), nscore::Timestamp(1)));
         let ctx = ReplyContext {
+            usage: None,
             persona: String::new(),
             facts: vec![view],
             summary: None,
             window: vec![],
             caps: Default::default(),
             user_text: "what was my name before?".into(),
+            obligations: vec![],
             turn_trace: String::new(),
             guidance: vec![],
             do_not_state: vec![],

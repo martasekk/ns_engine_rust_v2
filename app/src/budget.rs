@@ -27,6 +27,13 @@ struct Measured {
     summarizer_requests: u32,
     prompt: u64,
     completion: u64,
+    /// Prompt tokens the provider served from its cache, and the prompt
+    /// tokens it was measured over. Only calls with the provider's own
+    /// numbers count on either side: an estimated call has no cache split
+    /// to report, and folding its chars/4 prompt into the denominator would
+    /// report a real cache hit as a smaller one.
+    cached: u64,
+    cached_prompt: u64,
     peak_prompt: u32,
     /// At least one call's counts came from chars/4, not the provider.
     estimated: bool,
@@ -46,10 +53,20 @@ struct Measured {
     trace_chars: u64,
     clipped_chars: u64,
     tool_calls: usize,
+    /// Estimated tokens of the candidate cache prefix, one entry per call
+    /// that carried block sizes (M9 T0.5). The prefix is the run of blocks
+    /// before the breakpoint a role could set: facts + summary + window for
+    /// the emitter, whose trace is what changes between iterations, and
+    /// persona + facts + summary for the replier, whose window is the turn
+    /// it is answering. Kept per call rather than summed because the number
+    /// T2.3 reads is a *level* against the provider's 1,024-token floor, and
+    /// a sum over four calls clears a floor no single call does.
+    emitter_prefix: Vec<u32>,
+    replier_prefix: Vec<u32>,
 }
 
 impl Measured {
-    fn add_call(&mut self, usage: &Usage, manifest: &ContextManifest) {
+    fn add_call(&mut self, usage: &Usage, manifest: &ContextManifest, persona_chars: usize) {
         self.calls += 1;
         self.requests += usage.attempts;
         match usage.role.as_str() {
@@ -63,6 +80,10 @@ impl Measured {
         }
         self.prompt += u64::from(usage.prompt_tokens);
         self.completion += u64::from(usage.completion_tokens);
+        if !usage.estimated {
+            self.cached += u64::from(usage.cached_tokens);
+            self.cached_prompt += u64::from(usage.prompt_tokens);
+        }
         self.peak_prompt = self.peak_prompt.max(usage.prompt_tokens);
         self.estimated |= usage.estimated;
         self.schema_tokens += u64::from(usage.tools_tokens);
@@ -72,6 +93,22 @@ impl Measured {
         }
         self.trace_chars += manifest.trace_chars as u64;
         self.clipped_chars += manifest.clipped_chars as u64;
+        // All three zero means the call never recorded them: a summarizer,
+        // which is sent no stable blocks, or a log written before M9 added
+        // the sizes. Neither has a prefix to estimate, and folding a zero in
+        // would drag the median under the floor for free.
+        if manifest.facts_chars != 0 || manifest.summary_chars != 0 || manifest.window_chars != 0 {
+            let stable = manifest.facts_chars + manifest.summary_chars;
+            match usage.role.as_str() {
+                "emitter" => self
+                    .emitter_prefix
+                    .push(nscore::estimate_tokens(stable + manifest.window_chars)),
+                "replier" => self
+                    .replier_prefix
+                    .push(nscore::estimate_tokens(persona_chars + stable)),
+                _ => {}
+            }
+        }
     }
 
     fn merge(&mut self, other: &Measured) {
@@ -82,6 +119,8 @@ impl Measured {
         self.summarizer_requests += other.summarizer_requests;
         self.prompt += other.prompt;
         self.completion += other.completion;
+        self.cached += other.cached;
+        self.cached_prompt += other.cached_prompt;
         self.peak_prompt = self.peak_prompt.max(other.peak_prompt);
         self.estimated |= other.estimated;
         self.schema_tokens += other.schema_tokens;
@@ -90,6 +129,8 @@ impl Measured {
         self.trace_chars += other.trace_chars;
         self.clipped_chars += other.clipped_chars;
         self.tool_calls += other.tool_calls;
+        self.emitter_prefix.extend_from_slice(&other.emitter_prefix);
+        self.replier_prefix.extend_from_slice(&other.replier_prefix);
     }
 
     fn cells(&self, label: String) -> Vec<String> {
@@ -102,6 +143,7 @@ impl Measured {
                 self.emitter_requests, self.replier_requests, self.summarizer_requests
             ),
             self.prompt.to_string(),
+            self.cached.to_string(),
             self.completion.to_string(),
             self.peak_prompt.to_string(),
             self.schema_tokens.to_string(),
@@ -153,6 +195,7 @@ const MEASURED_COLUMNS: &[(&str, usize)] = &[
     ("calls", 7),
     ("e/r/s", 9),
     ("prompt", 9),
+    ("cached", 8),
     ("compl", 8),
     ("peak", 8),
     ("schema", 8),
@@ -185,6 +228,7 @@ pub fn render_budget(
     caps: Caps,
     verbatim_lines: usize,
     tool_result_max_chars: usize,
+    persona_chars: usize,
 ) -> String {
     if events.is_empty() {
         return "budget: no events for this session — `ns-app dump <session_id>` shows the log.\n"
@@ -194,19 +238,19 @@ pub fn render_budget(
         .iter()
         .any(|e| matches!(e.kind, EventKind::ModelCall { .. }))
     {
-        render_measured(events)
+        render_measured(events, persona_chars)
     } else {
         render_reconstructed(
-        events,
-        window_turns,
-        caps,
-        verbatim_lines,
-        tool_result_max_chars,
-    )
+            events,
+            window_turns,
+            caps,
+            verbatim_lines,
+            tool_result_max_chars,
+        )
     }
 }
 
-fn render_measured(events: &[Event]) -> String {
+fn render_measured(events: &[Event], persona_chars: usize) -> String {
     let mut rows: Vec<Measured> = Vec::new();
     for e in events {
         if !rows.iter().any(|r| r.turn == e.turn) {
@@ -220,7 +264,9 @@ fn render_measured(events: &[Event]) -> String {
             .find(|r| r.turn == e.turn)
             .expect("just inserted");
         match &e.kind {
-            EventKind::ModelCall { usage, manifest } => row.add_call(usage, manifest),
+            EventKind::ModelCall { usage, manifest } => {
+                row.add_call(usage, manifest, persona_chars)
+            }
             EventKind::ToolCalled { .. } => row.tool_calls += 1,
             _ => {}
         }
@@ -270,6 +316,29 @@ fn render_measured(events: &[Event]) -> String {
         plural(total.schema_calls, "call"),
         percent(total.schema_tokens, total.schema_prompt)
     ));
+    // What the provider says it did not have to re-read. Only the calls it
+    // reported numbers for are in either half, so this is a measurement and
+    // not a mixture of one with chars/4.
+    out.push_str(&format!(
+        "cached: {} of {} prompt tokens on measured calls ({})\n",
+        total.cached,
+        total.cached_prompt,
+        if total.cached_prompt == 0 {
+            "0.0%".to_string()
+        } else {
+            percent(total.cached, total.cached_prompt)
+        }
+    ));
+    // The level T2.3 is gated on. A breakpoint below the provider's
+    // 1,024-token minimum is not a cheaper prompt, it is a no-op, so what is
+    // printed is per call and per role rather than a total: the median says
+    // what a typical call would cache, the max whether any call clears the
+    // floor at all.
+    out.push_str(&format!(
+        "stable prefix (est.): emitter {} (facts+summary+window) \u{b7}          replier {} (persona+facts+summary) \u{b7} breakpoint floor 1,024\n",
+        prefix_summary(&total.emitter_prefix),
+        prefix_summary(&total.replier_prefix),
+    ));
     out.push_str(&format!(
         "the free tier meters requests, not tokens: 50 a day on openrouter/free, {} spent here\n",
         total.requests
@@ -318,9 +387,9 @@ fn render_reconstructed(
                 tool_result_max_chars,
             )
             .0
-                .join("\n")
-                .chars()
-                .count(),
+            .join("\n")
+            .chars()
+            .count(),
             tool_calls: events
                 .iter()
                 .filter(|e| e.turn == turn && matches!(e.kind, EventKind::ToolCalled { .. }))
@@ -430,6 +499,21 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
+/// `median N tok, max M`, or `n/a` when no call of that role carried block
+/// sizes — a session with no such call, or any log written before M9
+/// recorded them. `n/a` rather than `0` because nothing was measured, and a
+/// printed zero would read as a prefix that exists and is empty.
+fn prefix_summary(estimates: &[u32]) -> String {
+    if estimates.is_empty() {
+        return "n/a".to_string();
+    }
+    let mut sorted = estimates.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let max = *sorted.last().expect("non-empty");
+    format!("median {median} tok, max {max}")
+}
+
 /// `-` rather than `0.0%` when nothing carried a schema: a turn with no
 /// schema-bearing call has no fraction, and a printed zero would read as one.
 fn percent(part: u64, whole: u64) -> String {
@@ -458,6 +542,14 @@ mod tests {
             attempts,
             latency_ms: 5,
             tools_tokens,
+            cached_tokens: 0,
+        }
+    }
+
+    fn cached(role: &str, prompt: u32, cached_tokens: u32) -> Usage {
+        Usage {
+            cached_tokens,
+            ..usage(role, 1, prompt, 0)
         }
     }
 
@@ -466,6 +558,17 @@ mod tests {
             tools,
             trace_chars,
             clipped_chars,
+            ..Default::default()
+        }
+    }
+
+    /// A manifest carrying only the three stable block sizes, as an emitter
+    /// or replier call records them after the fit.
+    fn blocks(facts: usize, summary: usize, window: usize) -> ContextManifest {
+        ContextManifest {
+            facts_chars: facts,
+            summary_chars: summary,
+            window_chars: window,
             ..Default::default()
         }
     }
@@ -522,7 +625,7 @@ mod tests {
             usage("replier", 1, 800, 0),
             manifest(0, 900, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -530,13 +633,13 @@ mod tests {
         assert_eq!(cells[2], "3", "3 calls: {row}");
         assert_eq!(cells[3], "4/1/0", "by role: {row}");
         assert_eq!(
-            cells[6], "1400",
+            cells[7], "1400",
             "peak prompt is the max, not the sum: {row}"
         );
         // Summed, not maxed: the same trace re-sent on the next iteration is
         // paid for again, and that is what phase 1 has to move.
-        assert_eq!(cells[9], "1840", "trace chars summed over calls: {row}");
-        assert_eq!(cells[10], "13000", "clipped chars summed: {row}");
+        assert_eq!(cells[10], "1840", "trace chars summed over calls: {row}");
+        assert_eq!(cells[11], "13000", "clipped chars summed: {row}");
         assert!(
             out.contains("5 requests (5.0 per turn)"),
             "requests per turn is the free-tier number: {out}"
@@ -561,7 +664,7 @@ mod tests {
             usage("replier", 1, 2_000, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         assert!(row.contains("20.0%"), "200 of 1000 emitter tokens: {row}");
@@ -575,6 +678,81 @@ mod tests {
         );
     }
 
+    /// The cache share is a measurement or it is nothing: an estimated call
+    /// has no provider number to split, so neither its cached tokens nor its
+    /// chars/4 prompt may stand in the fraction.
+    #[test]
+    fn cached_column_sums_only_measured_calls() {
+        let mut log = log();
+        call(
+            &mut log,
+            1,
+            cached("emitter", 1_000, 100),
+            manifest(0, 0, 0),
+        );
+        call(
+            &mut log,
+            1,
+            cached("emitter", 1_000, 300),
+            manifest(0, 0, 0),
+        );
+        let mut guessed = cached("replier", 5_000, 999);
+        guessed.estimated = true;
+        call(&mut log, 1, guessed, manifest(0, 0, 0));
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+
+        let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cells[5], "400", "the estimated call's 999 is out: {row}");
+        assert!(
+            out.contains("cached: 400 of 2000 prompt tokens on measured calls (20.0%)"),
+            "the denominator is the two measured calls only: {out}"
+        );
+    }
+
+    /// The prefix estimate reads the manifest's three block sizes and nothing
+    /// else, and a call that recorded none of them is not a prefix of zero —
+    /// it is a call with no prefix to report (M9 T0.5).
+    #[test]
+    fn prefix_estimate_uses_the_manifests_block_sizes() {
+        let mut log = log();
+        for chars in [4_000usize, 12_000, 8_000] {
+            call(
+                &mut log,
+                1,
+                usage("emitter", 1, 100, 0),
+                blocks(chars / 4, chars / 4, chars / 2),
+            );
+        }
+        // Sent no stable blocks, so it records none: it must not become a
+        // fourth sample at zero and pull the median down.
+        call(
+            &mut log,
+            1,
+            usage("summarizer", 1, 100, 0),
+            manifest(0, 0, 0),
+        );
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
+
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("stable prefix"))
+            .expect("a stable prefix line");
+        assert!(
+            line.contains(&format!(
+                "emitter median {} tok, max {} (facts+summary+window)",
+                nscore::estimate_tokens(8_000),
+                nscore::estimate_tokens(12_000)
+            )),
+            "median is the middle of 4k/8k/12k and the summarizer is out: {line}"
+        );
+        assert!(
+            line.contains("replier n/a (persona+facts+summary)"),
+            "no replier called, so no replier prefix: {line}"
+        );
+        assert!(line.contains("breakpoint floor 1,024"), "{line}");
+    }
+
     /// A call whose tokens the provider never reported is marked, so nobody
     /// averages a guess with a measurement.
     #[test]
@@ -584,7 +762,7 @@ mod tests {
         let mut guessed = usage("replier", 1, 100, 0);
         guessed.estimated = true;
         call(&mut log, 2, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
 
         assert!(
             out.lines().any(|l| l.starts_with("t1 ")),
@@ -615,7 +793,7 @@ mod tests {
             },
         );
         replied(&mut log, 2, "je poledne");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
 
         assert!(out.contains("estimated (reconstructed)"), "{out}");
         assert!(out.contains("A floor, not a measurement"), "{out}");
@@ -691,7 +869,7 @@ mod tests {
             },
         );
         replied(&mut log, 1, "a browser window");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0);
 
         let t1 = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = t1.split_whitespace().collect();
@@ -710,7 +888,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_says_so_instead_of_printing_a_table() {
-        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP);
+        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP, 0);
         assert!(out.contains("no events for this session"), "{out}");
         assert!(!out.contains("turn"), "no header for nothing: {out}");
     }

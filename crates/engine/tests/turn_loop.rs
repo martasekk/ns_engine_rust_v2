@@ -7,10 +7,10 @@ use std::sync::Arc;
 struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         Err(ChannelError::Closed)
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -55,7 +55,7 @@ fn echo_proposal(text: &str) -> Proposal {
 #[tokio::test]
 async fn happy_path_tool_then_reply() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
     let sid = SessionId("s1".into());
     let reply = e
         .run_turn(Incoming {
@@ -93,7 +93,7 @@ async fn guard_denial_is_logged_and_turn_still_replies() {
         action: "echo".into(),
         reason: "blocked".into(),
     });
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![guard], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![guard], store.clone());
     let sid = SessionId("s2".into());
     let reply = e
         .run_turn(Incoming {
@@ -128,7 +128,7 @@ async fn illegal_action_is_rejected_then_falls_through() {
         action: "nuke".into(),
         args: serde_json::json!({}),
     };
-    let mut e = engine_with(vec![bad], vec![], store.clone());
+    let e = engine_with(vec![bad], vec![], store.clone());
     let sid = SessionId("s3".into());
     let _ = e
         .run_turn(Incoming {
@@ -154,7 +154,7 @@ async fn illegal_action_is_rejected_then_falls_through() {
 #[tokio::test]
 async fn second_turn_continues_same_log() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![],
         store.clone(),
@@ -199,8 +199,10 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::ReplyFailed { .. } => "ReplyFailed",
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",
         EventKind::ReplyEchoed { .. } => "ReplyEchoed",
+        EventKind::ReplyCited { .. } => "ReplyCited",
         EventKind::Summarized { .. } => "Summarized",
         EventKind::ModelCall { .. } => "ModelCall",
+        EventKind::Graded { .. } => "Graded",
     }
 }
 
@@ -234,7 +236,7 @@ async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -293,7 +295,7 @@ async fn a_reply_copied_out_of_its_own_prompt_is_logged_but_not_regenerated() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -336,7 +338,7 @@ async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("ground2".into());
     // ScriptedReplier echoes the trace, which is material by definition.
-    let mut e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
+    let e = engine_with(vec![echo_proposal("hi")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "say hi".into(),
@@ -360,7 +362,7 @@ async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
         reply_grounding_check: false,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("off".into()),
@@ -418,7 +420,7 @@ async fn emitter_context_includes_this_turn_actions() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -466,7 +468,7 @@ async fn persona_flows_from_config_to_reply_context() {
         persona: "Tomáš the salesbot".into(),
         ..Default::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("p1".into()),
@@ -506,7 +508,7 @@ async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -546,7 +548,7 @@ async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
 #[tokio::test]
 async fn real_classification_tags_user_input_and_residual() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "echo".into(),
             action: "echo".into(),
@@ -642,7 +644,7 @@ fn engine_with_tools(
 #[tokio::test]
 async fn irreversible_action_is_staged_not_executed() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with_tools(
+    let e = engine_with_tools(
         vec![Proposal {
             rationale: "wipe".into(),
             action: "wipe".into(),
@@ -694,7 +696,7 @@ async fn denied_action_is_removed_from_next_legal_set() {
         action: "echo".into(),
         reason: "no".into(),
     });
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![guard],
         store.clone(),
@@ -766,7 +768,7 @@ async fn never_residual_rejection_forces_clarification() {
     // The emitter invents an order id the user never gave, then obediently
     // asks a clarification question (the only remaining legal action).
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with_tools(
+    let e = engine_with_tools(
         vec![
             Proposal {
                 rationale: "cancel".into(),
@@ -812,7 +814,7 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
     let sid = SessionId("cf1".into());
     // Turn 1: propose wipe -> staged, asks for confirmation.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "wipe".into(),
                 action: "wipe".into(),
@@ -830,7 +832,7 @@ async fn confirmation_flow_executes_on_next_turn_yes() {
     }
     // Turn 2: user says yes; emitter proposes confirm_pending.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "user confirmed".into(),
                 action: "confirm_pending".into(),
@@ -869,7 +871,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("cf2".into());
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "wipe".into(),
                 action: "wipe".into(),
@@ -887,7 +889,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     }
     // Turn 2: user changes the subject; scripted emitter falls through to respond_directly.
     {
-        let mut e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
+        let e = engine_with_tools(vec![], vec![Arc::new(WipeTool::new())], store.clone());
         e.run_turn(Incoming {
             session: sid.clone(),
             text: "actually, what time is it?".into(),
@@ -897,7 +899,7 @@ async fn pending_confirmation_expires_after_one_turn() {
     }
     // Turn 3: a late confirm_pending must be rejected as illegal and nothing runs.
     {
-        let mut e = engine_with_tools(
+        let e = engine_with_tools(
             vec![Proposal {
                 rationale: "late yes".into(),
                 action: "confirm_pending".into(),
@@ -957,7 +959,7 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(42)),
@@ -1020,7 +1022,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     let sid = SessionId("facts5".into());
 
     // A grounded restatement promotes an unverified fact to full confidence.
-    let mut e = engine_with(vec![remember("Martin")], vec![], store.clone());
+    let e = engine_with(vec![remember("Martin")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "my name is Martin".into(),
@@ -1040,7 +1042,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     assert_eq!(f.trust, Trust::User);
 
     // A new value supersedes: the old version stays in history with valid_to.
-    let mut e = engine_with(vec![remember("Peter")], vec![], store.clone());
+    let e = engine_with(vec![remember("Peter")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "call me Peter".into(),
@@ -1059,7 +1061,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
 
     // An ungrounded value is flagged under the default policy: half
     // confidence, and a residual restatement only creeps up.
-    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    let e = engine_with(vec![remember("Zed")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "whatever".into(),
@@ -1075,7 +1077,7 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
         Timestamp(43),
         "coarse clock: still sorts after the previous version"
     );
-    let mut e = engine_with(vec![remember("Zed")], vec![], store.clone());
+    let e = engine_with(vec![remember("Zed")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "ok".into(),
@@ -1142,7 +1144,7 @@ async fn facts_in_context_are_pinned_plus_relevant_with_previous_values() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -1236,7 +1238,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
     let sid = SessionId("sum".into());
     let calls: Arc<std::sync::Mutex<Vec<(bool, u32, u32)>>> = Default::default();
     // turn 1 fetches external content; every other turn responds directly
-    let mut e = summarizing_engine(
+    let e = summarizing_engine(
         vec![Proposal {
             rationale: "".into(),
             action: "fetch".into(),
@@ -1297,7 +1299,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -1331,7 +1333,7 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
 async fn summarizer_failure_appends_nothing_and_zero_cadence_disables() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("sumfail".into());
-    let mut e = summarizing_engine(
+    let e = summarizing_engine(
         vec![],
         store.clone(),
         ScriptedSummarizer {
@@ -1356,7 +1358,7 @@ async fn summarizer_failure_appends_nothing_and_zero_cadence_disables() {
 
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("sumoff".into());
-    let mut e = summarizing_engine(vec![], store.clone(), ScriptedSummarizer::default(), 0);
+    let e = summarizing_engine(vec![], store.clone(), ScriptedSummarizer::default(), 0);
     for turn in 1..=6 {
         e.run_turn(Incoming {
             session: sid.clone(),
@@ -1383,7 +1385,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         .await
         .unwrap();
     // Eight plain turns; the first mentions the budget.
-    let mut e = engine_with(vec![], vec![], store.clone());
+    let e = engine_with(vec![], vec![], store.clone());
     for turn in 1..=8 {
         let text = if turn == 1 {
             "our budget is 2000 crowns".to_string()
@@ -1398,7 +1400,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
         .unwrap();
     }
     // Turn 9: the emitter recalls; the window (6) hides turns 1–2.
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "recall".into(),
@@ -1470,7 +1472,7 @@ async fn recall_searches_turns_beyond_the_window_and_facts() {
     }
 
     // No matches is a legitimate, grounded answer (abstention).
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "recall".into(),
@@ -1512,7 +1514,7 @@ async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
         remember_residual: nsengine::turn::RememberResidual::Never,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let sid = SessionId("never".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -1539,14 +1541,14 @@ async fn remember_fact_canonicalizes_key_spelling_variants() {
         args: serde_json::json!({"key": key, "value": "Brno"}),
     };
     let sid = SessionId("canon".into());
-    let mut e = engine_with(vec![remember("user.city")], vec![], store.clone());
+    let e = engine_with(vec![remember("user.city")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "I live in Brno".into(),
     })
     .await
     .unwrap();
-    let mut e = engine_with(vec![remember("User_City")], vec![], store.clone());
+    let e = engine_with(vec![remember("User_City")], vec![], store.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "Brno, as I said".into(),
@@ -1577,7 +1579,7 @@ async fn forget_fact_soft_deletes_and_unknown_key_is_malformed() {
         args: serde_json::json!({"key": key}),
     };
     let sid = SessionId("forget".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![forget("user.nope"), forget("user.name")],
         vec![],
         store.clone(),
@@ -1609,7 +1611,7 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     // the same key, then a staged forget_all — all in one turn.
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("contra".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             Proposal {
                 rationale: "".into(),
@@ -1655,7 +1657,7 @@ async fn forgetting_is_illegal_after_a_write_this_turn() {
     // store state, or replay from a fresh store would diverge) and is
     // staged like any irreversible action.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "forget_all".into(),
@@ -1696,7 +1698,7 @@ async fn second_forget_fact_miss_narrows_the_schema() {
         args: serde_json::json!({"key": key}),
     };
     let sid = SessionId("miss".into());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             forget("user.nope"),
             forget("user.nope"),
@@ -1744,7 +1746,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
     };
     // Turn 1: staged, not executed (seen live: "reset the memory" stored a
     // junk fact instead).
-    let mut e = engine_with(vec![forget_all()], vec![], store.clone());
+    let e = engine_with(vec![forget_all()], vec![], store.clone());
     let reply = e
         .run_turn(Incoming {
             session: sid.clone(),
@@ -1759,7 +1761,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
     );
     assert_eq!(store.facts("global", "").await.unwrap().len(), 2);
     // Turn 2: the user confirms; the purge runs and history is gone too.
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "".into(),
             action: "confirm_pending".into(),
@@ -1796,7 +1798,7 @@ async fn forget_all_is_staged_then_purges_on_confirmation() {
 #[tokio::test]
 async fn remember_fact_without_value_is_malformed() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "bad".into(),
             action: "remember_fact".into(),
@@ -1828,7 +1830,7 @@ async fn remember_fact_trims_stray_punctuation_from_key() {
     // Seen live: a model that reliably emits ":user.name". Edge punctuation
     // is normalized away (like the trim normalizer); the identifier survives.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: "remember".into(),
             action: "remember_fact".into(),
@@ -1877,7 +1879,7 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
     // yields no new information — the engine must refuse it, and the
     // narrowed schema must then remove the action entirely.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![
             echo_proposal("hi"),
             echo_proposal("hi"),
@@ -1920,7 +1922,7 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
 #[tokio::test]
 async fn same_action_with_different_args_is_not_a_repeat() {
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![echo_proposal("a"), echo_proposal("b")],
         vec![],
         store.clone(),
@@ -1945,7 +1947,7 @@ async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
         args: serde_json::json!({"key": "user.name", "value": "Martin"}),
     };
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
+    let e = engine_with(vec![fact(), fact(), fact()], vec![], store.clone());
     let sid = SessionId("rep3".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -1970,7 +1972,7 @@ async fn remember_fact_repeated_in_one_turn_is_denied_then_narrowed() {
 async fn remember_fact_with_junk_key_is_malformed() {
     // Degenerate model outputs (seen live: key ", ") must not become facts.
     let store = Arc::new(InMemoryStore::new());
-    let mut e = engine_with(
+    let e = engine_with(
         vec![Proposal {
             rationale: ", ".into(),
             action: "remember_fact".into(),
@@ -2054,7 +2056,7 @@ const RATE_LIMITED: &str =
 async fn fallback_reply_explains_provider_error() {
     // Seen live: a 429/402 from the provider surfaced as a bare "Sorry" and
     // the cause was only visible in the event log.
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitFailsWith(RATE_LIMITED)),
         Box::new(ScriptedReplier),
         EngineConfig::default(),
@@ -2110,7 +2112,7 @@ async fn a_terminal_provider_status_is_not_retried() {
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
     let sid = SessionId("terminal".into());
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(), // max_emit_retries = 3
         Box::new(|| Timestamp(42)),
@@ -2160,7 +2162,7 @@ async fn a_terminal_provider_status_is_not_retried() {
 #[tokio::test]
 async fn a_transient_provider_status_uses_the_retry_budget() {
     let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitProviderStatus(429, calls.clone())),
         Box::new(ScriptedReplier),
         EngineConfig::default(), // max_emit_retries = 3
@@ -2180,7 +2182,7 @@ async fn fallback_reply_explains_step_exhaustion() {
         .iter()
         .map(|t| echo_proposal(t))
         .collect();
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(ScriptedEmitter::new(proposals)),
         Box::new(ScriptedReplier),
         EngineConfig::default(), // max_iterations = 5
@@ -2211,7 +2213,7 @@ async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig::default(),
         Box::new(|| Timestamp(42)),
@@ -2257,7 +2259,7 @@ async fn cant_help_template_receives_reason_var() {
             .collect(),
         ..Default::default()
     };
-    let mut e = engine_from(
+    let e = engine_from(
         Box::new(EmitFailsWith(RATE_LIMITED)),
         Box::new(ScriptedReplier),
         cfg,
@@ -2292,7 +2294,7 @@ async fn registered_cant_help_template_replaces_fallback() {
             .collect(),
         ..Default::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let reply = e
         .run_turn(Incoming {
             session: SessionId("tpl1".into()),
@@ -2312,7 +2314,7 @@ async fn tool_args_failing_schema_are_rejected_as_malformed_not_called() {
         action: "echo".into(),
         args: serde_json::json!({"text": 42}),
     };
-    let mut e = engine_with(vec![bad, echo_proposal("ok")], vec![], store.clone());
+    let e = engine_with(vec![bad, echo_proposal("ok")], vec![], store.clone());
     let sid = SessionId("val".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2370,7 +2372,7 @@ async fn alias_action_rewrites_a_near_miss_name_but_proposed_event_keeps_the_raw
         action: "eko".into(),
         args: serde_json::json!({"text": "hi"}),
     };
-    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let e = engine_with_rules(vec![p], store.clone(), rules);
     let sid = SessionId("alias".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2402,7 +2404,7 @@ async fn normalize_arg_repairs_args_before_validation() {
         action: "echo".into(),
         args: serde_json::json!({"text": " \"hi\" "}),
     };
-    let mut e = engine_with_rules(vec![p], store.clone(), rules);
+    let e = engine_with_rules(vec![p], store.clone(), rules);
     let sid = SessionId("norm".into());
     let reply = e
         .run_turn(Incoming {
@@ -2443,7 +2445,7 @@ async fn aliased_action_still_goes_through_guards() {
         learned: rules_handle(rules),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     let sid = SessionId("alias-guard".into());
     e.run_turn(Incoming {
         session: sid.clone(),
@@ -2483,7 +2485,7 @@ async fn guidance_reaches_the_emitter_scoped_to_legal_actions() {
         learned: rules_handle(rules),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
     e.run_turn(Incoming {
         session: SessionId("g".into()),
         text: "go".into(),
@@ -2518,26 +2520,34 @@ enum Step {
     Idle,
 }
 
-/// Channel double: pops one step per recv. `Idle` sleeps long enough for the
-/// engine's idle timeout to cancel the recv future (timeouts drop it).
+/// How long an `Idle` step keeps the recv quiet: several times the engine's
+/// idle timeout, so the quiet period is seen even if its first tick lands
+/// while the previous turn is still finishing.
+const IDLE_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Channel double: one step per message. The dispatcher keeps its recv
+/// future across a timeout instead of dropping it, so `Idle` is a sleep
+/// *inside* the pending recv — long enough for the engine's idle timeout to
+/// fire — after which the same call goes on to the next step.
 struct ScriptedChannel(std::sync::Mutex<std::collections::VecDeque<Step>>);
 #[async_trait::async_trait]
 impl Channel for ScriptedChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        let next = self.0.lock().unwrap().pop_front();
-        match next {
-            Some(Step::Say(t)) => Ok(Incoming {
-                session: SessionId("idle".into()),
-                text: t.into(),
-            }),
-            Some(Step::Idle) => {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                Err(ChannelError::Closed)
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        loop {
+            let next = self.0.lock().unwrap().pop_front();
+            match next {
+                Some(Step::Say(t)) => {
+                    return Ok(Incoming {
+                        session: SessionId("idle".into()),
+                        text: t.into(),
+                    })
+                }
+                Some(Step::Idle) => tokio::time::sleep(IDLE_STEP).await,
+                None => return Err(ChannelError::Closed),
             }
-            None => Err(ChannelError::Closed),
         }
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -2604,7 +2614,7 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
         idle_after: Some(std::time::Duration::from_millis(20)),
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(1)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(1)));
     e.run().await.unwrap();
     // pass after "one", pass after "two", and NOT a third time (no turn in between).
     assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -2627,16 +2637,19 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
 /// announcement — so a loop that summarizes *before* recv deadlocks, and the
 /// test's timeout fails it. Nothing here can pass sequentially.
 struct HandshakeChannel {
-    received: usize,
+    received: std::sync::atomic::AtomicUsize,
     at_channel: Arc<tokio::sync::Notify>,
     summarized: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
 impl Channel for HandshakeChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        self.received += 1;
-        match self.received {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        let received = self
+            .received
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        match received {
             n @ (1 | 2) => Ok(Incoming {
                 session: SessionId("concurrent".into()),
                 text: format!("message {n}"),
@@ -2648,7 +2661,7 @@ impl Channel for HandshakeChannel {
             }
         }
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -2689,7 +2702,7 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(HandshakeChannel {
-        received: 0,
+        received: std::sync::atomic::AtomicUsize::new(0),
         at_channel: at_channel.clone(),
         summarized: summarized.clone(),
     }));
@@ -2705,7 +2718,7 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
         summary_every_turns: 1,
         ..EngineConfig::default()
     };
-    let mut e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
 
     tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
         .await
@@ -2735,7 +2748,7 @@ async fn recall_reaches_earlier_sessions_of_the_same_scope() {
     // An earlier conversation, and the digest the consolidator would write
     // for it once it had a rolling summary.
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: old.clone(),
         text: "the deployment password is kept in the vault".into(),
@@ -2762,7 +2775,7 @@ async fn recall_reaches_earlier_sessions_of_the_same_scope() {
 
     // A new conversation, asking about it. The recall cue routes this Deep,
     // so the engine searches before proposing anything.
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: new.clone(),
         text: "what did i tell you earlier about the deployment password".into(),
@@ -2854,7 +2867,7 @@ fn routed_engine(
 async fn a_chat_turn_is_offered_no_tools() {
     let store = Arc::new(InMemoryStore::new());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: SessionId("chat".into()),
         text: "hello there, how are you".into(),
@@ -2884,7 +2897,7 @@ async fn a_tool_proposed_on_a_chat_turn_widens_the_tier_instead_of_being_refused
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("misroute".into());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(
+    let e = routed_engine(
         vec![echo_proposal("hi"), echo_proposal("hi")],
         store.clone(),
         legal.clone(),
@@ -2925,7 +2938,7 @@ async fn a_deep_turn_recalls_before_the_first_proposal() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("deep".into());
     let legal = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = routed_engine(vec![], store.clone(), legal.clone());
+    let e = routed_engine(vec![], store.clone(), legal.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "what did i tell you earlier about the budget".into(),
@@ -2960,22 +2973,19 @@ async fn a_deep_turn_recalls_before_the_first_proposal() {
 async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, ContextManifest)> {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("budget".into());
-    let sink = Arc::new(UsageSink::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![]),
-        sink: sink.clone(),
     }));
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
-            usage: Some(sink.clone()),
             prompt_budget_tokens: limit,
             budget_mode: mode,
             ..EngineConfig::default()
@@ -3158,7 +3168,7 @@ async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(WideTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
@@ -3226,12 +3236,11 @@ async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap
     )));
 }
 
-/// Stands in for a provider client: leaves a `Usage` in the same sink
-/// `OpenRouterClient` writes to, so the engine's half of the accounting can
-/// be tested without a network.
+/// Stands in for a provider client: leaves a `Usage` in the sink the engine
+/// handed the call — the one `OpenRouterClient` writes to — so the engine's
+/// half of the accounting can be tested without a network.
 struct MeteredEmitter {
     inner: ScriptedEmitter,
-    sink: Arc<UsageSink>,
 }
 
 #[async_trait::async_trait]
@@ -3241,8 +3250,12 @@ impl Emitter for MeteredEmitter {
         ctx: EmitterContext,
         legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
+        let sink = ctx
+            .usage
+            .clone()
+            .expect("the engine hands every call a sink");
         let proposed = self.inner.propose(ctx, legal).await;
-        self.sink.record(Usage {
+        sink.record(Usage {
             role: "emitter".into(),
             model: "test-model".into(),
             prompt_tokens: 900,
@@ -3251,6 +3264,7 @@ impl Emitter for MeteredEmitter {
             attempts: 2,
             latency_ms: 11,
             tools_tokens: 300,
+            cached_tokens: 0,
         });
         proposed
     }
@@ -3272,23 +3286,20 @@ async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
         })
         .await
         .unwrap();
-    let sink = Arc::new(UsageSink::new());
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![echo_proposal("hi")]),
-        sink: sink.clone(),
     }));
     b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
-    let mut e = Engine::with_clock(
+    let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
             max_echo_ratio: 1.1,
-            usage: Some(sink.clone()),
             ..EngineConfig::default()
         },
         Box::new(|| Timestamp(42)),
@@ -3402,7 +3413,7 @@ async fn a_side_effect_is_persisted_before_the_reply_model_runs() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("durable".into());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e = engine_watching_the_store(
+    let e = engine_watching_the_store(
         vec![Proposal {
             rationale: "durable".into(),
             action: "remember_fact".into(),
@@ -3450,8 +3461,7 @@ async fn a_pure_tool_result_is_not_flushed_early() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("pure".into());
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut e =
-        engine_watching_the_store(vec![echo_proposal("hi")], store.clone(), &sid, seen.clone());
+    let e = engine_watching_the_store(vec![echo_proposal("hi")], store.clone(), &sid, seen.clone());
     e.run_turn(Incoming {
         session: sid.clone(),
         text: "say hi".into(),
@@ -3470,4 +3480,1053 @@ async fn a_pure_tool_result_is_not_flushed_early() {
         .unwrap()
         .iter()
         .any(|ev| matches!(&ev.kind, EventKind::ToolReturned { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-10 (many conversations at once) T0.2: two sessions through one
+// channel keep separate, intact logs. Serial today — this is the regression
+// guard for Phase 2's dispatcher, which runs sessions on their own tasks.
+
+/// Channel double that carries a session per message (`ScriptedChannel` pins
+/// one session). Pops one `(session, text)` per recv, then closes.
+struct SessionsChannel(std::sync::Mutex<std::collections::VecDeque<(&'static str, &'static str)>>);
+#[async_trait::async_trait]
+impl Channel for SessionsChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        let next = self.0.lock().unwrap().pop_front();
+        match next {
+            Some((s, t)) => Ok(Incoming {
+                session: SessionId(s.into()),
+                text: t.into(),
+            }),
+            None => Err(ChannelError::Closed),
+        }
+    }
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn two_sessions_interleaved_through_one_channel_keep_separate_intact_logs() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [
+            ("a", "a one"),
+            ("b", "b one"),
+            ("a", "a two"),
+            ("b", "b two"),
+        ]
+        .into_iter()
+        .collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after four messages")
+        .unwrap();
+
+    for (sid, expected, other) in [
+        ("a", ["a one", "a two"], "b "),
+        ("b", ["b one", "b two"], "a "),
+    ] {
+        let session = SessionId(sid.into());
+        let events = store.load(&session).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(2),
+            "session {sid} completed two turns"
+        );
+        let said: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::UserSaid { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said, expected,
+            "session {sid} holds its own messages, in order"
+        );
+        assert!(
+            !said.iter().any(|t| t.starts_with(other)),
+            "session {sid} holds nothing from the other session"
+        );
+        assert!(
+            EventLog::from_events(session, events)
+                .verify_chain()
+                .is_ok(),
+            "session {sid} chain verifies"
+        );
+    }
+}
+
+/// The session a call belongs to, read off the user text the engine put in
+/// the call's context (`"hello from a"` is session `"a"`).
+fn session_of(user_text: &str) -> String {
+    user_text
+        .strip_prefix("hello from ")
+        .unwrap_or_else(|| panic!("unexpected user text: {user_text:?}"))
+        .to_string()
+}
+
+fn usage_tagged(role: &str, session: &str) -> Usage {
+    Usage {
+        role: role.into(),
+        model: format!("model-for-{session}"),
+        prompt_tokens: 10,
+        completion_tokens: 1,
+        estimated: false,
+        attempts: 1,
+        latency_ms: 1,
+        tools_tokens: 0,
+        cached_tokens: 0,
+    }
+}
+
+/// Records its cost into the sink its context carries, tagged with the
+/// session it was called for, and yields on both sides of the record: before
+/// it so the other session's call is in flight at the same time, and after
+/// it so the other session's record lands before this call returns — the
+/// moment a process-wide sink drained after the call would hand one
+/// session's cost to the other.
+struct SessionTaggedEmitter {
+    records: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Emitter for SessionTaggedEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        tokio::task::yield_now().await;
+        let sink = ctx
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink");
+        sink.record(usage_tagged("emitter", &session_of(&ctx.user_text)));
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Ok(Proposal {
+            rationale: "nothing to do".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+struct SessionTaggedReplier {
+    records: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Replier for SessionTaggedReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        tokio::task::yield_now().await;
+        let session = session_of(&ctx.user_text);
+        let sink = ctx
+            .usage
+            .as_ref()
+            .expect("the engine hands every call a sink");
+        sink.record(usage_tagged("replier", &session));
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        Ok(format!("hello back, {session}"))
+    }
+}
+
+/// Multi-conversation plan Phase 1 (findings §2.6): what a call cost travels
+/// with the call. Two turns on two sessions run at once, each role records
+/// into the sink its context carries and yields around the record, and every
+/// `ModelCall` still carries only its own session's usage — nothing lost to
+/// the other session, nothing counted twice.
+#[tokio::test]
+async fn usage_from_two_overlapping_turns_lands_on_their_own_model_calls() {
+    let store = Arc::new(InMemoryStore::new());
+    let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(SessionTaggedEmitter {
+        records: records.clone(),
+    }));
+    b.set_replier(Box::new(SessionTaggedReplier {
+        records: records.clone(),
+    }));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let message = |sid: &str| Incoming {
+        session: SessionId(sid.into()),
+        text: format!("hello from {sid}"),
+    };
+    let (reply_a, reply_b) = tokio::join!(e.run_turn(message("a")), e.run_turn(message("b")));
+    reply_a.unwrap();
+    reply_b.unwrap();
+
+    let mut landed = 0;
+    for (sid, other) in [("a", "b"), ("b", "a")] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        let calls: Vec<&Usage> = events
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::ModelCall { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        for role in ["emitter", "replier"] {
+            assert!(
+                calls.iter().any(|u| u.role == role),
+                "session {sid} has a ModelCall for its {role}"
+            );
+        }
+        for u in &calls {
+            assert_eq!(
+                u.model,
+                format!("model-for-{sid}"),
+                "session {sid}: its {} call carries another session's usage",
+                u.role
+            );
+            assert_ne!(u.model, format!("model-for-{other}"));
+        }
+        landed += calls.len();
+    }
+    assert_eq!(
+        landed,
+        records.load(std::sync::atomic::Ordering::SeqCst),
+        "every record landed exactly once: nothing lost, nothing duplicated"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-conversation plan Phase 2: the dispatcher (`nsengine::dispatch`).
+// One turn at a time per session; `worker_slots` sessions at once.
+
+/// A `ScriptedEmitter` that yields to the scheduler before answering, so two
+/// turns started together both load the log before either appends to it —
+/// the same double as `app/tests/e2e.rs`.
+struct YieldingEmitter(ScriptedEmitter);
+#[async_trait::async_trait]
+impl Emitter for YieldingEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        tokio::task::yield_now().await;
+        self.0.propose(ctx, legal).await
+    }
+}
+
+/// A session's `UserSaid` lines in log order, each with its turn.
+fn user_said(events: &[Event]) -> Vec<(u32, &str)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::UserSaid { text } => Some((e.turn, text.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dispatcher_config(worker_slots: usize) -> EngineConfig {
+    EngineConfig {
+        worker_slots,
+        max_echo_ratio: 1.1,
+        ..EngineConfig::default()
+    }
+}
+
+/// The overlap hazard (`app/tests/e2e.rs`,
+/// `two_overlapping_turns_on_one_session_lose_one_silently`) inverted by the
+/// mailbox. Through `run_turn` directly, two messages for one session that
+/// overlap both number themselves turn 1 and one of them vanishes without an
+/// error. Through the dispatcher the same two messages — delivered back to
+/// back, answered by the same yielding emitter — go through the session's
+/// mailbox one after the other: the log holds turns 1 and 2, both
+/// `UserSaid`s in order, chain intact.
+#[tokio::test]
+async fn two_messages_for_one_session_through_the_dispatcher_become_two_turns() {
+    let store = Arc::new(InMemoryStore::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(YieldingEmitter(ScriptedEmitter::new(vec![]))));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [("a", "first"), ("a", "second")].into_iter().collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(1),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after two messages")
+        .unwrap();
+
+    let sid = SessionId("a".into());
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(
+        user_said(&events),
+        vec![(1, "first"), (2, "second")],
+        "both messages became turns, in order"
+    );
+    assert_eq!(events.last().map(|e| e.turn), Some(2));
+    assert!(
+        EventLog::from_events(sid, events).verify_chain().is_ok(),
+        "the chain verifies"
+    );
+}
+
+/// Parks session `a`'s turn until released; answers session `b` at once.
+/// The session is read off the user text (`session_of`).
+struct ParkedEmitter {
+    release_a: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Emitter for ParkedEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        if session_of(&ctx.user_text) == "a" {
+            self.release_a.notified().await;
+        }
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// A `SessionsChannel` that also announces when the reply to one session
+/// has gone out — that session's turn is complete, reply and all.
+struct ReleasingChannel {
+    script: SessionsChannel,
+    on_sent: &'static str,
+    release: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Channel for ReleasingChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        self.script.recv().await
+    }
+    async fn send(&self, s: &SessionId, t: &str) -> Result<(), ChannelError> {
+        self.script.send(s, t).await?;
+        if s.0 == self.on_sent {
+            self.release.notify_one();
+        }
+        Ok(())
+    }
+}
+
+/// Two sessions, two slots. Session `a`'s turn parks until session `b`'s
+/// reply has been sent, so the run completes only if `b`'s turn ran to the
+/// end while `a`'s was still in flight. With one slot `a` would hold it and
+/// `b` could never start; the timeout would fail the test.
+#[tokio::test]
+async fn two_sessions_run_concurrently_under_two_slots() {
+    let store = Arc::new(InMemoryStore::new());
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ParkedEmitter {
+        release_a: release_a.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(ReleasingChannel {
+        script: SessionsChannel(std::sync::Mutex::new(
+            [("a", "hello from a"), ("b", "hello from b")]
+                .into_iter()
+                .collect(),
+        )),
+        on_sent: "b",
+        release: release_a,
+    }));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(2),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("session b's turn must complete while session a's is parked")
+        .unwrap();
+
+    for sid in ["a", "b"] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(1),
+            "session {sid} completed its turn"
+        );
+    }
+}
+
+/// Counts the turns in flight through the emitter, and the most there ever
+/// were at once.
+struct InFlightEmitter {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    high_water: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl Emitter for InFlightEmitter {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.high_water.fetch_max(now, SeqCst);
+        // Every chance for the other session to start its turn beside this one.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// One slot — the default, the CLI's behaviour. Two sessions with a message
+/// each and an emitter that yields mid-turn: at no point are two turns in
+/// flight, and both sessions still complete.
+#[tokio::test]
+async fn one_slot_serializes_across_sessions() {
+    let store = Arc::new(InMemoryStore::new());
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let high_water = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(InFlightEmitter {
+        in_flight: in_flight.clone(),
+        high_water: high_water.clone(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [("a", "hello from a"), ("b", "hello from b")]
+            .into_iter()
+            .collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(1),
+        Box::new(|| Timestamp(42)),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("the channel closes after two messages")
+        .unwrap();
+
+    assert_eq!(
+        high_water.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "never two turns in flight under one slot"
+    );
+    assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for sid in ["a", "b"] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(1),
+            "session {sid} completed its turn"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-10 (many conversations at once) Phase 3: the leakage fixture
+// general-harness design §5.2b asked for — "two scopes, a fact stated in
+// one, and a recall in the other that must return nothing".
+
+/// Renders everything the reply model is shown — facts, summary, window,
+/// trace — so a test can assert on what did *not* reach it, not only on the
+/// trace `ScriptedReplier` echoes.
+struct ContextDump;
+#[async_trait::async_trait]
+impl Replier for ContextDump {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let mut out = String::new();
+        for f in &ctx.facts {
+            out.push_str(&render_fact(f));
+            out.push('\n');
+        }
+        if let Some(s) = &ctx.summary {
+            out.push_str(&render_summary(s));
+            out.push('\n');
+        }
+        out.push_str(&render_window(&ctx.window, ctx.window.len(), &ctx.caps));
+        out.push('\n');
+        out.push_str(&ctx.turn_trace);
+        Ok(out)
+    }
+}
+
+/// An engine whose `scope_for` maps each session to its own scope — what
+/// `ns-app serve` does (M6 §6.6: global facts are correct for a single-user
+/// CLI and a leak on a multi-user channel).
+fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
+    b.set_replier(Box::new(ContextDump));
+    b.set_memory(store);
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            scope_for: Arc::new(|sid| sid.0.clone()),
+            // `ContextDump` copies its prompt by design; see `engine_with`.
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+fn recall_proposal(query: &str) -> Proposal {
+    Proposal {
+        rationale: "".into(),
+        action: "recall".into(),
+        args: serde_json::json!({"query": query}),
+    }
+}
+
+/// General-harness design §5.2b, the leakage fixture: two scopes, a fact
+/// stated in one, a recall in the other that must return nothing. Session
+/// `a` remembers `user.city = Brno`; session `b` recalls "city" and then
+/// takes a plain turn. The fact is stored under scope `a` alone, `b`'s
+/// recall comes back empty, and nothing `b`'s reply model was shown —
+/// pinned facts, summary, window, trace — carries the value. The same
+/// recall under `a`'s scope does find it, so the empty result is the
+/// scope's doing and not the query's.
+#[tokio::test]
+async fn a_fact_remembered_in_one_scope_is_invisible_from_another() {
+    let store = Arc::new(InMemoryStore::new());
+    let a = SessionId("a".into());
+    let b = SessionId("b".into());
+
+    let e = per_session_scope_engine(
+        vec![Proposal {
+            rationale: "durable".into(),
+            action: "remember_fact".into(),
+            args: serde_json::json!({"key": "user.city", "value": "Brno"}),
+        }],
+        store.clone(),
+    );
+    let reply_a = e
+        .run_turn(Incoming {
+            session: a.clone(),
+            text: "I live in Brno".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply_a.contains("Brno"),
+        "session a sees its own fact: {reply_a}"
+    );
+
+    let e = per_session_scope_engine(vec![recall_proposal("city")], store.clone());
+    let recall_reply = e
+        .run_turn(Incoming {
+            session: b.clone(),
+            text: "which city do I live in?".into(),
+        })
+        .await
+        .unwrap();
+    let plain_reply = e
+        .run_turn(Incoming {
+            session: b.clone(),
+            text: "are you sure?".into(),
+        })
+        .await
+        .unwrap();
+
+    // Stored under `a`'s scope, and nowhere else.
+    let in_a = store.facts("a", "").await.unwrap();
+    assert_eq!(in_a.len(), 1, "{in_a:?}");
+    assert_eq!(in_a[0].key, "user.city");
+    assert!(store.facts("b", "").await.unwrap().is_empty());
+    assert!(store.facts("global", "").await.unwrap().is_empty());
+
+    // `b`'s recall found nothing ...
+    let events = store.load(&b).await.unwrap();
+    let returned = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            EventKind::ToolReturned {
+                outcome: ToolOutcome::Ok { output },
+                ..
+            } => Some(output.summary.clone()),
+            _ => None,
+        })
+        .expect("recall ran in session b");
+    assert_eq!(returned, "no matches");
+    // ... and nothing `b`'s reply model was shown carries the value.
+    assert!(!recall_reply.contains("Brno"), "{recall_reply}");
+    assert!(!plain_reply.contains("Brno"), "{plain_reply}");
+
+    // The same recall in `a`'s scope finds the fact: the fixture bites.
+    let e = per_session_scope_engine(vec![recall_proposal("city")], store.clone());
+    let reply_a = e
+        .run_turn(Incoming {
+            session: a.clone(),
+            text: "which city do I live in?".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply_a.contains("from memory, user.city is Brno"),
+        "{reply_a}"
+    );
+}
+
+/// Emitter double that meters like `MeteredEmitter` and keeps every context
+/// it was handed, so a test can assert on the prompt as sent *and* on the
+/// `ModelCall` the same call wrote.
+struct MeteredProbe(Arc<std::sync::Mutex<Vec<EmitterContext>>>);
+
+#[async_trait::async_trait]
+impl Emitter for MeteredProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let sink = ctx
+            .usage
+            .clone()
+            .expect("the engine hands every call a sink");
+        self.0.lock().unwrap().push(ctx);
+        sink.record(Usage {
+            role: "emitter".into(),
+            model: "test-model".into(),
+            prompt_tokens: 900,
+            completion_tokens: 20,
+            estimated: false,
+            attempts: 1,
+            latency_ms: 11,
+            tools_tokens: 300,
+            cached_tokens: 0,
+        });
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// The facts block exactly as `nsllm`'s `render_context` writes it — the
+/// engine crate cannot reach the renderer, so the shape is restated here and
+/// the assertion is about the header a blanked block must not produce.
+fn rendered_facts_block(ctx: &EmitterContext) -> String {
+    if ctx.facts.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("Facts:\n");
+    for f in &ctx.facts {
+        s.push_str(&format!("- {}\n", nscore::render_fact(f)));
+    }
+    s
+}
+
+/// One turn on a `MeteredProbe`, returning the contexts it saw and the
+/// `ModelCall` manifests the turn wrote.
+async fn probed_turn(
+    rules: LearnedRules,
+    ablate: Option<Ablate>,
+    facts: Vec<(&str, &str)>,
+) -> (Vec<EmitterContext>, Vec<ContextManifest>) {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("probe".into());
+    for (key, value) in facts {
+        store
+            .put_fact(Fact {
+                key: key.into(),
+                value: serde_json::json!(value),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let seen: Arc<std::sync::Mutex<Vec<EmitterContext>>> = Default::default();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredProbe(seen.clone())));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let cfg = EngineConfig {
+        max_echo_ratio: 1.1,
+        learned: rules_handle(rules),
+        ablate,
+        ..EngineConfig::default()
+    };
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "what is my name".into(),
+    })
+    .await
+    .unwrap();
+    let events = store.load(&sid).await.unwrap();
+    let manifests = events
+        .iter()
+        .filter_map(|ev| match &ev.kind {
+            EventKind::ModelCall { manifest, .. } => Some(manifest.clone()),
+            _ => None,
+        })
+        .collect();
+    let contexts = std::mem::take(&mut *seen.lock().unwrap());
+    (contexts, manifests)
+}
+
+/// M9 T0.3. A count said how many notes were rendered; it could not say
+/// *which*, because `learned.toml` is rewritten by the evolution pass. The
+/// hash is stable across those rewrites, so a note in a prompt can be joined
+/// to that turn's grade afterwards — which is the whole backward arrow.
+#[tokio::test]
+async fn manifest_records_a_hash_per_rendered_guidance_note() {
+    let notes = vec![
+        Note::new("global", "prefer the shortest action", 0.0),
+        Note::new("global", "never guess a name", 0.0),
+    ];
+    let rules = LearnedRules {
+        notes: notes.clone(),
+        ..Default::default()
+    };
+    let (contexts, manifests) = probed_turn(rules, None, vec![]).await;
+    assert_eq!(contexts[0].guidance.len(), 2, "both notes were rendered");
+    let emitter = manifests
+        .first()
+        .expect("the emitter call was recorded")
+        .clone();
+    assert_eq!(emitter.guidance, 2);
+    assert_eq!(
+        emitter.note_hashes.len(),
+        emitter.guidance,
+        "the count and the list come from one render"
+    );
+    assert_eq!(
+        emitter.note_hashes,
+        notes.iter().map(|n| n.hash.clone()).collect::<Vec<_>>(),
+        "and the hashes are the notes' own, in render order"
+    );
+    assert!(
+        emitter.note_hashes[0].starts_with("sha256:"),
+        "{:?}",
+        emitter.note_hashes[0]
+    );
+}
+
+/// M9 T0.4. The knob exists to price a block, so it must remove the block
+/// from the prompt and say so in the manifest — while leaving the budget
+/// report measuring the context as it was *composed*, because the arm's
+/// question is what the block bought, not what it cost.
+#[tokio::test]
+async fn an_ablated_block_is_absent_from_the_prompt_and_the_manifest() {
+    let facts = vec![("user.name", "Martin"), ("user.city", "Brno")];
+    let (full_ctx, full) = probed_turn(LearnedRules::default(), None, facts.clone()).await;
+    let (ablated_ctx, ablated) =
+        probed_turn(LearnedRules::default(), Some(Ablate::Facts), facts).await;
+
+    // The control arm really did carry the facts.
+    assert_eq!(full[0].fact_keys.len(), 2, "{:?}", full[0].fact_keys);
+    let block = rendered_facts_block(&full_ctx[0]);
+    assert!(block.starts_with("Facts:\n"), "{block}");
+    assert!(block.contains("user.name"), "{block}");
+
+    // The ablated arm's prompt has no facts block at all.
+    assert_eq!(rendered_facts_block(&ablated_ctx[0]), "");
+    assert!(ablated_ctx[0].facts.is_empty());
+    assert!(
+        ablated[0].fact_keys.is_empty(),
+        "{:?}",
+        ablated[0].fact_keys
+    );
+    assert_eq!(
+        ablated[0].facts_chars, 0,
+        "nothing was sent, nothing counted"
+    );
+    assert_eq!(ablated[0].ablated, Some(Ablate::Facts));
+    assert_eq!(full[0].ablated, None);
+
+    // But the budget still weighed the context the selection produced: the
+    // blanking happens after the fit, so `before` is the same number in both
+    // arms and the drop is attributable to the block rather than to a
+    // differently budgeted prompt.
+    let (a, b) = (
+        full[0].budget.as_ref().expect("a budget report"),
+        ablated[0].budget.as_ref().expect("a budget report"),
+    );
+    assert_eq!(a.before, b.before, "the fit saw the same context");
+    assert!(a.before > 0);
+    assert_eq!(a.dropped, b.dropped);
+}
+
+/// M9 T2.1. The obligations block is worth more than a fact ranked fifth by
+/// lexical overlap and less than the immediately preceding turn, so it is a
+/// stage of its own between the two — not part of the exempt `fixed` block
+/// the user's message and the trace sit in.
+#[tokio::test]
+async fn obligations_drop_after_the_window_and_before_facts() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("oblig-budget".into());
+    for (key, value) in [
+        ("order.status", "the order is shipped"),
+        ("invoice.status", "the invoice is paid"),
+        ("delivery.status", "the delivery is late"),
+    ] {
+        store
+            .put_fact(Fact {
+                key: key.into(),
+                value: serde_json::json!(value),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(MeteredEmitter {
+        inner: ScriptedEmitter::new(vec![]),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            // Deliberately far too small: everything droppable drops, so the
+            // whole order is visible in one report.
+            prompt_budget_tokens: 20,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    for turn in 1..=3 {
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: format!("earlier message {turn}, long enough to fill a window record"),
+        })
+        .await
+        .unwrap();
+    }
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "where is my order? and what is the invoice status? show me the delivery".into(),
+    })
+    .await
+    .unwrap();
+
+    let events = store.load(&sid).await.unwrap();
+    let manifest = events
+        .iter()
+        .filter(|ev| ev.turn == 4)
+        .find_map(|ev| match &ev.kind {
+            EventKind::ModelCall { manifest, .. } => Some(manifest.clone()),
+            _ => None,
+        })
+        .expect("the emitter call was recorded");
+    assert_eq!(
+        manifest.obligations, 3,
+        "two questions and an imperative were rendered"
+    );
+    let budget = manifest.budget.as_ref().expect("a budget report");
+    let blocks: Vec<&str> = budget.dropped.iter().map(|d| d.block.as_str()).collect();
+    let first = |name: &str| blocks.iter().position(|b| *b == name);
+    let window = first("window").unwrap_or_else(|| panic!("window dropped: {blocks:?}"));
+    let obligations =
+        first("obligations").unwrap_or_else(|| panic!("obligations dropped: {blocks:?}"));
+    let facts = first("facts").unwrap_or_else(|| panic!("facts dropped: {blocks:?}"));
+    assert!(window < obligations, "window goes first: {blocks:?}");
+    assert!(
+        obligations < facts,
+        "then obligations, then facts: {blocks:?}"
+    );
+    assert!(
+        blocks[..obligations].iter().all(|b| *b == "window"),
+        "every window record goes before the first obligation: {blocks:?}"
+    );
+}
+
+/// The first draft answers nothing the user asked. Counts its calls and
+/// records the guidance each one carried.
+struct ObligationBlindReplier {
+    calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+#[async_trait::async_trait]
+impl Replier for ObligationBlindReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(ctx.guidance.clone());
+        if calls.len() == 1 {
+            // No content word in common with "where is my order".
+            Ok("Nothing to report just now.".into())
+        } else {
+            Ok("Your order left the warehouse.".into())
+        }
+    }
+}
+
+/// M9 T2.1. The interceptor reuses the `ReplyFlagged` path's mechanics — one
+/// regeneration, the manifest re-recorded, no new event kind — with a
+/// distinct guidance line. It fires at most once, and only when its knob is
+/// on: the extraction is measured weak, and the cost of a false positive is
+/// a second billed call.
+#[tokio::test]
+async fn a_reply_leaving_an_obligation_unaddressed_regenerates_once() {
+    async fn run(obligation_check: bool) -> (Vec<Vec<String>>, String) {
+        let store = Arc::new(InMemoryStore::new());
+        let calls: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+        b.set_replier(Box::new(ObligationBlindReplier {
+            calls: calls.clone(),
+        }));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let e = Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig {
+                max_echo_ratio: 1.1,
+                obligation_check,
+                ..EngineConfig::default()
+            },
+            Box::new(|| Timestamp(42)),
+        );
+        let reply = e
+            .run_turn(Incoming {
+                session: SessionId("oblig".into()),
+                text: "where is my order?".into(),
+            })
+            .await
+            .unwrap();
+        let seen = calls.lock().unwrap().clone();
+        (seen, reply)
+    }
+
+    let (seen, reply) = run(true).await;
+    assert_eq!(seen.len(), 2, "exactly one regeneration: {seen:?}");
+    assert!(seen[0].is_empty(), "the first draft is asked plainly");
+    assert_eq!(
+        seen[1],
+        vec!["Not yet addressed: where is my order".to_string()],
+        "the second carries the unmet obligation as guidance"
+    );
+    assert_eq!(reply, "Your order left the warehouse.");
+
+    // Off by default, and off means one call and the first draft sent.
+    let (seen, reply) = run(false).await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(reply, "Nothing to report just now.");
+}
+
+/// A replier that says exactly what the test scripted, whatever it was shown.
+struct FixedReplier(&'static str);
+#[async_trait::async_trait]
+impl Replier for FixedReplier {
+    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
+        Ok(self.0.to_string())
+    }
+}
+
+/// M9 T4.2. A grade says a turn went well; a citation says what was in the
+/// prompt when it did. Without the second, the fitness join could only credit
+/// every fact a good turn happened to be carrying.
+#[tokio::test]
+async fn a_reply_quoting_a_fact_value_records_that_fact_as_cited() {
+    async fn run(reply: &'static str) -> Vec<Vec<String>> {
+        let store = Arc::new(InMemoryStore::new());
+        let sid = SessionId("cited".into());
+        store
+            .put_fact(Fact {
+                key: "user.name".into(),
+                value: serde_json::json!("Martin"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
+        b.set_replier(Box::new(FixedReplier(reply)));
+        b.set_memory(store.clone());
+        b.set_channel(Box::new(NullChannel));
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let cfg = EngineConfig {
+            // The grounding interceptor runs; the citation is recorded on the
+            // draft that stands, regenerated or not.
+            reply_grounding_check: true,
+            max_echo_ratio: 1.1,
+            ..EngineConfig::default()
+        };
+        let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+        e.run_turn(Incoming {
+            session: sid.clone(),
+            text: "what is my name".into(),
+        })
+        .await
+        .unwrap();
+        store
+            .load(&sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::ReplyCited { sources } => Some(sources.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let cited = run("Your name is Martin.").await;
+    assert_eq!(cited.len(), 1, "one event, on the final draft: {cited:?}");
+    assert!(
+        cited[0].contains(&"fact:user.name".to_string()),
+        "the fact whose value the reply quoted: {:?}",
+        cited[0]
+    );
+
+    // A reply that names nothing it was shown cites nothing, and an empty
+    // list is never written — absence is how the join reads "nothing cited".
+    let cited = run("Sure.").await;
+    assert!(cited.is_empty(), "{cited:?}");
 }

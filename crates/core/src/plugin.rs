@@ -28,7 +28,7 @@ pub struct HarnessBuilder {
     emitter: Option<Box<dyn Emitter>>,
     replier: Option<Box<dyn Replier>>,
     memory: Option<Arc<dyn MemoryStore>>,
-    channel: Option<Box<dyn Channel>>,
+    channel: Option<Arc<dyn Channel>>,
     consolidator: Option<Box<dyn Consolidator>>,
     /// Optional slot: `NoopSummarizer` when unset.
     summarizer: Option<Box<dyn Summarizer>>,
@@ -54,7 +54,10 @@ pub struct HarnessParts {
     pub emitter: Box<dyn Emitter>,
     pub replier: Box<dyn Replier>,
     pub memory: Arc<dyn MemoryStore>,
-    pub channel: Box<dyn Channel>,
+    /// Shared, not owned: the dispatcher's session tasks all send through
+    /// the one channel while its `recv` is pending (multi-conversation plan
+    /// Phase 2, D2.1).
+    pub channel: Arc<dyn Channel>,
     pub consolidator: Box<dyn Consolidator>,
     pub summarizer: Box<dyn Summarizer>,
     pub tools: Vec<Arc<dyn Tool>>,
@@ -92,7 +95,15 @@ impl HarnessBuilder {
         self.memory = Some(m);
     }
 
+    /// Takes the box every caller already builds; the parts hold it shared.
     pub fn set_channel(&mut self, c: Box<dyn Channel>) {
+        self.set_shared_channel(Arc::from(c));
+    }
+
+    /// The same slot, for a caller that already holds its channel shared —
+    /// `TcpChannel::bind` hands back an `Arc`, so the caller keeps a handle
+    /// (its `local_addr`) while the parts hold the channel.
+    pub fn set_shared_channel(&mut self, c: Arc<dyn Channel>) {
         if self.channel.is_some() {
             self.dup.push("channel");
         }
@@ -198,10 +209,10 @@ mod tests {
     struct NullChannel;
     #[async_trait]
     impl Channel for NullChannel {
-        async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        async fn recv(&self) -> Result<Incoming, ChannelError> {
             Err(ChannelError::Closed)
         }
-        async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
             Ok(())
         }
     }

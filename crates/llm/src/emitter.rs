@@ -28,8 +28,9 @@ impl CloudEmitter {
     }
 }
 
-/// M6 §4.2/§4.4: facts → summary → verbatim window → current turn → this
-/// turn's actions → pending/rejections → guidance. Stable blocks first.
+/// M6 §4.2/§4.4: facts → summary → obligations → verbatim window → current
+/// turn → this turn's actions → pending/rejections → guidance. Stable blocks
+/// first.
 fn render_context(ctx: &EmitterContext) -> String {
     let mut s = String::new();
     if !ctx.facts.is_empty() {
@@ -41,6 +42,15 @@ fn render_context(ctx: &EmitterContext) -> String {
     if let Some(summary) = &ctx.summary {
         s.push_str(&nscore::render_summary(summary));
         s.push('\n');
+    }
+    // Directly above the window (M9 T2.1): after the stable blocks, so the
+    // cacheable prefix is unchanged, and before the transcript, so what the
+    // turn owes is read before what earlier turns said.
+    if !ctx.obligations.is_empty() {
+        s.push_str("Obligations this turn:\n");
+        for o in &ctx.obligations {
+            s.push_str(&format!("- {o}\n"));
+        }
     }
     if !ctx.window.is_empty() {
         s.push_str("Recent turns:\n");
@@ -100,10 +110,14 @@ impl Emitter for CloudEmitter {
                 {"role": "user", "content": render_context(&ctx)},
             ],
         });
-        let body = self.client.chat(request).await.map_err(|e| match e {
-            ApiError::Transport(d) => EmitError::Transport(d),
-            ApiError::Status { status, detail } => EmitError::Provider { status, detail },
-        })?;
+        let body = self
+            .client
+            .chat_into(request, ctx.usage.as_deref())
+            .await
+            .map_err(|e| match e {
+                ApiError::Transport(d) => EmitError::Transport(d),
+                ApiError::Status { status, detail } => EmitError::Provider { status, detail },
+            })?;
 
         let message = &body["choices"][0]["message"];
         let tool_call = match message["tool_calls"]
@@ -216,6 +230,7 @@ mod tests {
 
     fn ctx() -> EmitterContext {
         EmitterContext {
+            usage: None,
             facts: vec![nscore::Fact {
                 key: "user.name".into(),
                 value: serde_json::json!("Martin"),
@@ -236,6 +251,7 @@ mod tests {
             }],
             caps: Default::default(),
             user_text: "say hi".into(),
+            obligations: vec![],
             trace_so_far: vec!["ToolReturned(ok: echo: hi)".into()],
             pending_confirmation: false,
             rejections_this_turn: vec!["guard g: nope".into()],
@@ -264,6 +280,29 @@ mod tests {
     fn emitter(mock: std::sync::Arc<MockTransport>) -> CloudEmitter {
         let client = OpenRouterClient::new(mock, "k".into()).with_retry(1, 1);
         CloudEmitter::new(client, "anthropic/claude-haiku-4.5".into())
+    }
+
+    /// The context's sink is the one the call records into, and the client's
+    /// own is left alone (multi-conversation plan Phase 1): that is how the
+    /// engine keeps two overlapping turns' costs on their own `ModelCall`s.
+    #[tokio::test]
+    async fn the_calls_cost_lands_in_the_contexts_sink_not_the_clients() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        let own = std::sync::Arc::new(nscore::UsageSink::new());
+        let client =
+            OpenRouterClient::new(mock, "k".into()).with_usage_sink(own.clone(), "emitter");
+        let e = CloudEmitter::new(client, "m".into());
+        let turn = std::sync::Arc::new(nscore::UsageSink::new());
+        let mut ctx = ctx();
+        ctx.usage = Some(turn.clone());
+        e.propose(ctx, &legal()).await.unwrap();
+        let recorded = turn.drain();
+        assert_eq!(recorded.len(), 1, "the turn's sink took the call");
+        assert_eq!(recorded[0].role, "emitter");
+        assert!(own.drain().is_empty(), "the client's own sink was not used");
     }
 
     #[tokio::test]
@@ -416,6 +455,34 @@ mod tests {
         let mock = MockTransport::new(vec![Err(TransportError::Network("down".into()))]);
         let err = emitter(mock).propose(ctx(), &legal()).await.unwrap_err();
         assert!(matches!(err, nscore::EmitError::Transport(_)));
+    }
+
+    /// M9 T2.1. Position is the whole design: the block sits after the
+    /// stable facts and summary, so the cacheable prefix is unchanged, and
+    /// directly above the transcript, so what the turn owes is read before
+    /// what earlier turns said.
+    #[test]
+    fn obligations_render_above_the_recent_turns_block() {
+        let mut c = ctx();
+        c.obligations = nscore::obligations_for("where is my order? send me the invoice", 5);
+        let rendered = render_context(&c);
+        let block = rendered
+            .find("Obligations this turn:\n")
+            .expect("a block: {rendered}");
+        let window = rendered.find("Recent turns:").expect("a window");
+        let summary_end = rendered.find("Current turn:").expect("a current turn");
+        assert!(block < window, "above the window: {rendered}");
+        assert!(window < summary_end);
+        assert!(
+            rendered.contains("- answer: where is my order\n- do: send me the invoice\n"),
+            "{rendered}"
+        );
+        // Facts stay first, so the prefix in front of the block is the
+        // stable one.
+        assert!(rendered.find("Facts:").unwrap() < block, "{rendered}");
+        // No obligations, no block and no blank heading.
+        c.obligations.clear();
+        assert!(!render_context(&c).contains("Obligations"));
     }
 
     /// An HTTP status keeps its status. The engine decides recovery by class,

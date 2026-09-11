@@ -26,6 +26,21 @@ const WEEKDAYS: [&str; 7] = [
     "Saturday",
 ];
 
+/// Wall clock in unix milliseconds, or `0` if the system clock is before the
+/// epoch.
+///
+/// The engine takes its time from an injected clock, which is what makes a
+/// turn replayable. A store does not have one: it is constructed before any
+/// engine and is shared by several. So the one reading a store needs — "how
+/// long ago was this fact last used", for M9 T3.1's decay — comes from here,
+/// and the decay is deliberately the only thing in a store that reads it.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// `2026-09-02 10:41:28 UTC (Wednesday)`.
 pub fn format_utc(unix_ms: u64) -> String {
     let secs = (unix_ms / 1000) as i64;

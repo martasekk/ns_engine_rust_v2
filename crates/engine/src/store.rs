@@ -15,11 +15,29 @@ pub struct InMemoryStore {
     /// the trait says writes are idempotent, so the map cannot hold the
     /// duplicate a re-digested session would otherwise create.
     digests: Mutex<HashMap<SessionId, nscore::SessionDigest>>,
+    /// M9 T3.1/T3.2: the activation prior's knobs, off by default.
+    ///
+    /// On the struct rather than on the trait method because the trait has
+    /// four implementors and two of them are test doubles that have no
+    /// opinion about ranking. A builder keeps every existing `new()` call
+    /// site — and both conformance suites — exactly as it was.
+    activation: nscore::Activation,
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// M9 T3.1/T3.2: rank with the activation prior at this weight.
+    ///
+    /// `half_life_days` decays the fact term; the turn term's half-life is
+    /// [`nscore::RECENCY_HALF_LIFE_TURNS`], a constant, because turns are not
+    /// days. `weight = 0.0` is the default and is today's behaviour exactly.
+    pub fn with_activation(mut self, weight: f32, half_life_days: f32) -> Self {
+        self.activation.weight = weight;
+        self.activation.half_life_days = half_life_days;
+        self
     }
 }
 
@@ -85,7 +103,11 @@ impl MemoryStore for InMemoryStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.turn.cmp(&a.turn))
         });
-        hits.truncate(k);
+        // M9 T3.2: the lexical top candidates, rescored by recency, then cut
+        // to `k`. At weight 0 `rescore_by_recency` only truncates, so this is
+        // the same list in the same order it has always been.
+        hits.truncate(nscore::recency_candidates(k));
+        nscore::rescore_by_recency(&mut hits, self.activation.weight, k);
         Ok(hits)
     }
 
@@ -195,6 +217,29 @@ impl MemoryStore for InMemoryStore {
         Ok(())
     }
 
+    /// M9 T4.3: the two derived columns on the current version, in place.
+    /// Overridden rather than left to the trait's default only so the
+    /// in-memory store cannot drift from the SQLite one — it is the store
+    /// every engine test ranks against.
+    async fn set_fact_fitness(
+        &self,
+        scope: &str,
+        key: &str,
+        exposures: u32,
+        credits: u32,
+    ) -> Result<(), StoreError> {
+        let mut all = self.facts.lock().await;
+        for row in all.iter_mut().filter(|f| {
+            f.scope == scope
+                && f.key == key
+                && matches!(f.state, FactState::Current | FactState::Cold)
+        }) {
+            row.exposures = exposures;
+            row.credits = credits;
+        }
+        Ok(())
+    }
+
     async fn forget_fact(&self, scope: &str, key: &str, at: Timestamp) -> Result<bool, StoreError> {
         let mut all = self.facts.lock().await;
         let mut hit = false;
@@ -224,7 +269,15 @@ impl MemoryStore for InMemoryStore {
         k: usize,
     ) -> Result<Vec<Fact>, StoreError> {
         let current = self.facts(scope, "").await?;
-        Ok(nscore::lexical_rank(&current, query, k))
+        Ok(nscore::lexical_rank(
+            &current,
+            query,
+            k,
+            nscore::Activation {
+                now: Timestamp(nscore::now_ms()),
+                ..self.activation
+            },
+        ))
     }
 
     async fn scopes(&self) -> Result<Vec<String>, StoreError> {
@@ -368,6 +421,80 @@ pub async fn fact_conformance(store: &dyn MemoryStore) {
     assert_eq!(store.facts("chat42", "").await.unwrap().len(), 1);
 }
 
+/// M9 T4.1/T4.3: the fitness counters round-trip through a write, and setting
+/// them moves *only* them — no new version, no changed value.
+///
+/// The second half is the property the whole design rests on. The evolution
+/// pass rescores every fact on every run; if that went through `put_fact`'s
+/// value path it would append a version per pass, and `fact_history` — the
+/// record M6 §6.1 exists for — would fill with rows that differ in nothing
+/// but a counter.
+pub async fn fitness_conformance(store: &dyn MemoryStore) {
+    let f = |key: &str, value: &str, at: u64| Fact {
+        key: key.into(),
+        value: serde_json::json!(value),
+        last_validated: Timestamp(at),
+        valid_from: Timestamp(at),
+        prov: nscore::Provenance::Constant,
+        ..Default::default()
+    };
+    // A write carries the counters it was given.
+    let mut born = f("user.name", "Martin", 10);
+    born.exposures = 4;
+    born.credits = 1;
+    store.put_fact(born).await.unwrap();
+    let cur = store.facts("global", "user.name").await.unwrap();
+    assert_eq!((cur[0].exposures, cur[0].credits), (4, 1));
+    // A new value supersedes, and the new version starts at 0/0.
+    store.put_fact(f("user.name", "Peter", 20)).await.unwrap();
+    let before = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!((before[0].exposures, before[0].credits), (0, 0));
+
+    store
+        .set_fact_fitness("global", "user.name", 9, 3)
+        .await
+        .unwrap();
+    let after = store.fact_history("global", "user.name").await.unwrap();
+    assert_eq!(after.len(), 2, "no version was added");
+    let values: Vec<&serde_json::Value> = after.iter().map(|f| &f.value).collect();
+    let was: Vec<&serde_json::Value> = before.iter().map(|f| &f.value).collect();
+    assert_eq!(values, was, "values unchanged");
+    let states: Vec<_> = after.iter().map(|f| f.state).collect();
+    assert_eq!(
+        states,
+        before.iter().map(|f| f.state).collect::<Vec<_>>(),
+        "states unchanged"
+    );
+    assert_eq!(
+        after.iter().map(|f| f.valid_from).collect::<Vec<_>>(),
+        before.iter().map(|f| f.valid_from).collect::<Vec<_>>(),
+        "identities unchanged"
+    );
+    assert_eq!(
+        (after[0].exposures, after[0].credits),
+        (9, 3),
+        "counters set"
+    );
+    assert_eq!(
+        (after[1].exposures, after[1].credits),
+        (4, 1),
+        "the superseded version keeps the numbers it had"
+    );
+    // Setting is a set, not an add: a second call with smaller numbers wins.
+    store
+        .set_fact_fitness("global", "user.name", 2, 0)
+        .await
+        .unwrap();
+    let cur = store.facts("global", "user.name").await.unwrap();
+    assert_eq!((cur[0].exposures, cur[0].credits), (2, 0));
+    // A key with no current version is a no-op, not an error.
+    store
+        .set_fact_fitness("global", "user.nothing", 5, 5)
+        .await
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +513,88 @@ mod tests {
             store.load(&SessionId("other".into())).await.unwrap(),
             vec![]
         );
+    }
+
+    /// The corpus of [`search_turns_ranks_by_token_hits_newest_first`], in a
+    /// store built however `build` says.
+    async fn turn_corpus(
+        build: impl Fn(InMemoryStore) -> InMemoryStore,
+    ) -> (InMemoryStore, SessionId) {
+        let store = build(InMemoryStore::new());
+        let sid = SessionId("s".into());
+        let mut log = EventLog::new(sid.clone());
+        for (turn, user, bot) in [
+            (1u32, "what time is it", "It is noon."),
+            (2, "remember my name is Martin", "Got it."),
+            (3, "and the time again?", "Still noon."),
+        ] {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::UserSaid { text: user.into() },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Replied { text: bot.into() },
+            );
+        }
+        store.append(&sid, log.events()).await.unwrap();
+        (store, sid)
+    }
+
+    /// M9 T3.2, the twin of the SQLite test: at weight 0 the rescoring pass
+    /// is not a pass — same hits, same order, same scores as a store built
+    /// without the builder at all.
+    #[tokio::test]
+    async fn search_turns_order_is_unchanged_at_weight_zero() {
+        let (plain, sid) = turn_corpus(|s| s).await;
+        let (zero, _) = turn_corpus(|s| s.with_activation(0.0, 7.0)).await;
+        for q in ["noon", "time", "what time", "martin"] {
+            for k in [1usize, 5] {
+                let a = plain.search_turns(&sid, q, k).await.unwrap();
+                let b = zero.search_turns(&sid, q, k).await.unwrap();
+                assert_eq!(a, b, "{q:?} k={k}");
+            }
+        }
+    }
+
+    /// Turn 1 and turn 3 each say "time" once, so the token-hit score ties
+    /// and only the newest-first tiebreak separates them.
+    ///
+    /// Which is why this arm reads the *score*, not just the order: this
+    /// store's scores are whole token counts, so a fractional recency term
+    /// can never outrank a real extra hit here — it can only confirm a tie
+    /// that already resolved the same way. The term bites where scores are
+    /// fractional, i.e. against bm25 (`memory-sqlite`, where the twin of this
+    /// test does reverse an order). Recorded rather than hidden: the
+    /// in-memory retriever is a test double, and T3.3's numbers come from
+    /// both.
+    #[tokio::test]
+    async fn a_recent_turn_outranks_an_older_equal_match_at_weight_one() {
+        let (off, sid) = turn_corpus(|s| s).await;
+        let (on, _) = turn_corpus(|s| s.with_activation(1.0, 7.0)).await;
+
+        let tied = off.search_turns(&sid, "time", 5).await.unwrap();
+        assert_eq!(tied.len(), 2);
+        assert_eq!(tied[0].score, tied[1].score, "a true tie on token hits");
+
+        let hits = on.search_turns(&sid, "time", 5).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.turn).collect::<Vec<_>>(),
+            vec![3, 1],
+            "the newer line first"
+        );
+        assert!(
+            hits[0].score > hits[1].score,
+            "and now by score, not by tiebreak: {hits:?}"
+        );
+        // Reorders, never admits.
+        assert!(on
+            .search_turns(&sid, "invoice", 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -564,6 +773,11 @@ mod tests {
     #[tokio::test]
     async fn fact_versions_scopes_search_forget_and_purge() {
         fact_conformance(&InMemoryStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn setting_fitness_updates_the_current_version_in_place_without_superseding() {
+        fitness_conformance(&InMemoryStore::new()).await;
     }
 
     #[tokio::test]

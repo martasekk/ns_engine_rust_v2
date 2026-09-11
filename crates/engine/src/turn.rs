@@ -7,9 +7,8 @@ use crate::trace::{
     DEFAULT_TOOL_RESULT_MAX_CHARS,
 };
 use nscore::{
-    Channel, ChannelError, ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming,
-    LegalActionSet, RejectReason, ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome,
-    Verdict,
+    ClassifiedProposal, EventKind, EventLog, HarnessParts, Incoming, LegalActionSet, RejectReason,
+    ReplyContext, ReplyPolicy, Timestamp, ToolCtx, ToolOutcome, Verdict,
 };
 
 pub struct EngineConfig {
@@ -51,6 +50,35 @@ pub struct EngineConfig {
     pub pinned_max: usize,
     /// M6 §6.5: facts lexically relevant to the current message.
     pub relevant_max: usize,
+    /// M9 T3.1: the activation prior's weight, and the half-life of its
+    /// fact term in days. Default 0.0 — pre-M9 ranking exactly.
+    ///
+    /// Carried here because `[memory]` is this struct's mirror and every
+    /// knob in that section has to be readable from one place, but *applied*
+    /// on the store: `lexical_rank` and `search_turns` live behind
+    /// `MemoryStore`, whose four implementors include two test doubles that
+    /// have no ranking to knob. The composition root reads these two and
+    /// hands them to `with_activation` on the store it opens; the engine
+    /// itself never consults them.
+    pub activation_weight: f32,
+    pub activation_half_life_days: f32,
+    /// M9 T2.1: how many obligations `obligations_for` may extract from one
+    /// user message. 0 renders no block at all.
+    pub obligations_max: usize,
+    /// M9 T2.1: check the drafted reply against this turn's `answer:`
+    /// obligations and regenerate once if one went unaddressed. Off until
+    /// T0.4's ablation arm has priced the block — the extraction over-fires
+    /// on cs+en mixed text, and the cost of a false positive is a second
+    /// billed call.
+    pub obligation_check: bool,
+    /// M9 T2.2: guidance notes rendered into either context, at most. The
+    /// tail is dropped and reported; file order is the priority order.
+    pub guidance_max: usize,
+    /// M9 T0.4: blank one context block after the fit, to measure what it
+    /// was worth. Set programmatically by the evaluation harness only —
+    /// there is deliberately no config key for it, because an ablated engine
+    /// answering a real user is a worse engine on purpose.
+    pub ablate: Option<nscore::Ablate>,
     /// M6 §5.1: summarize once this many turns have fallen out of the
     /// window since the last summary; 0 = no rolling summary.
     pub summary_every_turns: usize,
@@ -112,11 +140,18 @@ pub struct EngineConfig {
     /// a Flash-class model, and whether a 3B emitter acts on the line at all
     /// is exactly what the task set is for.
     pub show_budget_line: bool,
-    /// M7 T0.1: where the provider clients leave what each call cost. When
-    /// set, the engine appends one `ModelCall` per call, with the manifest
-    /// of what that call was shown. `None` — every scripted double, every
-    /// replay — measures nothing and writes nothing.
-    pub usage: Option<std::sync::Arc<nscore::UsageSink>>,
+    /// Multi-conversation plan Phase 2: how many turns may run at once
+    /// across all sessions (`dispatch::Dispatcher`). Every session is still
+    /// one turn at a time; this bounds how many *sessions* are mid-turn.
+    ///
+    /// `1` is the CLI's serial behaviour — one conversation, one turn, the
+    /// next message waits. A larger number buys overlap of *waiting* (the
+    /// user typing, tool latency, a desktop action in flight) under a
+    /// request budget that stays global: every model call still goes
+    /// through the one per-provider throttle and counts against the same
+    /// daily allowance, so N slots never mean N times the requests
+    /// (findings §2.9).
+    pub worker_slots: usize,
 }
 
 impl Default for EngineConfig {
@@ -140,6 +175,12 @@ impl Default for EngineConfig {
             pinned_prefixes: vec!["user.".into()],
             pinned_max: 5,
             relevant_max: 5,
+            activation_weight: 0.0,
+            activation_half_life_days: 7.0,
+            obligations_max: 5,
+            obligation_check: false,
+            guidance_max: 6,
+            ablate: None,
             summary_every_turns: 4,
             summary_rebuild_every: 3,
             summary_max_chars: 800,
@@ -154,7 +195,7 @@ impl Default for EngineConfig {
             prompt_budget_tokens: 6000,
             budget_mode: nscore::BudgetMode::Report,
             show_budget_line: false,
-            usage: None,
+            worker_slots: 1,
         }
     }
 }
@@ -404,6 +445,17 @@ impl Engine {
         }
     }
 
+    /// The wiring, for the dispatcher (`dispatch.rs`): it runs the
+    /// consolidator against the memory and hands the channel to the session
+    /// tasks. Crate-private so the roles stay the engine's to call.
+    pub(crate) fn parts(&self) -> &HarnessParts {
+        &self.parts
+    }
+
+    pub(crate) fn config(&self) -> &EngineConfig {
+        &self.cfg
+    }
+
     /// Identity of a call within a turn: action plus its args as JSON
     /// (serde_json's Map is ordered, so equal objects serialize identically).
     fn call_key(p: &nscore::Proposal) -> String {
@@ -471,7 +523,7 @@ impl Engine {
     /// reply is sent). Returns whether a `Summarized` event was appended.
     /// A summarizer failure appends nothing; the next boundary retries with
     /// the larger range.
-    pub async fn maybe_summarize(&mut self, sid: &nscore::SessionId) -> Result<bool, EngineError> {
+    pub async fn maybe_summarize(&self, sid: &nscore::SessionId) -> Result<bool, EngineError> {
         let every = self.cfg.summary_every_turns as u32;
         if every == 0 {
             return Ok(false);
@@ -510,11 +562,17 @@ impl Engine {
         } else {
             state.summary.as_ref()
         };
+        // This call's own sink (M7 T0.1; multi-conversation plan Phase 1):
+        // once more than one session is live the summary can run beside a
+        // turn, and a sink shared with that turn would hand this call's
+        // cost to whichever of the two drained first.
+        let usage = std::sync::Arc::new(nscore::UsageSink::new());
         let input = nscore::SummaryInput {
             previous,
             records: &records,
             caps: &self.cfg.caps,
             facts: &facts,
+            usage: Some(usage.clone()),
         };
         // The manifest for this call: the summarizer is shown the standing
         // facts and a range of verbatim records, and no tools or trace.
@@ -531,7 +589,7 @@ impl Engine {
         // turn came next; recording it says plainly that a request bought
         // no summary.
         let mut log = EventLog::from_events(sid.clone(), stored);
-        self.record_model_calls(&mut log, state.turn, &manifest);
+        self.record_model_calls(&usage, &mut log, state.turn, &manifest);
         let draft = match summarized {
             Ok(Some(d)) => d,
             Ok(None) => return self.persist_summary_events(sid, &log, n_loaded).await,
@@ -793,24 +851,27 @@ impl Engine {
         }
     }
 
-    /// Append one `ModelCall` for every provider call recorded since the
-    /// last drain (M7 T0.1).
+    /// Append one `ModelCall` for every provider call recorded in `sink`
+    /// since its last drain (M7 T0.1).
     ///
-    /// Called immediately after each of the engine's own model calls, so
-    /// what the sink returns is that call's and the manifest describes what
-    /// it was shown. The three call sites never overlap: the rolling summary
-    /// runs while the loop waits for the next message, never beside a turn.
+    /// Called immediately after each of the engine's own model calls, with
+    /// the sink that call's context carried — one per turn, one per summary
+    /// — so what the drain returns is that call's and the manifest describes
+    /// what it was shown, even while another session's turn is in flight
+    /// (multi-conversation plan Phase 1, findings §2.6). Nothing here reads
+    /// a process-wide sink: a client whose context carries none records into
+    /// its own, and that one belongs to the calls made outside a turn.
     ///
     /// Retries inside one call do not appear as separate events — they are
     /// counted in `Usage::attempts`, because the thing a reader wants to
     /// know is what one decision cost, requests included.
     fn record_model_calls(
         &self,
+        sink: &nscore::UsageSink,
         log: &mut EventLog,
         turn: u32,
         manifest: &nscore::ContextManifest,
     ) {
-        let Some(sink) = &self.cfg.usage else { return };
         for usage in sink.drain() {
             log.append(
                 turn,
@@ -829,12 +890,18 @@ impl Engine {
         }
     }
 
-    pub async fn run_turn(&mut self, incoming: Incoming) -> Result<String, EngineError> {
+    pub async fn run_turn(&self, incoming: Incoming) -> Result<String, EngineError> {
         let sid = incoming.session.clone();
         let scope = (self.cfg.scope_for)(&sid);
         let stored = self.parts.memory.load(&sid).await?;
         let n_loaded = stored.len();
         let mut log = EventLog::from_events(sid.clone(), stored);
+        // This turn's own sink for what its model calls cost (M7 T0.1). It
+        // travels in every context the turn builds and is drained right
+        // after each call, so a turn on another session running at the same
+        // time cannot land its records on this one's `ModelCall`s
+        // (multi-conversation plan Phase 1, findings §2.6).
+        let usage = std::sync::Arc::new(nscore::UsageSink::new());
 
         let turn = fold(log.events()).turn + 1;
         let now = &self.clock;
@@ -995,17 +1062,26 @@ impl Engine {
             };
             let facts = self.fact_views(&scope, &selected).await;
             let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
+            // Notes and their hashes together, so the manifest can say which
+            // note sat in this prompt (M9 T0.3). The texts go into the
+            // context; the hashes are cut to whatever survived to be sent.
+            let guidance_notes = rules.guidance_notes_for(&legal_names);
             let mut ctx = nscore::EmitterContext {
                 facts,
                 summary: state.summary.clone(),
                 window: state.window(self.cfg.window_turns),
                 caps: self.cfg.caps,
                 user_text: incoming.text.clone(),
+                // M9 T2.1: a pure function of the message, recomputed each
+                // iteration rather than carried, for the same reason the
+                // trace is — nothing per-turn is persisted as a column.
+                obligations: nscore::obligations_for(&incoming.text, self.cfg.obligations_max),
                 trace_so_far,
                 pending_confirmation: active_pending.is_some(),
                 rejections_this_turn: rejections_this_turn.clone(),
-                guidance: rules.guidance_for(&legal_names),
+                guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
                 budget_line: None,
+                usage: Some(usage.clone()),
             };
 
             // c. propose
@@ -1019,6 +1095,7 @@ impl Engine {
                 tier.budget(self.cfg.prompt_budget_tokens),
                 self.cfg.budget_mode,
                 &self.cfg.pinned_prefixes,
+                self.cfg.guidance_max,
             );
             if self.cfg.show_budget_line {
                 let clipped: Vec<String> =
@@ -1028,12 +1105,31 @@ impl Engine {
                     .collect();
                 ctx.budget_line = Some(budget.line(&clipped));
             }
-            let mut manifest = emitter_manifest(&ctx, legal.actions.len(), clipped_chars);
+            // M9 T0.4. After the fit, so the budget report above still
+            // counts the block as it was composed and the ablation shows up
+            // only in what was rendered and in the manifest's keys.
+            match self.cfg.ablate {
+                Some(nscore::Ablate::Facts) => ctx.facts.clear(),
+                Some(nscore::Ablate::Summary) => ctx.summary = None,
+                Some(nscore::Ablate::Guidance) => ctx.guidance.clear(),
+                None => {}
+            }
+            // Cut to what survived: nothing drops guidance from the middle,
+            // so a prefix is exact, and it keeps `note_hashes.len() ==
+            // guidance` true whether the list was clamped or blanked.
+            let note_hashes: Vec<String> = guidance_notes
+                .iter()
+                .take(ctx.guidance.len())
+                .map(|(h, _)| h.clone())
+                .collect();
+            let mut manifest =
+                emitter_manifest(&ctx, legal.actions.len(), clipped_chars, note_hashes);
             manifest.budget = Some(budget);
+            manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
             manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose(ctx, &legal).await;
-            self.record_model_calls(&mut log, turn, &manifest);
+            self.record_model_calls(&usage, &mut log, turn, &manifest);
             let mut proposal = match proposed {
                 Ok(p) => p,
                 Err(e) => {
@@ -1464,6 +1560,15 @@ impl Engine {
                         valid_to: None,
                         state: nscore::FactState::Current,
                         last_used: prev.last_used,
+                        // M9 T4.1: a new *value* is a new version, and it has
+                        // not been shown to anything yet. The counters stay
+                        // with the version whose exposures earned them —
+                        // inheriting them would credit "Peter" for the calls
+                        // that showed "Martin". The restatement arm above
+                        // keeps them, via `..prev`, because there the version
+                        // is the same one.
+                        exposures: 0,
+                        credits: 0,
                     },
                     None => nscore::Fact {
                         key: key.clone(),
@@ -2025,7 +2130,7 @@ impl Engine {
                 None => format!("[{id}] {vars}"),
             },
             ReplyPolicy::Generate => {
-                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn)
+                self.generate_reply(&scope, &incoming.text, &rules, &mut log, turn, &usage)
                     .await
             }
         };
@@ -2053,6 +2158,7 @@ impl Engine {
         rules: &nscore::LearnedRules,
         log: &mut EventLog,
         turn: u32,
+        usage: &std::sync::Arc<nscore::UsageSink>,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2082,36 +2188,65 @@ impl Engine {
         // M6 §4.3: the reply model gets the user's message, the
         // verbatim window and the summary — not a counter string.
         let window = state.window(self.cfg.window_turns);
-        let guidance = rules.guidance_for_reply();
-        let make_ctx =
-            |do_not_state: Vec<String>, do_not_repeat: Vec<String>| ReplyContext {
+        let guidance_notes = rules.guidance_notes_for_reply();
+        let guidance: Vec<String> = guidance_notes.iter().map(|(_, t)| t.clone()).collect();
+        // M9 T2.1: the same pure function the emitter path calls, on the
+        // same message.
+        let obligations = nscore::obligations_for(user_text, self.cfg.obligations_max);
+        // `extra_guidance` is how the obligation interceptor speaks to the
+        // second draft: one added note, the shape `do_not_state` already has
+        // on the grounding path.
+        let make_ctx = |do_not_state: Vec<String>,
+                        do_not_repeat: Vec<String>,
+                        extra_guidance: Vec<String>| {
+            let mut notes = guidance.clone();
+            notes.extend(extra_guidance);
+            ReplyContext {
                 persona: self.cfg.persona.clone(),
                 facts: facts.clone(),
                 summary: state.summary.clone(),
                 window: window.clone(),
                 caps: self.cfg.caps,
                 user_text: user_text.to_string(),
+                obligations: obligations.clone(),
                 turn_trace: trace.clone(),
-                guidance: guidance.clone(),
+                guidance: notes,
                 do_not_state,
                 do_not_repeat,
-            };
+                usage: Some(usage.clone()),
+            }
+        };
         // The reply context is fitted too, and reported on the same
         // way. Its `turn_trace` is exempt: it is the material the
         // reply narrates from, and the grounding interceptor flags a
         // reply for stating anything absent from it — trimming it
         // would manufacture the fabrications the interceptor catches.
-        let mut budgeted = make_ctx(vec![], vec![]);
+        let mut budgeted = make_ctx(vec![], vec![], vec![]);
         let budget = nscore::fit_reply(
             &mut budgeted,
             self.cfg.prompt_budget_tokens,
             self.cfg.budget_mode,
             &self.cfg.pinned_prefixes,
+            self.cfg.guidance_max,
         );
-        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars);
+        // M9 T0.4, as on the emitter path: after the fit, so only the
+        // rendered prompt and the manifest's keys change.
+        match self.cfg.ablate {
+            Some(nscore::Ablate::Facts) => budgeted.facts.clear(),
+            Some(nscore::Ablate::Summary) => budgeted.summary = None,
+            Some(nscore::Ablate::Guidance) => budgeted.guidance.clear(),
+            None => {}
+        }
+        let note_hashes: Vec<String> = guidance_notes
+            .iter()
+            .take(budgeted.guidance.len())
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut manifest = reply_manifest(&budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
+        manifest.ablated = self.cfg.ablate;
         let drafted = self.parts.replier.reply(budgeted).await;
-        self.record_model_calls(log, turn, &manifest);
+        self.record_model_calls(usage, log, turn, &manifest);
         match drafted {
             Ok(draft) if self.cfg.reply_grounding_check => {
                 // M6 §4.5. Two checks, one of which acts.
@@ -2133,7 +2268,7 @@ impl Engine {
                 // more conservative thresholds. So it is logged, and
                 // nothing is regenerated on it: the observability is
                 // what found all of this, and it is free.
-                let ctx = make_ctx(vec![], vec![]);
+                let ctx = make_ctx(vec![], vec![], vec![]);
                 let echo_material = crate::ground::echo_material(&ctx);
                 if let Some(span) =
                     crate::echo::echoed(&draft, &echo_material, self.cfg.max_echo_ratio)
@@ -2150,9 +2285,7 @@ impl Engine {
                 }
                 let material = crate::ground::Material::from_context(&ctx);
                 let spans = crate::ground::ungrounded(&draft, &material);
-                if spans.is_empty() {
-                    draft
-                } else {
+                if !spans.is_empty() {
                     log.append(
                         turn,
                         now(),
@@ -2162,12 +2295,48 @@ impl Engine {
                         },
                     );
                     let regenerated =
-                        self.parts.replier.reply(make_ctx(spans, vec![])).await;
+                        self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
                     // The regeneration is a second billed call, and
                     // the point of counting it is to know what the
                     // grounding check costs.
-                    self.record_model_calls(log, turn, &manifest);
-                    regenerated.unwrap_or(draft)
+                    self.record_model_calls(usage, log, turn, &manifest);
+                    let final_reply = regenerated.unwrap_or(draft);
+                    Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                    return final_reply;
+                }
+                // M9 T2.1. The obligation interceptor, behind its own
+                // knob and *after* grounding: a draft that already had
+                // to be regenerated has spent this turn's one spare
+                // call. No new event kind — the mechanics are the
+                // `ReplyFlagged` path's, with a distinct guidance
+                // line, because the extraction is measured weak and a
+                // signature written from it would be counted as if it
+                // were not.
+                match self
+                    .cfg
+                    .obligation_check
+                    .then(|| crate::ground::unaddressed(&obligations, &draft))
+                    .flatten()
+                {
+                    Some(clause) => {
+                        let regenerated = self
+                            .parts
+                            .replier
+                            .reply(make_ctx(
+                                vec![],
+                                vec![],
+                                vec![format!("Not yet addressed: {clause}")],
+                            ))
+                            .await;
+                        self.record_model_calls(usage, log, turn, &manifest);
+                        let final_reply = regenerated.unwrap_or(draft);
+                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                        final_reply
+                    }
+                    None => {
+                        Self::record_cited(log, turn, now(), &ctx, &draft);
+                        draft
+                    }
                 }
             }
             Ok(draft) => draft,
@@ -2189,122 +2358,38 @@ impl Engine {
         }
     }
 
-    /// Outer loop: recv → run_turn → send, until the channel closes. With
-    /// `idle_after` set, a quiet period runs the consolidator once (driver B,
-    /// spec M5 §5) — only when at least one turn ran since the last pass, and
-    /// never interleaved with a turn (same task).
+    /// M9 T4.2: record which reference parts the *final* reply drew on.
     ///
-    /// The rolling summary (M6 §5.1) runs *concurrently with the wait for the
-    /// next message*, not before it: it is sleep-time work, and a local
-    /// summarizer can take tens of seconds — long enough to hold up the
-    /// prompt if it sits on the critical path.
-    pub async fn run(&mut self) -> Result<(), EngineError> {
-        // The channel lives outside `self` for the loop's duration so the
-        // summary can borrow the engine while `recv` is still pending.
-        let mut channel = std::mem::replace(&mut self.parts.channel, Box::new(DetachedChannel));
-        let outcome = self.run_loop(&mut channel).await;
-        self.parts.channel = channel;
-        outcome
-    }
-
-    async fn run_loop(&mut self, channel: &mut Box<dyn Channel>) -> Result<(), EngineError> {
-        let mut turns_since_pass: u32 = 0;
-        // The session whose turn just ended: it may owe a rolling summary.
-        let mut summary_due: Option<nscore::SessionId> = None;
-        loop {
-            let due = summary_due.take();
-            let next = match &due {
-                None => next_message(&mut **channel, self.cfg.idle_after).await?,
-                Some(sid) => {
-                    // `recv` is polled first (biased), so the prompt appears
-                    // before the summary starts; the summary then runs while
-                    // the user reads the reply and types. If the user gets
-                    // there first the summary is dropped mid-flight — it is
-                    // recomputed from the store at the next boundary, and its
-                    // input range is capped by summary_input_max_chars, so an
-                    // abandoned summary cannot make the next one unbounded.
-                    let mut pending =
-                        std::pin::pin!(next_message(&mut **channel, self.cfg.idle_after));
-                    tokio::select! {
-                        biased;
-                        next = &mut pending => next?,
-                        summarized = self.maybe_summarize(sid) => {
-                            if let Err(e) = summarized {
-                                eprintln!("summary: {e}");
-                            }
-                            pending.await?
-                        }
-                    }
-                }
-            };
-            let incoming = match next {
-                Next::Closed => return Ok(()),
-                Next::Idle => {
-                    // Silence is not a message: the summary is still owed.
-                    summary_due = due;
-                    if turns_since_pass > 0 {
-                        if let Err(e) = self.parts.consolidator.run(&*self.parts.memory).await {
-                            eprintln!("evolution pass failed: {e}");
-                        }
-                        turns_since_pass = 0;
-                    }
-                    continue;
-                }
-                Next::Message(i) => i,
-            };
-            let session = incoming.session.clone();
-            let text = self.run_turn(incoming).await?;
-            turns_since_pass += 1;
-            channel
-                .send(&session, &text)
-                .await
-                .map_err(|e| EngineError::Channel(e.to_string()))?;
-            summary_due = Some(session);
+    /// The final draft, not the first: a flagged draft was regenerated, and
+    /// what the discarded one quoted is not what the user was told. Written
+    /// only when something was cited — an empty list is not a fact about the
+    /// turn, and the join downstream reads absence as "nothing cited".
+    fn record_cited(
+        log: &mut EventLog,
+        turn: u32,
+        at: nscore::Timestamp,
+        ctx: &ReplyContext,
+        reply: &str,
+    ) {
+        let sources = crate::ground::cited(ctx, reply);
+        if !sources.is_empty() {
+            log.append(turn, at, EventKind::ReplyCited { sources });
         }
     }
-}
 
-/// What the wait for the next message produced.
-enum Next {
-    Message(Incoming),
-    /// `idle_after` elapsed with the channel quiet.
-    Idle,
-    Closed,
-}
-
-/// One wait on the channel, with the idle timeout folded in. A free function
-/// so it borrows only the channel, leaving the engine free for the summary.
-async fn next_message(
-    channel: &mut dyn Channel,
-    idle_after: Option<std::time::Duration>,
-) -> Result<Next, EngineError> {
-    let received = match idle_after {
-        Some(d) => tokio::time::timeout(d, channel.recv()).await,
-        None => Ok(channel.recv().await),
-    };
-    match received {
-        Ok(Ok(i)) => Ok(Next::Message(i)),
-        Ok(Err(ChannelError::Closed)) => Ok(Next::Closed),
-        Ok(Err(e)) => Err(EngineError::Channel(e.to_string())),
-        Err(_elapsed) => Ok(Next::Idle),
-    }
-}
-
-/// Stands in for the real channel while `run` holds it as a local. Never
-/// polled — `run` puts the real one back before returning.
-struct DetachedChannel;
-
-#[async_trait::async_trait]
-impl Channel for DetachedChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
-        Err(ChannelError::Closed)
-    }
-    async fn send(
-        &mut self,
-        _session: &nscore::SessionId,
-        _text: &str,
-    ) -> Result<(), ChannelError> {
-        Ok(())
+    /// Runs the engine on its channel until the channel closes: every
+    /// message goes to its session's mailbox, a session runs one turn at a
+    /// time, `worker_slots` sessions run at once, a quiet channel runs the
+    /// consolidator (driver B, spec M5 §5), and the rolling summary (M6
+    /// §5.1) runs while its session waits for the next message. The loop is
+    /// `dispatch::Dispatcher`; this builds it, so the CLI and the tests keep
+    /// the one call they had.
+    pub async fn run(self) -> Result<(), EngineError> {
+        let channel = self.parts.channel.clone();
+        let slots = self.cfg.worker_slots;
+        crate::dispatch::Dispatcher::new(std::sync::Arc::new(self), channel, slots)
+            .run()
+            .await
     }
 }
 

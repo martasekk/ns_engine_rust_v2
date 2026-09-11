@@ -188,11 +188,13 @@ mod tests {
             window: vec![],
             caps: Default::default(),
             user_text: "".into(),
+            obligations: vec![],
             trace_so_far: vec![],
             pending_confirmation: false,
             rejections_this_turn: vec![],
             guidance: vec![],
             budget_line: None,
+            usage: None,
         };
         let p1 = e.propose(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(p1.action, "echo");

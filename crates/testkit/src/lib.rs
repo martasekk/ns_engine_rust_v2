@@ -12,6 +12,7 @@
 //! `replay_with` builds a scripted emitter, an in-memory store and a noop
 //! consolidator on its ordinary path, and it is the hard dependency of
 //! `ns-evolution`'s `verify_patch` gate.
+pub mod ablate;
 pub mod eval;
 pub mod grading;
 pub mod paraphrase;

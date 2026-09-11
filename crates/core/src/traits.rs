@@ -57,6 +57,10 @@ pub struct EmitterContext {
     pub caps: crate::memory::Caps,
     /// The current user message.
     pub user_text: String,
+    /// What this turn owes the user, from
+    /// [`crate::memory::obligations_for`] (M9 T2.1). A pure function of
+    /// `user_text`, so it needs no event and no store column.
+    pub obligations: Vec<String>,
     /// This turn's actions so far, one line each with outcomes and refusals.
     pub trace_so_far: Vec<String>,
     /// A staged action awaits the user's yes/no.
@@ -70,6 +74,12 @@ pub struct EmitterContext {
     /// gain from showing a model its budget, and whether a 3B emitter acts
     /// on the line or merely reads it is what the task set is for.
     pub budget_line: Option<String>,
+    /// Where the provider client leaves what this call cost (M7 T0.1). The
+    /// engine hands every call the sink of the turn it belongs to and drains
+    /// it right after the call, so two turns in flight at once cannot mix
+    /// their records. `None` — every scripted double, every caller outside a
+    /// turn — leaves the client to the sink it was built with, or to none.
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +134,9 @@ pub struct ReplyContext {
     pub caps: crate::memory::Caps,
     /// The current user message — the one thing the reply must answer.
     pub user_text: String,
+    /// What this turn owes the user (M9 T2.1); see
+    /// [`EmitterContext::obligations`].
+    pub obligations: Vec<String>,
     /// Outcomes AND refusal reasons, human-readable lines.
     pub turn_trace: String,
     /// Reply-scoped learned notes (M6 §8.5).
@@ -139,6 +152,8 @@ pub struct ReplyContext {
     /// actually operationalizes — overlap against a gold answer, not overlap
     /// in the abstract. Rendered by the replier when set.
     pub do_not_repeat: Vec<String>,
+    /// The sink this call records into; see [`EmitterContext::usage`].
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,6 +175,8 @@ pub struct SummaryInput<'a> {
     pub records: &'a [crate::memory::TurnRecord],
     pub caps: &'a crate::memory::Caps,
     pub facts: &'a [crate::memory::FactView],
+    /// The sink this call records into; see [`EmitterContext::usage`].
+    pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
 }
 
 /// The model's part of a summary; the engine adds range, trust and turn.
@@ -198,11 +215,15 @@ pub enum ChannelError {
     Io(String),
 }
 
+/// Both methods take `&self`: one `recv` is pending for the whole run while
+/// the session tasks `send` through the same handle, so an implementor keeps
+/// whatever it mutates behind its own lock or atomic (multi-conversation plan
+/// Phase 2, D2.1).
 #[async_trait]
 pub trait Channel: Send + Sync {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError>;
+    async fn recv(&self) -> Result<Incoming, ChannelError>;
     /// Callable WITHOUT a pending incoming turn (future proactive messages).
-    async fn send(&mut self, session: &SessionId, text: &str) -> Result<(), ChannelError>;
+    async fn send(&self, session: &SessionId, text: &str) -> Result<(), ChannelError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +306,42 @@ pub trait MemoryStore: Send + Sync {
         });
         out.truncate(k);
         Ok(out)
+    }
+    /// Set the derived fitness counters on the *current* version of a fact
+    /// (M9 T4.3), without superseding it.
+    ///
+    /// Deliberately not `put_fact`: `put_fact` is the write path for a
+    /// *value*, and a value write ends one version and starts another. Fitness
+    /// is not a value — it is a number about the version already there, and a
+    /// pass that recomputes it every run would otherwise grow one version per
+    /// pass and lose the history the versioning exists for.
+    ///
+    /// The default body is correct for any store and spends one read and one
+    /// write; a store with an index overrides it with one UPDATE on the
+    /// primary key, the way `search_turns_in` is overridden. A store with no
+    /// current version for `(scope, key)` does nothing: a fact forgotten
+    /// between the calls that exposed it and the pass that scores them has no
+    /// version to score.
+    async fn set_fact_fitness(
+        &self,
+        scope: &str,
+        key: &str,
+        exposures: u32,
+        credits: u32,
+    ) -> Result<(), StoreError> {
+        let history = self.fact_history(scope, key).await?;
+        let Some(mut current) = history.into_iter().find(|f| {
+            matches!(
+                f.state,
+                crate::action::FactState::Current | crate::action::FactState::Cold
+            )
+        }) else {
+            return Ok(());
+        };
+        current.exposures = exposures;
+        current.credits = credits;
+        // `valid_from` is unchanged, so `put_fact` takes its in-place branch.
+        self.put_fact(current).await
     }
     /// Write the digest of a closed session (M7 §8), **replacing** any
     /// digest that session already has. Idempotent by session id because a

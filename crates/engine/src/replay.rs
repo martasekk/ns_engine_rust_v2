@@ -43,8 +43,10 @@ pub fn normalize(events: &[Event]) -> Vec<String> {
             EventKind::ReplyFailed { .. }
             | EventKind::ReplyFlagged { .. }
             | EventKind::ReplyEchoed { .. }
+            | EventKind::ReplyCited { .. }
             | EventKind::Summarized { .. }
-            | EventKind::ModelCall { .. } => None,
+            | EventKind::ModelCall { .. }
+            | EventKind::Graded { .. } => None,
             other => Some(normalize_kind(other)),
         })
         .collect()
@@ -55,8 +57,10 @@ fn normalize_kind(kind: &EventKind) -> String {
         EventKind::ReplyFailed { .. }
         | EventKind::ReplyFlagged { .. }
         | EventKind::ReplyEchoed { .. }
+        | EventKind::ReplyCited { .. }
         | EventKind::Summarized { .. }
-        | EventKind::ModelCall { .. } => {
+        | EventKind::ModelCall { .. }
+        | EventKind::Graded { .. } => {
             unreachable!("filtered by normalize")
         }
         EventKind::UserSaid { text } => format!("UserSaid {text}"),
@@ -212,10 +216,10 @@ struct ReplayChannel;
 
 #[async_trait]
 impl Channel for ReplayChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         Err(ChannelError::Closed)
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -326,7 +330,7 @@ pub async fn replay_with(
         reply_grounding_check: false,
         ..EngineConfig::default()
     };
-    let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
+    let engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
 
     // 3. Re-feed the user inputs.
     for text in d.user_inputs {
@@ -390,10 +394,10 @@ mod tests {
     struct ClosedChannel;
     #[async_trait::async_trait]
     impl Channel for ClosedChannel {
-        async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        async fn recv(&self) -> Result<Incoming, ChannelError> {
             Err(ChannelError::Closed)
         }
-        async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
             Ok(())
         }
     }
@@ -415,7 +419,7 @@ mod tests {
         for g in guards {
             b.add_guard(g);
         }
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(42)),
@@ -489,7 +493,7 @@ mod tests {
         b.set_channel(Box::new(ClosedChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),

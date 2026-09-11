@@ -3,6 +3,7 @@
 pub mod consolidate;
 pub mod evaluate;
 pub mod files;
+pub mod fitness;
 pub mod kappa;
 pub mod ledger;
 pub mod local;

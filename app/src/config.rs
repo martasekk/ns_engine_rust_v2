@@ -27,6 +27,10 @@ pub struct AppConfig {
     /// Absent means no pointer actions are registered.
     #[serde(default)]
     pub pointer: Option<PointerSection>,
+    /// [serve] — `ns-app serve`: where the TCP channel listens and which env
+    /// var holds its token.
+    #[serde(default)]
+    pub serve: ServeSection,
 }
 
 /// [models] — the local CPU model service, for the evaluation lane only
@@ -77,6 +81,15 @@ pub struct ModelsSection {
     /// Chosen the same way, on the same half.
     #[serde(default = "default_relevance_cut")]
     pub relevance_cut: f32,
+    /// Not-yet-graded turns one evolution pass may grade (M8 T2.8, M9 T1.3).
+    ///
+    /// It lives under `[models]` rather than in an `[eval]` section of its
+    /// own because that is what the budget is *about*: grading is only
+    /// expensive when a scorer is dialled, and the scorer is configured
+    /// here. A graded turn is remembered by its `Graded` event, so this pays
+    /// for new turns only — a second pass over the same log grades nothing.
+    #[serde(default = "default_evaluate_budget_turns")]
+    pub evaluate_budget_turns: u32,
 }
 
 impl Default for ModelsSection {
@@ -87,8 +100,15 @@ impl Default for ModelsSection {
             timeout_ms: default_models_timeout_ms(),
             reask_cosine: default_reask_cosine(),
             relevance_cut: default_relevance_cut(),
+            evaluate_budget_turns: default_evaluate_budget_turns(),
         }
     }
+}
+
+/// 40, the same number `probe_budget_turns` uses. One idle pass, one budget
+/// of the same order: the two lanes compete for the same wait.
+fn default_evaluate_budget_turns() -> u32 {
+    40
 }
 
 fn default_models_base_url() -> String {
@@ -214,6 +234,62 @@ impl PointerSection {
     }
 }
 
+/// [serve] — `ns-app serve`: the TCP channel (`nschannel_tcp`) that carries
+/// many conversations at once, one session per connection (multi-conversation
+/// plan Phase 3). The token never goes in the file, for the same reason the
+/// provider keys and the pointer's do not.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ServeSection {
+    /// `host:port` to listen on. Loopback unless `allow_remote`.
+    #[serde(default = "default_serve_listen")]
+    pub listen: String,
+    /// The env var holding the token every client presents in its first
+    /// line. Unset or blank means `serve` refuses to start.
+    #[serde(default = "default_serve_token_env")]
+    pub token_env: String,
+    /// Connections at once, machine-wide; the next one is closed at accept.
+    #[serde(default = "default_serve_max_connections")]
+    pub max_connections: usize,
+    /// Whether a non-loopback `listen` is meant. Off, a bind to one is
+    /// refused at startup: the channel has no auth beyond the token and no
+    /// TLS, so on the network it would be the whole conversation in clear.
+    #[serde(default)]
+    pub allow_remote: bool,
+}
+
+fn default_serve_listen() -> String {
+    "127.0.0.1:7375".into()
+}
+
+fn default_serve_token_env() -> String {
+    "NS_SERVE_TOKEN".into()
+}
+
+fn default_serve_max_connections() -> usize {
+    8
+}
+
+impl Default for ServeSection {
+    fn default() -> Self {
+        Self {
+            listen: default_serve_listen(),
+            token_env: default_serve_token_env(),
+            max_connections: default_serve_max_connections(),
+            allow_remote: false,
+        }
+    }
+}
+
+impl ServeSection {
+    /// The token, or `None` when the variable is unset or blank.
+    pub fn token(&self) -> Option<String> {
+        std::env::var(&self.token_env)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+}
+
 /// [memory] — working memory sizes (M6 spec §4, §10).
 #[derive(Debug, serde::Deserialize)]
 pub struct MemorySection {
@@ -251,9 +327,55 @@ pub struct MemorySection {
     /// Facts lexically relevant to the current message (M6 §6.5).
     #[serde(default = "default_relevant_max")]
     pub relevant_max: usize,
+    /// M9 T3.1 — the activation prior's weight `w` in
+    /// `hits + w · ln(1 + uses) · exp(−Δdays / half_life)`, and the same `w`
+    /// on `search_turns`' recency term.
+    ///
+    /// **Default 0.0, which is pre-M9 ranking exactly.** vstash's negative
+    /// result on BEIR is why a recency×frequency prior ships off; T3.3's
+    /// suites at `w ∈ {0, 0.5, 1}` are what may move it, not taste.
+    #[serde(default = "default_activation_weight")]
+    pub activation_weight: f32,
+    /// M9 T5.2 — lines appended to the summarizer's system prompt after the
+    /// fixed-field instructions, as `Guidelines:` bullets.
+    ///
+    /// **Default empty, which is the pre-M9 prompt byte for byte.** Meant to
+    /// be hand-filled from graded summary failures; `--ablate summary` is
+    /// blind to it until a fixture carries a summary, so it ships unmeasured
+    /// and off rather than pre-populated on taste.
+    #[serde(default)]
+    pub summary_guidelines: Vec<String>,
+    /// Days for the fact term to halve (M9 T3.1). The turn term's half-life
+    /// is a constant in turns (`nscore::RECENCY_HALF_LIFE_TURNS`): a turn
+    /// number is not a clock.
+    #[serde(default = "default_activation_half_life_days")]
+    pub activation_half_life_days: f32,
+    /// Obligations extracted from one user message (M9 T2.1); 0 renders no
+    /// block.
+    #[serde(default = "default_obligations_max")]
+    pub obligations_max: usize,
+    /// Regenerate a reply once when an `answer:` obligation went
+    /// unaddressed (M9 T2.1). Off until T0.4's ablation arm has priced the
+    /// block: the block renders whatever this says.
+    #[serde(default)]
+    pub obligation_check: bool,
+    /// Guidance notes rendered into either context, at most (M9 T2.2).
+    #[serde(default = "default_guidance_max")]
+    pub guidance_max: usize,
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
+    /// M9 T4.4: model calls a fact must have been rendered into before zero
+    /// credits count as evidence against it. Beside `fact_stale_days` because
+    /// it is the same kind of knob — when a fact stops earning its place —
+    /// and the evolution pass applies both.
+    #[serde(default = "default_fitness_min_exposures")]
+    pub fitness_min_exposures: u32,
+    /// Whether the fitness signal demotes to cold or only reports the set it
+    /// would demote. **Off**, and staying off for one release: the rule is
+    /// that fitness reports before it demotes (plan §P4).
+    #[serde(default)]
+    pub fitness_demote: bool,
     /// How many of a turn's own tool outcomes stay verbatim in the prompt
     /// (M7 T1.3). Older ones fold into one counted line; refusals never
     /// fold. 0 turns the fold off.
@@ -319,11 +441,36 @@ fn default_pinned_prefixes() -> Vec<String> {
 fn default_pinned_max() -> usize {
     5
 }
+fn default_obligations_max() -> usize {
+    5
+}
+
+fn default_guidance_max() -> usize {
+    6
+}
+
 fn default_relevant_max() -> usize {
     5
 }
+
+/// Off. The prior ships inert and a measurement turns it on (M9 T3.1).
+fn default_activation_weight() -> f32 {
+    0.0
+}
+
+fn default_activation_half_life_days() -> f32 {
+    7.0
+}
 fn default_fact_stale_days() -> u64 {
     90
+}
+
+/// Eight calls. Enough that a fact has been in front of the model on more
+/// than one conversation, few enough that a real freeloader shows up inside
+/// a release. A guess with no corpus behind it, which is exactly why
+/// `fitness_demote` is off while the dry runs collect one.
+fn default_fitness_min_exposures() -> u32 {
+    8
 }
 
 /// Five outcomes. A desktop turn runs to twelve iterations and most of them
@@ -391,7 +538,15 @@ impl Default for MemorySection {
             pinned_prefixes: default_pinned_prefixes(),
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
+            activation_weight: default_activation_weight(),
+            summary_guidelines: Vec::new(),
+            activation_half_life_days: default_activation_half_life_days(),
+            obligations_max: default_obligations_max(),
+            obligation_check: false,
+            guidance_max: default_guidance_max(),
             fact_stale_days: default_fact_stale_days(),
+            fitness_min_exposures: default_fitness_min_exposures(),
+            fitness_demote: false,
             trace_verbatim_lines: default_trace_verbatim_lines(),
             tool_result_max_chars: default_tool_result_max_chars(),
             prompt_budget_tokens: default_prompt_budget_tokens(),
@@ -731,10 +886,22 @@ pub struct EngineSection {
     /// arming chord, and the badge's pie menu.
     #[serde(default = "default_confirm_irreversible")]
     pub confirm_irreversible: bool,
+    /// How many turns may run at once across all sessions (multi-conversation
+    /// plan Phase 2). Each session is still one turn at a time; this bounds
+    /// how many sessions are mid-turn. `1` is the CLI's serial behaviour. A
+    /// larger number overlaps the waiting of several conversations — it does
+    /// not add requests: the per-provider throttle and the daily allowance
+    /// stay global. Read through `worker_slots()`, which refuses 0.
+    #[serde(default = "default_worker_slots")]
+    pub worker_slots: usize,
 }
 
 fn default_confirm_irreversible() -> bool {
     true
+}
+
+fn default_worker_slots() -> usize {
+    1
 }
 
 impl Default for EngineSection {
@@ -743,6 +910,18 @@ impl Default for EngineSection {
             max_iterations: 5,
             max_emit_retries: 3,
             confirm_irreversible: default_confirm_irreversible(),
+            worker_slots: default_worker_slots(),
+        }
+    }
+}
+
+impl EngineSection {
+    /// Err names the bad value; config errors are fatal at startup. Zero
+    /// slots would park every turn forever.
+    pub fn worker_slots(&self) -> Result<usize, String> {
+        match self.worker_slots {
+            0 => Err("[engine] worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
         }
     }
 }
@@ -843,11 +1022,17 @@ impl Default for EvolutionSection {
 }
 
 impl EvolutionSection {
+    /// `memory` rather than a loose `fact_stale_days`: M9 T4.4 needs the
+    /// pinned prefixes and the two fitness knobs as well, and three more
+    /// positional `u64`s at this call site would be three more chances to
+    /// pass them in the wrong order.
     pub fn pass_config(
         &self,
         dry_run: bool,
-        fact_stale_days: u64,
+        memory: &MemorySection,
+        evaluate_budget_turns: u32,
     ) -> nsevolution::pass::PassConfig {
+        let fact_stale_days = memory.fact_stale_days;
         nsevolution::pass::PassConfig {
             regression_budget: self.regression_budget,
             probe_budget_turns: self.probe_budget_turns,
@@ -861,8 +1046,16 @@ impl EvolutionSection {
             digest_scope: "global".into(),
             evaluate: nsevolution::evaluate::EvaluateConfig {
                 reask_jaccard: self.reask_jaccard,
+                budget_turns: evaluate_budget_turns,
                 ..Default::default()
             },
+            // The symbolic checks are the baseline every other evaluator is
+            // calibrated against (T2.7), so they are what the gate believes
+            // until a κ threshold says otherwise.
+            authoritative_evaluator: "symbolic".into(),
+            fitness_min_exposures: memory.fitness_min_exposures,
+            fitness_demote: memory.fitness_demote,
+            pinned_prefixes: memory.pinned_prefixes.clone(),
         }
     }
     /// Driver B interval; None when disabled or set to 0.
@@ -1171,6 +1364,25 @@ mod tests {
         assert!(AppConfig::parse("[llm").is_err());
     }
 
+    /// M9 T5.2. Default empty — which is the pre-M9 summarizer prompt byte
+    /// for byte — and a plain list when set.
+    #[test]
+    fn summary_guidelines_parse_as_a_list() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!(cfg.memory.summary_guidelines.is_empty());
+        let cfg = AppConfig::parse(
+            "[memory]\nsummary_guidelines = [\"Keep `topic` to one clause.\", \"Name who asked.\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.memory.summary_guidelines,
+            vec![
+                "Keep `topic` to one clause.".to_string(),
+                "Name who asked.".to_string()
+            ]
+        );
+    }
+
     #[test]
     fn summarizer_role_falls_back_to_emitter_and_global_provider() {
         let cfg = AppConfig::parse(
@@ -1232,6 +1444,7 @@ mod tests {
         // Naming the section is not the same as switching it on.
         let cfg = AppConfig::parse("[models]\n").unwrap();
         assert!(!cfg.models.enabled);
+        assert_eq!(cfg.models.evaluate_budget_turns, 40);
 
         let cfg = AppConfig::parse(
             "[models]\nenabled = true\nbase_url = \"http://127.0.0.1:9999\"\ntimeout_ms = 500\n",
@@ -1242,6 +1455,44 @@ mod tests {
         assert_eq!(cfg.models.timeout_ms, 500);
     }
 
+    /// M9 T1.3. The grading budget is settable, and it reaches the pass.
+    #[test]
+    fn evaluate_budget_turns_parses_and_reaches_the_pass() {
+        let cfg = AppConfig::parse("[models]\nevaluate_budget_turns = 7\n").unwrap();
+        assert_eq!(cfg.models.evaluate_budget_turns, 7);
+        let pc = cfg
+            .evolution
+            .pass_config(true, &cfg.memory, cfg.models.evaluate_budget_turns);
+        assert_eq!(pc.evaluate.budget_turns, 7);
+        // And the gate's default belief is the symbolic baseline.
+        assert_eq!(pc.authoritative_evaluator, "symbolic");
+    }
+
+    /// M9 T4.4. The two fitness knobs sit beside `fact_stale_days` in
+    /// `[memory]` — they answer the same question, when a fact stops earning
+    /// its place — and they reach the pass together with the pinned prefixes,
+    /// which is what keeps the user's own name out of the demote set.
+    #[test]
+    fn fitness_knobs_parse_and_reach_the_pass() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.memory.fitness_min_exposures, 8);
+        assert!(!cfg.memory.fitness_demote, "reports before it demotes");
+        let pc = cfg.evolution.pass_config(true, &cfg.memory, 40);
+        assert_eq!(pc.fitness_min_exposures, 8);
+        assert!(!pc.fitness_demote);
+        assert_eq!(pc.pinned_prefixes, vec!["user.".to_string()]);
+        assert_eq!(pc.fact_stale_days, 90);
+
+        let cfg = AppConfig::parse(
+            "[memory]\nfitness_min_exposures = 3\nfitness_demote = true\npinned_prefixes = [\"me.\"]\n",
+        )
+        .unwrap();
+        let pc = cfg.evolution.pass_config(false, &cfg.memory, 40);
+        assert_eq!(pc.fitness_min_exposures, 3);
+        assert!(pc.fitness_demote);
+        assert_eq!(pc.pinned_prefixes, vec!["me.".to_string()]);
+    }
+
     #[test]
     fn memory_section_defaults_and_parses() {
         let cfg = AppConfig::parse("").unwrap();
@@ -1250,6 +1501,28 @@ mod tests {
         assert_eq!(cfg.memory.pinned_prefixes, vec!["user.".to_string()]);
         assert_eq!(cfg.memory.fact_stale_days, 90);
         assert_eq!(cfg.memory.caps(), nscore::Caps::default());
+        // M9 T2.1/T2.2: the block renders by default, the interceptor does
+        // not fire until T0.4's arm has priced it.
+        assert_eq!(cfg.memory.obligations_max, 5);
+        assert!(!cfg.memory.obligation_check);
+        assert_eq!(cfg.memory.guidance_max, 6);
+        let tuned = AppConfig::parse(
+            "[memory]\nobligations_max = 2\nobligation_check = true\nguidance_max = 3\n",
+        )
+        .unwrap();
+        assert_eq!(tuned.memory.obligations_max, 2);
+        assert!(tuned.memory.obligation_check);
+        assert_eq!(tuned.memory.guidance_max, 3);
+        // M9 T3.1: the activation prior ships inert. A config that never
+        // heard of it must rank exactly as it did before M9.
+        assert_eq!(cfg.memory.activation_weight, 0.0);
+        assert_eq!(cfg.memory.activation_half_life_days, 7.0);
+        let prior = AppConfig::parse(
+            "[memory]\nactivation_weight = 0.5\nactivation_half_life_days = 14.0\n",
+        )
+        .unwrap();
+        assert_eq!(prior.memory.activation_weight, 0.5);
+        assert_eq!(prior.memory.activation_half_life_days, 14.0);
         let cfg = AppConfig::parse("[memory]\nwindow_turns = 2\nrecord_max_chars = 50\n").unwrap();
         assert_eq!(cfg.memory.window_turns, 2);
         assert_eq!(cfg.memory.caps().record_max_chars, 50);
@@ -1268,6 +1541,27 @@ mod tests {
         );
         let cfg = AppConfig::parse("[memory]\nremember_residual = \"maybe\"\n").unwrap();
         assert!(cfg.memory.remember_residual().is_err());
+    }
+
+    /// `[engine] worker_slots` defaults to the CLI's one slot, takes a larger
+    /// number, and refuses 0 — which would park every turn forever — by name.
+    #[test]
+    fn engine_worker_slots_defaults_to_one_and_rejects_zero() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 1);
+        let cfg = AppConfig::parse("[engine]\nmax_iterations = 5\nmax_emit_retries = 3\n").unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 1);
+        let cfg = AppConfig::parse(
+            "[engine]\nmax_iterations = 5\nmax_emit_retries = 3\nworker_slots = 4\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.engine.worker_slots().unwrap(), 4);
+        let cfg = AppConfig::parse(
+            "[engine]\nmax_iterations = 5\nmax_emit_retries = 3\nworker_slots = 0\n",
+        )
+        .unwrap();
+        let err = cfg.engine.worker_slots().unwrap_err();
+        assert!(err.contains("[engine] worker_slots"), "{err}");
     }
 
     #[test]
@@ -1292,10 +1586,57 @@ mod tests {
         let cfg =
             AppConfig::parse("[evolution]\nenabled = false\nprobe_budget_turns = 7\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
-        assert_eq!(cfg.evolution.pass_config(true, 90).probe_budget_turns, 7);
-        assert!(cfg.evolution.pass_config(true, 90).dry_run);
+        assert_eq!(
+            cfg.evolution
+                .pass_config(true, &cfg.memory, 40)
+                .probe_budget_turns,
+            7
+        );
+        assert!(cfg.evolution.pass_config(true, &cfg.memory, 40).dry_run);
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
+    }
+
+    /// `[serve]` defaults to loopback 7375, `NS_SERVE_TOKEN`, eight
+    /// connections and no remote bind; each field parses on its own, and
+    /// the token is read from the named variable, trimmed, blank meaning
+    /// unset.
+    #[test]
+    fn serve_section_defaults_and_parses() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.serve, ServeSection::default());
+        assert_eq!(cfg.serve.listen, "127.0.0.1:7375");
+        assert_eq!(cfg.serve.token_env, "NS_SERVE_TOKEN");
+        assert_eq!(cfg.serve.max_connections, 8);
+        assert!(!cfg.serve.allow_remote);
+
+        let cfg = AppConfig::parse(
+            "[serve]\nlisten = \"0.0.0.0:9000\"\ntoken_env = \"MY_TOKEN\"\n\
+             max_connections = 2\nallow_remote = true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.serve.listen, "0.0.0.0:9000");
+        assert_eq!(cfg.serve.token_env, "MY_TOKEN");
+        assert_eq!(cfg.serve.max_connections, 2);
+        assert!(cfg.serve.allow_remote);
+
+        let cfg = AppConfig::parse("[serve]\nmax_connections = 3\n").unwrap();
+        assert_eq!(
+            cfg.serve.listen, "127.0.0.1:7375",
+            "the rest keep their defaults"
+        );
+        assert_eq!(cfg.serve.max_connections, 3);
+
+        // A variable no other test touches, so this cannot race one.
+        let cfg =
+            AppConfig::parse("[serve]\ntoken_env = \"NS_TEST_SERVE_TOKEN_2026_09_10\"\n").unwrap();
+        std::env::remove_var("NS_TEST_SERVE_TOKEN_2026_09_10");
+        assert_eq!(cfg.serve.token(), None);
+        std::env::set_var("NS_TEST_SERVE_TOKEN_2026_09_10", "  ");
+        assert_eq!(cfg.serve.token(), None, "blank is unset");
+        std::env::set_var("NS_TEST_SERVE_TOKEN_2026_09_10", " s3cret ");
+        assert_eq!(cfg.serve.token().as_deref(), Some("s3cret"));
+        std::env::remove_var("NS_TEST_SERVE_TOKEN_2026_09_10");
     }
 
     /// Absent is "no desktop"; present needs an address, and the token is an
@@ -1361,7 +1702,9 @@ mod tests {
             "[pointer]\naddr = \"10.0.0.5:7373\"\nmessages_addr = \"10.0.0.5:9999\"",
         )
         .unwrap();
-        let t = cfg.pointer_target(Some("192.168.1.40:7373".into())).unwrap();
+        let t = cfg
+            .pointer_target(Some("192.168.1.40:7373".into()))
+            .unwrap();
         assert_eq!(t.messages_target().as_deref(), Some("192.168.1.40:7374"));
     }
 

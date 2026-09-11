@@ -131,20 +131,270 @@ pub fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Verbs that open an imperative clause, Czech and English.
+///
+/// Deliberately a short closed list rather than a parser. The recorded risk
+/// for M9 T2.1 is over-firing on cs+en mixed text, and the cost of a missed
+/// obligation is one line absent from a prompt while the cost of a wrong one
+/// is a regenerated reply. The list grows only when a real session shows a
+/// request it missed.
+const IMPERATIVE_OPENERS: &[&str] = &[
+    // English
+    "add",
+    "call",
+    "check",
+    "close",
+    "create",
+    "delete",
+    "explain",
+    "find",
+    "fix",
+    "give",
+    "list",
+    "make",
+    "open",
+    "read",
+    "remove",
+    "run",
+    "search",
+    "send",
+    "set",
+    "show",
+    "start",
+    "stop",
+    "tell",
+    "translate",
+    "update",
+    "write",
+    // Czech — both spellings, because both occur live
+    "dej",
+    "najdi",
+    "napis",
+    "napiš",
+    "nastav",
+    "oprav",
+    "otevri",
+    "otevři",
+    "posli",
+    "pošli",
+    "preloz",
+    "přelož",
+    "pridej",
+    "přidej",
+    "rekni",
+    "řekni",
+    "smaz",
+    "smaž",
+    "spust",
+    "spusť",
+    "udelej",
+    "udělej",
+    "ukaz",
+    "ukaž",
+    "vysvetli",
+    "vysvětli",
+    "vytvor",
+    "vytvoř",
+    "zavolej",
+    "zavri",
+    "zavři",
+    "zjisti",
+    "zkontroluj",
+];
+
+/// What this turn owes the user, as a pure function of their message
+/// (M9 T2.1).
+///
+/// Each clause ending in `?` becomes `answer: <clause>`; each clause opening
+/// with one of [`IMPERATIVE_OPENERS`] becomes `do: <clause>`. Nothing else
+/// becomes anything, so small talk yields an empty list. Deterministic and
+/// capped at `max`.
+///
+/// Symbolic on purpose: obligations are checkable without a model, which is
+/// why they are not `SessionSummary.open` — that is model-written prose the
+/// summarizer rebuilds. Clauses split on `?`, `.`, `!`, `;` and newlines; a
+/// clause with no content token (`query_tokens`) is dropped, so a bare "?"
+/// owes nothing.
+pub fn obligations_for(user_text: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut clause = String::new();
+    for ch in user_text.chars() {
+        match ch {
+            '?' | '.' | '!' | ';' | '\n' => {
+                push_obligation(&mut out, &clause, ch == '?', max);
+                clause.clear();
+            }
+            _ => clause.push(ch),
+        }
+    }
+    push_obligation(&mut out, &clause, false, max);
+    out
+}
+
+fn push_obligation(out: &mut Vec<String>, clause: &str, asked: bool, max: usize) {
+    if out.len() >= max {
+        return;
+    }
+    let clause = clause.trim();
+    if clause.is_empty() || query_tokens(clause).is_empty() {
+        return;
+    }
+    if asked {
+        out.push(format!("answer: {clause}"));
+        return;
+    }
+    let opener: String = clause
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if IMPERATIVE_OPENERS.contains(&opener.as_str()) {
+        out.push(format!("do: {clause}"));
+    }
+}
+
+/// Whether `reply` shares a content word with `asked`.
+///
+/// The ignored-question predicate, moved down here from
+/// `nsevolution::evaluate::ignores_question` (M9 T2.1) so that the in-turn
+/// obligation interceptor and the offline signature share one definition
+/// instead of two that drift. Weak by construction — a reply that answers in
+/// other words looks like one that ignored the question — which is why the
+/// interceptor it gates is off by default and regenerates at most once.
+pub fn addresses(asked: &str, reply: &str) -> bool {
+    let asked: Vec<String> = query_tokens(asked);
+    let answered: std::collections::HashSet<String> = query_tokens(reply).into_iter().collect();
+    asked.is_empty() || answered.is_empty() || asked.iter().any(|t| answered.contains(t))
+}
+
+/// The activation prior's knobs (M9 T3.1).
+///
+/// `weight` is `[memory] activation_weight` and defaults to **0.0**, which
+/// is today's behaviour exactly: the term is multiplied by it, so at zero it
+/// contributes a hard `0.0` to every fact and the integer hit count is the
+/// whole score. vstash's negative result on BEIR is why the default is off
+/// and `ns-app eval --activation <w>` decides it, not this file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Activation {
+    /// `w` in `hits + w · ln(1 + freq) · exp(−Δdays / half_life)`.
+    pub weight: f32,
+    /// Days for the recency term to halve — `[memory]
+    /// activation_half_life_days`, default 7.0.
+    pub half_life_days: f32,
+    /// The clock's reading for this query. `Δ` is measured from the fact's
+    /// `last_used` to here and clamped at zero, so a clock that went
+    /// backwards costs a fact nothing.
+    pub now: crate::event::Timestamp,
+}
+
+impl Default for Activation {
+    fn default() -> Self {
+        Self {
+            weight: 0.0,
+            half_life_days: 7.0,
+            now: crate::event::Timestamp(0),
+        }
+    }
+}
+
+impl Activation {
+    /// The prior with the term switched off — today's ranking.
+    pub fn off() -> Self {
+        Self::default()
+    }
+
+    /// `w · ln(1 + freq) · exp(−Δdays / half_life)`, or a hard `0.0` at
+    /// `w = 0`.
+    ///
+    /// The early return is the byte-identity guarantee, not an optimization:
+    /// it keeps a zero weight from ever producing a `NaN` (a zero half-life
+    /// at `Δ = 0` would) and so from reordering two facts that today tie.
+    fn bonus(&self, freq: u32, last_used: crate::event::Timestamp) -> f32 {
+        if self.weight == 0.0 {
+            return 0.0;
+        }
+        let days = self.now.0.saturating_sub(last_used.0) as f32 / 86_400_000.0;
+        self.weight * (1.0 + freq as f32).ln() * (-days / self.half_life_days).exp()
+    }
+}
+
+/// The frequency column the prior reads. Since M9 P4 it is `credits`, not
+/// `uses`: recall ranks by how often a fact *helped*, not by how often it was
+/// shown. `activation_weight` is 0.0 by default, so at today's config the
+/// column changes nothing observable — the switch matters only on the day
+/// T3.3's corpus moves the weight off zero.
+fn activation_freq(f: &crate::action::Fact) -> u32 {
+    f.credits
+}
+
+/// Half-life of the recency term in `search_turns`, in turns (M9 T3.2).
+///
+/// A constant rather than a knob: the turn number is not a clock, and the
+/// only question the suite can answer is whether recency helps at all. One
+/// knob (`activation_weight`) decides that for facts and turns together;
+/// a second half-life would be a parameter nothing measured.
+pub const RECENCY_HALF_LIFE_TURNS: f32 = 20.0;
+
+/// M9 T3.2: rescore turn hits by how recent they are, then cut to `k`.
+///
+/// `score += w · exp(−(latest − turn) / half_life_turns)`, where `latest` is
+/// the newest turn in the candidate set — the stores hand over their top
+/// candidates, not the whole log, so this is the newest turn that *matched*,
+/// which is the only recency anchor both stores can produce without a second
+/// query.
+///
+/// At `w = 0` nothing is touched and nothing is re-sorted: the truncation is
+/// the only thing that happens, exactly as before.
+pub fn rescore_by_recency(hits: &mut Vec<crate::traits::TurnHit>, weight: f32, k: usize) {
+    if weight != 0.0 && !hits.is_empty() {
+        let latest = hits.iter().map(|h| h.turn).max().unwrap_or(0);
+        for h in hits.iter_mut() {
+            let behind = latest.saturating_sub(h.turn) as f32;
+            h.score += (weight * (-behind / RECENCY_HALF_LIFE_TURNS).exp()) as f64;
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.turn.cmp(&a.turn))
+        });
+    }
+    hits.truncate(k);
+}
+
+/// How many candidates a store fetches before [`rescore_by_recency`] cuts
+/// them to `k`: rescoring the top `k` alone could only reorder them, never
+/// bring a recent hit up from below the cut.
+pub fn recency_candidates(k: usize) -> usize {
+    (k * 4).max(20)
+}
+
 /// Lexical relevance of current facts to a query (M6 §6.5 "query-relevant"):
 /// number of query tokens found in the key (dots and underscores read as
 /// spaces) or the value; zero-score facts are dropped; ties go to the most
 /// recently validated. Shared by both stores until FTS5 lands (Phase 4).
+///
+/// M9 T3.1 adds the activation prior: `score = hits + w · ln(1 + freq) ·
+/// exp(−Δdays / half_life)`. The prior **reorders, it never admits** — a
+/// fact with no query token in it is dropped before the term is computed,
+/// however recently it was used. At `w = 0` every bonus is exactly `0.0`, so
+/// equal-hit facts hold exactly equal float scores and fall through to the
+/// same `last_validated` / key tiebreak they always did.
 pub fn lexical_rank(
     facts: &[crate::action::Fact],
     query: &str,
     k: usize,
+    activation: Activation,
 ) -> Vec<crate::action::Fact> {
     let tokens = query_tokens(query);
     if tokens.is_empty() || k == 0 {
         return Vec::new();
     }
-    let mut scored: Vec<(usize, &crate::action::Fact)> = facts
+    let mut scored: Vec<(f32, &crate::action::Fact)> = facts
         .iter()
         .map(|f| {
             let hay = format!(
@@ -160,10 +410,19 @@ pub fn lexical_rank(
                 f,
             )
         })
-        .filter(|(score, _)| *score > 0)
+        // Before the prior, not after: activation reorders the facts the
+        // query already matched, it never admits one the query missed.
+        .filter(|(hits, _)| *hits > 0)
+        .map(|(hits, f)| {
+            (
+                hits as f32 + activation.bonus(activation_freq(f), f.last_used),
+                f,
+            )
+        })
         .collect();
     scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.1.last_validated.cmp(&a.1.last_validated))
             .then_with(|| a.1.key.cmp(&b.1.key))
     });
@@ -362,16 +621,183 @@ mod tests {
             fact("user.previous_name", "Tomas", 3),
             fact("order.42.status", "shipped", 4),
         ];
-        let hits = lexical_rank(&facts, "what was my previous name?", 5);
+        let off = Activation::off();
+        let hits = lexical_rank(&facts, "what was my previous name?", 5, off);
         let keys: Vec<&str> = hits.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, vec!["user.previous_name", "user.name"]);
-        assert!(lexical_rank(&facts, "hi", 5).is_empty(), "no 3-char tokens");
-        assert_eq!(lexical_rank(&facts, "is my order shipped", 1).len(), 1);
+        assert!(
+            lexical_rank(&facts, "hi", 5, off).is_empty(),
+            "no 3-char tokens"
+        );
+        assert_eq!(lexical_rank(&facts, "is my order shipped", 1, off).len(), 1);
         assert_eq!(
-            lexical_rank(&facts, "brno", 5)[0].key,
+            lexical_rank(&facts, "brno", 5, off)[0].key,
             "user.city",
             "values match too"
         );
+    }
+
+    /// A dozen facts with mixed hit counts, `uses` and `last_used`, ranked at
+    /// `w = 0`. The expected order is written out from the pre-M9 rule alone
+    /// — hits desc, then `last_validated` desc, then key — so the assertion
+    /// fails if the prior leaks into a zero weight *or* if the old ordering
+    /// was quietly restated to match a new one.
+    #[test]
+    fn activation_weight_zero_reproduces_todays_order_exactly() {
+        let facts = ranking_corpus();
+        let day = 86_400_000u64;
+        let now = crate::event::Timestamp(100 * day);
+
+        let expected = vec![
+            // two hits ("user" and "name"), by `last_validated` desc
+            "user.name",
+            "user.previous_name",
+            "user.pet.name",
+            // one hit ("user"), by `last_validated` desc
+            "user.city",
+            "user.employer",
+            "user.language",
+            "user.timezone",
+            // `last_validated` ties at 1 → the key breaks it
+            "user.alias",
+            "user.birthday",
+        ];
+        let at = |w: f32| -> Vec<String> {
+            lexical_rank(
+                &facts,
+                "user name",
+                20,
+                Activation {
+                    weight: w,
+                    half_life_days: 7.0,
+                    now,
+                },
+            )
+            .iter()
+            .map(|f| f.key.clone())
+            .collect()
+        };
+        assert_eq!(at(0.0), expected, "w = 0 is today's order");
+        // And today's order is what a default `Activation` gives, whatever
+        // clock it is handed: the default weight is the off switch.
+        assert_eq!(
+            lexical_rank(&facts, "user name", 20, Activation::off())
+                .iter()
+                .map(|f| f.key.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_ne!(at(1.0), expected, "a live weight does reorder");
+    }
+
+    #[test]
+    fn a_recently_credited_fact_outranks_an_equal_hit_count_at_weight_one() {
+        let day = 86_400_000u64;
+        let now = crate::event::Timestamp(100 * day);
+        let fact = |key: &str, credits: u32, used_days_ago: u64| crate::action::Fact {
+            key: key.into(),
+            value: serde_json::json!("x"),
+            credits,
+            // Identical `last_validated`, so the only thing that can move
+            // these two is the prior.
+            last_validated: crate::event::Timestamp(7),
+            last_used: crate::event::Timestamp(now.0 - used_days_ago * day),
+            ..Default::default()
+        };
+        // One token, one hit each: "user" is in both keys.
+        let facts = vec![
+            fact("user.stale", 9, 60),
+            fact("user.credited", 9, 1),
+            fact("user.cold", 0, 1),
+        ];
+        let keys = |w: f32| -> Vec<String> {
+            lexical_rank(
+                &facts,
+                "user",
+                5,
+                Activation {
+                    weight: w,
+                    half_life_days: 7.0,
+                    now,
+                },
+            )
+            .iter()
+            .map(|f| f.key.clone())
+            .collect()
+        };
+        // At zero the key alone breaks the three-way tie.
+        assert_eq!(keys(0.0), vec!["user.cold", "user.credited", "user.stale"]);
+        // At one, recency × frequency does: nine uses a day ago beats nine
+        // uses two months ago, and both beat a fact never used.
+        assert_eq!(keys(1.0), vec!["user.credited", "user.stale", "user.cold"]);
+    }
+
+    /// The prior reorders; it never admits. A fact used a thousand times an
+    /// hour ago is still invisible to a query that does not mention it.
+    #[test]
+    fn activation_never_admits_a_zero_hit_fact() {
+        let day = 86_400_000u64;
+        let now = crate::event::Timestamp(100 * day);
+        let facts = vec![
+            crate::action::Fact {
+                key: "order.42.status".into(),
+                value: serde_json::json!("shipped"),
+                credits: 1000,
+                last_used: now,
+                ..Default::default()
+            },
+            crate::action::Fact {
+                key: "user.city".into(),
+                value: serde_json::json!("Brno"),
+                credits: 0,
+                last_used: crate::event::Timestamp(0),
+                ..Default::default()
+            },
+        ];
+        for w in [0.0f32, 1.0, 100.0] {
+            let hits = lexical_rank(
+                &facts,
+                "brno",
+                5,
+                Activation {
+                    weight: w,
+                    half_life_days: 7.0,
+                    now,
+                },
+            );
+            let keys: Vec<&str> = hits.iter().map(|f| f.key.as_str()).collect();
+            assert_eq!(keys, vec!["user.city"], "w = {w} admitted a zero-hit fact");
+        }
+    }
+
+    /// Mixed hits (2, 1 and 0), mixed `uses`, mixed `last_used`, and three
+    /// `last_validated` ties so the key tiebreak is exercised too.
+    fn ranking_corpus() -> Vec<crate::action::Fact> {
+        let day = 86_400_000u64;
+        let f = |key: &str, value: &str, validated: u64, credits: u32, used_days_ago: u64| {
+            crate::action::Fact {
+                key: key.into(),
+                value: serde_json::json!(value),
+                credits,
+                last_validated: crate::event::Timestamp(validated),
+                last_used: crate::event::Timestamp(100 * day - used_days_ago * day),
+                ..Default::default()
+            }
+        };
+        vec![
+            f("user.name", "Martin", 9, 1, 30),
+            f("user.city", "Brno", 6, 12, 0),
+            f("user.previous_name", "Tomas", 8, 0, 90),
+            f("order.42.status", "shipped", 7, 40, 0),
+            f("user.pet.name", "Fido", 7, 2, 14),
+            f("user.employer", "Acme", 5, 3, 3),
+            f("user.language", "Czech", 4, 0, 1),
+            f("user.timezone", "Europe/Prague", 2, 7, 2),
+            f("user.alias", "Maty", 1, 5, 1),
+            f("user.birthday", "1990-01-01", 1, 1, 40),
+            f("project.deadline", "friday", 3, 9, 0),
+            f("weather.brno", "rain", 10, 30, 0),
+        ]
     }
 
     #[test]
@@ -453,5 +879,57 @@ mod tests {
             render_summary(&minimal),
             "Conversation so far (turns 1–2): t"
         );
+    }
+
+    /// M9 T2.1. Two questions in one message are two things owed, and the
+    /// clause is carried verbatim so the check downstream compares against
+    /// the user's own words.
+    #[test]
+    fn two_questions_yield_two_answer_obligations() {
+        assert_eq!(
+            obligations_for("where is my order? and what did it cost?", 5),
+            vec![
+                "answer: where is my order".to_string(),
+                "answer: and what did it cost".to_string()
+            ]
+        );
+        // Czech, and an imperative beside a question.
+        assert_eq!(
+            obligations_for("kolik je hodin? pošli mi ten report", 5),
+            vec![
+                "answer: kolik je hodin".to_string(),
+                "do: pošli mi ten report".to_string()
+            ]
+        );
+    }
+
+    /// The recorded risk is over-firing. A greeting, a thank-you and a bare
+    /// question mark owe nothing, and neither does a statement.
+    #[test]
+    fn small_talk_yields_no_obligations() {
+        for text in ["hi", "díky!", "?", "ok.", "my name is Martin", ""] {
+            assert!(
+                obligations_for(text, 5).is_empty(),
+                "{text:?} should owe nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn obligations_are_capped_at_max() {
+        let text = "a co tohle? a tohle? a tamto? a jeste tohle? a posledni? a uplne posledni?";
+        assert_eq!(obligations_for(text, 3).len(), 3);
+        assert_eq!(obligations_for(text, 6).len(), 6);
+        assert!(obligations_for(text, 0).is_empty());
+    }
+
+    #[test]
+    fn addresses_is_lexical_overlap_and_abstains_when_it_cannot_tell() {
+        assert!(addresses("where is my order", "your order shipped"));
+        assert!(!addresses("where is my order", "nothing to report"));
+        // No content token on either side: the predicate abstains rather
+        // than accusing.
+        assert!(addresses("hi", "hello"));
+        assert!(addresses("where is my order", "ok"));
     }
 }

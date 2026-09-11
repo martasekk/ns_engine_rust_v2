@@ -15,11 +15,31 @@ use nsengine::turn::{Engine, EngineConfig};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// What the proposer is being asked for about one turn (M9 T5.1).
+///
+/// Two asks, one gate. The ask changes the *question* put to the proposer —
+/// nothing downstream of it: the candidate that comes back is a `Note` like
+/// any other and goes through [`verify_note`] unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// The turn went wrong; what would have changed the outcome.
+    Failure,
+    /// The turn went right and its route repeats; what would make the
+    /// emitter reach that route sooner.
+    Strategy { actions: String, times: u32 },
+}
+
 #[async_trait]
 pub trait NoteProposer: Send + Sync {
-    /// One imperative sentence that would have changed the failing turn, or
+    /// One imperative sentence that would have changed the failing turn (or,
+    /// for [`Ask::Strategy`], that would reach the working one sooner), or
     /// None if nothing helps.
-    async fn propose(&self, trace: &str, existing: &[Note]) -> Result<Option<Note>, String>;
+    async fn propose(
+        &self,
+        trace: &str,
+        existing: &[Note],
+        ask: &Ask,
+    ) -> Result<Option<Note>, String>;
 }
 
 pub struct ClientNoteProposer {
@@ -33,6 +53,18 @@ only: {\"scope\": \"global\" | \"action:<tool name>\", \"text\": \"<one imperati
 if a single new sentence would have changed the outcome and does not repeat an existing note; \
 otherwise {\"none\": true}.";
 
+/// The [`Ask::Strategy`] half (M9 T5.1). Same reply shape, same refusal path
+/// — only the question differs, because a note distilled from a success has
+/// to be phrased as a route, not as a correction.
+const STRATEGY_SYSTEM: &str = "You tune the action-selection prompt of a tool-using assistant. \
+You see the trace of ONE turn that an evaluator graded good, the tool sequence it ran, how \
+many graded-good turns ran that same sequence, and the guidance notes already in force. This \
+sequence is a strategy that works. Reply with JSON only: {\"scope\": \"global\" | \
+\"action:<tool name>\", \"text\": \"<one imperative sentence>\"} with one short reusable note \
+that would make the assistant reach this sequence sooner on a similar request, if such a \
+sentence exists and does not repeat an existing note; otherwise {\"none\": true}. Describe the \
+strategy, never this one turn's specific values.";
+
 fn strip_fence(s: &str) -> &str {
     let t = s.trim();
     let t = t
@@ -45,19 +77,36 @@ fn strip_fence(s: &str) -> &str {
 
 #[async_trait]
 impl NoteProposer for ClientNoteProposer {
-    async fn propose(&self, trace: &str, existing: &[Note]) -> Result<Option<Note>, String> {
+    async fn propose(
+        &self,
+        trace: &str,
+        existing: &[Note],
+        ask: &Ask,
+    ) -> Result<Option<Note>, String> {
         let mut user = String::from("Existing notes:\n");
         for n in existing {
             user.push_str(&format!("- [{}] {}\n", n.scope, n.text));
         }
-        user.push_str("\nFailed turn:\n");
+        let system = match ask {
+            Ask::Failure => {
+                user.push_str("\nFailed turn:\n");
+                PROPOSER_SYSTEM
+            }
+            Ask::Strategy { actions, times } => {
+                user.push_str(&format!(
+                    "\nThis tool sequence worked in {times} graded-good turns: {actions}\n\
+                     \nOne of those turns:\n"
+                ));
+                STRATEGY_SYSTEM
+            }
+        };
         user.push_str(trace);
         let request = serde_json::json!({
             "model": self.model,
             "max_tokens": 300,
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": PROPOSER_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         });
@@ -90,22 +139,64 @@ pub enum TurnOutcome {
     Ok,
     Fallback,
     Rejections(u32),
+    /// An evaluator's recorded verdict on the turn (M8 T2.6, M9 T1.2).
+    ///
+    /// It outranks every heuristic here because it is the only one that
+    /// looked at the *reply*. `Settled`/`ReplyFailed` see whether the machine
+    /// finished; a grade sees whether the answer was any good, which is the
+    /// thing a reply-scope note is trying to change.
+    Graded {
+        ok: bool,
+    },
 }
 
-/// Ok=0 > Rejections(n)=-n > Fallback=-1000.
+/// Ok=0 > Rejections(n)=-n > Fallback=-1000 > Graded{false}=-2000.
+///
+/// A graded-bad turn scores *below* a fallback deliberately. A fallback is
+/// the harness admitting it failed, and that admission is already worth
+/// something; a confidently wrong answer is the failure the user cannot see,
+/// and a note that trades a fallback for one must not read as an improvement.
 pub fn score(o: TurnOutcome) -> i64 {
     match o {
-        TurnOutcome::Ok => 0,
+        TurnOutcome::Ok | TurnOutcome::Graded { ok: true } => 0,
         TurnOutcome::Rejections(n) => -(n as i64),
         TurnOutcome::Fallback => -1000,
+        TurnOutcome::Graded { ok: false } => -2000,
     }
 }
 
-/// One outcome per turn, in turn order.
+/// One outcome per turn, in turn order, believing `"symbolic"` where several
+/// evaluators graded the same turn.
 pub fn classify_turns(events: &[Event]) -> Vec<TurnOutcome> {
-    let mut per_turn: BTreeMap<u32, (bool, u32)> = BTreeMap::new();
+    classify_turns_by(events, "symbolic")
+}
+
+/// One outcome per turn, in turn order.
+///
+/// A recorded [`EventKind::Graded`] from `authoritative` replaces the
+/// Settled/ReplyFailed heuristic for that turn — never averages with it. Any
+/// other evaluator's grade on the same turn is ignored here; comparing two
+/// scorers is κ's job (T2.7), not the gate's.
+pub fn classify_turns_by(events: &[Event], authoritative: &str) -> Vec<TurnOutcome> {
+    let mut per_turn: BTreeMap<u32, (bool, u32, Option<bool>)> = BTreeMap::new();
     for e in events {
-        let entry = per_turn.entry(e.turn).or_insert((false, 0));
+        // `Graded` is appended at the end of the log, not inside the turn it
+        // grades, so its own `turn` field is the one that counts — never
+        // `e.turn`, even though the pass keeps the two equal.
+        if let EventKind::Graded {
+            turn, grade, by, ..
+        } = &e.kind
+        {
+            if by == authoritative {
+                per_turn
+                    .entry(*turn)
+                    .or_insert((false, 0, None))
+                    .2
+                    .get_or_insert(grade.ok);
+            }
+            continue;
+        }
+        let entry = per_turn.entry(e.turn).or_insert((false, 0, None));
         match &e.kind {
             EventKind::Settled { policy } if is_fallback(policy) => entry.0 = true,
             EventKind::ReplyFailed { .. } => entry.0 = true,
@@ -115,16 +206,23 @@ pub fn classify_turns(events: &[Event]) -> Vec<TurnOutcome> {
     }
     per_turn
         .into_values()
-        .map(|(fallback, rejections)| {
-            if fallback {
-                TurnOutcome::Fallback
-            } else if rejections > 0 {
-                TurnOutcome::Rejections(rejections)
-            } else {
-                TurnOutcome::Ok
-            }
+        .map(|(fallback, rejections, graded)| match graded {
+            Some(ok) => TurnOutcome::Graded { ok },
+            None if fallback => TurnOutcome::Fallback,
+            None if rejections > 0 => TurnOutcome::Rejections(rejections),
+            None => TurnOutcome::Ok,
         })
         .collect()
+}
+
+/// Is any turn of any of these sessions graded by `authoritative`?
+///
+/// The question the gate asks before it trusts a reply-quality candidate.
+pub fn any_graded(sessions: &[Vec<Event>], authoritative: &str) -> bool {
+    sessions
+        .iter()
+        .flatten()
+        .any(|e| matches!(&e.kind, EventKind::Graded { by, .. } if by == authoritative))
 }
 
 #[async_trait]
@@ -149,10 +247,10 @@ pub struct LiveProbe {
 struct ClosedChannel;
 #[async_trait]
 impl nscore::Channel for ClosedChannel {
-    async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
         Err(ChannelError::Closed)
     }
-    async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+    async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
         Ok(())
     }
 }
@@ -184,7 +282,7 @@ impl ProbeRunner for LiveProbe {
             reply_grounding_check: false,
             ..EngineConfig::default()
         };
-        let mut engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
+        let engine = Engine::with_clock(parts, cfg, Box::new(|| Timestamp(0)));
         for text in d.user_inputs {
             engine
                 .run_turn(Incoming {
@@ -207,6 +305,33 @@ pub struct NoteVerdict {
     pub lift: f64,
     pub turns_used: u32,
     pub detail: String,
+    /// The candidate was neither proved nor disproved — the budget ran out,
+    /// or (M9 T1.2) nothing in the probed sessions is graded, so the probe
+    /// could not have measured what the note is for. A rejection would be a
+    /// claim the evidence does not support.
+    pub unverified: bool,
+}
+
+/// What a candidate needs before its probe means anything (M9 T1.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteGate {
+    /// The candidate is about reply *quality*, so the probe's score is only
+    /// readable where a recorded grade exists. An emitter-side candidate —
+    /// a malformed argument, an illegal action near a tool — is measured by
+    /// `Rejections` and `Fallback`, which need no grade at all, and this
+    /// stays false for it.
+    pub require_graded: bool,
+    /// Whose grade counts. Matches `PassConfig::authoritative_evaluator`.
+    pub authoritative: String,
+}
+
+impl NoteGate {
+    pub fn emitter_side() -> Self {
+        Self {
+            require_graded: false,
+            authoritative: "symbolic".into(),
+        }
+    }
 }
 
 pub async fn verify_note(
@@ -217,6 +342,7 @@ pub async fn verify_note(
     probe: &dyn ProbeRunner,
     regression_budget: u32,
     budget: &mut u32,
+    gate: &NoteGate,
 ) -> NoteVerdict {
     let without = Arc::new(base.clone());
     let mut with_rules = base.clone();
@@ -229,7 +355,26 @@ pub async fn verify_note(
         lift: 0.0,
         turns_used: 0,
         detail: String::new(),
+        unverified: false,
     };
+
+    // M9 T1.2. A reply-quality note is trying to change what the replier
+    // says; the probe's own classification cannot see that — it runs a live
+    // *emitter* and a scripted replier — so without a recorded grade in the
+    // sessions being probed there is nothing for `score` to move. Spending
+    // the probe budget to find that out would be worse than saying so.
+    if gate.require_graded
+        && !any_graded(positives, &gate.authoritative)
+        && !any_graded(negatives, &gate.authoritative)
+    {
+        v.unverified = true;
+        v.detail = format!(
+            "no turn graded by `{}` in the probed sessions; reply quality is unmeasured",
+            gate.authoritative
+        );
+        return v;
+    }
+
     let mut positives_probed = 0usize;
 
     // A session costs 2× its turns: one run without the note, one with.
@@ -249,6 +394,7 @@ pub async fn verify_note(
     for (is_positive, events) in queue {
         let Some(cost) = probe_pair(events) else {
             v.detail.push_str("budget exhausted; ");
+            v.unverified = true;
             break;
         };
         v.turns_used += cost;
@@ -338,6 +484,57 @@ mod tests {
         assert!(score(TurnOutcome::Rejections(3)) > score(TurnOutcome::Fallback));
     }
 
+    /// M9 T1.2. A recorded grade replaces the Settled/ReplyFailed heuristic
+    /// for the turn it names, and only for the evaluator the gate believes.
+    #[test]
+    fn a_recorded_grade_outranks_the_heuristic_for_its_own_turn() {
+        let ok = EventKind::Settled {
+            policy: ReplyPolicy::Generate,
+        };
+        let graded = |turn: u32, ok: bool, by: &str| EventKind::Graded {
+            turn,
+            grade: Grade {
+                ok,
+                issues: if ok { vec![] } else { vec!["reask".into()] },
+            },
+            by: by.into(),
+            revision: "n/a".into(),
+        };
+        let ev = turn_log(&[
+            &[EventKind::UserSaid { text: "a".into() }, ok.clone()],
+            &[EventKind::UserSaid { text: "b".into() }, ok.clone()],
+            // Both grades are appended after the session, as the pass writes
+            // them, and carry the turn they grade.
+            &[
+                graded(1, false, "symbolic"),
+                // A second scorer's disagreement is not the gate's business.
+                graded(1, true, "local"),
+                graded(2, true, "symbolic"),
+            ],
+        ]);
+        assert_eq!(
+            classify_turns(&ev),
+            vec![
+                TurnOutcome::Graded { ok: false },
+                TurnOutcome::Graded { ok: true },
+                // …and no third entry: the turn the grade events were
+                // appended under is not a turn of the conversation.
+            ]
+        );
+        // Believing the other scorer flips turn 1 and leaves turn 2 to the
+        // heuristic, because `local` never graded it.
+        assert_eq!(
+            classify_turns_by(&ev, "local")[0],
+            TurnOutcome::Graded { ok: true }
+        );
+        assert_eq!(classify_turns_by(&ev, "local")[1], TurnOutcome::Ok);
+        assert_eq!(
+            score(TurnOutcome::Graded { ok: true }),
+            score(TurnOutcome::Ok)
+        );
+        assert!(score(TurnOutcome::Graded { ok: false }) < score(TurnOutcome::Fallback));
+    }
+
     /// Probe double: outcome depends on whether the rules carry a note containing MARKER.
     struct MarkerProbe {
         with_marker: Vec<TurnOutcome>,
@@ -379,6 +576,216 @@ mod tests {
         ]])
     }
 
+    /// The same session with one turn graded by `symbolic`.
+    fn graded_session(text: &str) -> Vec<Event> {
+        turn_log(&[
+            &[
+                EventKind::UserSaid { text: text.into() },
+                EventKind::Settled {
+                    policy: ReplyPolicy::Generate,
+                },
+            ],
+            &[EventKind::Graded {
+                turn: 1,
+                grade: Grade {
+                    ok: false,
+                    issues: vec!["reask".into()],
+                },
+                by: "symbolic".into(),
+                revision: "n/a".into(),
+            }],
+        ])
+    }
+
+    fn reply_quality_gate() -> NoteGate {
+        NoteGate {
+            require_graded: true,
+            authoritative: "symbolic".into(),
+        }
+    }
+
+    /// M9 T1.2. The probe runs a live *emitter* against a scripted replier,
+    /// so nothing it classifies looks at reply quality. Without a recorded
+    /// grade there is nothing for `score` to move, and a candidate mined from
+    /// `UserReask` or `UngroundedReply` is therefore unverified — never
+    /// rejected, which would be a claim, and never accepted.
+    #[tokio::test]
+    async fn a_reply_quality_candidate_is_unverified_when_no_turn_in_the_session_is_graded() {
+        let probe = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: false,
+        };
+        let note = Note::new("global", &format!("{MARKER} before answering."), 0.0);
+        let mut budget = 40;
+        let v = verify_note(
+            &note,
+            &[session("positive")],
+            &[session("negative")],
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &reply_quality_gate(),
+        )
+        .await;
+        assert!(!v.accepted);
+        assert!(v.unverified, "{}", v.detail);
+        assert!(v.detail.contains("symbolic"), "{}", v.detail);
+        // And it did not spend the probe budget finding that out.
+        assert_eq!((v.turns_used, budget), (0, 40));
+
+        // One graded turn is enough to make the probe readable again.
+        let mut budget = 40;
+        let v = verify_note(
+            &note,
+            &[graded_session("positive")],
+            &[session("negative")],
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &reply_quality_gate(),
+        )
+        .await;
+        assert!(v.accepted && !v.unverified, "{}", v.detail);
+    }
+
+    /// The other half of the same rule: a signature mined from what the
+    /// harness *did* is measured by `Rejections` and `Fallback`, which need
+    /// no grade, so its path through the gate is exactly what it was.
+    #[tokio::test]
+    async fn an_emitter_side_candidate_still_verifies_without_grades() {
+        assert!(!crate::mine::SignatureKind::MalformedArg {
+            action: "echo".into(),
+            arg: "text".into(),
+            ops: vec![],
+        }
+        .from_grades());
+        assert!(crate::mine::SignatureKind::UngroundedReply { spans: vec![] }.from_grades());
+
+        let probe = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: false,
+        };
+        let note = Note::new("global", &format!("{MARKER} before answering."), 0.0);
+        let mut budget = 40;
+        let v = verify_note(
+            &note,
+            &[session("positive")],
+            &[session("negative")],
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &NoteGate::emitter_side(),
+        )
+        .await;
+        assert!(v.accepted, "{}", v.detail);
+        assert!(!v.unverified);
+        assert_eq!((v.improved, v.regressed), (1, 0));
+    }
+
+    /// M9 T5.1. The success lane earns nothing on its own: a candidate
+    /// proposed from a `Succeeded` signature runs the same positives, the
+    /// same negatives, the same regression budget and the same
+    /// `improved`/`regressed` arithmetic as one proposed from a failure.
+    /// Only the question put to the proposer differs.
+    #[tokio::test]
+    async fn a_succeeded_candidate_takes_the_same_gate_as_a_failure_candidate() {
+        use crate::mine::SignatureKind;
+
+        let succeeded = SignatureKind::Succeeded {
+            actions: "get_time -> get_weather".into(),
+            times: 2,
+        };
+        let failure = SignatureKind::UngroundedReply { spans: vec![] };
+        // The gate `pass.rs` builds is a function of `from_grades()` alone,
+        // and both kinds answer it the same way — so both get this gate.
+        assert_eq!(succeeded.from_grades(), failure.from_grades());
+        let gate = reply_quality_gate();
+
+        // Only the ask differs.
+        assert_eq!(
+            succeeded.ask(),
+            Ask::Strategy {
+                actions: "get_time -> get_weather".into(),
+                times: 2
+            }
+        );
+        assert_eq!(failure.ask(), Ask::Failure);
+
+        let note = Note::new("global", &format!("{MARKER} before answering."), 0.0);
+        let positives = [graded_session("positive")];
+        let negatives = [session("negative")];
+
+        // Helps a positive, hurts no negative: accepted, and the numbers are
+        // the probe's, not the lane's.
+        let probe = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: false,
+        };
+        let mut budget = 40;
+        let accepted = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &gate,
+        )
+        .await;
+        assert!(accepted.accepted, "{}", accepted.detail);
+        assert_eq!((accepted.improved, accepted.regressed), (1, 0));
+
+        // Break a negative and the same candidate is rejected under budget 0:
+        // there is no success-flavoured accept path around the regression
+        // rule.
+        let regressing = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: true,
+        };
+        let mut budget = 40;
+        let rejected = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &regressing,
+            0,
+            &mut budget,
+            &gate,
+        )
+        .await;
+        assert!(!rejected.accepted, "{}", rejected.detail);
+        assert!(!rejected.unverified);
+        assert_eq!((rejected.improved, rejected.regressed), (1, 1));
+
+        // And byte for byte the verdict a failure candidate gets on the same
+        // evidence — the gate cannot tell the two apart.
+        let mut budget = 40;
+        let as_failure = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &NoteGate {
+                require_graded: failure.from_grades(),
+                authoritative: "symbolic".into(),
+            },
+        )
+        .await;
+        assert_eq!(as_failure, accepted);
+    }
+
     #[tokio::test]
     async fn note_that_helps_a_positive_and_hurts_no_negative_is_accepted_with_lift() {
         let probe = MarkerProbe {
@@ -396,6 +803,7 @@ mod tests {
             &probe,
             0,
             &mut budget,
+            &NoteGate::emitter_side(),
         )
         .await;
         assert!(v.accepted, "{}", v.detail);
@@ -422,6 +830,7 @@ mod tests {
             &probe,
             0,
             &mut b,
+            &NoteGate::emitter_side(),
         )
         .await;
         assert!(!v0.accepted && v0.regressed == 1);
@@ -434,6 +843,7 @@ mod tests {
             &probe,
             1,
             &mut b,
+            &NoteGate::emitter_side(),
         )
         .await;
         assert!(v1.accepted);
@@ -457,6 +867,7 @@ mod tests {
             &probe,
             0,
             &mut budget,
+            &NoteGate::emitter_side(),
         )
         .await;
         assert!(!v.accepted);
@@ -543,13 +954,17 @@ mod tests {
             client: nsllm::client::OpenRouterClient::new(mock.clone(), "k".into()),
             model: "m".into(),
         };
-        let n = p.propose("trace", &[]).await.unwrap().unwrap();
+        let n = p
+            .propose("trace", &[], &Ask::Failure)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (n.scope.as_str(), n.text.as_str()),
             ("action:echo", "Call echo when asked to repeat.")
         );
-        assert_eq!(p.propose("trace", &[]).await.unwrap(), None);
-        assert!(p.propose("trace", &[]).await.is_err());
+        assert_eq!(p.propose("trace", &[], &Ask::Failure).await.unwrap(), None);
+        assert!(p.propose("trace", &[], &Ask::Failure).await.is_err());
         let sent = mock.requests.lock().unwrap()[0].clone();
         assert!(sent["messages"][1]["content"]
             .as_str()

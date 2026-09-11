@@ -1,0 +1,15 @@
+[package]
+name = "ns-channel-tcp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nschannel_tcp"
+
+[dependencies]
+ns-core = { path = "../core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

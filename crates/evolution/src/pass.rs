@@ -2,7 +2,7 @@
 //! chain-verify sessions → mine → symbolic lane → corrections as facts →
 //! notes lane → apply (atomic file + hot swap) → ledger. Implements
 //! `Consolidator`, so the idle driver and `ns-app evolve` share one path.
-use crate::evaluate::{evaluate, EvaluateConfig};
+use crate::evaluate::{evaluate, EvaluateConfig, Evaluator, SymbolicEvaluator};
 use crate::files::{load_rules, save_rules_atomic, FileError};
 use crate::ledger::{Evidence, Ledger, LedgerEntry, Verdict};
 use crate::mine::{mine, render_turn, Signature, SignatureKind};
@@ -40,6 +40,21 @@ pub struct PassConfig {
     /// because the lane is going to grow an evaluator, a κ threshold and a
     /// turn budget beside these, and they belong together.
     pub evaluate: EvaluateConfig,
+    /// Which evaluator's recorded grade the notes gate believes when several
+    /// have graded the same turn (M9 T1.2).
+    ///
+    /// One name rather than a merge rule: two scorers that disagree are a κ
+    /// measurement, not something to average away, and the gate has to be
+    /// able to say *whose* verdict it acted on.
+    pub authoritative_evaluator: String,
+    /// M9 T4.4: exposures a fact needs before zero credits mean anything.
+    pub fitness_min_exposures: u32,
+    /// Whether the fitness signal demotes or only reports. Off for a release.
+    pub fitness_demote: bool,
+    /// Key prefixes the fitness signal never demotes (`[memory]
+    /// pinned_prefixes`). Threaded through the pass the way `fact_stale_days`
+    /// is: the knob belongs to memory, and the pass is where it is applied.
+    pub pinned_prefixes: Vec<String>,
 }
 
 impl Default for PassConfig {
@@ -53,6 +68,10 @@ impl Default for PassConfig {
             fact_stale_days: 90,
             digest_scope: "global".into(),
             evaluate: EvaluateConfig::default(),
+            authoritative_evaluator: "symbolic".into(),
+            fitness_min_exposures: 8,
+            fitness_demote: false,
+            pinned_prefixes: vec!["user.".into()],
         }
     }
 }
@@ -88,10 +107,20 @@ pub struct Report {
     pub signature_turns: BTreeMap<&'static str, Vec<u32>>,
     pub candidates: Vec<CandidateReport>,
     pub probe_turns_used: u32,
+    /// Turns this run graded for the first time (M9 T1.3).
+    pub graded_turns: usize,
+    /// Turns whose grade was read back out of the log instead of recomputed.
+    /// The number T2.3a exists for: on a second run it is everything.
+    pub grades_reused: usize,
+    /// Grade attempts the scorer could not answer. Not a failure of a turn
+    /// and not counted against anything — the service was down.
+    pub grades_unavailable: usize,
     pub facts_written: usize,
     pub written: bool,
     /// M6 §6.4 fact consolidation numbers.
     pub consolidation: crate::consolidate::ConsolidationReport,
+    /// M9 T4.3 fitness numbers, derived from the log on every run.
+    pub fitness: crate::fitness::FitnessReport,
 }
 
 impl std::fmt::Display for Report {
@@ -120,8 +149,37 @@ impl std::fmt::Display for Report {
             };
             writeln!(f, "  [{}] {} — {verdict} {}", c.lane, c.summary, c.numbers)?;
         }
+        writeln!(
+            f,
+            "graded turns: {} newly graded, {} read back from the log, {} unavailable",
+            self.graded_turns, self.grades_reused, self.grades_unavailable
+        )?;
         writeln!(f, "probe turns used: {}", self.probe_turns_used)?;
         writeln!(f, "facts written: {}", self.facts_written)?;
+        // M9 T4.5: the numbers this phase exists to make readable without
+        // opening SQLite. `exposures` without `credits` is the whole point —
+        // a fact in every prompt and in no answer is the one worth finding.
+        writeln!(
+            f,
+            "fitness: {} facts derived, {} with exposures, {} zero-credit",
+            self.fitness.facts.len(),
+            self.fitness.with_exposures(),
+            self.fitness.zero_credit()
+        )?;
+        for (key, exposures) in self.fitness.top_zero_credit(10) {
+            writeln!(f, "  {key}  {exposures}")?;
+        }
+        for session in &self.fitness.graded_sessions_with_zero_exposures {
+            writeln!(f, "alarm: graded session {session} exposes no fact")?;
+        }
+        for (hash, n) in &self.fitness.notes {
+            let lift = self.fitness.note_lifts.get(hash).copied().unwrap_or(0.0);
+            writeln!(
+                f,
+                "  note {hash}  lift {lift:.3}  {} exposures  {} credits",
+                n.exposures, n.credits
+            )?;
+        }
         writeln!(f, "{}", self.consolidation)?;
         write!(f, "learned.toml written: {}", self.written)
     }
@@ -132,6 +190,10 @@ pub struct EvolutionPass {
     known_specs: Vec<ActionSpec>,
     probe: Option<Box<dyn ProbeRunner>>,
     proposer: Option<Box<dyn NoteProposer>>,
+    /// Who grades a turn (M8 T2.3a). The symbolic checks are always here —
+    /// they cost nothing and they are what every other scorer is calibrated
+    /// against — and `with_evaluator` adds the ones that do cost something.
+    evaluators: Vec<Arc<dyn Evaluator>>,
     learned_path: PathBuf,
     ledger_path: PathBuf,
     cfg: PassConfig,
@@ -143,6 +205,18 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Does `turn` already carry a grade from `by` — in the log, or in what this
+/// run has just decided to append to it?
+fn graded_by(
+    events: &[nscore::Event],
+    pending: Option<&Vec<nscore::EventKind>>,
+    turn: u32,
+    by: &str,
+) -> bool {
+    let hit = |k: &nscore::EventKind| matches!(k, nscore::EventKind::Graded { turn: t, by: b, .. } if *t == turn && b == by);
+    events.iter().any(|e| hit(&e.kind)) || pending.map(|v| v.iter().any(hit)).unwrap_or(false)
 }
 
 /// `key = value` with a dotted-identifier key → (key, value).
@@ -164,16 +238,26 @@ impl EvolutionPass {
         ledger_path: PathBuf,
         cfg: PassConfig,
     ) -> Self {
+        let symbolic = Arc::new(SymbolicEvaluator {
+            cfg: cfg.evaluate.clone(),
+        });
         Self {
             rules,
             known_specs,
             probe: None,
             proposer: None,
+            evaluators: vec![symbolic],
             learned_path,
             ledger_path,
             cfg,
             clock: Box::new(now_ms),
         }
+    }
+    /// Add a scorer beside the symbolic one. Its grades are recorded under
+    /// its own id, so two evaluators never overwrite each other.
+    pub fn with_evaluator(mut self, e: Arc<dyn Evaluator>) -> Self {
+        self.evaluators.push(e);
+        self
     }
     /// Enable the notes lane (needs a live emitter to probe with).
     pub fn with_notes(
@@ -188,6 +272,107 @@ impl EvolutionPass {
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Step 4b: grade what nothing has graded yet, and read back the rest.
+    ///
+    /// The recorded grades are consulted *first* and the scorer is never
+    /// asked about a turn that already has one from it. That single rule is
+    /// T2.3a: a second pass costs nothing, a replay costs nothing, and no
+    /// path from a recorded session to a verdict runs through a model.
+    ///
+    /// The new events go into `sessions` whether or not this is a dry run —
+    /// the gate downstream should see the same grades either way — but they
+    /// only reach the store when it is not.
+    async fn grade_sessions(
+        &self,
+        store: &dyn MemoryStore,
+        sessions: &mut [Recorded],
+        report: &mut Report,
+        now: u64,
+    ) -> Result<(), PassError> {
+        let per_session: Vec<Vec<crate::evaluate::RecordedTurn>> = sessions
+            .iter()
+            .map(|(_, e)| crate::evaluate::recorded_turns(e))
+            .collect();
+        // Newest first — a budget too small for every turn should be spent on
+        // what just happened — and ties broken by position, so the queue is a
+        // total order and two runs walk it identically.
+        let mut queue: Vec<(usize, usize)> = Vec::new();
+        for (si, turns) in per_session.iter().enumerate() {
+            for ti in 0..turns.len() {
+                queue.push((si, ti));
+            }
+        }
+        queue.sort_by(|a, b| {
+            per_session[b.0][b.1]
+                .at
+                .cmp(&per_session[a.0][a.1].at)
+                .then(a.cmp(b))
+        });
+
+        let mut budget = self.cfg.evaluate.budget_turns;
+        let mut fresh: BTreeMap<usize, Vec<nscore::EventKind>> = BTreeMap::new();
+        for (si, ti) in queue {
+            let t = &per_session[si][ti];
+            let mut wanted: Vec<&Arc<dyn Evaluator>> = Vec::new();
+            for ev in &self.evaluators {
+                if graded_by(&sessions[si].1, fresh.get(&si), t.turn, &ev.id()) {
+                    report.grades_reused += 1;
+                } else {
+                    wanted.push(ev);
+                }
+            }
+            if wanted.is_empty() || budget == 0 {
+                continue;
+            }
+            budget -= 1;
+            let shown = t.shown_refs();
+            let view = t.view(&shown);
+            let mut any = false;
+            for ev in wanted {
+                match ev.grade(&view).await {
+                    Ok(g) => {
+                        any = true;
+                        fresh
+                            .entry(si)
+                            .or_default()
+                            .push(nscore::EventKind::Graded {
+                                turn: t.turn,
+                                grade: (&g).into(),
+                                by: ev.id(),
+                                revision: ev.revision(),
+                            });
+                    }
+                    // The service was down or answered with nonsense. Neither
+                    // is a fact about the turn, so nothing is written and the
+                    // turn stays ungraded for the next pass to try.
+                    Err(_) => report.grades_unavailable += 1,
+                }
+            }
+            if any {
+                report.graded_turns += 1;
+            }
+        }
+
+        for (si, kinds) in fresh {
+            let (sid, events) = &mut sessions[si];
+            let mut log = EventLog::from_events(sid.clone(), events.clone());
+            let before = log.events().len();
+            for k in kinds {
+                let turn = match &k {
+                    nscore::EventKind::Graded { turn, .. } => *turn,
+                    _ => 0,
+                };
+                log.append(turn, Timestamp(now), k);
+            }
+            let added: Vec<nscore::Event> = log.events()[before..].to_vec();
+            if !self.cfg.dry_run {
+                store.append(sid, &added).await?;
+            }
+            *events = log.events().to_vec();
+        }
+        Ok(())
     }
 
     pub async fn run_report(&self, store: &dyn MemoryStore) -> Result<Report, PassError> {
@@ -225,6 +410,31 @@ impl EvolutionPass {
             sigs.extend(mine(sid, events, &self.known_specs));
             sigs.extend(evaluate(sid, events, &self.cfg.evaluate));
         }
+        // 4b. Grade (M8 T2.3a, M9 T1.1/T1.3).
+        //
+        // A grade is a recorded value. Every turn already carrying a
+        // `Graded` event from this evaluator is *read back*, never
+        // recomputed — that is the replay property, and it is why a second
+        // run of this pass grades nothing and a replay needs no service. The
+        // rest are graded newest first until the budget runs out, and each
+        // new grade is appended to its session's log as one more event: the
+        // chain is extended, never rewritten.
+        self.grade_sessions(store, &mut sessions, &mut report, now)
+            .await?;
+
+        // 4b'. Mine the success lane (M9 T5.1).
+        //
+        // A third source, and the only one that reads every session at once:
+        // `Succeeded` is a route two graded-good turns both took, and no
+        // single session's log can show that. It runs *after* grading and
+        // not with the rest of step 4, because `grade_sessions` appends this
+        // run's fresh verdicts into `sessions` — mining first would mean a
+        // session could never yield a strategy until a second pass, which is
+        // the sort of silence that reads as "nothing found".
+        sigs.extend(crate::mine::mine_succeeded(
+            &sessions,
+            &self.cfg.authoritative_evaluator,
+        ));
         for s in &sigs {
             *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
             let turns = report.signature_turns.entry(s.kind.name()).or_default();
@@ -234,6 +444,31 @@ impl EvolutionPass {
         }
         for turns in report.signature_turns.values_mut() {
             turns.sort_unstable();
+        }
+
+        // 4c. Fitness (M9 T4.3): the join from outcome back to selection.
+        //
+        // After grading, so this run's fresh verdicts count; before
+        // consolidation, so the demotion signal reads numbers derived from the
+        // log rather than whatever the last pass left in the columns. The
+        // numbers are *derived and set*, never incremented — running this
+        // twice over one log produces one answer.
+        report.fitness =
+            crate::fitness::derive(store, &sessions, &self.cfg.authoritative_evaluator).await?;
+        for note in &base.notes {
+            report
+                .fitness
+                .note_lifts
+                .insert(note.hash.clone(), note.lift);
+            report.fitness.notes.entry(note.hash.clone()).or_default();
+        }
+        if !self.cfg.dry_run {
+            for (scope, key, exposures, credits) in &report.fitness.facts {
+                store
+                    .set_fact_fitness(scope, key, *exposures, *credits)
+                    .await?;
+            }
+            ledger.fitness = report.fitness.notes.clone();
         }
 
         // `working` accumulates this run's accepted candidates so later ones
@@ -315,6 +550,15 @@ impl EvolutionPass {
             crate::consolidate::ConsolidateConfig {
                 stale_ms: self.cfg.fact_stale_days.saturating_mul(86_400_000),
                 dry_run: self.cfg.dry_run,
+                fitness_min_exposures: self.cfg.fitness_min_exposures,
+                fitness_demote: self.cfg.fitness_demote,
+                pinned_prefixes: self.cfg.pinned_prefixes.clone(),
+                fitness: report
+                    .fitness
+                    .facts
+                    .iter()
+                    .map(|(s, k, e, c)| ((s.clone(), k.clone()), (*e, *c)))
+                    .collect(),
             },
             Timestamp(now),
         )
@@ -347,7 +591,10 @@ impl EvolutionPass {
                     continue;
                 };
                 let trace = render_turn(events, s.turn);
-                let note = match proposer.propose(&trace, &working.notes).await {
+                let note = match proposer
+                    .propose(&trace, &working.notes, &s.kind.ask())
+                    .await
+                {
                     Ok(Some(n)) => n,
                     Ok(None) => continue,
                     Err(e) => {
@@ -381,12 +628,19 @@ impl EvolutionPass {
                     probe.as_ref(),
                     self.cfg.regression_budget,
                     &mut budget,
+                    // M9 T1.2: a reply-quality candidate needs a recorded
+                    // grade in the sessions it is probed on; an emitter-side
+                    // one keeps the path it had.
+                    &crate::notes::NoteGate {
+                        require_graded: s.kind.from_grades(),
+                        authoritative: self.cfg.authoritative_evaluator.clone(),
+                    },
                 )
                 .await;
                 report.probe_turns_used += v.turns_used;
                 let verdict = if v.accepted {
                     Verdict::Accepted
-                } else if v.detail.contains("budget exhausted") {
+                } else if v.unverified {
                     Verdict::Unverified
                 } else {
                     Verdict::Rejected
@@ -413,6 +667,10 @@ impl EvolutionPass {
                 let numbers = serde_json::json!({
                     "improved": v.improved, "regressed": v.regressed,
                     "lift": v.lift, "turns_used": v.turns_used,
+                    // Why a candidate is unverified is the only part of this
+                    // that is not a number, and the only part worth reading
+                    // when it is.
+                    "detail": v.detail,
                 });
                 let evidence = vec![Evidence {
                     session: s.session.0.clone(),
@@ -476,10 +734,10 @@ mod tests {
     struct Closed;
     #[async_trait::async_trait]
     impl Channel for Closed {
-        async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        async fn recv(&self) -> Result<Incoming, ChannelError> {
             Err(ChannelError::Closed)
         }
-        async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
             Ok(())
         }
     }
@@ -492,7 +750,7 @@ mod tests {
         b.set_channel(Box::new(Closed));
         b.set_consolidator(Box::new(NoopConsolidator));
         b.add_tool(Arc::new(EchoTool::new()));
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),
@@ -650,7 +908,12 @@ mod tests {
     struct FixedProposer(&'static str);
     #[async_trait::async_trait]
     impl NoteProposer for FixedProposer {
-        async fn propose(&self, _t: &str, _e: &[Note]) -> Result<Option<Note>, String> {
+        async fn propose(
+            &self,
+            _t: &str,
+            _e: &[Note],
+            _ask: &crate::notes::Ask,
+        ) -> Result<Option<Note>, String> {
             Ok(Some(Note::new("global", self.0, 0.0)))
         }
     }
@@ -720,5 +983,429 @@ mod tests {
         assert_eq!(live.notes[0].text, "Use echo to repeat text.");
         assert!(live.notes[0].lift > 0.0);
         assert!(report.probe_turns_used > 0);
+    }
+
+    // -----------------------------------------------------------------
+    // M8 T2.3a / M9 T1.1, T1.3 — a grade is a recorded value
+    // -----------------------------------------------------------------
+
+    /// A scripted scorer that answers once and then reports the service gone.
+    ///
+    /// The second state is the test's whole point: if anything downstream of
+    /// the first pass asks it a second question, the answer is an error, and
+    /// the recorded grade has to carry the session on its own.
+    struct StoppableEvaluator {
+        stopped: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Evaluator for StoppableEvaluator {
+        fn id(&self) -> String {
+            "scripted".into()
+        }
+        fn revision(&self) -> String {
+            "corpus-2026-09-09".into()
+        }
+        async fn grade(
+            &self,
+            _view: &crate::evaluate::TurnView<'_>,
+        ) -> Result<crate::evaluate::TurnGrade, crate::evaluate::GradeError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::evaluate::GradeError::Unavailable("stopped".into()));
+            }
+            Ok(crate::evaluate::TurnGrade {
+                issue: crate::evaluate::Issue::Reask,
+                answers_user: 0,
+                grounded: true,
+                scorer: "scripted".into(),
+            })
+        }
+    }
+
+    fn graded_events(events: &[nscore::Event]) -> Vec<&nscore::Event> {
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Graded { .. }))
+            .collect()
+    }
+
+    /// T2.3a's exit criterion, in one test: grade a session, stop the
+    /// scorer, read the log back — the verdicts are byte-identical and the
+    /// fold is untouched, because nothing recomputed them.
+    #[tokio::test]
+    async fn grading_a_session_then_replaying_it_yields_identical_grades_without_a_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        record_into(store.clone(), "s", vec![good()]).await;
+        let sid = SessionId("s".into());
+
+        let before = store.load(&sid).await.unwrap();
+        let fold_before = nsengine::state::fold(&before);
+        let normalized_before = nsengine::replay::normalize(&before);
+        assert!(graded_events(&before).is_empty());
+
+        let scorer = Arc::new(StoppableEvaluator {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let report = pass(dir.path(), rules.clone(), false)
+            .with_evaluator(scorer.clone())
+            .run_report(&*store)
+            .await
+            .unwrap();
+        assert_eq!(report.graded_turns, 1, "{report}");
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let after = store.load(&sid).await.unwrap();
+        let recorded: Vec<String> = graded_events(&after)
+            .iter()
+            .map(|e| serde_json::to_string(&e.kind).unwrap())
+            .collect();
+        // Both evaluators graded: the always-present symbolic one and ours.
+        assert!(
+            recorded
+                .iter()
+                .any(|j| j.contains(r#""by":"scripted""#) && j.contains("corpus-2026-09-09")),
+            "{recorded:?}"
+        );
+        assert!(recorded.iter().any(|j| j.contains(r#""by":"symbolic""#)));
+        assert!(
+            recorded
+                .iter()
+                .any(|j| j.contains(r#""ok":false"#) && j.contains("reask")),
+            "{recorded:?}"
+        );
+        // The chain still verifies — the grades extended it, nothing was
+        // rewritten.
+        assert!(EventLog::from_events(sid.clone(), after.clone())
+            .verify_chain()
+            .is_ok());
+        // And the behavioural projections are untouched.
+        assert_eq!(nsengine::replay::normalize(&after), normalized_before);
+        assert_eq!(nsengine::state::fold(&after), fold_before);
+
+        // Now stop the service and run the pass again with a scorer that
+        // cannot answer anything.
+        scorer
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let report2 = pass(dir.path(), rules, false)
+            .with_evaluator(scorer.clone())
+            .run_report(&*store)
+            .await
+            .unwrap();
+        assert_eq!(
+            (report2.graded_turns, report2.grades_unavailable),
+            (0, 0),
+            "a stopped scorer was never asked: {report2}"
+        );
+        assert!(report2.grades_reused >= 2, "{report2}");
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let replayed = store.load(&sid).await.unwrap();
+        let again: Vec<String> = graded_events(&replayed)
+            .iter()
+            .map(|e| serde_json::to_string(&e.kind).unwrap())
+            .collect();
+        assert_eq!(again, recorded, "verdicts are byte-identical");
+        assert_eq!(nsengine::state::fold(&replayed), fold_before);
+    }
+
+    /// M9 T1.3. The budget only ever pays for turns nothing has graded yet.
+    #[tokio::test]
+    async fn a_second_pass_grades_nothing_already_graded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        record_into(store.clone(), "a", vec![good()]).await;
+        record_into(store.clone(), "b", vec![good()]).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        let first = pass(dir.path(), rules.clone(), false)
+            .run_report(&*store)
+            .await
+            .unwrap();
+        assert_eq!((first.graded_turns, first.grades_reused), (2, 0), "{first}");
+
+        let second = pass(dir.path(), rules.clone(), false)
+            .run_report(&*store)
+            .await
+            .unwrap();
+        assert_eq!(
+            (second.graded_turns, second.grades_reused),
+            (0, 2),
+            "{second}"
+        );
+    }
+
+    /// The budget is a cap on *new* grades, and a dry run writes none.
+    #[tokio::test]
+    async fn the_budget_caps_new_grades_and_a_dry_run_writes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        record_into(store.clone(), "a", vec![good()]).await;
+        record_into(store.clone(), "b", vec![good()]).await;
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+
+        let capped = EvolutionPass::new(
+            rules.clone(),
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                evaluate: EvaluateConfig {
+                    budget_turns: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123));
+        let r = capped.run_report(&*store).await.unwrap();
+        assert_eq!(r.graded_turns, 1, "{r}");
+
+        // A dry run reports what it would grade and leaves the log alone.
+        let store2 = Arc::new(InMemoryStore::new());
+        record_into(store2.clone(), "a", vec![good()]).await;
+        let dry = pass(dir.path(), rules, true)
+            .run_report(&*store2)
+            .await
+            .unwrap();
+        assert_eq!(dry.graded_turns, 1, "{dry}");
+        let events = store2.load(&SessionId("a".into())).await.unwrap();
+        assert!(graded_events(&events).is_empty(), "dry run wrote a grade");
+    }
+
+    /// M9 T4.5. The exit criterion for the whole phase is that the numbers are
+    /// readable without opening SQLite — a fact in every prompt and in no
+    /// answer has to be visible in the dry run, beside the notes and beside
+    /// the alarm that says the join matched nothing.
+    #[tokio::test]
+    async fn the_dry_run_prints_exposures_and_credits_per_fact_and_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        let note = Note::new("global", "prefer the shortest action", 0.25);
+        crate::files::save_rules_atomic(
+            &dir.path().join("learned.toml"),
+            &LearnedRules {
+                notes: vec![note.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in ["shop.promo", "shop.hours"] {
+            store
+                .put_fact(Fact {
+                    key: key.into(),
+                    value: serde_json::json!("x"),
+                    valid_from: Timestamp(1),
+                    last_validated: Timestamp(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // One session: two turns, both showing both facts and the note; the
+        // first graded good, the second graded bad and citing one fact.
+        let sid = SessionId("s".into());
+        let mut log = EventLog::new(sid.clone());
+        for (turn, ok) in [(1u32, true), (2, false)] {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::UserSaid {
+                    text: "what is the promo".into(),
+                },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::ModelCall {
+                    usage: usage(),
+                    manifest: ContextManifest {
+                        fact_keys: vec!["shop.promo".into(), "shop.hours".into()],
+                        guidance: 1,
+                        note_hashes: vec![note.hash.clone()],
+                        ..Default::default()
+                    },
+                },
+            );
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Graded {
+                    turn,
+                    grade: Grade { ok, issues: vec![] },
+                    by: "symbolic".into(),
+                    revision: "r1".into(),
+                },
+            );
+        }
+        log.append(
+            2,
+            Timestamp(2),
+            EventKind::ReplyCited {
+                sources: vec!["fact:shop.hours".into()],
+            },
+        );
+        store.append(&sid, log.events()).await.unwrap();
+        // A second session that was graded and showed nothing: the alarm.
+        let blind = SessionId("blind".into());
+        let mut b = EventLog::new(blind.clone());
+        b.append(1, Timestamp(9), EventKind::UserSaid { text: "hi".into() });
+        b.append(
+            1,
+            Timestamp(9),
+            EventKind::ModelCall {
+                usage: usage(),
+                manifest: ContextManifest::default(),
+            },
+        );
+        b.append(
+            1,
+            Timestamp(9),
+            EventKind::Graded {
+                turn: 1,
+                grade: Grade {
+                    ok: true,
+                    issues: vec![],
+                },
+                by: "symbolic".into(),
+                revision: "r1".into(),
+            },
+        );
+        store.append(&blind, b.events()).await.unwrap();
+
+        let rules = Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default()));
+        let p = EvolutionPass::new(
+            rules,
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                dry_run: true,
+                // Every recorded grade is read back, so the scorer is never
+                // asked and the numbers are the fixture's own.
+                fitness_min_exposures: 2,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123));
+        let report = p.run_report(&*store).await.unwrap();
+
+        // `shop.promo` was shown twice and credited once (the good turn);
+        // `shop.hours` twice and credited twice (good turn, then cited in the
+        // bad one). Neither is zero-credit, so the top-10 list is empty here
+        // and the demote set with it.
+        assert_eq!(
+            report.fitness.facts,
+            vec![
+                ("global".into(), "shop.hours".into(), 2, 2),
+                ("global".into(), "shop.promo".into(), 2, 1),
+            ]
+        );
+        let text = report.to_string();
+        assert!(
+            text.contains("fitness: 2 facts derived, 2 with exposures, 0 zero-credit"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "note {}  lift 0.250  2 exposures  1 credits",
+                note.hash
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("alarm: graded session blind exposes no fact"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fitness demote: 0 candidates, knob off"),
+            "{text}"
+        );
+
+        // Dry run: nothing reached the store.
+        let stored = store.facts("global", "shop").await.unwrap();
+        assert!(
+            stored.iter().all(|f| f.exposures == 0 && f.credits == 0),
+            "{stored:?}"
+        );
+        assert!(Ledger::load(&dir.path().join("ledger.json"))
+            .unwrap()
+            .fitness
+            .is_empty());
+
+        // And the same pass, not dry, writes exactly those numbers — then a
+        // third derivation over the same log reproduces them.
+        let p = EvolutionPass::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
+            vec![EchoTool::new().spec().clone()],
+            dir.path().join("learned.toml"),
+            dir.path().join("ledger.json"),
+            PassConfig {
+                fitness_min_exposures: 2,
+                ..Default::default()
+            },
+        )
+        .with_clock(Box::new(|| 123));
+        let wet = p.run_report(&*store).await.unwrap();
+        assert_eq!(wet.fitness.facts, report.fitness.facts);
+        let stored = store.facts("global", "shop").await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|f| (f.key.clone(), f.exposures, f.credits))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shop.hours".to_string(), 2, 2),
+                ("shop.promo".to_string(), 2, 1)
+            ]
+        );
+        assert_eq!(
+            Ledger::load(&dir.path().join("ledger.json"))
+                .unwrap()
+                .fitness
+                .get(&note.hash)
+                .copied(),
+            Some(crate::fitness::NoteFitness {
+                exposures: 2,
+                credits: 1
+            })
+        );
+        let again = p.run_report(&*store).await.unwrap();
+        assert_eq!(again.fitness.facts, wet.fitness.facts, "idempotent");
+        let stored_again = store.facts("global", "shop").await.unwrap();
+        assert_eq!(
+            stored_again
+                .iter()
+                .map(|f| (f.exposures, f.credits))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (2, 1)]
+        );
+        // No version was added by the rescoring.
+        assert_eq!(
+            store
+                .fact_history("global", "shop.promo")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            role: "emitter".into(),
+            model: "m".into(),
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            estimated: false,
+            attempts: 1,
+            latency_ms: 5,
+            tools_tokens: 0,
+            cached_tokens: 0,
+        }
     }
 }

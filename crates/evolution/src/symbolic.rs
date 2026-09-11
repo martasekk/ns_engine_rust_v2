@@ -218,10 +218,10 @@ mod tests {
     struct Closed;
     #[async_trait::async_trait]
     impl Channel for Closed {
-        async fn recv(&mut self) -> Result<Incoming, ChannelError> {
+        async fn recv(&self) -> Result<Incoming, ChannelError> {
             Err(ChannelError::Closed)
         }
-        async fn send(&mut self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
+        async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), ChannelError> {
             Ok(())
         }
     }
@@ -240,7 +240,7 @@ mod tests {
         for g in guards {
             b.add_guard(g);
         }
-        let mut e = Engine::with_clock(
+        let e = Engine::with_clock(
             b.build().unwrap(),
             EngineConfig::default(),
             Box::new(|| Timestamp(1)),

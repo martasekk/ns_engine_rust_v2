@@ -6,12 +6,33 @@
 use nscore::{squash, Fact, FactState, MemoryStore, StoreError, Timestamp, Trust};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct ConsolidateConfig {
     /// A live fact neither validated nor used for this long goes cold.
     pub stale_ms: u64,
     /// Count and report, write nothing.
     pub dry_run: bool,
+    /// M9 T4.4: exposures at or above which a fact with no credits is a
+    /// demotion candidate. Below it the fact has not had a fair trial — a
+    /// fact shown twice and unused twice is noise, not evidence.
+    pub fitness_min_exposures: u32,
+    /// Whether the fitness signal *demotes* or only reports. Off for one
+    /// release (plan §P4): the rule is that fitness reports before it demotes,
+    /// and the knob flips only after a release's dry runs show the candidate
+    /// set is not simply the facts nothing ever queried.
+    pub fitness_demote: bool,
+    /// Key prefixes never demoted for low fitness, from `[memory]
+    /// pinned_prefixes`. Excluded *before* the branch: a pinned fact is in
+    /// every prompt by construction, so it accrues exposures whether or not
+    /// anything needed it, and its credit rate measures the prompt rather
+    /// than the fact.
+    pub pinned_prefixes: Vec<String>,
+    /// This pass's freshly derived counters, `(scope, key) -> (exposures,
+    /// credits)`. Passed in rather than read off the facts because on a dry
+    /// run nothing was written: without them the report would judge the store
+    /// by the numbers the *last* real pass left, and a dry run must show what
+    /// a real run would do now.
+    pub fitness: BTreeMap<(String, String), (u32, u32)>,
 }
 
 /// Write one digest per session that has a rolling summary (M7 Phase 4).
@@ -80,6 +101,13 @@ pub struct ConsolidationReport {
     pub conflicting: Vec<(String, String, String)>,
     /// Sessions whose digest was written or refreshed (M7 Phase 4).
     pub digests: usize,
+    /// M9 T4.4: `(scope, key, exposures)` for every fact the fitness signal
+    /// would send cold — reported whether or not `fitness_demote` acted.
+    pub fitness_demote_candidates: Vec<(String, String, u32)>,
+    /// Whether those candidates were written. The knob's state, printed, so a
+    /// report cannot be read as "nothing happened" when it means "nothing was
+    /// allowed to happen".
+    pub fitness_demote_applied: bool,
 }
 
 impl std::fmt::Display for ConsolidationReport {
@@ -91,6 +119,19 @@ impl std::fmt::Display for ConsolidationReport {
         )?;
         for (scope, keep, other) in &self.conflicting {
             write!(f, "\n  conflicting keys in {scope}: {keep} vs {other}")?;
+        }
+        write!(
+            f,
+            "\nfitness demote: {} candidates, knob {}",
+            self.fitness_demote_candidates.len(),
+            if self.fitness_demote_applied {
+                "on (applied)"
+            } else {
+                "off (reported only)"
+            }
+        )?;
+        for (scope, key, exposures) in &self.fitness_demote_candidates {
+            write!(f, "\n  {scope}/{key}  {exposures} exposures, 0 credits")?;
         }
         Ok(())
     }
@@ -119,6 +160,45 @@ pub async fn consolidate_facts(
                     c.state = FactState::Cold;
                     store.put_fact(c).await?;
                 }
+            }
+        }
+
+        // 1b. M9 T4.4: the third demotion signal — shown often enough to have
+        //     had a fair trial, and credited by nothing. Cold, not forgotten:
+        //     a cold fact stays searchable and revives on restatement, so the
+        //     worst case of a wrong demotion is a rank position, not a loss.
+        //
+        //     `fitness_demote` is off for a release. The rule (plan §P4) is
+        //     that fitness reports before it demotes: until a release of dry
+        //     runs shows this set is not simply the facts nobody ever asked
+        //     about, the candidates are printed and the store is untouched.
+        report.fitness_demote_applied = cfg.fitness_demote;
+        for f in live.iter().filter(|f| f.state == FactState::Current) {
+            // Pinned first, before any number is looked at: a pinned fact is
+            // in every prompt whether or not it was wanted, so its exposures
+            // measure the prompt and its credit rate would demote the user's
+            // own name.
+            if cfg.pinned_prefixes.iter().any(|p| f.key.starts_with(p)) {
+                continue;
+            }
+            let (exposures, credits) = cfg
+                .fitness
+                .get(&(scope.clone(), f.key.clone()))
+                .copied()
+                .unwrap_or((f.exposures, f.credits));
+            if cfg.fitness_min_exposures == 0
+                || exposures < cfg.fitness_min_exposures
+                || credits > 0
+            {
+                continue;
+            }
+            report
+                .fitness_demote_candidates
+                .push((scope.clone(), f.key.clone(), exposures));
+            if cfg.fitness_demote && !cfg.dry_run {
+                let mut c = f.clone();
+                c.state = FactState::Cold;
+                store.put_fact(c).await?;
             }
         }
 
@@ -300,6 +380,7 @@ mod tests {
             ConsolidateConfig {
                 stale_ms: 90 * DAY,
                 dry_run: false,
+                ..Default::default()
             },
             Timestamp(101 * DAY),
         )
@@ -355,6 +436,7 @@ mod tests {
             ConsolidateConfig {
                 stale_ms: 90 * DAY,
                 dry_run: true,
+                ..Default::default()
             },
             Timestamp(101 * DAY),
         )
@@ -367,5 +449,139 @@ mod tests {
         let live = store.facts("global", "").await.unwrap();
         assert_eq!(live.len(), 8);
         assert!(live.iter().all(|f| f.state == FactState::Current));
+    }
+
+    // ---- M9 T4.4: the third demotion signal ----
+
+    /// Four facts, all fresh enough that decay cannot touch them, so the only
+    /// thing that can move any of them is fitness.
+    async fn fit_store(now: u64) -> InMemoryStore {
+        let store = InMemoryStore::new();
+        // (key, exposures, credits)
+        for (key, exposures, credits) in [
+            ("user.name", 40u32, 0u32),
+            ("shop.promo", 12, 0),
+            ("shop.hours", 12, 1),
+            ("shop.rare", 2, 0),
+        ] {
+            store
+                .put_fact(Fact {
+                    key: key.into(),
+                    value: serde_json::json!("x"),
+                    confidence: 1.0,
+                    last_validated: Timestamp(now),
+                    last_used: Timestamp(now),
+                    valid_from: Timestamp(now),
+                    prov: nscore::Provenance::Constant,
+                    exposures,
+                    credits,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        store
+    }
+
+    fn fit_cfg(demote: bool, dry_run: bool) -> ConsolidateConfig {
+        ConsolidateConfig {
+            stale_ms: 90 * DAY,
+            dry_run,
+            fitness_min_exposures: 8,
+            fitness_demote: demote,
+            pinned_prefixes: vec!["user.".into()],
+            // Empty: these tests seed the counters on the facts themselves, so
+            // the fallback path — reading what the last pass wrote — is what
+            // is under test here. `pass.rs` exercises the override.
+            fitness: BTreeMap::new(),
+        }
+    }
+
+    async fn state_of(store: &InMemoryStore, key: &str) -> FactState {
+        store.fact_history("global", key).await.unwrap()[0].state
+    }
+
+    /// A pinned fact is in every prompt by construction. Its exposures measure
+    /// the prompt, not the fact, and its credit rate would send the user's own
+    /// name cold on the first quiet week. Excluded before the branch.
+    #[tokio::test]
+    async fn a_pinned_fact_is_never_demoted_for_low_fitness() {
+        let now = 100 * DAY;
+        let store = fit_store(now).await;
+        let report = consolidate_facts(&store, fit_cfg(true, false), Timestamp(now))
+            .await
+            .unwrap();
+        assert!(
+            !report
+                .fitness_demote_candidates
+                .iter()
+                .any(|(_, k, _)| k == "user.name"),
+            "{:?}",
+            report.fitness_demote_candidates
+        );
+        assert_eq!(state_of(&store, "user.name").await, FactState::Current);
+    }
+
+    /// One credit is enough. The signal is "shown often and never once
+    /// useful", not "shown more often than it was useful" — the second is a
+    /// ratio, and a ratio would demote the fact that answers a rare question
+    /// perfectly.
+    #[tokio::test]
+    async fn a_fact_with_credits_is_not_demoted() {
+        let now = 100 * DAY;
+        let store = fit_store(now).await;
+        let report = consolidate_facts(&store, fit_cfg(true, false), Timestamp(now))
+            .await
+            .unwrap();
+        let keys: Vec<&str> = report
+            .fitness_demote_candidates
+            .iter()
+            .map(|(_, k, _)| k.as_str())
+            .collect();
+        assert_eq!(keys, vec!["shop.promo"], "one credit saves shop.hours");
+        // And a fact below the exposure floor has not had a fair trial.
+        assert_eq!(state_of(&store, "shop.rare").await, FactState::Current);
+    }
+
+    /// The rule the phase is built on: fitness reports before it demotes. With
+    /// the knob off the candidate set is printed and the store is untouched.
+    #[tokio::test]
+    async fn demotion_is_reported_not_applied_while_the_knob_is_off() {
+        let now = 100 * DAY;
+        let store = fit_store(now).await;
+        let report = consolidate_facts(&store, fit_cfg(false, false), Timestamp(now))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.fitness_demote_candidates,
+            vec![("global".to_string(), "shop.promo".to_string(), 12)]
+        );
+        assert!(!report.fitness_demote_applied);
+        assert_eq!(state_of(&store, "shop.promo").await, FactState::Current);
+        assert!(
+            format!("{report}").contains("knob off (reported only)"),
+            "{report}"
+        );
+    }
+
+    /// And with the knob on it is cold — cold, not forgotten: a cold fact
+    /// stays searchable and revives on restatement, so a wrong demotion costs
+    /// a rank position rather than the value.
+    #[tokio::test]
+    async fn demotion_applies_when_the_knob_is_on() {
+        let now = 100 * DAY;
+        let store = fit_store(now).await;
+        let report = consolidate_facts(&store, fit_cfg(true, false), Timestamp(now))
+            .await
+            .unwrap();
+        assert!(report.fitness_demote_applied);
+        assert_eq!(state_of(&store, "shop.promo").await, FactState::Cold);
+        assert_eq!(report.fitness_demote_candidates.len(), 1);
+        // A dry run with the knob on still writes nothing.
+        let store = fit_store(now).await;
+        consolidate_facts(&store, fit_cfg(true, true), Timestamp(now))
+            .await
+            .unwrap();
+        assert_eq!(state_of(&store, "shop.promo").await, FactState::Current);
     }
 }

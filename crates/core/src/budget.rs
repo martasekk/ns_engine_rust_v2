@@ -49,7 +49,7 @@ impl BudgetMode {
 /// One thing the fit removed, or would have removed under `Report`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dropped {
-    /// `window`, `facts` or `summary`.
+    /// `window`, `obligations`, `facts`, `summary` or `guidance`.
     pub block: String,
     /// Which item, in the terms the log already uses: a turn number, a fact
     /// key. Enough to ask afterwards whether the turns that went wrong were
@@ -112,20 +112,23 @@ fn chars(s: &str) -> usize {
     s.chars().count()
 }
 
-fn facts_chars(facts: &[crate::memory::FactView]) -> usize {
+/// The rendered size of each stable block, in characters. Public because
+/// the engine records them in the manifest after the fit, and a second
+/// measurement written there would be the one that drifts (M9 T0.5).
+pub fn facts_chars(facts: &[crate::memory::FactView]) -> usize {
     facts
         .iter()
         .map(|f| chars(&crate::memory::render_fact(f)) + 3)
         .sum()
 }
 
-fn summary_chars(summary: Option<&crate::memory::SessionSummary>) -> usize {
+pub fn summary_chars(summary: Option<&crate::memory::SessionSummary>) -> usize {
     summary
         .map(|s| chars(&crate::memory::render_summary(s)))
         .unwrap_or(0)
 }
 
-fn window_chars(window: &[crate::memory::TurnRecord], caps: &crate::memory::Caps) -> usize {
+pub fn window_chars(window: &[crate::memory::TurnRecord], caps: &crate::memory::Caps) -> usize {
     chars(&crate::memory::render_window(window, window.len(), caps))
 }
 
@@ -139,9 +142,33 @@ fn emitter_chars(ctx: &crate::traits::EmitterContext) -> usize {
         + summary_chars(ctx.summary.as_ref())
         + window_chars(&ctx.window, &ctx.caps)
         + chars(&ctx.user_text)
+        + lines_chars(&ctx.obligations)
         + lines_chars(&ctx.trace_so_far)
         + lines_chars(&ctx.rejections_this_turn)
         + lines_chars(&ctx.guidance)
+}
+
+/// Cut `guidance` to `max`, reporting each note that went (M9 T2.2).
+///
+/// From the end: file order is the priority order today — `learned.toml` is
+/// written newest-last by the evolution pass and read in order — so a prefix
+/// is the notes that earned their place first. Dropping from the end is also
+/// what keeps `ContextManifest.note_hashes` truthful: the engine cuts the
+/// hash list to `ctx.guidance.len()`, which is only the right list if nothing
+/// was taken from the middle.
+///
+/// Unlike every other stage this is a hard cap rather than a budget
+/// decision, so it runs whether or not the context is over the limit — but
+/// like every other stage it only *reports* under [`BudgetMode::Report`].
+fn clamp_guidance(guidance: &mut Vec<String>, max: usize, report: &mut BudgetReport) {
+    while guidance.len() > max {
+        let note = guidance.pop().expect("len > max >= 0");
+        report.dropped.push(Dropped {
+            block: "guidance".into(),
+            detail: note.chars().take(40).collect(),
+            tokens: estimate_tokens(chars(&note) + 3),
+        });
+    }
 }
 
 /// The blocks of a reply context, in characters.
@@ -151,6 +178,7 @@ fn reply_chars(ctx: &crate::traits::ReplyContext) -> usize {
         + summary_chars(ctx.summary.as_ref())
         + window_chars(&ctx.window, &ctx.caps)
         + chars(&ctx.user_text)
+        + lines_chars(&ctx.obligations)
         + chars(&ctx.turn_trace)
         + lines_chars(&ctx.guidance)
 }
@@ -166,7 +194,10 @@ fn is_pinned(key: &str, pinned_prefixes: &[String]) -> bool {
 /// Bring an emitter context inside `limit`, or report what would.
 ///
 /// Order, first to go (plan §6, T2.1): oldest window records, then
-/// non-pinned relevant facts newest-rank-last, then the summary clamped.
+/// obligations from the end (M9 T2.1), then non-pinned relevant facts
+/// newest-rank-last, then the summary clamped. Guidance is clamped to
+/// `guidance_max` before any of it (M9 T2.2) and is no longer exempt from
+/// the count.
 /// Never the user's message, the rejections, the pending-confirmation line,
 /// or this turn's trace — the trace is already bounded deterministically by
 /// the fold (T1.3), which keeps refusals, and a second budget-driven trimmer
@@ -182,6 +213,7 @@ pub fn fit_emitter(
     limit: u32,
     mode: BudgetMode,
     pinned_prefixes: &[String],
+    guidance_max: usize,
 ) -> BudgetReport {
     let before = estimate_tokens(emitter_chars(ctx));
     let mut report = BudgetReport {
@@ -191,71 +223,96 @@ pub fn fit_emitter(
         mode,
         dropped: Vec::new(),
     };
-    if before <= limit || limit == 0 {
-        return report;
-    }
     // Work on a copy under Report, so the caller's context is untouched and
     // the numbers are still the ones enforcing would have produced.
     let mut facts = ctx.facts.clone();
     let mut window = ctx.window.clone();
     let mut summary = ctx.summary.clone();
+    let mut obligations = ctx.obligations.clone();
+    let mut guidance = ctx.guidance.clone();
+    // The hard cap first (M9 T2.2): it is not a budget decision, so it does
+    // not wait for the context to be over, and the stages below then see the
+    // notes that are actually going to be sent.
+    clamp_guidance(&mut guidance, guidance_max, &mut report);
     let fixed = chars(&ctx.user_text)
         + lines_chars(&ctx.trace_so_far)
         + lines_chars(&ctx.rejections_this_turn)
-        + lines_chars(&ctx.guidance);
+        + lines_chars(&guidance);
     let total = |facts: &[crate::memory::FactView],
                  window: &[crate::memory::TurnRecord],
-                 summary: Option<&crate::memory::SessionSummary>| {
+                 summary: Option<&crate::memory::SessionSummary>,
+                 obligations: &[String]| {
         estimate_tokens(
-            fixed + facts_chars(facts) + window_chars(window, &ctx.caps) + summary_chars(summary),
+            fixed
+                + facts_chars(facts)
+                + window_chars(window, &ctx.caps)
+                + summary_chars(summary)
+                + lines_chars(obligations),
         )
     };
 
-    while total(&facts, &window, summary.as_ref()) > limit && window.len() > 1 {
-        let record = window.remove(0);
-        report.dropped.push(Dropped {
-            block: "window".into(),
-            detail: format!("t{}", record.turn),
-            tokens: estimate_tokens(chars(&crate::memory::render_record(&record, &ctx.caps))),
-        });
-    }
-    while total(&facts, &window, summary.as_ref()) > limit {
-        let Some(at) = facts
-            .iter()
-            .rposition(|f| !is_pinned(&f.key, pinned_prefixes))
-        else {
-            break;
-        };
-        let fact = facts.remove(at);
-        report.dropped.push(Dropped {
-            block: "facts".into(),
-            detail: fact.key.clone(),
-            tokens: estimate_tokens(chars(&crate::memory::render_fact(&fact))),
-        });
-    }
-    if total(&facts, &window, summary.as_ref()) > limit {
-        if let Some(s) = summary.as_mut() {
-            let over = total(&facts, &window, Some(s)).saturating_sub(limit);
-            let was = summary_chars(Some(s));
-            // Four characters to the token, so trimming `over` tokens means
-            // trimming four times as many characters.
-            let target = was.saturating_sub(over as usize * 4);
-            s.clamp(target);
-            let now = summary_chars(Some(s));
-            if now < was {
-                report.dropped.push(Dropped {
-                    block: "summary".into(),
-                    detail: format!("clamped to {target} chars"),
-                    tokens: estimate_tokens(was - now),
-                });
+    if limit > 0 {
+        while total(&facts, &window, summary.as_ref(), &obligations) > limit && window.len() > 1 {
+            let record = window.remove(0);
+            report.dropped.push(Dropped {
+                block: "window".into(),
+                detail: format!("t{}", record.turn),
+                tokens: estimate_tokens(chars(&crate::memory::render_record(&record, &ctx.caps))),
+            });
+        }
+        // Obligations sit between the window and the facts (M9 T2.1): they
+        // are worth more than a fact ranked fifth by lexical overlap and
+        // less than the immediately preceding turn.
+        while total(&facts, &window, summary.as_ref(), &obligations) > limit
+            && !obligations.is_empty()
+        {
+            let o = obligations.pop().expect("not empty");
+            report.dropped.push(Dropped {
+                block: "obligations".into(),
+                detail: o.chars().take(40).collect(),
+                tokens: estimate_tokens(chars(&o) + 3),
+            });
+        }
+        while total(&facts, &window, summary.as_ref(), &obligations) > limit {
+            let Some(at) = facts
+                .iter()
+                .rposition(|f| !is_pinned(&f.key, pinned_prefixes))
+            else {
+                break;
+            };
+            let fact = facts.remove(at);
+            report.dropped.push(Dropped {
+                block: "facts".into(),
+                detail: fact.key.clone(),
+                tokens: estimate_tokens(chars(&crate::memory::render_fact(&fact))),
+            });
+        }
+        if total(&facts, &window, summary.as_ref(), &obligations) > limit {
+            if let Some(s) = summary.as_mut() {
+                let over = total(&facts, &window, Some(s), &obligations).saturating_sub(limit);
+                let was = summary_chars(Some(s));
+                // Four characters to the token, so trimming `over` tokens
+                // means trimming four times as many characters.
+                let target = was.saturating_sub(over as usize * 4);
+                s.clamp(target);
+                let now = summary_chars(Some(s));
+                if now < was {
+                    report.dropped.push(Dropped {
+                        block: "summary".into(),
+                        detail: format!("clamped to {target} chars"),
+                        tokens: estimate_tokens(was - now),
+                    });
+                }
             }
         }
     }
-    report.after = total(&facts, &window, summary.as_ref());
+    report.after = total(&facts, &window, summary.as_ref(), &obligations);
     if mode == BudgetMode::Enforce {
         ctx.facts = facts;
         ctx.window = window;
         ctx.summary = summary;
+        ctx.obligations = obligations;
+        ctx.guidance = guidance;
     }
     report
 }
@@ -270,6 +327,7 @@ pub fn fit_reply(
     limit: u32,
     mode: BudgetMode,
     pinned_prefixes: &[String],
+    guidance_max: usize,
 ) -> BudgetReport {
     let before = estimate_tokens(reply_chars(ctx));
     let mut report = BudgetReport {
@@ -279,50 +337,65 @@ pub fn fit_reply(
         mode,
         dropped: Vec::new(),
     };
-    if before <= limit || limit == 0 {
-        return report;
-    }
     let mut facts = ctx.facts.clone();
     let mut window = ctx.window.clone();
     let summary = ctx.summary.clone();
+    let mut obligations = ctx.obligations.clone();
+    let mut guidance = ctx.guidance.clone();
+    clamp_guidance(&mut guidance, guidance_max, &mut report);
     let fixed = chars(&ctx.persona)
         + chars(&ctx.user_text)
         + chars(&ctx.turn_trace)
-        + lines_chars(&ctx.guidance);
-    let total = |facts: &[crate::memory::FactView], window: &[crate::memory::TurnRecord]| {
+        + lines_chars(&guidance);
+    let total = |facts: &[crate::memory::FactView],
+                 window: &[crate::memory::TurnRecord],
+                 obligations: &[String]| {
         estimate_tokens(
             fixed
                 + facts_chars(facts)
                 + window_chars(window, &ctx.caps)
-                + summary_chars(summary.as_ref()),
+                + summary_chars(summary.as_ref())
+                + lines_chars(obligations),
         )
     };
-    while total(&facts, &window) > limit && window.len() > 1 {
-        let record = window.remove(0);
-        report.dropped.push(Dropped {
-            block: "window".into(),
-            detail: format!("t{}", record.turn),
-            tokens: estimate_tokens(chars(&crate::memory::render_record(&record, &ctx.caps))),
-        });
+    if limit > 0 {
+        while total(&facts, &window, &obligations) > limit && window.len() > 1 {
+            let record = window.remove(0);
+            report.dropped.push(Dropped {
+                block: "window".into(),
+                detail: format!("t{}", record.turn),
+                tokens: estimate_tokens(chars(&crate::memory::render_record(&record, &ctx.caps))),
+            });
+        }
+        while total(&facts, &window, &obligations) > limit && !obligations.is_empty() {
+            let o = obligations.pop().expect("not empty");
+            report.dropped.push(Dropped {
+                block: "obligations".into(),
+                detail: o.chars().take(40).collect(),
+                tokens: estimate_tokens(chars(&o) + 3),
+            });
+        }
+        while total(&facts, &window, &obligations) > limit {
+            let Some(at) = facts
+                .iter()
+                .rposition(|f| !is_pinned(&f.key, pinned_prefixes))
+            else {
+                break;
+            };
+            let fact = facts.remove(at);
+            report.dropped.push(Dropped {
+                block: "facts".into(),
+                detail: fact.key.clone(),
+                tokens: estimate_tokens(chars(&crate::memory::render_fact(&fact))),
+            });
+        }
     }
-    while total(&facts, &window) > limit {
-        let Some(at) = facts
-            .iter()
-            .rposition(|f| !is_pinned(&f.key, pinned_prefixes))
-        else {
-            break;
-        };
-        let fact = facts.remove(at);
-        report.dropped.push(Dropped {
-            block: "facts".into(),
-            detail: fact.key.clone(),
-            tokens: estimate_tokens(chars(&crate::memory::render_fact(&fact))),
-        });
-    }
-    report.after = total(&facts, &window);
+    report.after = total(&facts, &window, &obligations);
     if mode == BudgetMode::Enforce {
         ctx.facts = facts;
         ctx.window = window;
+        ctx.obligations = obligations;
+        ctx.guidance = guidance;
     }
     report
 }
@@ -355,6 +428,7 @@ mod tests {
 
     fn ctx() -> EmitterContext {
         EmitterContext {
+            usage: None,
             facts: vec![
                 fact("user.name", "Martin"),
                 fact("user.city", "Brno"),
@@ -372,6 +446,7 @@ mod tests {
             window: (1..=6).map(|t| record(t, &"w".repeat(200))).collect(),
             caps: Caps::default(),
             user_text: "what now".into(),
+            obligations: vec![],
             trace_so_far: vec!["ToolReturned(ok: done)".into()],
             pending_confirmation: false,
             rejections_this_turn: vec!["guard g: no".into()],
@@ -394,7 +469,7 @@ mod tests {
         let mut c = ctx();
         let facts_before = c.facts.len();
         let window_before = c.window.len();
-        let r = fit_emitter(&mut c, 100, BudgetMode::Report, &pinned());
+        let r = fit_emitter(&mut c, 100, BudgetMode::Report, &pinned(), 6);
         assert!(r.over(), "the fixture is deliberately over: {}", r.before);
         assert!(!r.dropped.is_empty(), "it says what it would drop");
         assert!(r.after < r.before, "and what that would save");
@@ -406,7 +481,7 @@ mod tests {
     #[test]
     fn enforce_applies_the_same_drops_in_the_planned_order() {
         let mut c = ctx();
-        let r = fit_emitter(&mut c, 100, BudgetMode::Enforce, &pinned());
+        let r = fit_emitter(&mut c, 100, BudgetMode::Enforce, &pinned(), 6);
         let blocks: Vec<&str> = r.dropped.iter().map(|d| d.block.as_str()).collect();
         assert_eq!(
             blocks.iter().position(|b| *b == "window"),
@@ -429,7 +504,7 @@ mod tests {
     #[test]
     fn pinned_facts_are_never_dropped_however_tight_the_budget() {
         let mut c = ctx();
-        let r = fit_emitter(&mut c, 1, BudgetMode::Enforce, &pinned());
+        let r = fit_emitter(&mut c, 1, BudgetMode::Enforce, &pinned(), 6);
         let keys: Vec<&str> = c.facts.iter().map(|f| f.key.as_str()).collect();
         assert!(keys.contains(&"user.name"), "{keys:?}");
         assert!(keys.contains(&"user.city"), "{keys:?}");
@@ -454,7 +529,7 @@ mod tests {
     #[test]
     fn a_context_within_budget_is_left_alone() {
         let mut c = ctx();
-        let r = fit_emitter(&mut c, 100_000, BudgetMode::Enforce, &pinned());
+        let r = fit_emitter(&mut c, 100_000, BudgetMode::Enforce, &pinned(), 6);
         assert!(!r.over());
         assert_eq!(r.before, r.after);
         assert!(r.dropped.is_empty());
@@ -467,9 +542,63 @@ mod tests {
     #[test]
     fn a_zero_limit_disables_the_fit() {
         let mut c = ctx();
-        let r = fit_emitter(&mut c, 0, BudgetMode::Enforce, &pinned());
+        let r = fit_emitter(&mut c, 0, BudgetMode::Enforce, &pinned(), 6);
         assert!(r.dropped.is_empty());
         assert_eq!(c.window.len(), 6);
+    }
+
+    /// M9 T2.2. Guidance used to be exempt from the count entirely, so
+    /// twelve notes could push a context past its ceiling and the fit would
+    /// answer by clamping the summary. The cap runs first and is enough on
+    /// its own here: the summary comes out untouched.
+    #[test]
+    fn guidance_is_clamped_before_the_summary_is() {
+        let mut c = ctx();
+        c.window.clear();
+        c.summary = Some(SessionSummary {
+            through_turn: 4,
+            topic: "t".repeat(200),
+            established: vec![],
+            open: vec![],
+            trust: Trust::User,
+            rebuilt_from: 1,
+        });
+        c.guidance = (1..=12)
+            .map(|n| format!("note {n}: {}", "g".repeat(60)))
+            .collect();
+        let summary_before = summary_chars(c.summary.as_ref());
+        // A ceiling the twelve notes breach and the six do not.
+        let limit = estimate_tokens(
+            summary_before
+                + chars(&c.user_text)
+                + lines_chars(&c.trace_so_far)
+                + lines_chars(&c.rejections_this_turn)
+                + facts_chars(&c.facts)
+                + lines_chars(&c.guidance[..8]),
+        );
+        let r = fit_emitter(&mut c, limit, BudgetMode::Enforce, &pinned(), 6);
+
+        assert_eq!(c.guidance.len(), 6, "six notes are rendered");
+        assert_eq!(c.guidance[0], "note 1: ".to_string() + &"g".repeat(60));
+        let guidance_drops: Vec<&Dropped> =
+            r.dropped.iter().filter(|d| d.block == "guidance").collect();
+        assert_eq!(guidance_drops.len(), 6, "{:?}", r.dropped);
+        assert!(
+            guidance_drops[0].detail.starts_with("note 12"),
+            "the tail goes first: {:?}",
+            guidance_drops[0]
+        );
+        assert_eq!(
+            summary_chars(c.summary.as_ref()),
+            summary_before,
+            "the clamp alone brought it under, so the summary stands"
+        );
+        assert!(
+            !r.dropped.iter().any(|d| d.block == "summary"),
+            "{:?}",
+            r.dropped
+        );
+        assert!(r.after <= limit, "after {} limit {limit}", r.after);
     }
 
     #[test]

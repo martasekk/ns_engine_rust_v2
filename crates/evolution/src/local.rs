@@ -383,6 +383,17 @@ impl Evaluator for LocalEvaluator {
         "local".into()
     }
 
+    /// The two fitted cuts, exactly as configured. They are what changes when
+    /// a sweep is re-run, so they are what a recorded grade has to carry: a
+    /// metric whose ranking inverts between datasets will certainly move when
+    /// its cuts do (`2026-09-09-local-evaluator-findings.md` §1).
+    fn revision(&self) -> String {
+        format!(
+            "reask_cosine={};relevance_cut={}",
+            self.cfg.reask_cosine, self.cfg.relevance_cut
+        )
+    }
+
     async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError> {
         // The exact facts first, and without a network call: if the turn was
         // told to act and did not, or stated something it was not shown, that

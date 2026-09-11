@@ -11,6 +11,7 @@ path = "src/main.rs"
 ns-core = { path = "../crates/core" }
 ns-engine = { path = "../crates/engine" }
 ns-channel-cli = { path = "../crates/channel-cli" }
+ns-channel-tcp = { path = "../crates/channel-tcp" }
 ns-llm = { path = "../crates/llm" }
 ns-components-std = { path = "../crates/components-std" }
 ns-memory-sqlite = { path = "../crates/memory-sqlite" }

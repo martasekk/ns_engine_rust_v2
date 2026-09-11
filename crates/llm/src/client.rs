@@ -119,6 +119,21 @@ impl OpenRouterClient {
     /// exponential backoff (backoff_base_ms * 2^attempt); other non-2xx fail
     /// immediately.
     pub async fn chat(&self, request: serde_json::Value) -> Result<serde_json::Value, ApiError> {
+        self.chat_into(request, None).await
+    }
+
+    /// [`chat`](Self::chat), leaving what the call cost in `sink` rather
+    /// than in the sink this client was built with. The engine passes the
+    /// sink of the turn a call belongs to (`EmitterContext::usage` and its
+    /// siblings), so two turns in flight at once cannot mix their records;
+    /// `None` falls back to the constructed sink, which is what a probe or
+    /// any other caller outside a turn still records into. The `role` in
+    /// the record is the client's either way.
+    pub async fn chat_into(
+        &self,
+        request: serde_json::Value,
+        sink: Option<&nscore::UsageSink>,
+    ) -> Result<serde_json::Value, ApiError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let headers = vec![
             (
@@ -142,7 +157,7 @@ impl OpenRouterClient {
             self.trace_attempt(&url, attempt, started.elapsed(), &request, &outcome);
             match outcome {
                 Ok(resp) if (200..300).contains(&resp.status) => {
-                    self.record_usage(&request, &resp.body, attempt + 1, started.elapsed());
+                    self.record_usage(sink, &request, &resp.body, attempt + 1, started.elapsed());
                     return Ok(resp.body);
                 }
                 Ok(resp) if resp.status == 429 || resp.status >= 500 => {
@@ -164,7 +179,8 @@ impl OpenRouterClient {
         Err(last_err)
     }
 
-    /// One `Usage` per successful call.
+    /// One `Usage` per successful call, into `sink` when the call brought
+    /// one and into the client's own otherwise.
     ///
     /// `attempts` counts the HTTP requests it took to get here, not the
     /// successes: a 429 retried twice spent three requests out of a daily
@@ -179,12 +195,15 @@ impl OpenRouterClient {
     /// what was paid for.
     fn record_usage(
         &self,
+        sink: Option<&nscore::UsageSink>,
         request: &serde_json::Value,
         body: &serde_json::Value,
         attempts: u32,
         took: std::time::Duration,
     ) {
-        let Some(sink) = &self.usage_sink else { return };
+        let Some(sink) = sink.or(self.usage_sink.as_deref()) else {
+            return;
+        };
         let count = |v: &serde_json::Value| v.as_u64().map(|n| n as u32);
         let usage = &body["usage"];
         let (prompt_tokens, completion_tokens, estimated) = match (
@@ -205,6 +224,11 @@ impl OpenRouterClient {
             Some(tools) => nscore::estimate_tokens(tools.to_string().len()),
             None => 0,
         };
+        // The provider's own cache accounting, where it keeps it. Absent from
+        // every shim that omits the `usage` block, so a missing details
+        // object is zero rather than an error: nothing was reported, and
+        // nothing is claimed.
+        let cached_tokens = count(&usage["prompt_tokens_details"]["cached_tokens"]).unwrap_or(0);
         sink.record(nscore::Usage {
             role: self.role.clone(),
             model: request["model"].as_str().unwrap_or_default().to_string(),
@@ -214,6 +238,7 @@ impl OpenRouterClient {
             attempts,
             latency_ms: took.as_millis() as u32,
             tools_tokens,
+            cached_tokens,
         });
     }
 
@@ -299,6 +324,53 @@ mod tests {
         assert!(u.tools_tokens > 0 && u.tools_tokens < u.prompt_tokens);
     }
 
+    /// The cache share, where OpenRouter reports it. It decides whether a
+    /// stable prefix is actually being reused, and no other number in the
+    /// body says so.
+    #[tokio::test]
+    async fn cached_tokens_is_read_from_prompt_tokens_details() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {
+                "prompt_tokens": 1234,
+                "completion_tokens": 56,
+                "prompt_tokens_details": {"cached_tokens": 2048}
+            }
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        c.chat(serde_json::json!({"model": "m", "messages": []}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        let u = &recorded[0];
+        assert_eq!(u.cached_tokens, 2048);
+        assert!(!u.estimated, "the provider reported these");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1234, 56));
+    }
+
+    /// Most providers send no details object at all. A zero says "not
+    /// reported" and leaves the counts that *were* reported alone.
+    #[tokio::test]
+    async fn a_usage_block_without_details_reports_zero_cached() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1234, "completion_tokens": 56}
+        })]);
+        let sink = Arc::new(nscore::UsageSink::new());
+        let c = client(mock).with_usage_sink(sink.clone(), "emitter");
+        c.chat(serde_json::json!({"model": "m", "messages": []}))
+            .await
+            .unwrap();
+
+        let recorded = sink.drain();
+        let u = &recorded[0];
+        assert_eq!(u.cached_tokens, 0, "nothing was reported");
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (1234, 56));
+        assert!(!u.estimated);
+    }
+
     /// Several OpenAI-compatible shims send no `usage` block at all, and
     /// those are the endpoints a small-model deployment actually runs on.
     /// An estimate that says it is one is better than a zero that does not.
@@ -339,6 +411,37 @@ mod tests {
         let c = client(mock).with_usage_sink(sink.clone(), "emitter");
         c.chat(serde_json::json!({})).await.unwrap();
         assert_eq!(sink.drain()[0].attempts, 2);
+    }
+
+    /// A call that brings its own sink records there and nowhere else; one
+    /// that brings none still records into the constructed sink. The first
+    /// is how the engine keeps two overlapping turns' costs apart, the
+    /// second is what keeps every caller outside a turn working unchanged.
+    #[tokio::test]
+    async fn a_per_call_sink_takes_the_record_and_the_constructed_one_is_the_fallback() {
+        let mock = MockTransport::ok(vec![
+            serde_json::json!({"usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
+            serde_json::json!({"usage": {"prompt_tokens": 2, "completion_tokens": 2}}),
+        ]);
+        let constructed = Arc::new(nscore::UsageSink::new());
+        let per_call = nscore::UsageSink::new();
+        let c = client(mock).with_usage_sink(constructed.clone(), "emitter");
+
+        c.chat_into(serde_json::json!({"model": "m"}), Some(&per_call))
+            .await
+            .unwrap();
+        assert!(
+            constructed.drain().is_empty(),
+            "the call's own sink took the record"
+        );
+        let recorded = per_call.drain();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].prompt_tokens, 1);
+        assert_eq!(recorded[0].role, "emitter", "the role stays the client's");
+
+        c.chat(serde_json::json!({"model": "m"})).await.unwrap();
+        assert!(per_call.drain().is_empty());
+        assert_eq!(constructed.drain()[0].prompt_tokens, 2);
     }
 
     /// Without a sink the client is exactly what it was.

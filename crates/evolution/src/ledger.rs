@@ -33,6 +33,17 @@ pub struct LedgerEntry {
 pub struct Ledger {
     #[serde(default)]
     pub entries: BTreeMap<String, LedgerEntry>,
+    /// M9 T4.5: per-note fitness by note hash, derived from the log on every
+    /// pass (`fitness::derive`).
+    ///
+    /// Beside `entries` rather than inside a `LedgerEntry.numbers`: an entry
+    /// records how a *candidate* was verified, and a hand-written note in
+    /// `learned.toml` was never a candidate, so it has no entry to hang a
+    /// number on. Exposures and credits are facts about a note that is being
+    /// rendered now, whatever put it there. `#[serde(default)]`, so a ledger
+    /// written before M9 loads with the map empty.
+    #[serde(default)]
+    pub fitness: BTreeMap<String, crate::fitness::NoteFitness>,
 }
 
 impl Ledger {

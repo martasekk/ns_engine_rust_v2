@@ -44,6 +44,19 @@ pub struct Usage {
     /// design that is portable across all seven provider presets.
     #[serde(default)]
     pub tools_tokens: u32,
+    /// Prompt tokens the provider served out of its own prompt cache, as it
+    /// reported them: OpenRouter puts the number in
+    /// `usage.prompt_tokens_details.cached_tokens`. Part of `prompt_tokens`
+    /// rather than extra to it — the share of a prompt that was already
+    /// sitting on the provider's side, and the only evidence that a stable
+    /// prefix is being reused rather than merely intended.
+    ///
+    /// Zero when the provider sends no details block, and zero on an
+    /// estimated call, where there is no provider number to split. A zero
+    /// therefore means "not reported", which is why it is read from the
+    /// body rather than derived from anything here.
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 /// Four characters to the token.
@@ -55,6 +68,19 @@ pub struct Usage {
 /// visible without being load-bearing.
 pub fn estimate_tokens(chars: usize) -> u32 {
     (chars / 4) as u32
+}
+
+/// One context block, blanked to measure what it was worth (M9 T0.4).
+///
+/// The blanking happens *after* the fit, so the budget report still counts
+/// the block as it was composed and the ablation is visible only in the
+/// rendered prompt and in the manifest's keys for that block being empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ablate {
+    Facts,
+    Summary,
+    Guidance,
 }
 
 /// What one call was shown, in keys rather than content.
@@ -88,10 +114,42 @@ pub struct ContextManifest {
     /// with a desktop wired in there are seventeen.
     #[serde(default)]
     pub tools: usize,
-    /// Guidance notes rendered. A count, not a reconstruction key: the notes
-    /// live in `learned.toml`, which the evolution pass rewrites.
+    /// Guidance notes rendered, and the hash of each.
+    ///
+    /// The count came first, and stays: the notes live in `learned.toml`,
+    /// which the evolution pass rewrites, so a count was all the log could
+    /// hold. The hashes now ride alongside it (M9 T0.3) — a note's hash is
+    /// stable across rewrites of that file, so a note can be scored per turn
+    /// by joining this manifest to the turn's grade. `note_hashes.len() ==
+    /// guidance` on every call written since, which is the invariant saying
+    /// both were filled from one render. Manifests written before M9 carry
+    /// no list and deserialize with an empty one; they are never backfilled,
+    /// because events are hash-chained over their JSON.
     #[serde(default)]
     pub guidance: usize,
+    #[serde(default)]
+    pub note_hashes: Vec<String>,
+    /// Obligation lines rendered (M9 T2.1). A count, not the text: the
+    /// clauses are the user's own words, which the `UserSaid` event of the
+    /// same turn already holds verbatim — `obligations_for` replays them
+    /// from it. Manifests written before M9 carry a zero.
+    #[serde(default)]
+    pub obligations: usize,
+    /// The rendered size, in characters, of the three stable blocks *as
+    /// sent* — measured after the fit with the same render functions the fit
+    /// measures with (M9, for T0.5's stable-prefix estimate). A sum of block
+    /// sizes is not recoverable from the keys, which is why it is recorded
+    /// rather than derived.
+    #[serde(default)]
+    pub facts_chars: usize,
+    #[serde(default)]
+    pub summary_chars: usize,
+    #[serde(default)]
+    pub window_chars: usize,
+    /// Which block, if any, was blanked after fitting (M9 T0.4). Set only by
+    /// the evaluation harness; `None` on every live call.
+    #[serde(default)]
+    pub ablated: Option<Ablate>,
     /// Which tier this call was routed to (M7 Phase 3), and the cues that
     /// decided it. `None` when no router is installed. Recorded because a
     /// misroute is invisible in an answer — a `Chat` turn that needed a tool
@@ -120,10 +178,12 @@ pub struct ContextManifest {
 /// would push an accounting concern into the contract the whole engine mocks
 /// against, for a number only the real client can produce.
 ///
-/// The engine drains after each of its own calls, and its three call sites
-/// never overlap — the rolling summary runs while the loop waits for the
-/// next message, never beside a turn — so what a drain returns belongs to
-/// the call that just finished.
+/// The engine gives each call its own sink through the call's context
+/// ([`crate::EmitterContext::usage`] and its siblings) and drains it right
+/// after the call, so what a drain returns belongs to that call even when
+/// another session's turn is in flight at the same time. A client built with
+/// a sink of its own records there only for a call whose context carries
+/// none — the evolution pass's probes, and anything else outside a turn.
 #[derive(Debug, Default)]
 pub struct UsageSink {
     calls: std::sync::Mutex<Vec<Usage>>,
@@ -164,6 +224,7 @@ mod tests {
             attempts: 1,
             latency_ms: 5,
             tools_tokens: 0,
+            cached_tokens: 0,
         }
     }
 
@@ -205,6 +266,12 @@ mod tests {
             tier: Some(crate::router::Tier::Task),
             route_cues: vec!["click".into()],
             guidance: 1,
+            note_hashes: vec!["sha256:beef".into()],
+            obligations: 2,
+            facts_chars: 40,
+            summary_chars: 200,
+            window_chars: 300,
+            ablated: Some(Ablate::Summary),
             budget: None,
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -214,5 +281,37 @@ mod tests {
         // here later).
         let sparse: ContextManifest = serde_json::from_str("{}").unwrap();
         assert_eq!(sparse, ContextManifest::default());
+    }
+
+    /// The rule the M9 plan records as a risk: events are hash-chained over
+    /// their serialized JSON, so a manifest written before `note_hashes`
+    /// existed can never be rewritten to carry one. It has to read as an
+    /// empty list with every other field intact — a pre-M9 session simply
+    /// scores no notes.
+    #[test]
+    fn an_old_manifest_json_without_note_hashes_still_parses() {
+        let old = r#"{
+            "fact_keys": ["user.name", "user.city"],
+            "summary_through": 4,
+            "window": [5, 10],
+            "trace_lines": 3,
+            "trace_chars": 120,
+            "clipped_chars": 0,
+            "tools": 17,
+            "guidance": 2,
+            "tier": "task",
+            "route_cues": ["click"]
+        }"#;
+        let m: ContextManifest = serde_json::from_str(old).unwrap();
+        assert!(m.note_hashes.is_empty(), "no list is an empty list");
+        assert_eq!(m.fact_keys, vec!["user.name", "user.city"]);
+        assert_eq!(m.guidance, 2, "the count it did carry is untouched");
+        assert_eq!(m.summary_through, Some(4));
+        assert_eq!(m.window, Some((5, 10)));
+        assert_eq!(m.tools, 17);
+        assert_eq!(m.tier, Some(crate::router::Tier::Task));
+        // The other M9 fields read the same way.
+        assert_eq!((m.facts_chars, m.summary_chars, m.window_chars), (0, 0, 0));
+        assert_eq!(m.ablated, None);
     }
 }

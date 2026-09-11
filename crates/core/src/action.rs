@@ -227,6 +227,20 @@ pub struct Fact {
     /// Last time the fact was shown to a model (decay input, M6 §6.2).
     #[serde(default)]
     pub last_used: Timestamp,
+    /// M9 T4.1: model calls this fact was rendered into, derived by the
+    /// evolution pass from `ModelCall.manifest.fact_keys`.
+    ///
+    /// Derived, never incremented: every pass recomputes both counters from
+    /// the whole log and *sets* them, so a second pass is idempotent, the
+    /// numbers are auditable against the events, and a pre-M9 session — whose
+    /// manifests are never backfilled — contributes zero.
+    #[serde(default)]
+    pub exposures: u32,
+    /// Of those calls, the ones whose turn went well: a good `Graded` verdict
+    /// from the authoritative evaluator, or a `ReplyCited` naming this fact.
+    /// The usefulness half of the fitness pair (M9 T4.1).
+    #[serde(default)]
+    pub credits: u32,
 }
 
 fn default_scope() -> String {
@@ -252,6 +266,8 @@ impl Default for Fact {
             valid_to: None,
             state: FactState::Current,
             last_used: Timestamp(0),
+            exposures: 0,
+            credits: 0,
         }
     }
 }
@@ -301,7 +317,10 @@ mod tests {
             let err = spec
                 .check_arg_names()
                 .expect_err("argument sorting before the rationale must be refused");
-            assert!(err.contains(bad), "error names the offending argument: {err}");
+            assert!(
+                err.contains(bad),
+                "error names the offending argument: {err}"
+            );
         }
     }
 

@@ -304,7 +304,7 @@ fn build_pass(
         std::path::PathBuf::from(&cfg.evolution.learned_path),
         std::path::PathBuf::from(&cfg.evolution.ledger_path),
         cfg.evolution
-            .pass_config(dry_run, cfg.memory.fact_stale_days),
+            .pass_config(dry_run, &cfg.memory, cfg.models.evaluate_budget_turns),
     );
     match emitter.key() {
         None => {
@@ -421,6 +421,7 @@ async fn main() {
                 cfg.memory.caps(),
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
+                cfg.persona.text.len(),
             )
         );
         return;
@@ -440,7 +441,11 @@ async fn main() {
             }
         };
         if parsed.paraphrase {
-            std::process::exit(eval::run_paraphrase().await);
+            std::process::exit(eval::run_paraphrase(parsed.activation).await);
+        }
+        // M9 T0.4. A report, not a gate: exits 0 whatever the delta.
+        if let Some(block) = parsed.ablate {
+            std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
         std::process::exit(eval::run(&parsed.ledger).await);
     }
@@ -494,6 +499,12 @@ async fn main() {
         return;
     }
 
+    // `ns-app serve`: the chat assembly below, on the TCP channel instead of
+    // stdin (multi-conversation plan Phase 3). Not a separate path — the
+    // harness is built exactly as for the chat, and the flag is consulted
+    // at the points that differ: the channel, the fact scope, the banner.
+    let serve = args.get(1).map(String::as_str) == Some("serve");
+
     // Each role resolves on its own, so the emitter can sit on a local
     // model while the replier stays in the cloud (or the other way round).
     let emitter_target = role_or_exit(&cfg, Role::Emitter);
@@ -521,14 +532,49 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let worker_slots = match cfg.engine.worker_slots() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("config.toml: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The listener too, for the same reason: a missing token or a bad
+    // address is refused here, before the pointer has been dialled.
+    let tcp = if serve {
+        let Some(token) = cfg.serve.token() else {
+            eprintln!(
+                "{} is not set — `ns-app serve` needs a token; every client presents it in \
+                 its first line.",
+                cfg.serve.token_env
+            );
+            std::process::exit(1);
+        };
+        match nschannel_tcp::TcpChannel::bind(
+            &cfg.serve.listen,
+            token,
+            cfg.serve.max_connections,
+            cfg.serve.allow_remote,
+        )
+        .await
+        {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                eprintln!("serve: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules_or_exit(&cfg);
     let tools = build_tools(&cfg).await;
 
-    // M7 T0.1: one sink for the three roles. The engine drains it after each
-    // of its own calls, and those never overlap, so every record lands on
-    // the `ModelCall` of the call that produced it.
+    // M7 T0.1: the engine hands each of its own calls a sink of its own
+    // through the call's context, so this one is only the fallback for calls
+    // made outside a turn — and it is what names the role in every record.
     let usage = Arc::new(nscore::UsageSink::new());
 
     let mut b = HarnessBuilder::new();
@@ -547,22 +593,38 @@ async fn main() {
     ));
     b.set_memory(Arc::new(
         nsmemory_sqlite::SqliteStore::open(std::path::Path::new(&cfg.store.path))
-            .expect("open sqlite store"),
+            .expect("open sqlite store")
+            // M9 T3.1/T3.2. The composition root is where the `[memory]`
+            // knobs meet the store; `EngineConfig` carries the same two
+            // numbers for anything that reads the config as one object.
+            // Both default to today's ranking.
+            .with_activation(
+                cfg.memory.activation_weight,
+                cfg.memory.activation_half_life_days,
+            ),
     ));
-    // stdin, plus the desktop's compose box when there is one to read. The
-    // agent has offered that channel since 2026-09-05 and nothing collected
-    // it; a line typed into the badge went into the outbox and stopped there.
     // Says whether the local model service is answering, when one is asked
     // for. Before the channel so the line lands with the other startup
     // reports rather than in the middle of the first turn.
     models::announce(&cfg.models).await;
-    let cli = nschannel_cli::CliChannel::new_stdio();
-    match desktop_messages(&cfg).await {
-        Some(client) => b.set_channel(Box::new(
-            nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
-        )),
-        None => b.set_channel(Box::new(cli)),
-    };
+    let serve_addr = tcp.as_ref().map(|c| c.local_addr());
+    if let Some(channel) = tcp {
+        // `serve`: the TCP channel and nothing else — no stdin, and no
+        // compose box, which joins a desktop to *one* session.
+        b.set_shared_channel(channel);
+    } else {
+        // stdin, plus the desktop's compose box when there is one to read.
+        // The agent has offered that channel since 2026-09-05 and nothing
+        // collected it; a line typed into the badge went into the outbox and
+        // stopped there.
+        let cli = nschannel_cli::CliChannel::new_stdio();
+        match desktop_messages(&cfg).await {
+            Some(client) => b.set_channel(Box::new(
+                nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
+            )),
+            None => b.set_channel(Box::new(cli)),
+        };
+    }
     // M6 §5.1: the rolling summary runs on its own role (model, provider,
     // key), so it can be swapped without touching the emitter or replier.
     if cfg.memory.summary_every_turns > 0 {
@@ -571,10 +633,10 @@ async fn main() {
             Some(role_key) => {
                 let c = client_for(&target, transport.clone(), &role_key)
                     .with_usage_sink(usage.clone(), "summarizer");
-                b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(
-                    c,
-                    target.model.clone(),
-                )));
+                b.set_summarizer(Box::new(
+                    nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
+                        .with_guidelines(cfg.memory.summary_guidelines.clone()),
+                ));
             }
             None => eprintln!(
                 "{} is not set — rolling summary disabled.",
@@ -610,6 +672,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // M6 §6.6: the fact scope. The CLI is single-user, so every session
+    // shares `global`. `serve` is a multi-user channel, and a global scope
+    // there is a leak — what one client tells the engine would surface as a
+    // standing fact in every other client's context — so each session is
+    // its own scope. (§6.6 named the Telegram target; the TCP channel is the
+    // same shape.)
+    let scope_for: Arc<dyn Fn(&SessionId) -> String + Send + Sync> = if serve {
+        Arc::new(|sid| sid.0.clone())
+    } else {
+        Arc::new(|_| "global".to_string())
+    };
     let engine_cfg = EngineConfig {
         max_iterations: cfg.engine.max_iterations,
         max_emit_retries: cfg.engine.max_emit_retries,
@@ -623,12 +696,19 @@ async fn main() {
         facts_in_context: cfg.memory.facts_in_context,
         reply_grounding_check: cfg.memory.reply_grounding_check,
         max_echo_ratio: cfg.memory.max_echo_ratio,
-        // The CLI is single-user: every session shares the global scope.
-        scope_for: Arc::new(|_| "global".to_string()),
+        scope_for,
         remember_residual,
         pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
         pinned_max: cfg.memory.pinned_max,
         relevant_max: cfg.memory.relevant_max,
+        activation_weight: cfg.memory.activation_weight,
+        activation_half_life_days: cfg.memory.activation_half_life_days,
+        obligations_max: cfg.memory.obligations_max,
+        obligation_check: cfg.memory.obligation_check,
+        guidance_max: cfg.memory.guidance_max,
+        // M9 T0.4 is an evaluation knob with no config key: the live harness
+        // never ablates a block.
+        ablate: None,
         summary_every_turns: cfg.memory.summary_every_turns,
         summary_rebuild_every: cfg.memory.summary_rebuild_every,
         summary_max_chars: cfg.memory.summary_max_chars,
@@ -644,9 +724,9 @@ async fn main() {
         prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
         budget_mode,
         show_budget_line: cfg.memory.show_budget_line,
-        usage: Some(usage),
+        worker_slots,
     };
-    let mut engine = Engine::new(parts, engine_cfg);
+    let engine = Engine::new(parts, engine_cfg);
     println!(
         "ns-harness — {}  |  {}",
         emitter_target.describe(),
@@ -663,7 +743,13 @@ async fn main() {
              input for 5s, or use the badge's pie menu)."
         );
     }
-    println!("type text, /quit to exit  ·  `ns-app providers` lists the backends");
+    match serve_addr {
+        Some(addr) => println!(
+            "serving on {addr} — one session per connection, facts scoped per session  ·  \
+             `ns-app providers` lists the backends"
+        ),
+        None => println!("type text, /quit to exit  ·  `ns-app providers` lists the backends"),
+    }
     if let Err(e) = engine.run().await {
         eprintln!("engine stopped: {e}");
     }
