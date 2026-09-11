@@ -344,3 +344,13 @@ Follow-ups recorded, not built: schema slimming with `tools_tokens` as the befor
 fixtures carrying a summary and notes so `--ablate summary|guidance` can read anything;
 the reply regeneration cost (a second replier request on a plain chat turn) as a signature
 for the pass to count.
+
+### P3 — done 2026-09-11, 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T3.1 | at `w = 0.0` output byte-identical to today's | met: `Activation { weight, half_life_days, now }`, `bonus()` returns a hard `0.0` at weight 0 (also rules out NaN from a zero half-life); zero-hit filter runs before the bonus; `activation_freq(f) = f.uses` is the one line P4 flips to `credits` |
+| T3.2 | `search_turns` order unchanged at weight 0 | met in both stores; candidates `max(4k, 20)`, `RECENCY_HALF_LIFE_TURNS = 20`, trait signature untouched via `with_activation` builders. Finding: in `InMemoryStore` scores are whole token counts, so a fractional recency term can only confirm the newest-first tiebreak; it reorders only against fractional bm25 (SQLite) |
+| T3.3 | `w` moves off 0 only if the verbatim arm holds | **suites insensitive**: at `w ∈ {0, 0.5, 1.0}` paraphrase verbatim miss 0%/0%, paraphrase-arm miss 75% (in-mem) / 83% (SQLite), ablate-facts 9/9 → 4/9 — identical lists at every weight. The verbatim arm does not regress, and nothing is evidence *for* moving. **Default stays 0.0.** A corpus where recall targets tie on hits is the follow-up before this knob can be decided |
+
+`ns-app eval --activation <w>` exists for that day.
