@@ -34,6 +34,23 @@ pub struct EngineConfig {
     /// copies its own prompt instead of answering. Off in replay and probes,
     /// where recorded doubles stand in for the replier.
     pub reply_grounding_check: bool,
+    /// M12 T1.2: whether a flagged draft is regenerated, split out of
+    /// `reply_grounding_check` so the observation and the billed second call
+    /// can be decided apart. On by default, which is today's behaviour;
+    /// `main.rs` turns it off under `Capability::Strong`, where the draft
+    /// is still flagged and still logged but stands as written.
+    pub reply_regenerate: bool,
+    /// M12 T4.3: on a chat-tier turn, let the emitter call either act or
+    /// answer, and take its answer as the reply. Off by default, and off is
+    /// today's two-call chat turn, request for request and event for event.
+    ///
+    /// Chat only. On Task and Deep the emitter/replier split is doing real
+    /// work — one model chooses, the other narrates what happened — and a
+    /// model that answers mid-loop would be answering before the turn is
+    /// over. A chat turn has no loop to speak of: its emitter call exists to
+    /// say "no tool applies", which is a sentence the same call could have
+    /// spent on the user instead.
+    pub chat_act_or_answer: bool,
     /// Reporting threshold, not a gate: a draft at or over this fraction of
     /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
     /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
@@ -74,6 +91,14 @@ pub struct EngineConfig {
     /// M9 T2.2: guidance notes rendered into either context, at most. The
     /// tail is dropped and reported; file order is the priority order.
     pub guidance_max: usize,
+    /// M12 T3.2: skip guidance notes learned on a model other than
+    /// `learning_model`. Off, so the default renders every note, the way it
+    /// always did.
+    pub archive_foreign_notes: bool,
+    /// M12 T3.2: the emitter model this deployment runs, as the composition
+    /// root resolved it. Only `archive_foreign_notes` reads it; the engine
+    /// otherwise has no model id at render time.
+    pub learning_model: Option<String>,
     /// M9 T0.4: blank one context block after the fit, to measure what it
     /// was worth. Set programmatically by the evaluation harness only —
     /// there is deliberately no config key for it, because an ablated engine
@@ -127,6 +152,9 @@ pub struct EngineConfig {
     /// M10 T1.3: which spelling of every tool description the emitter is
     /// shown. `Full` — the default — is today's text unchanged.
     pub schema_profile: nscore::SchemaProfile,
+    /// M12 T1.1: which class of model this deployment drives. `Small` — the
+    /// default — is today's behaviour in every place that reads it.
+    pub capability: nscore::Capability,
     /// M10 T1.4: whether the synthetic tools that cannot apply are left out
     /// of the legal set. On by default, and **off under replay**.
     ///
@@ -194,6 +222,15 @@ pub struct EngineConfig {
     /// return it carries the digests' *lowest* trust, it is in the
     /// provenance index, and it replays.
     pub exemplars_max: usize,
+    /// M12 T6.1: the hard ceiling on model requests this engine may spend
+    /// before it stops taking turns. `None` — the default — is no ceiling,
+    /// which is every deployment but a metered one.
+    ///
+    /// Counted across every role, the summarizer included, from the moment
+    /// the engine was built; checked at the start of a turn, never inside
+    /// one, so a run stops between turns rather than mid-flight with a tool
+    /// called and nothing said about it.
+    pub max_requests: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -211,6 +248,8 @@ impl Default for EngineConfig {
             caps: nscore::Caps::default(),
             facts_in_context: 10,
             reply_grounding_check: true,
+            reply_regenerate: true,
+            chat_act_or_answer: false,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
@@ -222,6 +261,8 @@ impl Default for EngineConfig {
             obligations_max: 5,
             obligation_check: false,
             guidance_max: 6,
+            archive_foreign_notes: false,
+            learning_model: None,
             ablate: None,
             summary_every_turns: 4,
             summary_rebuild_every: 3,
@@ -234,6 +275,7 @@ impl Default for EngineConfig {
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
             schema_profile: nscore::SchemaProfile::Full,
+            capability: nscore::Capability::Small,
             prune_inapplicable: true,
             router: None,
             prompt_budget_tokens: 6000,
@@ -242,6 +284,7 @@ impl Default for EngineConfig {
             worker_slots: 1,
             recall_hybrid: false,
             exemplars_max: 0,
+            max_requests: None,
         }
     }
 }
@@ -253,6 +296,12 @@ pub struct Engine {
     /// Always-on guard chain, checked before plugin guards. Plugins cannot
     /// remove these (spec §5.4).
     builtin_guards: Vec<Box<dyn nscore::Guard>>,
+    /// M12 T6.1: model requests recorded since this engine was built, what
+    /// `max_requests` is measured against. Every role counts, and it is
+    /// incremented where the calls are already counted once —
+    /// `record_model_calls` — so a role that books usage is capped by the
+    /// fact that it books usage, with nothing to keep in step.
+    spent: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +310,11 @@ pub enum EngineError {
     Store(#[from] nscore::StoreError),
     #[error("channel: {0}")]
     Channel(String),
+    /// M12 T6.1: `max_requests` is spent, so no further turn is started.
+    /// Not a failure of the turn it is returned from — that turn made no
+    /// call at all — but the end of a metered run.
+    #[error("request cap {cap} reached after {spent} requests")]
+    RequestCap { spent: u32, cap: u32 },
 }
 
 pub const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
@@ -565,6 +619,7 @@ impl Engine {
             cfg,
             clock,
             builtin_guards: guards,
+            spent: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1113,6 +1168,7 @@ impl Engine {
         turn: u32,
         manifest: &nscore::ContextManifest,
     ) {
+        let mut calls = 0u32;
         for usage in sink.drain() {
             log.append(
                 turn,
@@ -1122,7 +1178,30 @@ impl Engine {
                     manifest: manifest.clone(),
                 },
             );
+            calls += 1;
         }
+        // M12 T6.1: what the request cap is measured against. Here because
+        // this is the one place the engine's own calls are already counted.
+        self.spent
+            .fetch_add(calls, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// M12 T6.1: whether this engine may start another turn.
+    ///
+    /// Checked at the start of a turn and again once it has ended — an
+    /// engine over its ceiling refuses the *next* turn, rather than cutting
+    /// the one in flight, whose tool calls have already happened and whose
+    /// reply is owed to whoever is reading. The check after the turn is the
+    /// same check: it is the one the next `run_turn` makes.
+    fn cap_reached(&self) -> Result<(), EngineError> {
+        let Some(cap) = self.cfg.max_requests else {
+            return Ok(());
+        };
+        let spent = self.spent.load(std::sync::atomic::Ordering::SeqCst);
+        if spent >= cap {
+            return Err(EngineError::RequestCap { spent, cap });
+        }
+        Ok(())
     }
 
     async fn flush(&self, sid: &nscore::SessionId, log: &EventLog, from: usize) {
@@ -1132,6 +1211,10 @@ impl Engine {
     }
 
     pub async fn run_turn(&self, incoming: Incoming) -> Result<String, EngineError> {
+        // Before anything is loaded or called: a capped run stops between
+        // turns, with the message it could not afford left unanswered
+        // rather than half answered.
+        self.cap_reached()?;
         let sid = incoming.session.clone();
         let scope = (self.cfg.scope_for)(&sid);
         let stored = self.parts.memory.load(&sid).await?;
@@ -1290,6 +1373,10 @@ impl Engine {
         // which fallback reason the user is given.
         let mut proposed_this_turn = false;
         let mut settled: Option<ReplyPolicy> = None;
+        // M12 T4.3: the reply text the emitter call already produced, when
+        // the turn settled on an answer rather than an action. `None` is
+        // every turn before M12 and every turn with the knob off.
+        let mut pre_draft: Option<String> = None;
 
         for _ in 0..self.cfg.max_iterations {
             // a. project
@@ -1315,7 +1402,13 @@ impl Engine {
                 // would otherwise re-send on every iteration of a turn that
                 // was never going to click anything. The synthetic actions
                 // stay legal at every tier: they are how a turn ends.
-                let mut actions: Vec<_> = if tier.allows_tools() {
+                //
+                // M12 T2.1: unless the route selected some. A chat turn that
+                // asked the time carries exactly the tools its own cue named
+                // (`[router] chat_tools`) and nothing else — the selection is
+                // the whole allowance there, so the filter below narrows to
+                // it the same way, once per turn.
+                let mut actions: Vec<_> = if tier.allows_tools() || selected_tools.is_some() {
                     self.parts
                         .tools
                         .iter()
@@ -1411,7 +1504,13 @@ impl Engine {
             // Notes and their hashes together, so the manifest can say which
             // note sat in this prompt (M9 T0.3). The texts go into the
             // context; the hashes are cut to whatever survived to be sent.
-            let guidance_notes = rules.guidance_notes_for(&legal_names);
+            // M12 T3.2: with the archive knob on, a note learned on another
+            // emitter never reaches this prompt.
+            let guidance_notes = if self.cfg.archive_foreign_notes {
+                rules.guidance_notes_for_model(&legal_names, self.cfg.learning_model.as_deref())
+            } else {
+                rules.guidance_notes_for(&legal_names)
+            };
             let mut ctx = nscore::EmitterContext {
                 facts,
                 summary: state.summary.clone(),
@@ -1428,6 +1527,7 @@ impl Engine {
                 guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
                 budget_line: None,
                 usage: Some(usage.clone()),
+                answer: None,
             };
 
             // c. propose
@@ -1460,6 +1560,25 @@ impl Engine {
                 Some(nscore::Ablate::Guidance) => ctx.guidance.clear(),
                 None => {}
             }
+            // M12 T4.3: chat-tier only, and only with the knob on. Filled
+            // after the fit and the ablation, so `memory_silent` is a
+            // statement about the context as sent rather than as composed —
+            // the same thing the replier's silence line says.
+            let offered_answer = self.cfg.chat_act_or_answer && tier == nscore::Tier::Chat;
+            if offered_answer {
+                let reply_guidance = if self.cfg.archive_foreign_notes {
+                    rules.guidance_for_reply_model(self.cfg.learning_model.as_deref())
+                } else {
+                    rules.guidance_for_reply()
+                };
+                ctx.answer = Some(nscore::AnswerBlocks {
+                    persona: self.cfg.persona.clone(),
+                    reply_guidance,
+                    memory_silent: ctx.facts.is_empty()
+                        && ctx.summary.is_none()
+                        && !ctx.trace_so_far.iter().any(|l| l.contains("recall")),
+                });
+            }
             // Cut to what survived: nothing drops guidance from the middle,
             // so a prefix is exact, and it keeps `note_hashes.len() ==
             // guidance` true whether the list was clamped or blanked.
@@ -1482,10 +1601,21 @@ impl Engine {
             manifest.ablated = self.cfg.ablate;
             manifest.tier = self.cfg.router.is_some().then_some(tier);
             manifest.route_cues = routed.cues.clone();
-            let proposed = self.parts.emitter.propose(ctx, &legal).await;
+            let proposed = self.parts.emitter.propose_or_answer(ctx, &legal).await;
             self.record_model_calls(&usage, &mut log, turn, &manifest);
+            // Carried only as far as the `respond_directly` branch below:
+            // an answer that arrives beside any other action is not an
+            // answer to this turn, and a stale one must not reach the reply.
+            let mut emitted_answer: Option<String>;
             let mut proposal = match proposed {
-                Ok(p) => p,
+                Ok(e) => {
+                    // An answer is only ever taken from a call that was
+                    // offered the choice. A double may return one anyway;
+                    // with the knob off this turn must be the turn it was
+                    // before M12, event for event.
+                    emitted_answer = offered_answer.then_some(e.answer).flatten();
+                    e.proposal
+                }
                 Err(e) => {
                     // Four failure classes, three recoveries. A refused or
                     // failed endpoint is not a malformed proposal, and a
@@ -1549,6 +1679,10 @@ impl Engine {
 
             // e. direct reply
             if proposal.action == "respond_directly" {
+                // M12 T4.3. `Settled { Generate }` either way: what changes
+                // is who drafts, not what the log says happened, so a replay
+                // of this turn is the shape it always was.
+                pre_draft = emitted_answer.take();
                 let e = log.append(
                     turn,
                     now(),
@@ -2545,6 +2679,7 @@ impl Engine {
                     turn,
                     &usage,
                     self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                    pre_draft,
                 )
                 .await
             }
@@ -2578,6 +2713,12 @@ impl Engine {
         // (M11 T1.1 follow-up). Passed in rather than re-derived: the tier
         // is the caller's, and it may have been upgraded mid-turn.
         hybrid_facts: bool,
+        // M12 T4.3: the answer the emitter call already produced. `Some`
+        // skips the replier and its `ModelCall` — the turn costs one
+        // request — and then runs the identical echo, grounding, obligation
+        // and citation block on the text, because an emitted answer is a
+        // draft like any other and is not owed a lighter check.
+        pre_draft: Option<String>,
     ) -> String {
         let now = &self.clock;
         let state = fold(log.events());
@@ -2607,7 +2748,12 @@ impl Engine {
         // M6 §4.3: the reply model gets the user's message, the
         // verbatim window and the summary — not a counter string.
         let window = state.window(self.cfg.window_turns);
-        let guidance_notes = rules.guidance_notes_for_reply();
+        // M12 T3.2: the reply path archives by the same rule as the emitter.
+        let guidance_notes = if self.cfg.archive_foreign_notes {
+            rules.guidance_notes_for_reply_model(self.cfg.learning_model.as_deref())
+        } else {
+            rules.guidance_notes_for_reply()
+        };
         let guidance: Vec<String> = guidance_notes.iter().map(|(_, t)| t.clone()).collect();
         // M9 T2.1: the same pure function the emitter path calls, on the
         // same message.
@@ -2664,8 +2810,16 @@ impl Engine {
         let mut manifest = reply_manifest(scope, &budgeted, reply_clipped_chars, note_hashes);
         manifest.budget = Some(budget);
         manifest.ablated = self.cfg.ablate;
-        let drafted = self.parts.replier.reply(budgeted).await;
-        self.record_model_calls(usage, log, turn, &manifest);
+        // M12 T4.3. An emitted answer is already drafted and already paid
+        // for; everything below it is the same.
+        let drafted = match pre_draft {
+            Some(text) => Ok(text),
+            None => {
+                let d = self.parts.replier.reply(budgeted).await;
+                self.record_model_calls(usage, log, turn, &manifest);
+                d
+            }
+        };
         match drafted {
             Ok(draft) if self.cfg.reply_grounding_check => {
                 // M6 §4.5. Two checks, one of which acts.
@@ -2713,15 +2867,22 @@ impl Engine {
                             spans: spans.clone(),
                         },
                     );
-                    let regenerated =
-                        self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
-                    // The regeneration is a second billed call, and
-                    // the point of counting it is to know what the
-                    // grounding check costs.
-                    self.record_model_calls(usage, log, turn, &manifest);
-                    let final_reply = regenerated.unwrap_or(draft);
-                    Self::record_cited(log, turn, now(), &ctx, &final_reply);
-                    return final_reply;
+                    // M12 T1.2: the flag above is free and always written;
+                    // the call below is billed and exists to talk a weak
+                    // model out of its fabrication. Where the model is not
+                    // weak, the draft stands and falls through to the same
+                    // obligations and citation path any draft takes.
+                    if self.cfg.reply_regenerate {
+                        let regenerated =
+                            self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
+                        // The regeneration is a second billed call, and
+                        // the point of counting it is to know what the
+                        // grounding check costs.
+                        self.record_model_calls(usage, log, turn, &manifest);
+                        let final_reply = regenerated.unwrap_or(draft);
+                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
+                        return final_reply;
+                    }
                 }
                 // M9 T2.1. The obligation interceptor, behind its own
                 // knob and *after* grounding: a draft that already had

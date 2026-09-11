@@ -57,6 +57,14 @@ pub struct KeywordRouter {
     /// M10 T2.1: `Full` — the default — puts every registered tool the tier
     /// allows in front of the emitter, exactly as before this existed.
     pub depth: nscore::Depth,
+    /// M12 T2.1: the cheap tools a `Chat` turn may carry, each one only when
+    /// its own cue in [`TOOL_CUES`] fires. Empty means a chat turn carries
+    /// no tools at all, which is how the tier behaved before this existed.
+    ///
+    /// Named rather than derived: the tier is the budget decision and this
+    /// is not allowed to move it, so which tools are cheap enough to ride a
+    /// chat turn is a list someone writes down, not a guess.
+    pub chat_tools: Vec<String>,
 }
 
 /// Cue → the tool group it asks for (M10 T2.1). One flat table rather than a
@@ -168,6 +176,7 @@ impl Default for KeywordRouter {
     fn default() -> Self {
         Self {
             depth: nscore::Depth::Full,
+            chat_tools: vec!["get_time".to_string()],
             recall_cues: [
                 "before",
                 "earlier",
@@ -212,6 +221,23 @@ impl Router for KeywordRouter {
         // narrowing that never happened.
         if self.depth == nscore::Depth::Adaptive && route.tier.allows_tools() {
             route.tools = select_tools(&text, input.tool_names);
+        }
+        // M12 T2.1. A chat turn may carry the named cheap tools, and only
+        // the ones this message's own cue asked for: the same table, run
+        // over a list of at most a handful of names. `None` here keeps its
+        // chat meaning — no tools — rather than the "full set" it means at
+        // the tiers above, which is why the cue table is consulted through
+        // a list that is already the whole allowance.
+        if route.tier == Tier::Chat && !self.chat_tools.is_empty() {
+            let allowed: Vec<String> = input
+                .tool_names
+                .iter()
+                .filter(|n| self.chat_tools.contains(n))
+                .cloned()
+                .collect();
+            if !allowed.is_empty() {
+                route.tools = select_tools(&text, &allowed);
+            }
         }
         route
     }
@@ -437,6 +463,39 @@ mod tests {
                 .tools,
             None
         );
+    }
+
+    /// M12 T2.1. Asking the time is a conversational turn by every cue the
+    /// tier knows, and before this it could not reach `get_time` at all: the
+    /// tier hid the tool, and only a proposal the emitter could not make
+    /// would have widened it. The tier stays `Chat` — this buys one cheap
+    /// tool, not the task budget.
+    #[test]
+    fn a_time_question_carries_get_time_and_stays_on_the_chat_tier() {
+        let t = desktop();
+        let router = KeywordRouter::default();
+        for text in ["What time is it right now?", "Kolik je hodin?"] {
+            let r = router.route(&input(text, &t));
+            assert_eq!(r.tier, Tier::Chat, "{text}");
+            assert_eq!(
+                r.tools,
+                Some(vec!["get_time".to_string()]),
+                "{text} — its own cue, and nothing else off the desktop"
+            );
+        }
+        // No cue is no tools, exactly as a chat turn behaved before this.
+        let plain = router.route(&input("hello there", &t));
+        assert_eq!(plain.tier, Tier::Chat);
+        assert_eq!(plain.tools, None);
+
+        // An empty list is the off switch, whatever the cue says.
+        let none = KeywordRouter {
+            chat_tools: Vec::new(),
+            ..KeywordRouter::default()
+        };
+        let r = none.route(&input("What time is it right now?", &t));
+        assert_eq!(r.tier, Tier::Chat);
+        assert_eq!(r.tools, None);
     }
 
     #[test]

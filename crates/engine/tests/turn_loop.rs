@@ -267,6 +267,84 @@ async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
         .unwrap();
 }
 
+/// M12 T1.2. On a strong model the flag stays and the second call goes: the
+/// observation is what the log is graded on and it is free, while the
+/// regeneration is a billed request that exists to talk a weak model out of
+/// a fabrication. The first draft is what the user is told, and it flows
+/// down the same citation path any unflagged draft does.
+#[tokio::test]
+async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("ground_strong".into());
+    // A fact the draft states, so the draft has something to cite while
+    // still inventing the count.
+    store
+        .put_fact(Fact {
+            key: "user.city".into(),
+            value: serde_json::json!("Oslo"),
+            confidence: 1.0,
+            last_validated: Timestamp(1),
+            prov: Provenance::Constant,
+            valid_from: Timestamp(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let replier = Arc::new(InventingReplier(Default::default()));
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
+    b.set_replier(Box::new(CountingReplier(replier.clone())));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            reply_regenerate: false,
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let reply = e
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "anything new?".into(),
+        })
+        .await
+        .unwrap();
+    // The first draft, verbatim.
+    assert_eq!(reply, "You have 42 orders waiting in Oslo.");
+    assert_eq!(
+        replier.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one replier request, not two"
+    );
+    let events = store.load(&sid).await.unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
+    assert!(kinds.contains(&"ReplyFlagged"), "{kinds:?}");
+    assert!(kinds.contains(&"ReplyCited"), "{kinds:?}");
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::ReplyFlagged { draft, spans }
+            if draft == "You have 42 orders waiting in Oslo." && spans == &["42"]
+    )));
+    assert!(events.iter().any(|ev| matches!(
+        &ev.kind,
+        EventKind::Replied { text } if text == "You have 42 orders waiting in Oslo."
+    )));
+}
+
+/// Hands every reply to the inner double so a test can count the calls the
+/// engine made without owning the double.
+struct CountingReplier(Arc<InventingReplier>);
+#[async_trait::async_trait]
+impl Replier for CountingReplier {
+    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+        self.0.reply(ctx).await
+    }
+}
+
 /// The live failure, as a double: a draft that copies a line out of the turn
 /// trace instead of answering.
 struct ParrotingReplier(std::sync::atomic::AtomicU32);
@@ -2937,6 +3015,101 @@ async fn a_tool_proposed_on_a_chat_turn_widens_the_tier_instead_of_being_refused
         "no refusal was recorded"
     );
     assert_eq!(tool_calls(&events, "echo"), 1, "and the action ran");
+}
+
+/// M12 T2.1. The defect M11 recorded: a user asking the time routes to
+/// `Chat` by every cue the tier has, and a `Chat` turn carried no tools at
+/// all, so `get_time` was unreachable on exactly the turn that wanted it.
+/// `[router] chat_tools` names the cheap tools a chat turn may carry, and
+/// each rides only when its own cue fires — a chat turn that asks nothing
+/// still carries nothing.
+#[tokio::test]
+async fn a_time_question_on_the_chat_tier_carries_exactly_get_time() {
+    let store = Arc::new(InMemoryStore::new());
+    let sid = SessionId("chat-time".into());
+    let mut b = HarnessBuilder::new();
+    // `ArrayProbe` rather than a bare `ScriptedEmitter`: a scripted emitter
+    // records no cost, and no cost means no `ModelCall` and so no manifest.
+    b.set_emitter(Box::new(ArrayProbe {
+        inner: ScriptedEmitter::new(vec![]),
+        arrays: Default::default(),
+        traces: Default::default(),
+    }));
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(NamedTool::new("get_time")));
+    b.add_tool(Arc::new(EchoTool::new()));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_echo_ratio: 1.1,
+            reply_grounding_check: false,
+            router: Some(Arc::new(nsengine::router::KeywordRouter::default())),
+            ..EngineConfig::default()
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "What time is it right now?".into(),
+    })
+    .await
+    .unwrap();
+
+    // The registered tools each emitter call carried, in manifest order. The
+    // synthetic actions are in `tool_names` at every tier and are not what
+    // this is about.
+    let registered_names = |events: &[Event]| -> Vec<Vec<String>> {
+        manifest_tool_names(events)
+            .into_iter()
+            .map(|names| {
+                names
+                    .into_iter()
+                    .filter(|n| n == "get_time" || n == "echo")
+                    .collect()
+            })
+            .collect()
+    };
+    let events = store.load(&sid).await.unwrap();
+    let carried = registered_names(&events);
+    assert!(!carried.is_empty(), "the emitter was called");
+    for (i, names) in carried.iter().enumerate() {
+        assert_eq!(
+            names,
+            &vec!["get_time".to_string()],
+            "iteration {i} carried the time tool and nothing else: {names:?}"
+        );
+    }
+    // And it is still a chat turn: one cheap tool, not the task budget.
+    for ev in &events {
+        if let EventKind::ModelCall { usage, manifest } = &ev.kind {
+            if usage.role == "emitter" {
+                assert_eq!(manifest.tier, Some(Tier::Chat), "the tier did not widen");
+            }
+        }
+    }
+
+    // A chat turn with no cue of its own carries nothing, exactly as before.
+    e.run_turn(Incoming {
+        session: sid.clone(),
+        text: "thanks!".into(),
+    })
+    .await
+    .unwrap();
+    let after = store.load(&sid).await.unwrap();
+    let second: Vec<Vec<String>> = registered_names(&after)
+        .into_iter()
+        .skip(carried.len())
+        .collect();
+    assert!(!second.is_empty(), "the second turn called the emitter");
+    for names in &second {
+        assert!(
+            names.is_empty(),
+            "no cue, no tools on a chat turn: {names:?}"
+        );
+    }
 }
 
 /// The saving the Deep tier exists for: the engine runs the recall itself

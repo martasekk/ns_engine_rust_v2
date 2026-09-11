@@ -277,20 +277,24 @@ fn strongest(issues: &[Issue]) -> Issue {
 pub fn parse_verdict(content: &str, scorer: String) -> Result<TurnGrade, GradeError> {
     let body = strip_fence(content);
     let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| GradeError::Unavailable(format!("verdict is not JSON ({e})")))?;
+        .map_err(|e| GradeError::Unavailable(format!("not json: verdict is not JSON ({e})")))?;
     let ok = v
         .get("ok")
         .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| GradeError::Unavailable("verdict has no boolean `ok`".into()))?;
+        .ok_or_else(|| {
+            GradeError::Unavailable("no ok field: verdict has no boolean `ok`".into())
+        })?;
     let raw = v
         .get("issues")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| GradeError::Unavailable("verdict has no `issues` array".into()))?;
+        .ok_or_else(|| {
+            GradeError::Unavailable("no issues array: verdict has no `issues` array".into())
+        })?;
     let mut issues: Vec<Issue> = Vec::new();
     for item in raw {
-        let code = item
-            .as_str()
-            .ok_or_else(|| GradeError::Unavailable("an issue was not a string".into()))?;
+        let code = item.as_str().ok_or_else(|| {
+            GradeError::Unavailable("issue not a string: an issue was not a string".into())
+        })?;
         if let Some(i) = issue_of(code) {
             if i.is_problem() {
                 issues.push(i);
@@ -304,7 +308,7 @@ pub fn parse_verdict(content: &str, scorer: String) -> Result<TurnGrade, GradeEr
     // answer: not graded.
     if ok != issues.is_empty() {
         return Err(GradeError::Unavailable(format!(
-            "verdict contradicts itself: ok={ok} with {} issues",
+            "contradiction: verdict contradicts itself: ok={ok} with {} issues",
             issues.len()
         )));
     }
@@ -349,6 +353,11 @@ impl Evaluator for ClientEvaluator {
         Some(self.requests())
     }
 
+    /// Every grade is one provider request, so a dry run must not ask.
+    fn paid(&self) -> bool {
+        true
+    }
+
     async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError> {
         // Counted before the call, not after it: a request that fails was
         // still spent, and a count that only saw successes would understate
@@ -359,11 +368,36 @@ impl Evaluator for ClientEvaluator {
             .client
             .chat(self.request(view))
             .await
-            .map_err(|e| GradeError::Unavailable(e.to_string()))?;
+            .map_err(|e| GradeError::Unavailable(format!("transport: {e}")))?;
+        // M12 T0.4: why the answer is unusable, before trying to read it.
+        // A reply cut off at `max_tokens` is half a JSON object, and
+        // parsing it first would report the one fix that is a number —
+        // raise the cap — as "the model returned nonsense".
+        if let Some(finish) = body
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+        {
+            match finish {
+                "length" => {
+                    return Err(GradeError::Unavailable(format!(
+                        "length: the verdict was cut off at max_tokens {}",
+                        self.cfg.max_tokens
+                    )))
+                }
+                "content_filter" => {
+                    return Err(GradeError::Unavailable(
+                        "content_filter: the provider withheld the verdict".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
         let content = body
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| GradeError::Unavailable("no message content in the reply".into()))?;
+            .ok_or_else(|| {
+                GradeError::Unavailable("no content: no message content in the reply".into())
+            })?;
         parse_verdict(content, self.id())
     }
 }
@@ -487,6 +521,47 @@ mod tests {
         ));
     }
 
+    /// M12 T0.4: a verdict cut off by `max_tokens` is a budget problem, not
+    /// a broken model. It has to say so — "not json" sends a reader after
+    /// the prompt, and the fix is one number.
+    #[tokio::test]
+    async fn a_truncated_verdict_says_length_not_not_json() {
+        let truncated = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "{\"ok\": false, \"issu"},
+            }]
+        });
+        let (e, _t) = judge(vec![truncated]);
+        let err = e
+            .grade(&view("kde jsem?", "v Praze", &["user.city Praha"]))
+            .await
+            .expect_err("a cut-off verdict is not a grade");
+        assert_eq!(err.reason(), "length", "{err:?}");
+
+        // And the reasons the other rejections carry, so a report can count
+        // them apart.
+        let (e, _t) = judge(vec![said("not json at all")]);
+        assert_eq!(
+            e.grade(&view("a", "b", &[])).await.unwrap_err().reason(),
+            "not json"
+        );
+        let (e, _t) = judge(vec![said("{\"ok\": false, \"issues\": []}")]);
+        assert_eq!(
+            e.grade(&view("a", "b", &[])).await.unwrap_err().reason(),
+            "contradiction"
+        );
+        let transport = MockTransport::new(vec![Err(nsllm::transport::TransportError::Network(
+            "down".into(),
+        ))]);
+        let client = nsllm::client::OpenRouterClient::new(transport, "k".into()).with_retry(1, 0);
+        let e = ClientEvaluator::for_model(Some("m"), client, |c| c, symbolic()).unwrap();
+        assert_eq!(
+            e.grade(&view("a", "b", &[])).await.unwrap_err().reason(),
+            "transport"
+        );
+    }
+
     /// A well-formed verdict does become a grade, under this scorer's own
     /// id, and the request carries the P0 shape: no `temperature` key at all
     /// for a Sonnet judge, an effort block, a capped `max_tokens`, and the
@@ -567,6 +642,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = PassConfig {
             dry_run: true,
+            // M12 T0.1: a dry run is free unless it is told to spend, and
+            // this test is about what the judge's requests buy — so it is
+            // one of the runs that says so.
+            spend: true,
             evaluator_min_kappa: 0.4,
             ..Default::default()
         };

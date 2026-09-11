@@ -280,6 +280,13 @@ pub fn render_budget(
         "rejections by reason: {}\n",
         nscore::tally_rejections(events).line()
     ));
+    // M12 T1.3, on the same two paths and for the same reason: a call the
+    // model answered in prose bought no tool call, and until now nothing
+    // counted how often the emitter had to rescue one.
+    out.push_str(&format!(
+        "text fallbacks: {}\n",
+        nscore::text_fallbacks(events)
+    ));
     out.push_str(&chat_counter_line(events));
     out
 }
@@ -331,9 +338,36 @@ fn chat_counter_line(events: &[Event]) -> String {
             any && all
         })
         .count();
+    // M12 T4.5: what the act-or-answer path actually bought, read from the
+    // same log rather than from the config. The first number is how often a
+    // chat turn's emitter call answered instead of acting; the second is the
+    // thing the phase exists to move, and it is a mean rather than a count
+    // because a chat turn that reached for a tool still costs its two.
+    let emitted = chat_turns
+        .iter()
+        .filter(|turn| {
+            events.iter().any(|e| {
+                e.turn == **turn
+                    && matches!(&e.kind, EventKind::Proposed { proposal }
+                        if proposal.rationale.starts_with(nscore::ANSWERED_IN_EMITTER_PREFIX))
+            })
+        })
+        .count();
+    let calls: usize = chat_turns
+        .iter()
+        .map(|turn| {
+            events
+                .iter()
+                .filter(|e| e.turn == *turn && matches!(e.kind, EventKind::ModelCall { .. }))
+                .count()
+        })
+        .sum();
+    let per_turn = calls as f64 / chat_turns.len() as f64;
     format!(
         "chat turns answered without a tool: {answered} of {} chat-tier turns proposed only \
-         respond_directly\n",
+         respond_directly\nanswered in the emitter call: {emitted} of {}; requests per chat \
+         turn: {per_turn:.2}\n",
+        chat_turns.len(),
         chat_turns.len()
     )
 }
@@ -426,6 +460,16 @@ fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::Acti
         "stable prefix (est.): emitter {} (facts+summary+window) \u{b7}          replier {} (persona+facts+summary) \u{b7} breakpoint floor 1,024\n",
         prefix_summary(&total.emitter_prefix),
         prefix_summary(&total.replier_prefix),
+    ));
+    // M12 T1.4. The system prompt rides every emitter call and every
+    // iteration of every turn, so what the trimmed preamble saves is read
+    // per call, not per session — which is why both numbers are printed and
+    // neither is multiplied out here.
+    let (small, strong) = nsllm::emitter::system_prompts();
+    out.push_str(&format!(
+        "emitter system prompt (est.): small {} tokens \u{b7} strong {} tokens\n",
+        nscore::estimate_tokens(small.len()),
+        nscore::estimate_tokens(strong.len()),
     ));
     out.push_str(&render_tool_table(events, specs));
     out.push_str(&format!(
@@ -1337,6 +1381,108 @@ mod tests {
         assert!(!tally.by_reason.contains_key("GuardDenied"));
         assert_eq!(tally.rejections(), 9);
         assert!((tally.per_hundred().unwrap() - 11.111).abs() < 0.01);
+    }
+
+    /// M12 T1.3. A text fallback is a request that bought no tool call, the
+    /// same kind of waste as a rejection, so it is printed on the same
+    /// screen and right under it.
+    #[test]
+    fn text_fallbacks_are_counted_next_to_the_rejections_line() {
+        let mut log = log();
+        for (i, rationale) in [
+            format!("{} the time is 10:41", nscore::TEXT_FALLBACK_PREFIX),
+            "the user asked for the time".to_string(),
+            format!("{} nothing to do", nscore::TEXT_FALLBACK_PREFIX),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            log.append(
+                1,
+                Timestamp(i as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: "respond_directly".into(),
+                        args: serde_json::json!({}),
+                        rationale,
+                    },
+                },
+            );
+        }
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("rejections by reason"))
+            .expect("a rejections line");
+        assert_eq!(lines[at + 1], "text fallbacks: 2", "{out}");
+    }
+
+    /// M12 T4.5. The counter that says what act-or-answer bought: how many
+    /// chat turns the emitter call itself answered, and what a chat turn
+    /// costs on average. Read from the log — the rationale prefix and the
+    /// `ModelCall`s — so a deployment is priced on what it did rather than
+    /// on what its config says it would do.
+    #[test]
+    fn the_chat_counter_reads_answers_and_requests_per_chat_turn() {
+        fn proposed(log: &mut EventLog, turn: u32, action: &str, rationale: &str) {
+            log.append(
+                turn,
+                Timestamp(turn as u64),
+                EventKind::Proposed {
+                    proposal: nscore::Proposal {
+                        action: action.into(),
+                        args: serde_json::json!({}),
+                        rationale: rationale.into(),
+                    },
+                },
+            );
+        }
+        fn chat() -> ContextManifest {
+            ContextManifest {
+                tier: Some(nscore::Tier::Chat),
+                ..Default::default()
+            }
+        }
+
+        let mut log = log();
+        // Turn 1: answered in the emitter call — one request, no replier.
+        call(&mut log, 1, usage("emitter", 1, 100, 0), chat());
+        proposed(
+            &mut log,
+            1,
+            "respond_directly",
+            &format!("{} it is 10:41", nscore::ANSWERED_IN_EMITTER_PREFIX),
+        );
+        // Turn 2: the old shape — emitter, then replier.
+        call(&mut log, 2, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 2, "respond_directly", "no tool applies");
+        call(&mut log, 2, usage("replier", 1, 100, 0), chat());
+        // Turn 3: a tool first, so three requests.
+        call(&mut log, 3, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 3, "get_time", "the user asked");
+        call(&mut log, 3, usage("emitter", 1, 100, 0), chat());
+        proposed(&mut log, 3, "respond_directly", "done");
+        call(&mut log, 3, usage("replier", 1, 100, 0), chat());
+
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("answered in the emitter call"))
+            .expect("an act-or-answer counter line");
+        // (1 + 2 + 3) / 3 = 2.00.
+        assert_eq!(
+            line,
+            "answered in the emitter call: 1 of 3; requests per chat turn: 2.00",
+            "{out}"
+        );
+        // It sits with the line it qualifies, not somewhere else on the page.
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("chat turns answered without a tool"))
+            .expect("the chat counter line");
+        assert_eq!(lines[at + 1], line, "{out}");
     }
 
     /// M10, decision 1 — measure the chat path before changing it. A chat

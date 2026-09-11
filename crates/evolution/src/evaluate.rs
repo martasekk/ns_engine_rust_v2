@@ -573,6 +573,25 @@ pub enum GradeError {
     Invalid(String),
 }
 
+impl GradeError {
+    /// The short word a report can count these by (M12 T0.4).
+    ///
+    /// `Unavailable` carries a classified message — `length: …`,
+    /// `transport: …`, `not json: …` — and the reason is the part before
+    /// the first `: `. A message with no classifier is its own reason
+    /// rather than a blank one, so a scorer this crate does not own still
+    /// shows up under something readable.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unavailable(m) => match m.split_once(": ") {
+                Some((reason, _)) => reason,
+                None => m,
+            },
+            Self::Invalid(_) => "invalid",
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Evaluator: Send + Sync {
     /// Stable identity, recorded with every grade.
@@ -592,6 +611,16 @@ pub trait Evaluator: Send + Sync {
     /// line only for the lanes that have a number.
     fn requests(&self) -> Option<u32> {
         None
+    }
+    /// Does asking this scorer cost a provider request (M12 T0.1)?
+    ///
+    /// Not `requests().is_some()`: that says what a scorer already spent,
+    /// and the question a dry run has to answer is what it *would* spend
+    /// before it has spent anything. `false` is the honest default — the
+    /// symbolic checks and the local scorer on loopback dial nobody — and
+    /// the pass skips every lane that says `true` unless `spend` is set.
+    fn paid(&self) -> bool {
+        false
     }
     async fn grade(&self, view: &TurnView<'_>) -> Result<TurnGrade, GradeError>;
 }

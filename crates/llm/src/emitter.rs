@@ -19,10 +19,39 @@ with their results; never repeat a completed action — when those results answe
 choose respond_directly. A line marked done is such an action: proposing it again is refused \
 and costs a step. ";
 
+/// The same preamble for a model that does not need the repeat gate
+/// explained to it (M12 T1.4).
+///
+/// First two sentences verbatim — they say what the task is, and that is not
+/// a small-model concession. What goes is the narration that follows: three
+/// clauses telling a weak emitter what a `done` line means and what happens
+/// if it proposes one anyway, kept as the one clause that is actually a
+/// rule. Sent on every emitter call and every iteration of every turn, which
+/// is why a few dozen tokens are worth the second string.
+const SYSTEM_PREAMBLE_STRONG: &str = "You translate the user's latest message into exactly one \
+action call from the provided tools. Choose respond_directly when no tool applies. Never invent \
+argument values the user did not supply. Never repeat an action the context lists as done. ";
+
+/// The one clause that turns a forced tool call into a choice (M12 T4.2).
+/// Appended, never substituted: what the task is has not changed, only what
+/// counts as finishing it.
+pub const ACT_OR_ANSWER_CLAUSE: &str = " Or, when no tool applies and the context already \
+answers, reply to the user in plain text instead of calling a tool.";
+
 /// Assembled rather than written out so the rationale instruction has exactly
 /// one home in the workspace and the test can assert it appears once.
-fn system_prompt() -> String {
-    format!("{SYSTEM_PREAMBLE}{RATIONALE_INSTRUCTION}")
+fn system_prompt(capability: nscore::Capability) -> String {
+    let preamble = capability.pick(SYSTEM_PREAMBLE, SYSTEM_PREAMBLE_STRONG);
+    format!("{preamble}{RATIONALE_INSTRUCTION}")
+}
+
+/// The two system prompts, for the cost report that prices them
+/// (`ns-app budget`). Nothing else needs them: the emitter renders its own.
+pub fn system_prompts() -> (String, String) {
+    (
+        system_prompt(nscore::Capability::Small),
+        system_prompt(nscore::Capability::Strong),
+    )
 }
 
 /// 4096, not 1024: reasoning models spend output tokens on reasoning before
@@ -44,6 +73,7 @@ pub struct CloudEmitter {
     model: String,
     shape: crate::provider::RequestShape,
     prompt_cache: bool,
+    capability: nscore::Capability,
 }
 
 impl CloudEmitter {
@@ -53,6 +83,7 @@ impl CloudEmitter {
             model,
             shape: default_shape(),
             prompt_cache: false,
+            capability: nscore::Capability::Small,
         }
     }
 
@@ -78,6 +109,14 @@ impl CloudEmitter {
     /// session, never by reading this code.
     pub fn with_prompt_cache(mut self, on: bool) -> Self {
         self.prompt_cache = on;
+        self
+    }
+
+    /// `[llm] capability` (M12 T1.1). `Small` is the default and is the
+    /// request this emitter has always sent; `Strong` only shortens the
+    /// system preamble (T1.4).
+    pub fn with_capability(mut self, capability: nscore::Capability) -> Self {
+        self.capability = capability;
         self
     }
 }
@@ -159,38 +198,116 @@ fn render_context_split(ctx: &EmitterContext) -> (String, String) {
             s.push_str(&format!("- {g}\n"));
         }
     }
-    s.push_str("Propose the next action.");
+    s.push_str(PROPOSE_LINE);
     (stable, s)
 }
 
-#[async_trait]
-impl Emitter for CloudEmitter {
-    async fn propose(
+/// How every emitter message has always closed.
+const PROPOSE_LINE: &str = "Propose the next action.";
+
+/// How an act-or-answer message closes instead (M12 T4.2).
+///
+/// *Instead*, not *as well*: two closing instructions is two tasks, and the
+/// second one a model reads is the one it follows. This says both options in
+/// one sentence, which is what the choice actually is.
+const ACT_OR_ANSWER_CLOSING: &str = "Propose the next action, or, if the context already \
+answers and no tool applies, answer the user in plain text.";
+
+/// The chat-tier act-or-answer user message (M12 T4.2).
+///
+/// The stable half is replaced by the replier's fenced `<reference>` block,
+/// because this call may produce the reply and a reply drafted from an
+/// untagged transcript is the failure `reference.rs` documents. Everything
+/// live — the current turn, the trace, the budget line, what was refused,
+/// the emitter's own guidance — is the string the emitter has always sent,
+/// minus its closing line; what follows it is the reply side: the persona,
+/// the reply-scoped notes, the silence line, and the one closing instruction
+/// that names both options.
+fn render_act_or_answer(ctx: &EmitterContext, answer: &nscore::AnswerBlocks) -> String {
+    let (_, live) = render_context_split(ctx);
+    // The live half ends with the line that says "call a tool"; on this path
+    // that is half the instruction, and it is replaced rather than repeated.
+    let live = live.strip_suffix(PROPOSE_LINE).unwrap_or(&live);
+    let mut s = crate::reference::render_reference(
+        &ctx.facts,
+        ctx.summary.as_ref(),
+        &ctx.window,
+        &ctx.caps,
+    );
+    s.push_str("\n\n");
+    if !answer.persona.is_empty() {
+        s.push_str(&answer.persona);
+        s.push_str("\n\n");
+    }
+    // Above the live half, as on the emitter's own path: what the turn owes
+    // is read before what it has done so far.
+    if !ctx.obligations.is_empty() {
+        s.push_str("Obligations this turn:\n");
+        for o in &ctx.obligations {
+            s.push_str(&format!("- {o}\n"));
+        }
+    }
+    s.push_str(live);
+    if !answer.reply_guidance.is_empty() {
+        s.push_str("\nGuidance for the answer:\n");
+        for g in &answer.reply_guidance {
+            s.push_str(&format!("- {g}\n"));
+        }
+    }
+    if answer.memory_silent {
+        s.push('\n');
+        s.push_str(crate::reference::MEMORY_SILENCE);
+        s.push('\n');
+    }
+    s.push('\n');
+    s.push_str(ACT_OR_ANSWER_CLOSING);
+    s
+}
+
+impl CloudEmitter {
+    /// One emitter call, from the request to the proposal. `propose` and
+    /// `propose_or_answer` are two views of it; with `ctx.answer` unset the
+    /// request below is byte for byte the one this emitter has always sent.
+    async fn emit(
         &self,
         ctx: EmitterContext,
         legal: &LegalActionSet,
-    ) -> Result<Proposal, EmitError> {
+    ) -> Result<nscore::Emission, EmitError> {
         // Content-parts only when the knob is on, and the same form the
         // replier already uses: one `cache_control` breakpoint on the part
         // that ends the window block, so what the provider is asked to keep
         // is the tool array plus the blocks that do not move inside a turn.
         // Off, this is `serde_json::Value::String` and the request is the
         // one this emitter has always sent, byte for byte.
-        let user_content = if self.prompt_cache {
-            let (stable, rest) = render_context_split(&ctx);
-            serde_json::json!([
-                {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": rest},
-            ])
+        // M12 T4.2: an act-or-answer call sends one string. Its stable half
+        // is a different block from the cached one, and a breakpoint whose
+        // prefix is not the prefix it was measured on buys nothing.
+        let user_content = match &ctx.answer {
+            Some(answer) => serde_json::Value::String(render_act_or_answer(&ctx, answer)),
+            None if self.prompt_cache => {
+                let (stable, rest) = render_context_split(&ctx);
+                serde_json::json!([
+                    {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": rest},
+                ])
+            }
+            None => serde_json::Value::String(render_context(&ctx)),
+        };
+        // `required` says the answer must be a tool call; `auto` is what
+        // makes the choice real, and it is the whole mechanism.
+        let mut system = system_prompt(self.capability);
+        let tool_choice = if ctx.answer.is_some() {
+            system.push_str(ACT_OR_ANSWER_CLAUSE);
+            "auto"
         } else {
-            serde_json::Value::String(render_context(&ctx))
+            "required"
         };
         let mut request = serde_json::json!({
             "model": self.model,
-            "tool_choice": "required",
+            "tool_choice": tool_choice,
             "tools": build_tools(legal),
             "messages": [
-                {"role": "system", "content": system_prompt()},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
         });
@@ -207,23 +324,49 @@ impl Emitter for CloudEmitter {
             })?;
 
         let message = &body["choices"][0]["message"];
+        let content = message["content"].as_str().unwrap_or_default().trim();
         let tool_call = match message["tool_calls"]
             .as_array()
             .and_then(|calls| calls.first())
         {
             Some(call) => call,
+            // M12 T4.2. An act-or-answer call that produced text and no tool
+            // call has answered: the text *is* the reply, the proposal is
+            // the `respond_directly` the loop already knows how to settle
+            // on, and the replier is not called at all. Only on this path —
+            // with `ctx.answer` unset the two branches below are M12 T1.3's,
+            // untouched.
+            None if ctx.answer.is_some() && !content.is_empty() => {
+                let mut rationale = format!("{} {content}", nscore::ANSWERED_IN_EMITTER_PREFIX);
+                truncate_chars(&mut rationale, 300);
+                return Ok(nscore::Emission {
+                    proposal: Proposal {
+                        rationale,
+                        action: crate::schema::RESPOND_DIRECTLY.to_string(),
+                        args: serde_json::json!({}),
+                    },
+                    answer: Some(content.to_string()),
+                });
+            }
             None => {
                 // Models that ignore tool_choice "required" answer in plain
                 // text; treat that as respond_directly — the engine stays in
                 // control, and the replier narrates from the trace as usual.
-                let text = message["content"].as_str().unwrap_or_default().trim();
+                let text = content;
                 if !text.is_empty() {
-                    let mut rationale = format!("model answered in text: {text}");
-                    rationale.truncate(300);
-                    return Ok(Proposal {
-                        rationale,
-                        action: crate::schema::RESPOND_DIRECTLY.to_string(),
-                        args: serde_json::json!({}),
+                    // M12 T1.3: the prefix is `nscore`'s so the counter that
+                    // reads the log and the line that writes it cannot drift.
+                    let mut rationale = format!("{} {text}", nscore::TEXT_FALLBACK_PREFIX);
+                    // Chars, not bytes: this deployment's traffic is Czech,
+                    // and a 300-byte cut lands mid-codepoint and panics.
+                    truncate_chars(&mut rationale, 300);
+                    return Ok(nscore::Emission {
+                        proposal: Proposal {
+                            rationale,
+                            action: crate::schema::RESPOND_DIRECTLY.to_string(),
+                            args: serde_json::json!({}),
+                        },
+                        answer: None,
                     });
                 }
                 // Neither a tool call nor text. Seen live with Ollama: the
@@ -238,10 +381,14 @@ impl Emitter for CloudEmitter {
                 if ctx.trace_so_far.is_empty() {
                     return Err(EmitError::Malformed("no tool_calls in response".into()));
                 }
-                return Ok(Proposal {
-                    rationale: "model returned nothing; answering from this turn's results".into(),
-                    action: crate::schema::RESPOND_DIRECTLY.to_string(),
-                    args: serde_json::json!({}),
+                return Ok(nscore::Emission {
+                    proposal: Proposal {
+                        rationale: "model returned nothing; answering from this turn's results"
+                            .into(),
+                        action: crate::schema::RESPOND_DIRECTLY.to_string(),
+                        args: serde_json::json!({}),
+                    },
+                    answer: None,
                 });
             }
         };
@@ -278,16 +425,63 @@ impl Emitter for CloudEmitter {
         // validation — `validate_args` checks required keys, not unknown
         // ones — it would quietly travel into classification and into the
         // repeat gate's identity.
-        let rationale = input
+        let mut rationale = input
             .remove(crate::schema::RATIONALE)
             .or_else(|| input.remove("rationale"))
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
-        Ok(Proposal {
-            rationale,
-            action,
-            args: serde_json::Value::Object(input),
+        // M12 T4.2. A tool call wins, always: a model that both called and
+        // talked has acted, and acting on the call while replying with the
+        // talk would settle the turn on half of what it said. The text is
+        // not thrown away though — on an act-or-answer call it is often the
+        // reason for the action, which is exactly what the rationale is for.
+        // Gated on the act-or-answer call, not merely on there being text:
+        // with the knob off every event in the log must read as it did
+        // before M12, and a rationale is an event.
+        if ctx.answer.is_some() && !content.is_empty() {
+            let mut said = format!("model said: {content}");
+            truncate_chars(&mut said, 300);
+            rationale = if rationale.is_empty() {
+                said
+            } else {
+                format!("{said} {rationale}")
+            };
+        }
+        Ok(nscore::Emission {
+            proposal: Proposal {
+                rationale,
+                action,
+                args: serde_json::Value::Object(input),
+            },
+            answer: None,
         })
+    }
+}
+
+/// `String::truncate` on a char boundary. Model text is Czech as often as
+/// English, and a 300-byte cut lands mid-codepoint and panics.
+fn truncate_chars(s: &mut String, max_chars: usize) {
+    if let Some((i, _)) = s.char_indices().nth(max_chars) {
+        s.truncate(i);
+    }
+}
+
+#[async_trait]
+impl Emitter for CloudEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Ok(self.emit(ctx, legal).await?.proposal)
+    }
+
+    async fn propose_or_answer(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<nscore::Emission, EmitError> {
+        self.emit(ctx, legal).await
     }
 }
 
@@ -301,25 +495,55 @@ mod tests {
     /// a missing one.
     #[test]
     fn the_system_prompt_carries_the_rationale_instruction_once() {
-        let prompt = system_prompt();
-        assert_eq!(
-            prompt.matches(RATIONALE_INSTRUCTION).count(),
-            1,
-            "the rationale instruction is not in the system prompt exactly once: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("_rationale"),
-            "the instruction must name the field the schema injects"
-        );
-        assert_eq!(
-            prompt.matches("_rationale").count(),
-            1,
-            "one mention, not a restatement per paragraph"
-        );
+        // M12 T1.4: both profiles, because the trimmed one is a different
+        // string and a dropped instruction would be invisible otherwise.
+        for capability in [nscore::Capability::Small, nscore::Capability::Strong] {
+            let prompt = system_prompt(capability);
+            assert_eq!(
+                prompt.matches(RATIONALE_INSTRUCTION).count(),
+                1,
+                "the rationale instruction is not in the {} system prompt exactly once: {prompt:?}",
+                capability.as_str()
+            );
+            assert!(
+                prompt.contains("_rationale"),
+                "the instruction must name the field the schema injects"
+            );
+            assert_eq!(
+                prompt.matches("_rationale").count(),
+                1,
+                "one mention, not a restatement per paragraph"
+            );
+        }
         // And the schema is now the short label, not this sentence.
         assert!(
             !crate::schema::RATIONALE_HINT.contains("grounded"),
             "the per-tool property is still carrying the instruction"
+        );
+    }
+
+    /// M12 T1.4. The preamble's third sentence explains the repeat gate to a
+    /// model that needs it explained; a strong model needs the rule, not the
+    /// explanation. The saving is per emitter call and per iteration, so the
+    /// test prints it rather than merely asserting an inequality - the
+    /// number is the point.
+    #[test]
+    fn the_strong_preamble_is_shorter_and_says_by_how_much() {
+        let small = nscore::estimate_tokens(system_prompt(nscore::Capability::Small).len());
+        let strong = nscore::estimate_tokens(system_prompt(nscore::Capability::Strong).len());
+        assert!(
+            strong < small,
+            "strong preamble is not shorter: small {small} tokens, strong {strong} tokens"
+        );
+        // The rule it keeps, in one clause.
+        let prompt = system_prompt(nscore::Capability::Strong);
+        assert!(
+            prompt.contains("Never repeat an action the context lists as done."),
+            "the strong preamble dropped the repeat-gate rule: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains("costs a step"),
+            "the strong preamble kept the narration: {prompt:?}"
         );
     }
     use crate::client::OpenRouterClient;
@@ -346,6 +570,7 @@ mod tests {
     fn ctx() -> EmitterContext {
         EmitterContext {
             usage: None,
+            answer: None,
             facts: vec![nscore::Fact {
                 key: "user.name".into(),
                 value: serde_json::json!("Martin"),
@@ -569,6 +794,117 @@ mod tests {
         assert!(text.ends_with("Propose the next action."));
     }
 
+    /// M12 T4.2. `ctx.answer` is what makes the choice legal, and it has to
+    /// change exactly two things in the request: the tool choice, and the
+    /// material the answer would be drawn from.
+    #[tokio::test]
+    async fn a_chat_tier_request_offers_auto_tool_choice_and_carries_the_fence() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "respond_directly",
+            serde_json::json!({"rationale": "chat"}),
+        )]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            persona: "You are Tomáš.".into(),
+            reply_guidance: vec!["keep it short".into()],
+            memory_silent: false,
+        });
+        emitter(mock.clone())
+            .propose_or_answer(c, &legal())
+            .await
+            .unwrap();
+
+        let reqs = mock.requests.lock().unwrap();
+        let req = &reqs[0];
+        assert_eq!(req["tool_choice"], "auto");
+        let system = req["messages"][0]["content"].as_str().unwrap();
+        assert!(system.ends_with(ACT_OR_ANSWER_CLAUSE), "{system}");
+        let text = req["messages"][1]["content"].as_str().unwrap();
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        };
+        // The replier's fence, in the replier's order, under the replier's
+        // rule — and the reply-side blocks after the live half.
+        assert!(text.starts_with("<reference>"), "{text}");
+        assert!(text.contains("never reproduce a line of it."), "{text}");
+        assert!(at("<facts>") < at("<transcript>"));
+        assert!(at("</reference>") < at("You are Tomáš."));
+        assert!(at("You are Tomáš.") < at("Current turn:\nuser: say hi"));
+        assert!(at("This turn so far:\n- ToolReturned(ok: echo: hi)") < at("keep it short"));
+        // Exactly one closing instruction, naming both options. Two would be
+        // two tasks, and the emitter's own "Propose the next action." is
+        // half of this one — it must not also be in there on its own.
+        assert!(text.ends_with(ACT_OR_ANSWER_CLOSING), "{text}");
+        assert_eq!(text.matches(ACT_OR_ANSWER_CLOSING).count(), 1, "{text}");
+        assert!(!text.contains(PROPOSE_LINE), "{text}");
+        assert!(
+            !text.contains(crate::reference::ANSWER_INSTRUCTION),
+            "{text}"
+        );
+        // The silence line is the replier's, and this context has facts.
+        assert!(!text.contains(crate::reference::MEMORY_SILENCE), "{text}");
+    }
+
+    /// M12 T4.2. A model that both calls a tool and talks has acted: acting
+    /// on the call and replying with the talk would settle the turn on half
+    /// of what it said. The text survives as the rationale.
+    #[tokio::test]
+    async fn a_tool_call_wins_over_content_and_the_content_becomes_rationale() {
+        let mut response = tool_call_response("echo", serde_json::json!({"text": "hi"}));
+        response["choices"][0]["message"]["content"] =
+            serde_json::json!("I will echo that for you.");
+        let mock = MockTransport::ok(vec![response]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            persona: String::new(),
+            reply_guidance: vec![],
+            memory_silent: true,
+        });
+        let e = emitter(mock).propose_or_answer(c, &legal()).await.unwrap();
+        assert_eq!(e.answer, None, "a tool call is never an answer");
+        assert_eq!(e.proposal.action, "echo");
+        assert!(
+            e.proposal.rationale.starts_with("model said: I will echo that for you."),
+            "{}",
+            e.proposal.rationale
+        );
+        assert!(e.proposal.rationale.chars().count() <= 300 + 64);
+    }
+
+    /// M12 T4.2. No tool call and text: the text is the reply, the proposal
+    /// is the `respond_directly` the loop settles on, and the rationale
+    /// carries the prefix the counter reads.
+    #[tokio::test]
+    async fn a_text_answer_becomes_an_emission_with_the_answer() {
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "id": "gen_1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "  Je deset čtyřicet jedna.  "}
+            }]
+        })]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            persona: "p".into(),
+            reply_guidance: vec![],
+            memory_silent: false,
+        });
+        let e = emitter(mock).propose_or_answer(c, &legal()).await.unwrap();
+        assert_eq!(e.answer.as_deref(), Some("Je deset čtyřicet jedna."));
+        assert_eq!(e.proposal.action, "respond_directly");
+        assert_eq!(
+            e.proposal.rationale,
+            format!(
+                "{} Je deset čtyřicet jedna.",
+                nscore::ANSWERED_IN_EMITTER_PREFIX
+            )
+        );
+        // and not the fallback prefix, which means a request that bought
+        // nothing — this one bought the turn.
+        assert!(!e.proposal.rationale.starts_with(nscore::TEXT_FALLBACK_PREFIX));
+    }
+
     #[tokio::test]
     async fn text_only_response_maps_to_respond_directly() {
         // Models that ignore tool_choice "required" (common on free tiers)
@@ -584,6 +920,28 @@ mod tests {
         let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
         assert_eq!(p.action, "respond_directly");
         assert!(p.rationale.contains("The time is noon."));
+    }
+
+    /// The rationale is cut to 300, and a byte cut through a Czech letter
+    /// panics. Seen as a class, not as an accident: every letter in
+    /// `ěščřžýáíé` is two bytes, so a long Czech fallback is the ordinary
+    /// case here rather than the exotic one.
+    #[tokio::test]
+    async fn a_long_czech_text_fallback_does_not_panic() {
+        let long: String = "ěščřžýáíé".chars().cycle().take(400).collect();
+        assert_eq!(long.chars().count(), 400);
+        assert!(long.len() > 400, "the text has to be multi-byte to test it");
+        let mock = MockTransport::ok(vec![serde_json::json!({
+            "id": "gen_1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": long}
+            }]
+        })]);
+        let p = emitter(mock).propose(ctx(), &legal()).await.unwrap();
+        assert_eq!(p.action, "respond_directly");
+        assert!(p.rationale.starts_with(nscore::TEXT_FALLBACK_PREFIX));
+        assert_eq!(p.rationale.chars().count(), 300);
     }
 
     fn empty_message() -> Vec<serde_json::Value> {

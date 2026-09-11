@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use nscore::{
-    ActionSpec, ClassifiedProposal, EmitError, Emitter, EmitterContext, Guard, GuardCtx,
+    ActionSpec, ClassifiedProposal, Emission, EmitError, Emitter, EmitterContext, Guard, GuardCtx,
     LegalActionSet, Proposal, Replier, ReplyContext, ReplyError, SideEffect, Tool, ToolCtx,
     ToolError, ToolOutput, Trust, Verdict,
 };
@@ -11,14 +11,45 @@ use std::sync::Mutex;
 /// If a popped proposal's action is not legal, it is returned anyway —
 /// the ENGINE must reject it (that's what we're testing).
 pub struct ScriptedEmitter {
-    queue: Mutex<VecDeque<Proposal>>,
+    queue: Mutex<VecDeque<Emission>>,
 }
 
 impl ScriptedEmitter {
     pub fn new(proposals: Vec<Proposal>) -> Self {
+        Self::answering(
+            proposals
+                .into_iter()
+                .map(|proposal| Emission {
+                    proposal,
+                    answer: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// M12 T4.4a: a script whose entries may answer instead of acting, for
+    /// the chat-tier act-or-answer path. `new` is this with every `answer`
+    /// set to `None`, which is what every test written before M12 gets.
+    pub fn answering(emissions: Vec<Emission>) -> Self {
         Self {
-            queue: Mutex::new(proposals.into()),
+            queue: Mutex::new(emissions.into()),
         }
+    }
+
+    fn pop(&self) -> Emission {
+        let popped = self
+            .queue
+            .lock()
+            .expect("scripted emitter lock")
+            .pop_front();
+        popped.unwrap_or_else(|| Emission {
+            proposal: Proposal {
+                rationale: "nothing left to do".into(),
+                action: "respond_directly".into(),
+                args: serde_json::json!({}),
+            },
+            answer: None,
+        })
     }
 }
 
@@ -29,16 +60,15 @@ impl Emitter for ScriptedEmitter {
         _ctx: EmitterContext,
         _legal: &LegalActionSet,
     ) -> Result<Proposal, EmitError> {
-        let popped = self
-            .queue
-            .lock()
-            .expect("scripted emitter lock")
-            .pop_front();
-        Ok(popped.unwrap_or_else(|| Proposal {
-            rationale: "nothing left to do".into(),
-            action: "respond_directly".into(),
-            args: serde_json::json!({}),
-        }))
+        Ok(self.pop().proposal)
+    }
+
+    async fn propose_or_answer(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        Ok(self.pop())
     }
 }
 
@@ -175,14 +205,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn scripted_emitter_pops_then_responds_directly() {
-        let e = ScriptedEmitter::new(vec![Proposal {
-            rationale: "r".into(),
-            action: "echo".into(),
-            args: serde_json::json!({"text":"hi"}),
-        }]);
-        let ctx = || EmitterContext {
+    fn ctx() -> EmitterContext {
+        EmitterContext {
             facts: vec![],
             summary: None,
             window: vec![],
@@ -195,11 +219,53 @@ mod tests {
             guidance: vec![],
             budget_line: None,
             usage: None,
-        };
+            answer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_emitter_pops_then_responds_directly() {
+        let e = ScriptedEmitter::new(vec![Proposal {
+            rationale: "r".into(),
+            action: "echo".into(),
+            args: serde_json::json!({"text":"hi"}),
+        }]);
         let p1 = e.propose(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(p1.action, "echo");
         let p2 = e.propose(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(p2.action, "respond_directly");
+    }
+
+    /// M12 T4.4a. `answering` is the only way a script carries a reply text,
+    /// and `new` must keep meaning "act, never answer" — every test written
+    /// before M12 builds its emitter that way.
+    #[tokio::test]
+    async fn a_scripted_emission_can_answer_instead_of_acting() {
+        let e = ScriptedEmitter::answering(vec![Emission {
+            proposal: Proposal {
+                rationale: "answered".into(),
+                action: "respond_directly".into(),
+                args: serde_json::json!({}),
+            },
+            answer: Some("it is 10:41".into()),
+        }]);
+        let first = e.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
+        assert_eq!(first.answer.as_deref(), Some("it is 10:41"));
+        assert_eq!(first.proposal.action, "respond_directly");
+        // Exhausted, it falls back to the same respond_directly as `new`.
+        let second = e.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
+        assert_eq!(second.answer, None);
+        assert_eq!(second.proposal.action, "respond_directly");
+
+        // And a plain script never answers, whichever method is called.
+        let plain = ScriptedEmitter::new(vec![Proposal {
+            rationale: "r".into(),
+            action: "echo".into(),
+            args: serde_json::json!({"text":"hi"}),
+        }]);
+        let emission = plain.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
+        assert_eq!(emission.answer, None);
+        assert_eq!(emission.proposal.action, "echo");
     }
 
     #[tokio::test]

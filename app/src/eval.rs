@@ -335,11 +335,35 @@ pub struct Args {
     /// verbatim control — asked of the other retriever. `search_facts` is
     /// `lexical_rank`, not bm25, and the turns number says nothing about it.
     pub facts: bool,
+    /// `[memory] window_turns` and `facts_in_context` for this run (M12
+    /// T5.2), without editing the config.
+    pub profile: Profile,
+}
+
+/// The context profile one run is measured at (M12 T5.2).
+///
+/// `None` on both is the default arm — the engine's own `window_turns = 6`
+/// and `facts_in_context = 10` — and is the only arm the ledger records. A
+/// pair rather than two loose arguments because the two move together: the
+/// question the arm answers is what a wider context costs per emitter call,
+/// and a run that widened one of them is half a reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub window: Option<usize>,
+    pub facts: Option<usize>,
+}
+
+impl Profile {
+    /// Whether this is the default arm, and so whether the ledger may record
+    /// it.
+    fn is_default(&self) -> bool {
+        self.window.is_none() && self.facts.is_none()
+    }
 }
 
 const USAGE: &str = "usage: ns-app eval [<ledger-path>] [--paraphrase [--facts]] \
      [--ablate facts|summary|guidance] [--activation <weight>] [--depth full|adaptive] \
-     [--obligations] [--guidelines]";
+     [--window <turns>] [--facts <count>] [--obligations] [--guidelines]";
 
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut ledger = None;
@@ -350,11 +374,33 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut obligations = false;
     let mut guidelines = false;
     let mut facts = false;
-    let mut rest = args.iter();
+    let mut profile = Profile::default();
+    let mut rest = args.iter().peekable();
     while let Some(a) = rest.next() {
         match a.as_str() {
             "--paraphrase" => paraphrase = true,
-            "--facts" => facts = true,
+            // Two flags spelled the same, told apart by what follows them:
+            // `--facts 16` is M12 T5.2's cap and a bare `--facts` is M11
+            // T1.1's corpus modifier on `--paraphrase`. The alternative was
+            // to rename one of them, and the modifier is in the M11 results
+            // as `--paraphrase --facts` — a spelling that already means
+            // something to a reader of those numbers.
+            "--facts" => match rest.peek().and_then(|n| n.parse::<usize>().ok()) {
+                Some(n) => {
+                    rest.next();
+                    profile.facts = Some(positive(n, "--facts")?);
+                }
+                None => facts = true,
+            },
+            "--window" => {
+                let n = rest
+                    .next()
+                    .ok_or_else(|| format!("{USAGE} (--window needs a turn count)"))?;
+                let n = n
+                    .parse::<usize>()
+                    .map_err(|_| format!("{USAGE} (got {n:?})"))?;
+                profile.window = Some(positive(n, "--window")?);
+            }
             "--obligations" => obligations = true,
             "--guidelines" => guidelines = true,
             "--depth" => {
@@ -405,7 +451,19 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         obligations,
         guidelines,
         facts,
+        profile,
     })
+}
+
+/// A cap of zero is not a profile: it is the context block switched off,
+/// which is `--ablate`'s question and is measured against a control there.
+fn positive(n: usize, flag: &str) -> Result<usize, String> {
+    if n == 0 {
+        return Err(format!(
+            "{USAGE} ({flag} 0 blanks the block — use --ablate, which runs a control beside it)"
+        ));
+    }
+    Ok(n)
 }
 
 /// `ns-app eval --obligations` / `--guidelines` — the two M9 knobs that are
@@ -741,17 +799,29 @@ fn now_ms() -> u64 {
 /// The tie corpus is the arm built to move, and printing the two together is
 /// what makes the difference attributable — a run whose abilities held and
 /// whose ties changed is the reading the knob needs.
-pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
+pub async fn run_at(
+    ledger_path: &Path,
+    activation: f32,
+    depth: nscore::Depth,
+    profile: Profile,
+) -> i32 {
     let abilities = run_all_for(Run {
         activation_weight: activation,
         depth,
+        window_turns: profile.window,
+        facts_in_context: profile.facts,
         ..Run::default()
     })
     .await;
     if depth != nscore::Depth::Full {
         println!("router depth: {} (M10 T2.1)", depth.as_str());
     }
-    let code = report(&abilities, ledger_path, activation, depth);
+    let code = report(&abilities, ledger_path, activation, depth, profile);
+    // M12 T5.2. Printed on every run, not only on the arm: the default's
+    // prefix level is the number the arm is compared against, and a footer
+    // that appeared only when a flag was passed would leave the comparison
+    // to be reconstructed from an older paste.
+    print!("{}", profile_footer(&abilities, profile));
     print!(
         "{}",
         nstestkit::ties::render(&nstestkit::ties::measure(activation).await)
@@ -763,6 +833,8 @@ pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -
     let fx = nstestkit::fixtures::run_all_for(Run {
         activation_weight: activation,
         depth,
+        window_turns: profile.window,
+        facts_in_context: profile.facts,
         ..Run::default()
     })
     .await;
@@ -773,14 +845,78 @@ pub async fn run_at(ledger_path: &Path, activation: f32, depth: nscore::Depth) -
     code
 }
 
+/// What this run was measured at, and what its emitter prefix came to
+/// (M12 T5.2).
+///
+/// The prefix is the run of blocks a provider cache breakpoint would sit
+/// behind, and it is worth nothing under the 1,024-token floor every current
+/// provider applies — so the floor is printed beside the level rather than
+/// left to be remembered. A returned string rather than a `println!` because
+/// the line is the arm's whole deliverable, and a line nothing can assert on
+/// is a line that drifts.
+///
+/// The median and max are over the ability rows, each of which already
+/// carries the median over *its* emitter calls. A median of medians, not of
+/// calls: [`Ability`] records one number per ability, and a raw per-call list
+/// in the ledger row would be a schema change for a footer.
+///
+/// An ability whose emitter was sent no stable blocks at all is left out,
+/// the way `ns-app budget`'s own prefix summary leaves such a call out: the
+/// four desktop tasks are one turn on an empty store, and folding their
+/// zeros in would drag the median under the floor for free.
+fn profile_footer(rows: &[Ability], profile: Profile) -> String {
+    let default = nsengine::turn::EngineConfig::default();
+    let mut levels: Vec<u32> = rows
+        .iter()
+        .map(|r| r.emitter_prefix_tokens)
+        .filter(|t| *t > 0)
+        .collect();
+    levels.sort_unstable();
+    let (median, max) = match levels.last() {
+        Some(max) => (levels[levels.len() / 2], *max),
+        None => (0, 0),
+    };
+    format!(
+        "context profile: window {}, facts {} · emitter prefix (est.) median {median} tokens, \
+         max {max} · breakpoint floor 1,024\n",
+        profile.window.unwrap_or(default.window_turns),
+        profile.facts.unwrap_or(default.facts_in_context),
+    )
+}
+
 /// The gate, separated from the run so that a failing set can be tested
 /// without one. The six abilities pass, which is exactly why the non-zero
 /// path needs its own test: an exit code nothing exercises is a gate nobody
 /// has checked.
-fn report(abilities: &[Ability], ledger_path: &Path, activation: f32, depth: nscore::Depth) -> i32 {
+fn report(
+    abilities: &[Ability],
+    ledger_path: &Path,
+    activation: f32,
+    depth: nscore::Depth,
+    profile: Profile,
+) -> i32 {
     print!("{}", render_table(abilities));
 
     let current = Row::build(harness_hash(Path::new(".")), now_ms(), abilities);
+    // M12 T5.2, the same rule again: a run at a wider window or a deeper
+    // fact list is a different arm, and a row of its numbers would make the
+    // next default diff read as a harness change.
+    if !profile.is_default() {
+        println!(
+            "ledger: not written — this run is the window = {}, facts = {} arm, \
+             not the default one the ledger diffs.",
+            profile
+                .window
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".into()),
+            profile
+                .facts
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".into()),
+        );
+        let failed = abilities.iter().filter(|a| !a.passed).count();
+        return i32::from(failed > 0);
+    }
     // Same rule as the activation arm, and for the same reason: a run at
     // `depth = adaptive` is a different arm, and recording it would make the
     // next diff read as a harness change.
@@ -849,6 +985,8 @@ mod tests {
             requests,
             prompt_chars: 512,
             prompt_tokens: 128,
+            context_chars: 300,
+            emitter_prefix_tokens: 75,
             peak_chars: 700,
             tool_calls: 3,
             recall_fired: false,
@@ -1090,7 +1228,8 @@ mod tests {
                 &[ability("abstention", true, 7)],
                 &path,
                 0.0,
-                nscore::Depth::Full
+                nscore::Depth::Full,
+                Profile::default()
             ),
             0
         );
@@ -1099,7 +1238,8 @@ mod tests {
                 &[ability("abstention", false, 7)],
                 &path,
                 0.0,
-                nscore::Depth::Full
+                nscore::Depth::Full,
+                Profile::default()
             ),
             1,
             "a failed ability has to reach the exit code"
@@ -1127,7 +1267,8 @@ mod tests {
                 &[ability("abstention", true, 7)],
                 &path,
                 0.0,
-                nscore::Depth::Full
+                nscore::Depth::Full,
+                Profile::default()
             ),
             0
         );
@@ -1141,7 +1282,8 @@ mod tests {
                 &[ability("abstention", false, 7)],
                 &path,
                 0.0,
-                nscore::Depth::Full
+                nscore::Depth::Full,
+                Profile::default()
             ),
             1
         );
@@ -1252,6 +1394,85 @@ mod tests {
         assert!(a(vec!["--activation", "-1"]).is_err(), "no negative weight");
         assert!(a(vec!["--activation", "nan"]).is_err());
         assert!(a(vec!["--activation", "heavy"]).is_err());
+    }
+
+    /// **M12 T5.2: the context-profile arm.**
+    ///
+    /// Three things, and each of them is a way the arm could quietly stop
+    /// being an arm: the caps parse, the footer says what the run was
+    /// measured at, and the ledger is left alone — a profile run recorded in
+    /// it would make the next default diff read as a harness change, which is
+    /// the rule `--depth` and `--activation` already follow.
+    #[test]
+    fn the_profile_arm_prints_and_does_not_write_the_ledger() {
+        let a =
+            |args: Vec<&str>| parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(a(vec![]).unwrap().profile, Profile::default());
+        let parsed = a(vec!["--window", "10", "--facts", "16"]).unwrap();
+        assert_eq!(
+            parsed.profile,
+            Profile {
+                window: Some(10),
+                facts: Some(16)
+            }
+        );
+        assert_eq!(
+            a(vec!["--window", "10"]).unwrap().profile,
+            Profile {
+                window: Some(10),
+                facts: None
+            },
+            "either flag alone is an arm"
+        );
+        // `--facts` with no number after it is still `--paraphrase`'s
+        // modifier, which is the flag it was before this arm existed.
+        let corpus = a(vec!["--paraphrase", "--facts"]).unwrap();
+        assert!(corpus.facts && corpus.profile.facts.is_none());
+        assert!(a(vec!["--window"]).is_err(), "the cap is required");
+        assert!(
+            a(vec!["--window", "0"]).is_err(),
+            "and a window of none is not a profile"
+        );
+        assert!(a(vec!["--facts", "0"]).is_err());
+
+        // The footer is the deliverable of the arm: without the prefix level
+        // the caps are two numbers nobody can act on.
+        let rows = [ability("abstention", true, 7)];
+        assert_eq!(
+            profile_footer(&rows, parsed.profile),
+            "context profile: window 10, facts 16 · emitter prefix (est.) median 75 tokens, \
+             max 75 · breakpoint floor 1,024\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_LEDGER);
+        assert_eq!(
+            report(&rows, &path, 0.0, nscore::Depth::Full, Profile::default()),
+            0
+        );
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            report(&rows, &path, 0.0, nscore::Depth::Full, parsed.profile),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            recorded,
+            "the profile arm must not add a row to the ledger the default arm diffs"
+        );
+        // And the verdict still travels: an arm that swallowed a failure
+        // would be a gate with the light removed.
+        assert_eq!(
+            report(
+                &[ability("abstention", false, 7)],
+                &path,
+                0.0,
+                nscore::Depth::Full,
+                parsed.profile
+            ),
+            1
+        );
     }
 
     /// ledger path either way round, and refuses anything that is not one of

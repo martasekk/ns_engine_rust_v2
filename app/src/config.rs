@@ -269,6 +269,15 @@ pub struct RouterSection {
     /// the eval numbers say.
     #[serde(default)]
     pub depth: Option<String>,
+    /// M12 T2.1: the named cheap tools a `chat` turn may carry, each one only
+    /// when its own cue fires. An empty list is the off switch — no tools on
+    /// chat, which is how the tier behaved before this knob existed.
+    ///
+    /// Unlike the cue lists above, empty here means empty: the whole point of
+    /// writing `chat_tools = []` is to take the tools back off a chat turn,
+    /// and a "keep the built-in one" reading would make that impossible.
+    #[serde(default = "default_chat_tools")]
+    pub chat_tools: Vec<String>,
 }
 
 impl Default for RouterSection {
@@ -278,8 +287,16 @@ impl Default for RouterSection {
             recall_cues: Vec::new(),
             task_cues: Vec::new(),
             depth: None,
+            chat_tools: default_chat_tools(),
         }
     }
+}
+
+/// `get_time` and nothing else: the defect M11 recorded is the time question,
+/// the tool is one schema and it reads a clock. Anything that touches the
+/// desktop belongs to a tier that budgeted for it.
+fn default_chat_tools() -> Vec<String> {
+    vec!["get_time".to_string()]
 }
 
 impl RouterSection {
@@ -298,6 +315,8 @@ impl RouterSection {
         // composition root calls first; an unreadable value never gets this
         // far, and if it somehow did, the default is today's behaviour.
         r.depth = self.depth().unwrap_or_default();
+        // Taken as written, empty included: see `chat_tools`.
+        r.chat_tools = self.chat_tools.clone();
         r
     }
 
@@ -494,6 +513,12 @@ pub struct MemorySection {
     /// Guidance notes rendered into either context, at most (M9 T2.2).
     #[serde(default = "default_guidance_max")]
     pub guidance_max: usize,
+    /// Skip guidance notes learned on another emitter model (M12 T3.2). Off,
+    /// because a note learned before the field carries no model and is kept
+    /// either way: the knob is for a deployment that changed emitters and
+    /// wants the old model's notes to stop steering the new one.
+    #[serde(default)]
+    pub archive_foreign_notes: bool,
     /// Days without use before a fact goes cold (M6 §6.2).
     #[serde(default = "default_fact_stale_days")]
     pub fact_stale_days: u64,
@@ -687,6 +712,7 @@ impl Default for MemorySection {
             obligations_max: default_obligations_max(),
             obligation_check: false,
             guidance_max: default_guidance_max(),
+            archive_foreign_notes: false,
             fact_stale_days: default_fact_stale_days(),
             fitness_min_exposures: default_fitness_min_exposures(),
             fitness_demote: false,
@@ -882,6 +908,22 @@ pub struct LlmConfig {
     /// M10 T1.6 say `slim` holds.
     #[serde(default)]
     pub schema_profile: Option<String>,
+    /// M12 T1.1: `"small"` (the default) or `"strong"` — which class of
+    /// model this deployment drives. `small` is today's behaviour byte for
+    /// byte; `strong` stands down the scaffolding that exists to compensate
+    /// for a weak emitter, and never adds any.
+    #[serde(default)]
+    pub capability: Option<String>,
+    /// M12 T4.3: on a chat-tier turn, let the one emitter call either act or
+    /// answer, and take its answer as the reply. Default **false**, and
+    /// false is today's two-call chat turn byte for byte.
+    ///
+    /// Chat only, and only where a router is configured — the tier is what
+    /// decides it. On Task and Deep the emitter/replier split is doing real
+    /// work; on Chat the emitter call exists to say "no tool applies", which
+    /// is a sentence the same call could have spent on the user.
+    #[serde(default)]
+    pub chat_act_or_answer: bool,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -912,6 +954,15 @@ impl LlmConfig {
         match self.schema_profile.as_deref() {
             None => Ok(nscore::SchemaProfile::Full),
             Some(s) => nscore::SchemaProfile::parse(s).map_err(|e| format!("[llm] {e}")),
+        }
+    }
+
+    /// `[llm] capability`, resolved. Err carries the message a startup
+    /// error should print; unset is [`nscore::Capability::Small`].
+    pub fn capability(&self) -> Result<nscore::Capability, String> {
+        match self.capability.as_deref() {
+            None => Ok(nscore::Capability::Small),
+            Some(s) => nscore::Capability::parse(s).map_err(|e| format!("[llm] {e}")),
         }
     }
 
@@ -1296,6 +1347,9 @@ impl EvolutionSection {
             max_notes: self.max_notes,
             regression_replay_cap: self.regression_replay_cap,
             dry_run,
+            // M12 T0.2: `--spend` is a flag of the run, not a config knob —
+            // `build_pass` sets it from the command line.
+            spend: false,
             fact_stale_days,
             // The CLI maps every session to one scope (M6 §15), so digests
             // are written under it. A multi-user channel replaces this with
@@ -1397,6 +1451,28 @@ mod tests {
         assert_eq!(cfg.http_components[0].name, "check_stock");
     }
 
+    /// M12 T4.3. Off is the two-call chat turn every deployment has today,
+    /// so an absent key and an explicit `false` must be the same thing, and
+    /// the key has to survive being written down.
+    #[test]
+    fn chat_act_or_answer_defaults_to_off_and_round_trips() {
+        assert!(!AppConfig::parse("").unwrap().llm.chat_act_or_answer);
+        assert!(!AppConfig::parse("[llm]\ncapability = \"strong\"")
+            .unwrap()
+            .llm
+            .chat_act_or_answer);
+        assert!(
+            !AppConfig::parse("[llm]\nchat_act_or_answer = false")
+                .unwrap()
+                .llm
+                .chat_act_or_answer
+        );
+        assert!(AppConfig::parse("[llm]\nchat_act_or_answer = true")
+            .unwrap()
+            .llm
+            .chat_act_or_answer);
+    }
+
     /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an
     /// unknown depth is a startup error rather than a silent `full` — a
     /// deployment that asked for `adaptive` and got `full` would read its
@@ -1427,6 +1503,18 @@ mod tests {
         assert!(err.contains("full, adaptive"), "{err}");
     }
 
+    /// M12 T3.2. Off is today's behaviour: every note reaches the prompt,
+    /// whichever emitter it was learned on. A deployment that switched
+    /// emitters turns it on to stop inheriting the old model's notes.
+    #[test]
+    fn archive_foreign_notes_defaults_to_off_and_round_trips() {
+        assert!(!AppConfig::parse("").unwrap().memory.archive_foreign_notes);
+        let on = AppConfig::parse("[memory]\narchive_foreign_notes = true\n").unwrap();
+        assert!(on.memory.archive_foreign_notes);
+        // The rest of [memory] is untouched by the knob.
+        assert_eq!(on.memory.window_turns, MemorySection::default().window_turns);
+    }
+
     /// M10 T1.3. The knob defaults to today's behaviour, the way every knob
     /// in this plan does, and an unknown spelling is a startup error rather
     /// than a silent fall back to `full` — a deployment that asked for `slim`
@@ -1451,6 +1539,33 @@ mod tests {
             .schema_profile()
             .unwrap_err();
         assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
+    }
+
+    /// M12 T1.1. Which class of model is driving decides how much scaffolding
+    /// the engine spends on it. `small` is today's behaviour byte for byte,
+    /// and an unknown spelling is a startup error rather than a silent
+    /// fallback: a deployment that asked for `strong` and got `small` would
+    /// pay for the regeneration it thought it had turned off.
+    #[test]
+    fn capability_defaults_to_small_and_rejects_an_unknown_name() {
+        assert_eq!(
+            AppConfig::parse("").unwrap().llm.capability().unwrap(),
+            nscore::Capability::Small
+        );
+        assert_eq!(
+            AppConfig::parse("[llm]\ncapability = \"strong\"")
+                .unwrap()
+                .llm
+                .capability()
+                .unwrap(),
+            nscore::Capability::Strong
+        );
+        let err = AppConfig::parse("[llm]\ncapability = \"huge\"")
+            .unwrap()
+            .llm
+            .capability()
+            .unwrap_err();
+        assert!(err.contains("huge") && err.contains("small, strong"), "{err}");
     }
 
     #[test]

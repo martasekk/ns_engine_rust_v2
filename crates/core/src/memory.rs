@@ -131,6 +131,78 @@ pub fn query_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Czech diacritics mapped to their ASCII base letter; everything else is
+/// passed through unchanged (M12 T1.5).
+///
+/// A match table rather than a Unicode normalization crate: the alphabet
+/// this engine is spoken in is known and closed, and a dependency for
+/// nineteen letters would be paid for on every build.
+pub fn fold_diacritics(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'á' => 'a',
+            'ä' => 'a',
+            'č' => 'c',
+            'ď' => 'd',
+            'é' => 'e',
+            'ě' => 'e',
+            'í' => 'i',
+            'ň' => 'n',
+            'ó' => 'o',
+            'ô' => 'o',
+            'ř' => 'r',
+            'š' => 's',
+            'ť' => 't',
+            'ú' => 'u',
+            'ů' => 'u',
+            'ý' => 'y',
+            'ž' => 'z',
+            'Á' => 'A',
+            'Ä' => 'A',
+            'Č' => 'C',
+            'Ď' => 'D',
+            'É' => 'E',
+            'Ě' => 'E',
+            'Í' => 'I',
+            'Ň' => 'N',
+            'Ó' => 'O',
+            'Ô' => 'O',
+            'Ř' => 'R',
+            'Š' => 'S',
+            'Ť' => 'T',
+            'Ú' => 'U',
+            'Ů' => 'U',
+            'Ý' => 'Y',
+            'Ž' => 'Z',
+            other => other,
+        })
+        .collect()
+}
+
+/// Whether two words are the same word, allowing for Czech inflection
+/// (M12 T1.5).
+///
+/// Both sides are folded and lowercased; equal words match. Otherwise the
+/// two must share a prefix of at least 3 characters, differ by at most 3
+/// characters on *each* side, and the shorter of the two must be at least 4
+/// characters long. That is a stemmer's rule with no stemmer: it accepts
+/// `Praze`/`Praha` and `Tomáše`/`Tomáš` and refuses `Canberra`/`Canada` and
+/// `Bob`/`Bobby`. Tight on purpose — the grounding check is what this feeds,
+/// and a wrong match is an invented name passed off as supported.
+pub fn stem_match(a: &str, b: &str) -> bool {
+    let a: Vec<char> = fold_diacritics(a).to_lowercase().chars().collect();
+    let b: Vec<char> = fold_diacritics(b).to_lowercase().chars().collect();
+    if a == b {
+        return !a.is_empty();
+    }
+    let shorter = a.len().min(b.len());
+    if shorter < 4 {
+        return false;
+    }
+    let prefix = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    prefix >= 3 && a.len() - prefix <= 3 && b.len() - prefix <= 3
+}
+
 /// Verbs that open an imperative clause, Czech and English.
 ///
 /// Deliberately a short closed list rather than a parser. The recorded risk
@@ -267,8 +339,30 @@ fn push_obligation(out: &mut Vec<String>, clause: &str, asked: bool, max: usize)
 /// interceptor it gates is off by default and regenerates at most once.
 pub fn addresses(asked: &str, reply: &str) -> bool {
     let asked: Vec<String> = query_tokens(asked);
-    let answered: std::collections::HashSet<String> = query_tokens(reply).into_iter().collect();
-    asked.is_empty() || answered.is_empty() || asked.iter().any(|t| answered.contains(t))
+    let answered: Vec<String> = query_tokens(reply);
+    // M12 T1.5: a pair overlaps when the words share a stem, so a reply that
+    // declines the asked word still counts as addressing it.
+    //
+    // Stems only on words of five characters or more. `stem_match` accepts a
+    // three-character common prefix with up to three characters differing on
+    // each side, which on short words is not inflection but coincidence:
+    // "order" and "arrive" are safe, but the four-letter tail of an English
+    // question matches half the dictionary, and a false overlap here is an
+    // obligation silently reported as met. Five is where the rule stops
+    // buying anything on Czech inflection ("vysyp"/"vysypání" survives it)
+    // and starts costing precision.
+    let overlaps = |t: &String, a: &String| {
+        if t.chars().count() >= 5 && a.chars().count() >= 5 {
+            stem_match(t, a)
+        } else {
+            fold_diacritics(t).to_lowercase() == fold_diacritics(a).to_lowercase()
+        }
+    };
+    asked.is_empty()
+        || answered.is_empty()
+        || asked
+            .iter()
+            .any(|t| answered.iter().any(|a| overlaps(t, a)))
 }
 
 /// The activation prior's knobs (M9 T3.1).
@@ -1009,5 +1103,36 @@ mod tests {
         // than accusing.
         assert!(addresses("hi", "hello"));
         assert!(addresses("where is my order", "ok"));
+        // M12 T1.5: an inflected Czech form of the asked word counts as
+        // overlap, which is what the exact-set version missed.
+        assert!(addresses("kdy je vysyp", "vysypání je ve čtvrtek"));
+        // And the stem rule is off below five characters, where a
+        // three-character prefix is coincidence rather than inflection:
+        // "order" against "arrive" must not read as an answer.
+        assert!(!addresses("where is my order", "when will it arrive"));
+    }
+
+    /// M12 T1.5. Czech inflects the words a reply is checked against, so
+    /// exact equality is the wrong test for a single word: `Praze` and
+    /// `Praha` are the same place. The rule stays deliberately tight - a
+    /// shared stem of 3, at most 3 characters differing on either side, on
+    /// words of at least 4 - because the cost of a wrong match is an
+    /// invented name passed off as grounded.
+    #[test]
+    fn stem_match_folds_diacritics_and_accepts_czech_inflection() {
+        assert_eq!(
+            fold_diacritics("Příliš žluťoučký kůň"),
+            "Prilis zlutoucky kun"
+        );
+        assert!(stem_match("Praze", "Praha"));
+        assert!(stem_match("Prahy", "Praha"));
+        assert!(stem_match("Brna", "Brno"));
+        assert!(stem_match("Martine", "Martin"));
+        assert!(stem_match("Tomáše", "Tomáš"));
+        // Different words that happen to share an opening.
+        assert!(!stem_match("Canberra", "Canada"));
+        assert!(!stem_match("Melbourne", "Melanie"));
+        // Too short to tell an inflection from a different name.
+        assert!(!stem_match("Bob", "Bobby"));
     }
 }

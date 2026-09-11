@@ -38,6 +38,22 @@ provider = "openrouter"
 # [llm.replier]
 # model = "openrouter/free"
 
+# ── Capability profile (M12) ──────────────────────────────────────────────
+# "small" (the default) keeps every scaffold built for a small caller.
+# "strong" retires the grounding *regeneration* (the flag and its events
+# stay), trims the emitter's per-iteration preamble (138 → 86 estimated
+# tokens) and leaves the text fallback as a counter. Recommended with
+# Sonnet 5 or Luna; measured in the M11/M12 plans.
+#   capability = "strong"
+# On a chat-tier turn only, let the one emitter call either act or answer,
+# and take its answer as the reply — a chat turn for one request instead of
+# two. Off by default, and needs a router, because the tier decides it.
+# Measured 2026-09-11 on Luna (M12 P6): 2.10 requests per turn against 2.90
+# without it, 6 of 12 chat turns answered in one call, no flag on any emitted
+# answer; requests per chat turn read exactly 2.00, and the rule for moving
+# the default asks for less than 2.00, so it stays off for now.
+#   chat_act_or_answer = true
+
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the
 # request this engine has always sent.
@@ -132,6 +148,10 @@ pinned_prefixes = ["user."]   # always shown, newest first, with the value they 
 pinned_max = 5
 relevant_max = 5
 fact_stale_days = 90          # unused this long -> cold (kept, searchable, not pinned)
+# Skip guidance notes learned on an emitter other than the one configured
+# now (M12 T3.2). Notes from before the field name no model and are kept
+# either way; turn this on after switching emitters.
+archive_foreign_notes = false
 # How many of a turn's own tool outcomes stay verbatim in the prompt (M7
 # T1.3). Older ones fold into one counted line — "earlier this turn (7
 # steps): pointer_move ok x3 ..." — and refusals never fold, since they are
@@ -180,6 +200,9 @@ show_budget_line = false
 enabled = true
 # recall_cues = ["before", "earlier", "last time", "co jsem", "minule"]
 # task_cues = ["click", "type", "open", "klikni", "otevři"]
+# The named cheap tools a chat turn may carry, each one only when its own cue fires
+# ("what time is it" reaches get_time without leaving the chat tier). [] = no tools on chat.
+chat_tools = ["get_time"]
 reply_grounding_check = true  # regenerate once a reply that invents numbers/names
 max_echo_ratio = 0.6          # log (do not rewrite) a reply this much of which is lifted from its own prompt
 remember_residual = "flag"    # "never": refuse remembered values the user never said

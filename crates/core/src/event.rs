@@ -219,6 +219,39 @@ pub fn reject_bucket(reason: &crate::action::RejectReason) -> String {
     }
 }
 
+/// How the emitter labels a proposal it built from plain text because the
+/// model ignored `tool_choice: "required"` (M12 T1.3).
+///
+/// Lives here rather than in `nsllm` because the counter that reads it is
+/// here: the rationale in the log is the only trace such a call leaves, and
+/// the writer and the reader must agree on one string.
+pub const TEXT_FALLBACK_PREFIX: &str = "model answered in text:";
+
+/// How the emitter labels a proposal whose text *is* the reply, because a
+/// chat-tier act-or-answer call chose to answer rather than act (M12 T4.2).
+///
+/// Here for the same reason as [`TEXT_FALLBACK_PREFIX`], and distinct from
+/// it on purpose: a fallback is a request that bought nothing, and this is a
+/// request that bought the whole turn.
+pub const ANSWERED_IN_EMITTER_PREFIX: &str = "answered in the emitter call:";
+
+/// How many proposals in this log came from the emitter's text fallback.
+///
+/// A fallback is a request that bought no tool call, so it belongs next to
+/// the rejection rate: both say what the day's request budget was spent on
+/// without getting an action for it.
+pub fn text_fallbacks(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .filter(|e| match &e.kind {
+            EventKind::Proposed { proposal } => {
+                proposal.rationale.starts_with(TEXT_FALLBACK_PREFIX)
+            }
+            _ => false,
+        })
+        .count() as u32
+}
+
 /// Count `Proposed` and bucket `Rejected` over one session's events.
 ///
 /// Pure over the slice so both callers share one definition of the number:
@@ -335,6 +368,44 @@ impl EventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M12 T1.3. The text fallback is a silent tax: the emitter asked for a
+    /// tool call, got prose, and turned it into `respond_directly` without
+    /// anything counting how often that happened. The rationale the emitter
+    /// writes is the only record in the log, so the counter reads it, and
+    /// only a rationale that *starts* with the prefix counts - a model that
+    /// quotes the phrase mid-sentence is not a fallback.
+    #[test]
+    fn a_text_fallback_is_counted_from_the_recorded_rationale() {
+        let mut log = EventLog::new(SessionId("s1".into()));
+        let propose = |rationale: &str| EventKind::Proposed {
+            proposal: crate::action::Proposal {
+                action: "respond_directly".into(),
+                args: serde_json::json!({}),
+                rationale: rationale.into(),
+            },
+        };
+        assert_eq!(text_fallbacks(log.events()), 0);
+        log.append(
+            0,
+            Timestamp(1),
+            propose(&format!("{TEXT_FALLBACK_PREFIX} the time is 10:41")),
+        );
+        log.append(0, Timestamp(2), propose("the user asked for the time"));
+        log.append(
+            1,
+            Timestamp(3),
+            propose(&format!("{TEXT_FALLBACK_PREFIX} nothing to do")),
+        );
+        // Mid-sentence, and a different event kind: neither is a fallback.
+        log.append(
+            1,
+            Timestamp(4),
+            propose("I would say model answered in text: but I did not"),
+        );
+        log.append(1, Timestamp(5), EventKind::Replied { text: "ok".into() });
+        assert_eq!(text_fallbacks(log.events()), 2);
+    }
 
     #[test]
     fn append_chains_hashes_and_verifies() {
