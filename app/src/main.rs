@@ -625,7 +625,15 @@ async fn main() {
         if let Some(block) = parsed.ablate {
             std::process::exit(eval::run_ablate(block, parsed.activation).await);
         }
-        std::process::exit(eval::run_at(&parsed.ledger, parsed.activation, parsed.depth).await);
+        std::process::exit(
+            eval::run_at(
+                &parsed.ledger,
+                parsed.activation,
+                parsed.depth,
+                parsed.profile,
+            )
+            .await,
+        );
     }
 
     // `ns-app grade [--local] [--split dev|held|all]`: what an evaluator is

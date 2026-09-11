@@ -375,6 +375,8 @@ mod tests {
             requests: 19,
             prompt_chars: 512,
             prompt_tokens: 128,
+            context_chars: 300,
+            emitter_prefix_tokens: 75,
             peak_chars: 700,
             tool_calls: 3,
             recall_fired: false,

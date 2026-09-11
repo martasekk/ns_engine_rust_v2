@@ -791,6 +791,12 @@ pub(crate) struct Harness {
     /// and `recall` is (correctly) not offered. A one-turn window puts turn 1
     /// out of sight and restores the ability's own shape: the search runs,
     /// finds nothing, and the reply has to decline.
+    ///
+    /// M12 T5.1 starts it from [`Run::window_turns`], so a context-profile
+    /// arm reaches every fixture through this one field. A fixture that
+    /// overrides it keeps its own window under every arm, which is the point
+    /// of the override: `abstention` grades what one turn out of sight does,
+    /// not what six do.
     window_turns: Option<usize>,
     /// M10 T5.1: the learned rules this fixture hands the engine, which is
     /// where the guidance block comes from. Empty on the ten abilities, so
@@ -839,6 +845,20 @@ pub struct Run {
     /// value into every fixture, and the names are literals at every call
     /// site anyway.
     pub withhold: &'static [&'static str],
+    /// `[memory] window_turns` for this arm (M12 T5.1), or `None` for the
+    /// engine's own default — which is what every run before this field was
+    /// measured at, so `None` and `Some(6)` must render the same table.
+    ///
+    /// It reaches the engine through [`Harness::window_turns`], the
+    /// per-fixture override M10 T1.4 added, rather than through a second
+    /// path: a fixture that needs a particular window needs it under every
+    /// arm (`abstention` asks its question with exactly one turn out of
+    /// sight), so the fixture's own value wins where it sets one.
+    pub window_turns: Option<usize>,
+    /// `[memory] facts_in_context` for this arm (M12 T5.1), or `None` for
+    /// the engine's own default. No fixture overrides this one, so it goes
+    /// straight into every `EngineConfig` the harness builds.
+    pub facts_in_context: Option<usize>,
     /// `[router] depth` for this arm (M10 T2.1/T2.3). `Full` is the default
     /// and is the engine's behaviour before adaptive depth existed.
     ///
@@ -903,7 +923,10 @@ impl Harness {
             sessions: Mutex::new(Vec::new()),
             ticks: Arc::new(AtomicU64::new(0)),
             desktop: false,
-            window_turns: None,
+            // M12 T5.1. The arm's cap is the fixture's starting value; a
+            // fixture that needs its own window says so afterwards, the way
+            // `abstention` does.
+            window_turns: run.window_turns,
             learned: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(LearnedRules::default())),
             summaries: false,
             persona: String::new(),
@@ -1032,6 +1055,12 @@ impl Harness {
             window_turns: self
                 .window_turns
                 .unwrap_or(EngineConfig::default().window_turns),
+            // M12 T5.1. `None` on every existing run, so the ten abilities
+            // and the thirty fixtures keep the numbers they have.
+            facts_in_context: self
+                .run
+                .facts_in_context
+                .unwrap_or(EngineConfig::default().facts_in_context),
             ..EngineConfig::default()
         };
         let cfg = if self.desktop {
@@ -1206,8 +1235,21 @@ impl Harness {
                     // manifest rather than recomputed here: the manifest is
                     // built from the context immediately before it is moved
                     // into the call, so it cannot drift from what was sent.
-                    EventKind::ModelCall { manifest, .. } => {
+                    EventKind::ModelCall { usage, manifest } => {
                         legal_on_last_call = manifest.tools;
+                        // M12 T5.3. The stable prefix as the emitter was
+                        // sent it: the three blocks that do not change
+                        // between the iterations of a turn, which is what a
+                        // cache breakpoint would sit behind. Emitter only —
+                        // the replier's window is the turn it is answering,
+                        // so folding it in would measure a different prefix.
+                        if usage.role == "emitter" {
+                            let stable = manifest.facts_chars
+                                + manifest.summary_chars
+                                + manifest.window_chars;
+                            c.context_chars += stable;
+                            c.emitter_prefix.push(estimate_tokens(stable));
+                        }
                         c.legal_max = c.legal_max.max(manifest.tools);
                         c.clipped_chars += manifest.clipped_chars;
                         c.budget_drops += manifest
@@ -1260,6 +1302,16 @@ pub(crate) struct Counters {
     pub(crate) recall_hits: usize,
     pub(crate) flags: usize,
     pub(crate) clarifications: usize,
+    /// The three stable blocks as sent to the *emitter*, summed over the
+    /// fixture's emitter calls (M12 T5.3).
+    context_chars: usize,
+    /// The same sum in estimated tokens, one entry per emitter call rather
+    /// than a total: the number a cache breakpoint is judged against is a
+    /// level per call, and a sum over twelve iterations clears a floor no
+    /// single call does. A call whose three blocks were all empty is a zero
+    /// entry and stays in — an emitter that was sent nothing stable is what
+    /// this arm is measuring, not a record that went missing.
+    emitter_prefix: Vec<u32>,
     /// The four M7 numbers, summed over every model call the fixture made.
     clipped_chars: usize,
     inspections: usize,
@@ -1284,6 +1336,21 @@ pub(crate) struct Counters {
 }
 
 impl Counters {
+    /// The middle emitter prefix of the fixture, in estimated tokens, or `0`
+    /// when no emitter call carried one (M12 T5.3).
+    ///
+    /// The median rather than the mean, and the same upper-median convention
+    /// `ns-app budget`'s `prefix_summary` uses, so the harness column and the
+    /// live report cannot disagree about what a "median prefix" is.
+    fn emitter_prefix_tokens(&self) -> u32 {
+        if self.emitter_prefix.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.emitter_prefix.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    }
+
     /// The deciding call for `target`: the first proposal of that action and
     /// the legal-set size it was chosen from, or the widest set seen and a
     /// miss (M10 T0.4).
@@ -1378,6 +1445,26 @@ pub struct Ability {
     /// Four characters to the token, `nscore`'s own offline estimate, so this
     /// column and the engine's budget report cannot disagree.
     pub prompt_tokens: u32,
+    /// The three stable blocks — facts, summary and verbatim window — as the
+    /// *emitter* was sent them, summed over the ability's emitter calls
+    /// (M12 T5.3, column `ctx chars`).
+    ///
+    /// Off `ContextManifest`, not off the fixture's own rendering: the
+    /// manifest is built from the context immediately before it is moved
+    /// into the call, so this is the size that was sent. `prompt_chars`
+    /// beside it is the fixture's rendering of the graded *reply* context,
+    /// which is a different prompt for a different model — the pair is what
+    /// makes a context-profile arm readable.
+    pub context_chars: usize,
+    /// The median of `estimate_tokens(facts + summary + window)` over the
+    /// ability's emitter calls (M12 T5.3, column `prefix tok`), or `0` when
+    /// it made none.
+    ///
+    /// A level, not a total: this is the run of blocks a provider cache
+    /// breakpoint would sit behind, and it buys nothing until it clears the
+    /// 1,024-token floor. A sum over a turn's iterations would clear that
+    /// floor without any single call doing so.
+    pub emitter_prefix_tokens: u32,
     pub peak_chars: usize,
     pub tool_calls: usize,
     pub recall_fired: bool,
@@ -1449,6 +1536,8 @@ impl Ability {
             requests: c.emitter_calls + h.reply_calls(),
             prompt_chars: graded.chars(),
             prompt_tokens: estimate_tokens(graded.chars()),
+            context_chars: c.context_chars,
+            emitter_prefix_tokens: c.emitter_prefix_tokens(),
             peak_chars: h.peak_chars(),
             tool_calls: c.tool_calls,
             recall_fired: c.recall_calls > 0,
@@ -1474,10 +1563,10 @@ pub(crate) fn require(fails: &mut Vec<String>, ok: bool, why: impl FnOnce() -> S
 
 /// Header, rule and every row through one set of widths, so a column cannot
 /// drift out of line with its heading when a number grows.
-fn row_line(cells: [&str; 17]) -> String {
+fn row_line(cells: [&str; 19]) -> String {
     format!(
-        "  {:<24}  {:<4}  {:>5}  {:>4}  {:>6}  {:>4}  {:>4}  {:>5}  {:<6}  {:>4}  {:>5}  \
-         {:>7}  {:>5}  {:>5}  {:>4}  {:>5}  {:>5}\n",
+        "  {:<24}  {:<4}  {:>5}  {:>4}  {:>6}  {:>4}  {:>9}  {:>10}  {:>4}  {:>5}  {:<6}  \
+         {:>4}  {:>5}  {:>7}  {:>5}  {:>5}  {:>4}  {:>5}  {:>5}\n",
         cells[0],
         cells[1],
         cells[2],
@@ -1495,14 +1584,33 @@ fn row_line(cells: [&str; 17]) -> String {
         cells[14],
         cells[15],
         cells[16],
+        cells[17],
+        cells[18],
     )
 }
 
 pub fn render_table(rows: &[Ability]) -> String {
     let mut out = String::from("\nM7 T5.1 — memory and desktop abilities, scripted model\n\n");
     out.push_str(&row_line([
-        "ability", "pass", "turns", "reqs", "prompt", "~tok", "peak", "tools", "recall", "hits",
-        "flags", "clipped", "insp", "drops", "esc", "legal", "BoR",
+        "ability",
+        "pass",
+        "turns",
+        "reqs",
+        "prompt",
+        "~tok",
+        "ctx chars",
+        "prefix tok",
+        "peak",
+        "tools",
+        "recall",
+        "hits",
+        "flags",
+        "clipped",
+        "insp",
+        "drops",
+        "esc",
+        "legal",
+        "BoR",
     ]));
     out.push_str(&row_line([
         "------------------------",
@@ -1511,6 +1619,8 @@ pub fn render_table(rows: &[Ability]) -> String {
         "----",
         "------",
         "----",
+        "---------",
+        "----------",
         "----",
         "-----",
         "------",
@@ -1531,6 +1641,8 @@ pub fn render_table(rows: &[Ability]) -> String {
             &r.requests.to_string(),
             &r.prompt_chars.to_string(),
             &r.prompt_tokens.to_string(),
+            &r.context_chars.to_string(),
+            &r.emitter_prefix_tokens.to_string(),
             &r.peak_chars.to_string(),
             &r.tool_calls.to_string(),
             if r.recall_fired { "yes" } else { "no" },
@@ -2519,6 +2631,8 @@ mod tests {
             requests: 19,
             prompt_chars: 512,
             prompt_tokens: 128,
+            context_chars: 300,
+            emitter_prefix_tokens: 75,
             peak_chars: 700,
             tool_calls: 3,
             recall_fired: false,
@@ -2575,6 +2689,8 @@ mod tests {
             requests: 2,
             prompt_chars: 0,
             prompt_tokens: 0,
+            context_chars: 0,
+            emitter_prefix_tokens: 0,
             peak_chars: 0,
             tool_calls: 1,
             recall_fired: false,
@@ -2710,6 +2826,80 @@ mod tests {
         assert!(
             desktop.iter().any(|r| r.escalations > 0),
             "one of them has to start conversational, or the misroute path is untested"
+        );
+    }
+
+    /// **M12 T5.1: `None` is today's defaults.**
+    ///
+    /// The caps are an arm, not a change: a run that leaves them unset and a
+    /// run that names the engine's own numbers have to render the same table,
+    /// byte for byte, or every ledger diff taken after this task reads as a
+    /// harness change.
+    #[tokio::test]
+    async fn a_run_at_the_default_profile_is_byte_identical_to_todays() {
+        let today = render_table(&run_all().await);
+        assert_eq!(
+            render_table(&run_all_for(Run::default()).await),
+            today,
+            "the default arm is `Run::default()` and nothing else"
+        );
+        let named = Run {
+            window_turns: Some(EngineConfig::default().window_turns),
+            facts_in_context: Some(EngineConfig::default().facts_in_context),
+            ..Run::default()
+        };
+        assert_eq!(
+            render_table(&run_all_for(named).await),
+            today,
+            "an arm that names the defaults must be the default arm"
+        );
+    }
+
+    /// **M12 T5.3: the two context columns come off the manifest.**
+    ///
+    /// `prompt_chars` is the fixture's own rendering of the graded reply
+    /// context; `context_chars` is what the engine recorded having sent the
+    /// *emitter*, summed over that ability's calls. They are different
+    /// numbers from different places, and the point of the new columns is
+    /// that the second is measured rather than re-derived from the first.
+    ///
+    /// The two are compared at the level they are comparable at: a *call's*
+    /// prefix against the graded prompt. `context_chars` is a sum over every
+    /// emitter call of the fixture and `prompt_chars` is one prompt, so
+    /// `information extraction` spends 3,840 context characters over nine
+    /// turns against a 550-character graded prompt — a sum being larger than
+    /// one of its neighbours' single readings says nothing about either.
+    /// `emitter_prefix_tokens` is the per-call level, and that is what has to
+    /// sit under the prompt the same fixture rendered.
+    #[tokio::test]
+    async fn the_prompt_column_sums_the_manifest_not_the_fixture() {
+        let rows = run_all_for(Run::default()).await;
+        println!("{}", render_table(&rows));
+        for r in rows.iter().filter(|r| r.context_chars > 0) {
+            assert!(
+                r.emitter_prefix_tokens <= r.prompt_tokens,
+                "{}: a {}-token median emitter prefix against a {}-token graded prompt",
+                r.ability,
+                r.emitter_prefix_tokens,
+                r.prompt_tokens
+            );
+            assert!(
+                r.emitter_prefix_tokens > 0,
+                "{}: stable blocks were sent and none of them was counted",
+                r.ability
+            );
+        }
+        // The ability whose scripted turns pin three facts and then ask for
+        // them: its emitter calls carry a facts block, so its prefix is not
+        // zero. Without this the loop above would pass on a column that was
+        // zero everywhere.
+        let extraction = rows
+            .iter()
+            .find(|r| r.ability == "information extraction")
+            .expect("the set opens with information extraction");
+        assert!(
+            extraction.context_chars > 0 && extraction.emitter_prefix_tokens > 0,
+            "{extraction:?}"
         );
     }
 
