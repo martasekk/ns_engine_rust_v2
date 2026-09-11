@@ -15,11 +15,31 @@ use nsengine::turn::{Engine, EngineConfig};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// What the proposer is being asked for about one turn (M9 T5.1).
+///
+/// Two asks, one gate. The ask changes the *question* put to the proposer —
+/// nothing downstream of it: the candidate that comes back is a `Note` like
+/// any other and goes through [`verify_note`] unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// The turn went wrong; what would have changed the outcome.
+    Failure,
+    /// The turn went right and its route repeats; what would make the
+    /// emitter reach that route sooner.
+    Strategy { actions: String, times: u32 },
+}
+
 #[async_trait]
 pub trait NoteProposer: Send + Sync {
-    /// One imperative sentence that would have changed the failing turn, or
+    /// One imperative sentence that would have changed the failing turn (or,
+    /// for [`Ask::Strategy`], that would reach the working one sooner), or
     /// None if nothing helps.
-    async fn propose(&self, trace: &str, existing: &[Note]) -> Result<Option<Note>, String>;
+    async fn propose(
+        &self,
+        trace: &str,
+        existing: &[Note],
+        ask: &Ask,
+    ) -> Result<Option<Note>, String>;
 }
 
 pub struct ClientNoteProposer {
@@ -33,6 +53,18 @@ only: {\"scope\": \"global\" | \"action:<tool name>\", \"text\": \"<one imperati
 if a single new sentence would have changed the outcome and does not repeat an existing note; \
 otherwise {\"none\": true}.";
 
+/// The [`Ask::Strategy`] half (M9 T5.1). Same reply shape, same refusal path
+/// — only the question differs, because a note distilled from a success has
+/// to be phrased as a route, not as a correction.
+const STRATEGY_SYSTEM: &str = "You tune the action-selection prompt of a tool-using assistant. \
+You see the trace of ONE turn that an evaluator graded good, the tool sequence it ran, how \
+many graded-good turns ran that same sequence, and the guidance notes already in force. This \
+sequence is a strategy that works. Reply with JSON only: {\"scope\": \"global\" | \
+\"action:<tool name>\", \"text\": \"<one imperative sentence>\"} with one short reusable note \
+that would make the assistant reach this sequence sooner on a similar request, if such a \
+sentence exists and does not repeat an existing note; otherwise {\"none\": true}. Describe the \
+strategy, never this one turn's specific values.";
+
 fn strip_fence(s: &str) -> &str {
     let t = s.trim();
     let t = t
@@ -45,19 +77,36 @@ fn strip_fence(s: &str) -> &str {
 
 #[async_trait]
 impl NoteProposer for ClientNoteProposer {
-    async fn propose(&self, trace: &str, existing: &[Note]) -> Result<Option<Note>, String> {
+    async fn propose(
+        &self,
+        trace: &str,
+        existing: &[Note],
+        ask: &Ask,
+    ) -> Result<Option<Note>, String> {
         let mut user = String::from("Existing notes:\n");
         for n in existing {
             user.push_str(&format!("- [{}] {}\n", n.scope, n.text));
         }
-        user.push_str("\nFailed turn:\n");
+        let system = match ask {
+            Ask::Failure => {
+                user.push_str("\nFailed turn:\n");
+                PROPOSER_SYSTEM
+            }
+            Ask::Strategy { actions, times } => {
+                user.push_str(&format!(
+                    "\nThis tool sequence worked in {times} graded-good turns: {actions}\n\
+                     \nOne of those turns:\n"
+                ));
+                STRATEGY_SYSTEM
+            }
+        };
         user.push_str(trace);
         let request = serde_json::json!({
             "model": self.model,
             "max_tokens": 300,
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": PROPOSER_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         });
@@ -638,6 +687,105 @@ mod tests {
         assert_eq!((v.improved, v.regressed), (1, 0));
     }
 
+    /// M9 T5.1. The success lane earns nothing on its own: a candidate
+    /// proposed from a `Succeeded` signature runs the same positives, the
+    /// same negatives, the same regression budget and the same
+    /// `improved`/`regressed` arithmetic as one proposed from a failure.
+    /// Only the question put to the proposer differs.
+    #[tokio::test]
+    async fn a_succeeded_candidate_takes_the_same_gate_as_a_failure_candidate() {
+        use crate::mine::SignatureKind;
+
+        let succeeded = SignatureKind::Succeeded {
+            actions: "get_time -> get_weather".into(),
+            times: 2,
+        };
+        let failure = SignatureKind::UngroundedReply { spans: vec![] };
+        // The gate `pass.rs` builds is a function of `from_grades()` alone,
+        // and both kinds answer it the same way — so both get this gate.
+        assert_eq!(succeeded.from_grades(), failure.from_grades());
+        let gate = reply_quality_gate();
+
+        // Only the ask differs.
+        assert_eq!(
+            succeeded.ask(),
+            Ask::Strategy {
+                actions: "get_time -> get_weather".into(),
+                times: 2
+            }
+        );
+        assert_eq!(failure.ask(), Ask::Failure);
+
+        let note = Note::new("global", &format!("{MARKER} before answering."), 0.0);
+        let positives = [graded_session("positive")];
+        let negatives = [session("negative")];
+
+        // Helps a positive, hurts no negative: accepted, and the numbers are
+        // the probe's, not the lane's.
+        let probe = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: false,
+        };
+        let mut budget = 40;
+        let accepted = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &gate,
+        )
+        .await;
+        assert!(accepted.accepted, "{}", accepted.detail);
+        assert_eq!((accepted.improved, accepted.regressed), (1, 0));
+
+        // Break a negative and the same candidate is rejected under budget 0:
+        // there is no success-flavoured accept path around the regression
+        // rule.
+        let regressing = MarkerProbe {
+            with_marker: vec![TurnOutcome::Ok],
+            without: vec![TurnOutcome::Fallback],
+            negatives_regress: true,
+        };
+        let mut budget = 40;
+        let rejected = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &regressing,
+            0,
+            &mut budget,
+            &gate,
+        )
+        .await;
+        assert!(!rejected.accepted, "{}", rejected.detail);
+        assert!(!rejected.unverified);
+        assert_eq!((rejected.improved, rejected.regressed), (1, 1));
+
+        // And byte for byte the verdict a failure candidate gets on the same
+        // evidence — the gate cannot tell the two apart.
+        let mut budget = 40;
+        let as_failure = verify_note(
+            &note,
+            &positives,
+            &negatives,
+            &LearnedRules::default(),
+            &probe,
+            0,
+            &mut budget,
+            &NoteGate {
+                require_graded: failure.from_grades(),
+                authoritative: "symbolic".into(),
+            },
+        )
+        .await;
+        assert_eq!(as_failure, accepted);
+    }
+
     #[tokio::test]
     async fn note_that_helps_a_positive_and_hurts_no_negative_is_accepted_with_lift() {
         let probe = MarkerProbe {
@@ -806,13 +954,17 @@ mod tests {
             client: nsllm::client::OpenRouterClient::new(mock.clone(), "k".into()),
             model: "m".into(),
         };
-        let n = p.propose("trace", &[]).await.unwrap().unwrap();
+        let n = p
+            .propose("trace", &[], &Ask::Failure)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (n.scope.as_str(), n.text.as_str()),
             ("action:echo", "Call echo when asked to repeat.")
         );
-        assert_eq!(p.propose("trace", &[]).await.unwrap(), None);
-        assert!(p.propose("trace", &[]).await.is_err());
+        assert_eq!(p.propose("trace", &[], &Ask::Failure).await.unwrap(), None);
+        assert!(p.propose("trace", &[], &Ask::Failure).await.is_err());
         let sent = mock.requests.lock().unwrap()[0].clone();
         assert!(sent["messages"][1]["content"]
             .as_str()

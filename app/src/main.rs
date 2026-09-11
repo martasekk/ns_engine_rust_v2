@@ -633,10 +633,10 @@ async fn main() {
             Some(role_key) => {
                 let c = client_for(&target, transport.clone(), &role_key)
                     .with_usage_sink(usage.clone(), "summarizer");
-                b.set_summarizer(Box::new(nsllm::summarizer::CloudSummarizer::new(
-                    c,
-                    target.model.clone(),
-                )));
+                b.set_summarizer(Box::new(
+                    nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
+                        .with_guidelines(cfg.memory.summary_guidelines.clone()),
+                ));
             }
             None => eprintln!(
                 "{} is not set — rolling summary disabled.",

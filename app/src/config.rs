@@ -336,6 +336,15 @@ pub struct MemorySection {
     /// suites at `w ∈ {0, 0.5, 1}` are what may move it, not taste.
     #[serde(default = "default_activation_weight")]
     pub activation_weight: f32,
+    /// M9 T5.2 — lines appended to the summarizer's system prompt after the
+    /// fixed-field instructions, as `Guidelines:` bullets.
+    ///
+    /// **Default empty, which is the pre-M9 prompt byte for byte.** Meant to
+    /// be hand-filled from graded summary failures; `--ablate summary` is
+    /// blind to it until a fixture carries a summary, so it ships unmeasured
+    /// and off rather than pre-populated on taste.
+    #[serde(default)]
+    pub summary_guidelines: Vec<String>,
     /// Days for the fact term to halve (M9 T3.1). The turn term's half-life
     /// is a constant in turns (`nscore::RECENCY_HALF_LIFE_TURNS`): a turn
     /// number is not a clock.
@@ -530,6 +539,7 @@ impl Default for MemorySection {
             pinned_max: default_pinned_max(),
             relevant_max: default_relevant_max(),
             activation_weight: default_activation_weight(),
+            summary_guidelines: Vec::new(),
             activation_half_life_days: default_activation_half_life_days(),
             obligations_max: default_obligations_max(),
             obligation_check: false,
@@ -1352,6 +1362,25 @@ mod tests {
     #[test]
     fn bad_toml_is_a_readable_error() {
         assert!(AppConfig::parse("[llm").is_err());
+    }
+
+    /// M9 T5.2. Default empty — which is the pre-M9 summarizer prompt byte
+    /// for byte — and a plain list when set.
+    #[test]
+    fn summary_guidelines_parse_as_a_list() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert!(cfg.memory.summary_guidelines.is_empty());
+        let cfg = AppConfig::parse(
+            "[memory]\nsummary_guidelines = [\"Keep `topic` to one clause.\", \"Name who asked.\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.memory.summary_guidelines,
+            vec![
+                "Keep `topic` to one clause.".to_string(),
+                "Name who asked.".to_string()
+            ]
+        );
     }
 
     #[test]

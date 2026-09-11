@@ -387,3 +387,37 @@ Caveat recorded: the manifest carries no scope, so counters are keyed by fact ke
 to whichever scope's current version holds it — exact on this deployment (every session maps
 to `global`); a multi-scope channel needs the scope in the manifest before `fitness_demote`
 may be turned on there.
+
+### P5 — done 2026-09-11 (T5.1, T5.2), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T5.1 | no new accept path; candidates show lift and regression like any note | met: `SignatureKind::Succeeded { actions, times }`, mined **cross-session** in a step after grading (mining beside step 4 would see no grades until a second pass — hit on the first dry run and moved), requires a recorded `Graded{ok}` by the authoritative evaluator and the same action sequence in ≥ 2 graded-ok turns, `recall` and `inspect_result` excluded from sequences as bookkeeping; `Ask::Strategy` phrases the proposer for a reusable strategy, `verify_note` untouched; `a_succeeded_candidate_takes_the_same_gate_as_a_failure_candidate` asserts the verdict arithmetic is identical |
+| T5.2 | guidelines stay only if the arm's delta ≥ 0 | knob and render built (`[memory] summary_guidelines`, `CloudSummarizer::with_guidelines`, empty list → prompt byte-identical); **unmeasured and shipped empty** — `--ablate summary` is blind on the scripted suite (T0.4) |
+| T5.3 | default 0 until `--ablate` shows a gain | **not built**: blocked on M8 T3.1, no embeddings table, and a turn must never block on an embedding |
+| HiAgent | build only if `trace_lines` median > 8 on a real desktop session | **not built**: turn 21's manifests report `trace_lines` 1, 3, 6, 6 (median 4.5, max 6) — a chat turn; the desktop trigger is still unevaluated |
+
+**Reading on the recorded session** (dry run, no key, zero requests): `Succeeded: 2 (turns 6,
+7)` — both ran the single-action sequence `pointer_ui_read` and both graded ok, so
+`times = 2`; the failure signatures are unchanged (FallbackReply 3, IgnoredQuestion 2,
+UserReask 7) plus one `UngroundedReply` on the new turn 21. `candidates: 0` because the notes
+lane needs a key; the first keyed pass will propose from those two and gate them like any
+failure note.
+
+### Status after P0–P5
+
+Built and green across the workspace, one live turn spent (4 requests, against the plan's
+2–3: one grounding regeneration). Every knob defaults to today's behaviour:
+`activation_weight = 0`, `fitness_demote = false`, `obligation_check = false`,
+`summary_guidelines = []`, `guidance_max` and `obligations_max` biting only under
+`budget_mode = enforce`. What changed for a user of an old config: three new columns and
+three footer lines in `ns-app budget`, `Graded` and `ReplyCited` events in the log after the
+next idle pass, and a fitness report in `ns-app evolve --dry-run`.
+
+Follow-ups, in the order the numbers rank them: (1) slim the tool schemas — 45.9% of the
+emitter prompt — with `tools_tokens` as the before/after; (2) wire `LocalEvaluator` into
+`build_pass` so κ per evaluator prints (M8 T2.7); (3) fixtures carrying a summary and notes
+so `--ablate summary|guidance` and T5.2 can be read; (4) a recall corpus whose targets tie on
+hits so `activation_weight` can be decided; (5) M8 T3.1 embeddings, which unblocks T5.3;
+(6) a desktop-session `trace_lines` reading for the HiAgent trigger; (7) the scope in the
+manifest before `fitness_demote` is enabled on a multi-scope channel.

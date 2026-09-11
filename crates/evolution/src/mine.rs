@@ -121,6 +121,29 @@ pub enum SignatureKind {
     /// field: there the tier was too narrow and the turn widened it; here it
     /// was wide enough and nothing happened.
     IgnoredRequest,
+    /// A turn the authoritative evaluator graded good, whose action sequence
+    /// at least one *other* graded-good turn also ran, identically (M9 T5.1).
+    ///
+    /// The only signature in the enum that is not a failure, and it is here
+    /// rather than in a lane of its own because the gate is the point: a
+    /// note written from a success takes exactly the same positives,
+    /// negatives, regression budget and lift arithmetic as a note written
+    /// from a fallback. A strategy that cannot be shown to help is not a
+    /// strategy, and giving it a private accept path would be how the
+    /// crate's one rule — nothing is applied that was not measured — gets
+    /// lost to optimism about the turns that went right.
+    ///
+    /// Repetition is what separates a reusable strategy from a turn that
+    /// happened to work. One good turn is an anecdote; the same sequence in
+    /// a second graded-good turn is the emitter having found a route worth
+    /// reaching sooner.
+    Succeeded {
+        /// The turn's action sequence, `" -> "`-joined — the payload the
+        /// proposer is asked to turn into guidance.
+        actions: String,
+        /// How many graded-good turns ran this exact sequence (always >= 2).
+        times: u32,
+    },
 }
 
 impl SignatureKind {
@@ -163,6 +186,7 @@ impl SignatureKind {
                 | SignatureKind::UngroundedReply { .. }
                 | SignatureKind::IgnoredQuestion
                 | SignatureKind::IgnoredRequest
+                | SignatureKind::Succeeded { .. }
         )
     }
 
@@ -181,6 +205,20 @@ impl SignatureKind {
             SignatureKind::UngroundedReply { .. } => "UngroundedReply",
             SignatureKind::IgnoredQuestion => "IgnoredQuestion",
             SignatureKind::IgnoredRequest => "IgnoredRequest",
+            SignatureKind::Succeeded { .. } => "Succeeded",
+        }
+    }
+
+    /// What the note proposer should be asked for about this signature
+    /// (M9 T5.1). Every kind but [`SignatureKind::Succeeded`] is a failure,
+    /// and the ask is what went wrong; a success asks for the strategy.
+    pub fn ask(&self) -> crate::notes::Ask {
+        match self {
+            SignatureKind::Succeeded { actions, times } => crate::notes::Ask::Strategy {
+                actions: actions.clone(),
+                times: *times,
+            },
+            _ => crate::notes::Ask::Failure,
         }
     }
 }
@@ -614,6 +652,89 @@ pub fn mine(session: &SessionId, events: &[Event], known_specs: &[ActionSpec]) -
     out
 }
 
+/// Action names that say nothing about *what* a turn did (M9 T5.1).
+///
+/// `recall` is the Deep tier's pre-emptive retrieval and `inspect_result` is
+/// the model paging back a result the cap clipped. Both are bookkeeping the
+/// emitter performs *around* a strategy rather than part of one, and leaving
+/// them in would split one repeated route into as many distinct sequences as
+/// there were clips — which is the opposite of what the signature is for.
+pub const BOOKKEEPING_ACTIONS: [&str; 2] = ["recall", nsengine::turn::INSPECT_RESULT];
+
+/// The ordered names of the tools a turn actually called, bookkeeping
+/// removed. Empty for a turn that called nothing — a chat turn has no route
+/// to reach sooner.
+pub fn action_sequence(events: &[Event], turn: u32) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.turn == turn)
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolCalled { action, .. } => Some(action.clone()),
+            _ => None,
+        })
+        .filter(|a| !BOOKKEEPING_ACTIONS.contains(&a.as_str()))
+        .collect()
+}
+
+/// Mine [`SignatureKind::Succeeded`] across every session in one pass
+/// (M9 T5.1).
+///
+/// Separate from [`mine`] for one reason: repetition is the evidence, and
+/// repetition is not visible inside a single session's log. [`mine`] stays a
+/// per-session failure miner, byte for byte what it was.
+///
+/// A turn qualifies when `authoritative` graded it `ok` **and** its action
+/// sequence — non-empty, bookkeeping stripped — also ran in at least one
+/// other graded-ok turn, in this session or any other. The grade must be
+/// recorded: an ungraded turn that ran the same sequence is not evidence,
+/// because nothing looked at whether its reply was any good.
+pub fn mine_succeeded(sessions: &[(SessionId, Vec<Event>)], authoritative: &str) -> Vec<Signature> {
+    let mut good: Vec<(usize, u32, EventId, String)> = Vec::new();
+    for (i, (_, events)) in sessions.iter().enumerate() {
+        // A re-graded turn counts once. `Graded` carries the turn it grades
+        // in its own field, never `e.turn` — it is appended at the end of
+        // the log (see `classify_turns_by`).
+        let mut seen: HashSet<u32> = HashSet::new();
+        for e in events {
+            let EventKind::Graded {
+                turn, grade, by, ..
+            } = &e.kind
+            else {
+                continue;
+            };
+            if by != authoritative || !grade.ok || !seen.insert(*turn) {
+                continue;
+            }
+            let seq = action_sequence(events, *turn);
+            if seq.is_empty() {
+                continue;
+            }
+            good.push((i, *turn, e.id, seq.join(" -> ")));
+        }
+    }
+    let mut times: HashMap<&str, u32> = HashMap::new();
+    for (_, _, _, seq) in &good {
+        *times.entry(seq.as_str()).or_insert(0) += 1;
+    }
+    good.iter()
+        .filter_map(|(i, turn, id, seq)| {
+            let n = *times.get(seq.as_str()).unwrap_or(&0);
+            if n < 2 {
+                return None;
+            }
+            Some(Signature {
+                session: sessions[*i].0.clone(),
+                turn: *turn,
+                event_id: *id,
+                kind: SignatureKind::Succeeded {
+                    actions: seq.clone(),
+                    times: n,
+                },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +765,142 @@ mod tests {
             action: action.into(),
             args,
         }
+    }
+
+    fn called(action: &str) -> EventKind {
+        EventKind::ToolCalled {
+            action: action.into(),
+            args: vec![],
+        }
+    }
+
+    fn graded(turn: u32, ok: bool, by: &str) -> EventKind {
+        EventKind::Graded {
+            turn,
+            grade: Grade { ok, issues: vec![] },
+            by: by.into(),
+            revision: "n/a".into(),
+        }
+    }
+
+    /// M9 T5.1. Repetition across graded-good turns is the whole signature:
+    /// one good turn is an anecdote, and an ungraded turn is not evidence at
+    /// all because nothing looked at whether its reply was any good.
+    #[test]
+    fn a_repeated_good_turn_pattern_mines_a_succeeded_signature_into_the_note_lane() {
+        // Session a, turn 1: the repeated route, with `recall` bookkeeping
+        // in front of it that must not make the sequence a different one.
+        // Turn 2: a route no other graded turn took.
+        let mut a = EventLog::new(SessionId("a".into()));
+        for k in [
+            EventKind::UserSaid { text: "x".into() },
+            called("recall"),
+            called("get_time"),
+            called("get_weather"),
+        ] {
+            a.append(1, Timestamp(1), k);
+        }
+        for k in [EventKind::UserSaid { text: "y".into() }, called("echo")] {
+            a.append(2, Timestamp(2), k);
+        }
+        // Session b, turn 1: the same route, graded good — the second
+        // occurrence. Turn 2: the same route again, but ungraded.
+        let mut b = EventLog::new(SessionId("b".into()));
+        for k in [
+            EventKind::UserSaid { text: "z".into() },
+            called("get_time"),
+            called("get_weather"),
+        ] {
+            b.append(1, Timestamp(3), k);
+        }
+        for k in [
+            EventKind::UserSaid { text: "w".into() },
+            called("get_time"),
+            called("get_weather"),
+        ] {
+            b.append(2, Timestamp(4), k);
+        }
+        // Grades are appended at the end of the log and name their own turn.
+        a.append(3, Timestamp(9), graded(1, true, "symbolic"));
+        a.append(3, Timestamp(9), graded(2, true, "symbolic"));
+        b.append(3, Timestamp(9), graded(1, true, "symbolic"));
+
+        let sessions = vec![
+            (SessionId("a".into()), a.events().to_vec()),
+            (SessionId("b".into()), b.events().to_vec()),
+        ];
+        let sigs = mine_succeeded(&sessions, "symbolic");
+
+        assert_eq!(
+            sigs.len(),
+            2,
+            "one per graded-good turn on the route: {sigs:?}"
+        );
+        for s in &sigs {
+            assert_eq!(s.turn, 1);
+            assert_eq!(s.kind.name(), "Succeeded");
+            assert_eq!(
+                s.kind.lane(),
+                "note",
+                "a strategy is guidance, never a patch"
+            );
+            assert!(
+                s.kind.from_grades(),
+                "it exists only because a grade said so"
+            );
+            assert_eq!(
+                s.kind,
+                SignatureKind::Succeeded {
+                    actions: "get_time -> get_weather".into(),
+                    times: 2,
+                },
+                "`recall` is bookkeeping and stays out of the sequence"
+            );
+        }
+        assert_eq!(
+            sigs.iter()
+                .map(|s| s.session.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        // a/2 ran a unique route; b/2 ran the repeated one but is ungraded.
+        assert!(sigs.iter().all(|s| s.turn != 2));
+
+        // The failure miner is untouched by any of it.
+        for (sid, events) in &sessions {
+            assert!(mine(sid, events, &[]).is_empty());
+        }
+    }
+
+    /// A graded-good turn that called nothing has no route to reach sooner,
+    /// and a grade from another evaluator is not the authoritative one.
+    #[test]
+    fn succeeded_ignores_toolless_turns_and_other_evaluators() {
+        let mut l = EventLog::new(SessionId("s".into()));
+        for turn in [1u32, 2] {
+            l.append(turn, Timestamp(1), EventKind::UserSaid { text: "x".into() });
+            l.append(turn, Timestamp(1), called("recall"));
+            l.append(turn, Timestamp(2), graded(turn, true, "symbolic"));
+        }
+        let toolless = vec![(SessionId("s".into()), l.events().to_vec())];
+        assert!(mine_succeeded(&toolless, "symbolic").is_empty());
+
+        let mut m = EventLog::new(SessionId("s".into()));
+        for turn in [1u32, 2] {
+            m.append(turn, Timestamp(1), called("get_time"));
+            m.append(turn, Timestamp(2), graded(turn, true, "other"));
+        }
+        let elsewhere = vec![(SessionId("s".into()), m.events().to_vec())];
+        assert!(mine_succeeded(&elsewhere, "symbolic").is_empty());
+        assert_eq!(mine_succeeded(&elsewhere, "other").len(), 2);
+        // A bad grade is never a strategy.
+        let mut n = EventLog::new(SessionId("s".into()));
+        for turn in [1u32, 2] {
+            n.append(turn, Timestamp(1), called("get_time"));
+            n.append(turn, Timestamp(2), graded(turn, false, "symbolic"));
+        }
+        let bad = vec![(SessionId("s".into()), n.events().to_vec())];
+        assert!(mine_succeeded(&bad, "symbolic").is_empty());
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub struct CloudSummarizer {
     client: OpenRouterClient,
     model: String,
     max_tokens: u32,
+    guidelines: Vec<String>,
 }
 
 impl CloudSummarizer {
@@ -23,8 +24,39 @@ impl CloudSummarizer {
             client,
             model,
             max_tokens: 400,
+            guidelines: Vec::new(),
         }
     }
+
+    /// `[memory] summary_guidelines` (M9 T5.2) — hand-written lines appended
+    /// to the system prompt after the fixed-field instructions.
+    ///
+    /// Ships empty, and empty means the prompt is byte-identical to what it
+    /// was before M9. The knob exists so a graded summary failure has
+    /// somewhere to go; `ns-app eval --ablate summary` cannot read it yet
+    /// (no scripted fixture carries a summary), so nothing here is tuned on
+    /// a number and the default is the conservative one.
+    pub fn with_guidelines(mut self, guidelines: Vec<String>) -> Self {
+        self.guidelines = guidelines;
+        self
+    }
+}
+
+/// The system prompt: the fixed-field instructions, then the guidelines.
+///
+/// Order is load-bearing. The JSON contract has to be the last thing a cheap
+/// model cannot misread, so guidance about *what to write* follows the
+/// instruction about *what shape to write it in*, never interleaves with it.
+pub fn system_prompt(guidelines: &[String]) -> String {
+    if guidelines.is_empty() {
+        return SYSTEM.to_string();
+    }
+    let mut s = String::from(SYSTEM);
+    s.push_str("\nGuidelines:\n");
+    for g in guidelines {
+        s.push_str(&format!("- {g}\n"));
+    }
+    s
 }
 
 fn strip_fence(s: &str) -> &str {
@@ -72,7 +104,7 @@ impl Summarizer for CloudSummarizer {
             "max_tokens": self.max_tokens,
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": system_prompt(&self.guidelines)},
                 {"role": "user", "content": render_input(&input)},
             ],
         });
@@ -104,6 +136,37 @@ mod tests {
     use super::*;
     use crate::transport::{HttpResponse, MockTransport};
     use nscore::{Caps, SessionSummary, Trust, TurnRecord};
+
+    /// M9 T5.2. Guidelines follow the fixed-field instructions; the JSON
+    /// contract stays the last thing a cheap model reads about *shape*.
+    #[test]
+    fn guidelines_render_after_the_fixed_field_instructions() {
+        let p = system_prompt(&[
+            "Name the person who asked for something in `open`.".to_string(),
+            "Keep `topic` to one clause.".to_string(),
+        ]);
+        assert!(p.starts_with(SYSTEM), "the fixed fields come first");
+        assert_eq!(
+            &p[SYSTEM.len()..],
+            "\nGuidelines:\n\
+             - Name the person who asked for something in `open`.\n\
+             - Keep `topic` to one clause.\n"
+        );
+        // Order is the config's, not sorted.
+        assert!(p.find("Name the person").unwrap() < p.find("Keep `topic`").unwrap());
+    }
+
+    /// The knob ships empty, and empty has to cost nothing — not a newline,
+    /// not a header. Anything else would be an unmeasured prompt change on
+    /// every summary this box has ever written.
+    #[test]
+    fn no_guidelines_leave_the_prompt_byte_identical() {
+        assert_eq!(system_prompt(&[]), SYSTEM);
+        assert_eq!(
+            system_prompt(&Vec::<String>::new()).as_bytes(),
+            SYSTEM.as_bytes()
+        );
+    }
 
     fn records() -> Vec<TurnRecord> {
         vec![

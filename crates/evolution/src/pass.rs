@@ -410,17 +410,6 @@ impl EvolutionPass {
             sigs.extend(mine(sid, events, &self.known_specs));
             sigs.extend(evaluate(sid, events, &self.cfg.evaluate));
         }
-        for s in &sigs {
-            *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
-            let turns = report.signature_turns.entry(s.kind.name()).or_default();
-            if !turns.contains(&s.turn) {
-                turns.push(s.turn);
-            }
-        }
-        for turns in report.signature_turns.values_mut() {
-            turns.sort_unstable();
-        }
-
         // 4b. Grade (M8 T2.3a, M9 T1.1/T1.3).
         //
         // A grade is a recorded value. Every turn already carrying a
@@ -432,6 +421,30 @@ impl EvolutionPass {
         // chain is extended, never rewritten.
         self.grade_sessions(store, &mut sessions, &mut report, now)
             .await?;
+
+        // 4b'. Mine the success lane (M9 T5.1).
+        //
+        // A third source, and the only one that reads every session at once:
+        // `Succeeded` is a route two graded-good turns both took, and no
+        // single session's log can show that. It runs *after* grading and
+        // not with the rest of step 4, because `grade_sessions` appends this
+        // run's fresh verdicts into `sessions` — mining first would mean a
+        // session could never yield a strategy until a second pass, which is
+        // the sort of silence that reads as "nothing found".
+        sigs.extend(crate::mine::mine_succeeded(
+            &sessions,
+            &self.cfg.authoritative_evaluator,
+        ));
+        for s in &sigs {
+            *report.signatures.entry(s.kind.name()).or_insert(0) += 1;
+            let turns = report.signature_turns.entry(s.kind.name()).or_default();
+            if !turns.contains(&s.turn) {
+                turns.push(s.turn);
+            }
+        }
+        for turns in report.signature_turns.values_mut() {
+            turns.sort_unstable();
+        }
 
         // 4c. Fitness (M9 T4.3): the join from outcome back to selection.
         //
@@ -578,7 +591,10 @@ impl EvolutionPass {
                     continue;
                 };
                 let trace = render_turn(events, s.turn);
-                let note = match proposer.propose(&trace, &working.notes).await {
+                let note = match proposer
+                    .propose(&trace, &working.notes, &s.kind.ask())
+                    .await
+                {
                     Ok(Some(n)) => n,
                     Ok(None) => continue,
                     Err(e) => {
@@ -892,7 +908,12 @@ mod tests {
     struct FixedProposer(&'static str);
     #[async_trait::async_trait]
     impl NoteProposer for FixedProposer {
-        async fn propose(&self, _t: &str, _e: &[Note]) -> Result<Option<Note>, String> {
+        async fn propose(
+            &self,
+            _t: &str,
+            _e: &[Note],
+            _ask: &crate::notes::Ask,
+        ) -> Result<Option<Note>, String> {
             Ok(Some(Note::new("global", self.0, 0.0)))
         }
     }
