@@ -278,3 +278,17 @@ reasons are read on a live pass.
 
 Workspace suite: 713 passed, 0 failed, 1 ignored. Not built, as planned: archiving the one existing note — it is
 desktop-only and the line is parked; the knob waits for the first chat note.
+
+### P1 — done 2026-09-11 (commit `493e227`), 0 requests
+
+| Task | Exit criterion | Measured |
+|---|---|---|
+| T1.1 | `small` byte-identical to today | met: `nscore::Capability { Small, Strong }` beside `SchemaProfile`; `[llm] capability` with `LlmConfig::capability()` and a startup error on an unknown name; `EngineConfig.capability`, `CloudEmitter::with_capability`; `capability_defaults_to_small_and_rejects_an_unknown_name`; every request-byte test unchanged |
+| T1.2 | under `strong` a flagged turn issues 1 replier request and still appends `ReplyFlagged` and `ReplyCited` | met: `EngineConfig.reply_regenerate` (true; false under strong, set in `main.rs`); only `make_ctx` + the second `replier.reply` + its `record_model_calls` are skipped; `a_flagged_reply_is_logged_but_not_regenerated_under_strong` |
+| T1.3 | the M11 logs read 0; a synthetic log reads N; no event field added | met: `nscore::TEXT_FALLBACK_PREFIX` shared with the emitter, `text_fallbacks(events)`; `text fallbacks: N` in `ns-app budget` and in the pass report; `a_text_fallback_is_counted_from_the_recorded_rationale`, `text_fallbacks_are_counted_next_to_the_rejections_line` |
+| T1.4 | both preambles carry the rationale instruction once; the footer prints each weight | met: **small 138 tokens · strong 86 tokens** (estimated), `emitter system prompt (est.)` footer line; `the_strong_preamble_is_shorter_and_says_by_how_much` |
+| T1.5 | `Praze`/`Praha`, `Martine`/`Martin` ground; `Canberra`/`Canada` stays distinct; `vysyp`/`vysypání` overlap | met: `fold_diacritics`, `stem_match` (equal, or common folded prefix ≥ 3 with both remainders ≤ 3 and the shorter word ≥ 4); `Material::contains` exact first, stem fallback for single-word claims **only against material tokens capitalized in their source** — the rule as first briefed grounded the invented `Turku` on the summary header's `turns` and un-declined two abstention fixtures; `stem_match_folds_diacritics_and_accepts_czech_inflection`, `a_czech_inflected_name_is_grounded_by_its_stem`, `a_lowercase_prose_word_never_grounds_a_name_by_stem` |
+
+Workspace suite: 720 passed, 0 failed, 1 ignored. The replay of M11's nine flagged turns is P6's reading (the
+log is on the live box, not in the tree). Not built, as planned: argument examples behind
+the profile — desktop parked.
