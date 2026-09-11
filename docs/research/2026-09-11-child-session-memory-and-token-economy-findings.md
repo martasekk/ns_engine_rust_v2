@@ -535,7 +535,120 @@ ships at weight 0 because the suites return identical numbers at 0, 0.5 and 1.0.
 fitness loop is built and its first derivation reports that the live store holds no facts at
 all, which is why the smoke reply could not name the user.
 
-## 8. Sources
+## 8. What M9 measured, and the optimal moves it surfaced (2026-09-11, later)
+
+M9 built the instruments this document asked for (`docs/superpowers/plans/2026-09-11-m9-memory-that-earns-its-context.md`
+§Results). One live turn and one offline pass over the recorded 21-turn log then produced
+numbers that reorder the levers above. Three of this document's own assumptions were wrong;
+each is corrected here with the number that corrected it. A second web sweep, targeted at the
+problems the numbers exposed, is folded in with sources.
+
+### 8.1 The tool array, taken apart
+
+`schema::build_tools` (`crates/llm/src/schema.rs:230`) emits one strict function per legal
+action and injects a `_rationale` property into every one (`:209-213`, `:241`). Reproducing
+the turn-21 array byte-for-byte gives 2,927 chars → 731 tokens, matching the log.
+
+| Fact | Number | Source |
+|---|---|---|
+| Per-tool JSON envelope before any name or description (`type`, `strict`, `additionalProperties`, `required`, empty `properties`) | ~282 chars ≈ **70 tokens per tool**, a floor | schema.rs |
+| `_rationale` boilerplate repeated verbatim in every tool | 106 chars each; **25% of all tool tokens** on turn 21, ~475 tokens on the full desktop set | schema.rs:210-213 |
+| Chat tier, zero registered tools (the synthetic five + `respond_directly`) | **~650 tokens** — the floor every call pays | router.rs:73-75, turn.rs:976-1037 |
+| Deep tier with the desktop up | 17–18 tools, **~2,018–2,173 tokens** | same |
+| Top carriers | `pointer_click` 218, `pointer_move` 174, `inspect_result` 154 tokens; `xy_schema` (`pointer_tool.rs:79-98`) duplicates ~280 chars of per-axis text in both click and move | |
+| Parameters never used in 21 turns | `screen`, `count`, `dx`, `modifiers`, `button=middle`; `pointer_drag`, `pointer_scroll`, `pointer_clipboard_*` never called | log |
+| Synthetic tools sent when they cannot apply | `forget_fact`, `forget_all` (~216 tokens) sent while the store holds **zero facts**; `recall` sent on turn 1 | turn.rs:1001-1037 |
+
+**Correction 1.** §2 and §7.1 item 06 carried the docs' 13–20% estimate; the share is 45.9% on
+a deep-tier chat turn and higher with the desktop up. The estimate missed the envelope floor
+and the repeated boilerplate, neither of which scales with description length.
+
+What the field measures on exactly this problem: deterministic JSON-schema compression (TsCG,
+arXiv 2605.26165) saves **44–50%** of schema tokens at its conservative profile with no
+accuracy loss on BFCL/TAB, and the accuracy gains it reports (+20.5 pp) appear only when the
+context is overflowing — here it is not, so the saving is tokens, not intelligence; argument
+examples inside a tool block moved complex-parameter accuracy 72% → 90% (Anthropic, advanced
+tool use); OpenAI's guidance is under 20 functions per turn, short descriptions, enums over
+free strings, `strict`; Gemini's is a 10–20 tool active set and steering selection from the
+prompt rather than the declarations; format swaps (TRON −27% tokens, TOON −18%) cost up to
+14 pp accuracy and are not worth it (arXiv 2605.29676); an adaptive shortlist of **7 tools
+instead of 50 held coverage at 90.3% vs 90.8%** and raised selection 87.1% → 93.1% (arXiv
+2605.24660), which is `2026-09-08-tool-loading` §1.3 again. Manus's "mask, don't remove"
+protects a prefix cache this tier does not bill; on a request budget **remove** is the right
+side of that trade, and the tool-loading doc's Design A (adaptive depth in the router, zero
+requests, replay-safe) is the mechanism.
+
+### 8.2 Two candidate levers, measured away
+
+**Multi-action batching** (§5 R1's candidate): on the 20 desktop turns, 81 emitter proposals,
+55 tool calls, **4 runs** of ≥ 2 consecutive desktop actions with no observation between
+(longest 3: click, type, click), and every run is irreversible-only. A bounded batch of ≤ 3
+reversible actions saves **zero** requests; one allowing irreversible actions saves 5 of 81
+(~6%). The model observes between almost every click (`pointer_ui_find` ×14, `pointer_ui_read`
+×7 against `pointer_click` ×18). **Not adopted; the log does not support it.**
+
+**Replacing regenerate-on-flag** (the second web sweep's rank 2 rested on a premise I gave it,
+"about one turn in two regenerates", taken from the single smoke turn): the log holds **one
+`ReplyFlagged` in 21 turns**, on turn 21, spans `["Recycle", "Bin"]` — a false positive, the
+English rendering of the Czech `koš` task the summary carried. Cost: one replier request. The
+field's numbers still matter for the design if the rate ever rises (a shallow checker on
+summary-shaped text sits near chance, AUC .47–.57, arXiv 2606.29809; a gated verifier cut
+error 22% → 4% at 3.2× fewer calls, arXiv 2607.17417; precision-only faithfulness scoring
+rewards abstention, arXiv 2606.09376; Czech proper nouns need lemma matching, arXiv 2404.00482),
+but at one flag per twenty turns the fix is a bilingual/lemma match in `extract_claims`, not a
+new interceptor. **Correction 2.**
+
+### 8.3 The lever that surfaced instead
+
+Of 81 emitter proposals, **9 were `Rejected`** — each one a request spent — and **6 of those
+are `repeat_gate`**: the model re-proposed a call identical to one already executed this turn
+(t4 ×3, t15 ×2, t2/t8/t11/t12 ×1 among all rejections; 2 `IllegalAction`, 1 `Malformed`).
+That is 7.4% of the day's emitter requests spent on self-inflicted loops, more than batching
+could ever save, and it is prompt-side: the trace shows the outcome, the model repeats anyway.
+
+### 8.4 What the memory measurements mean
+
+- The store holds no facts because **no user turn stated one**; there is no passive fact
+  extraction (`remember_residual` only shapes confidence *after* the emitter proposes
+  `remember_fact`, `turn.rs:1489-1506`), and zero `remember_fact` proposals occurred in 21
+  desktop turns. Expected for this log; the smoke reply was correct to say it did not know
+  the name. **Correction 3** to §7.6's reading of the fitness alarm: it fired truthfully, and
+  it says nothing about capture.
+- The activation prior cannot be decided by the current suites (identical numbers at every
+  weight), `--ablate summary|guidance` are blind (no fixture carries either), and κ per
+  evaluator does not print (`LocalEvaluator` is not wired into `build_pass`). Every
+  intelligence lever in §7.6 is now gated on **fixtures**, not on code. The field's smallest
+  separator is the paraphrase + knowledge-update + abstention triple (LongMemEval, arXiv
+  2410.10813); fully synthetic offline generators exist (arXiv 2602.01313, 2608.00009).
+- The largest measured intelligence gain on record remains M8 Phase 3's own table: paraphrase
+  miss **83% → 8–25%** with bge-m3 coarse-10 → rerank, zero requests, local CPU — unbuilt,
+  and the thing that unblocks M9's exemplars.
+
+### 8.5 Optimal moves, ranked by measured gain per request
+
+1. **Slim the tool array**: drop the repeated `_rationale` boilerplate to one clause (25% of
+   tool tokens), dedupe `xy_schema`, shorten descriptions under the TsCG conservative profile,
+   send `forget_*` only when the scope holds facts and `recall` only when there is history to
+   recall. Zero requests; the accuracy instrument is the pass's Malformed/Illegal/repeat rates
+   per 100 proposals on later sessions.
+2. **Adaptive depth in the router**, removing not masking, into the 3–7 band, guarded by a
+   hard-query fixture built first (tool-loading §5.3, §4.1). Zero requests.
+3. **M8 Phase 3 recall** (embeddings backfilled in the idle pass, hybrid search deep-tier
+   only, `coarse_k = 10`): 83% → ≤ 25% paraphrase miss. Zero requests.
+4. **Repeat-gate loop prevention**, prompt-side, measured by the rejection counter. Zero
+   requests, 7.4% of emitter requests at stake.
+5. **Fixtures**: ~50 scripted sessions carrying summaries, notes, a knowledge update,
+   paraphrased targets and unanswerable items; the tie-heavy recall corpus; `LocalEvaluator`
+   in `build_pass`. Zero requests, and the precondition for deciding every knob M9 shipped
+   at its default.
+
+Not adopted, with the number: batching (5/81, irreversible-only), a new grounding interceptor
+(1/21, false positive), format swaps (accuracy loss), tool-RAG (17 tools), masking (no cache
+to protect), caching (prefix under the floor), passive fact extraction (no evidence of need).
+
+The plan that sequences these is `docs/superpowers/plans/2026-09-11-m10-tool-array-loop-and-recall.md`.
+
+## 9. Sources
 
 Repo: `docs/research/2026-09-02-memory-findings.md`, `2026-09-04-entrainment-findings.md`,
 `2026-09-07-context-budget-findings.md`, `2026-09-08-context-composition-findings.md`,
@@ -584,6 +697,21 @@ Title-matched from listings only: Mobile-Agent-E 2501.11733 · Synapse 2306.0786
 2504.14603 · SkillWeaver 2504.07079 · Agent KB 2507.06229 · CRADLE 2403.03186 · Theanine
 2406.10996 · MemInsight 2503.21760 · HiAgent 2408.09559 · SeCom 2502.05589 · PREMem 2509.10852 ·
 O-Mem 2511.13593. Unverified: an ACT-R-inspired dialogue architecture (HAI 2025, ACM, 403).
+
+Third sweep (§8), opened and verified: TsCG schema compression 2605.26165 · TRON/TOON format
+study 2605.29676 · adaptive tool shortlists / Bits-over-Random 2605.24660 · hard masking for
+small models 2512.17052 · parallel fan-out limits 2608.06370 · EASYTOOL 2401.06201 · DRAFT
+2410.08197 · DocsChisel 2608.10037 · CPU-only hallucination detectors on HaluEval 2606.29809 ·
+Grounded Continuation 2605.14175 · gated claim verification 2607.17417 · distilled verifier
+2604.23588 · precision-only faithfulness rewards abstention 2606.09376 · Czech/Slavic NER
+2404.00482 · EverMemBench 2602.01313 · synthetic memory benchmarks 2608.00009 · Anthropic
+advanced tool use (anthropic.com/engineering/advanced-tool-use), tool-use overview
+(platform.claude.com/docs/en/agents-and-tools/tool-use/overview) · Gemini function calling and
+tokens (ai.google.dev/gemini-api/docs/function-calling, /tokens) · OpenAI function calling
+guide (developers.openai.com/api/docs/guides/function-calling) · BFCL leaderboard
+(gorilla.cs.berkeley.edu/leaderboard.html). The Gemini Flash-class BFCL figure and the per-model
+10→50-tool drops came through aggregators, not vendor pages; no published false-positive rate
+exists for Czech claim extraction.
 
 Footnote, Claude Code side (out of scope, recorded once): a Claude Code subagent receives
 CLAUDE.md, its delegation prompt (which this box's `graphify_gate.py` hook prefixes with the
