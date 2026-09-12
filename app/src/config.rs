@@ -945,6 +945,18 @@ pub struct LlmConfig {
     /// is a sentence the same call could have spent on the user.
     #[serde(default = "default_true")]
     pub chat_act_or_answer: bool,
+    /// M13 T2.1: make the same offer on Task and Deep, so every iteration of
+    /// the loop is the model choosing between the next tool and the reply.
+    /// Default **false**, which is the chat-only offer above; it does nothing
+    /// unless `chat_act_or_answer` is on, because that knob is the offer.
+    ///
+    /// On a task turn the emitter is already holding the trace the replier
+    /// would narrate from, so ending the turn is a judgement it can make.
+    /// What the second call buys is a reading of that trace by a model which
+    /// did not choose the actions. That is worth a request on a long task and
+    /// not on a short one, and no reading yet says where the line falls.
+    #[serde(default)]
+    pub act_or_answer_every_tier: bool,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]
@@ -1472,26 +1484,41 @@ mod tests {
         assert_eq!(cfg.http_components[0].name, "check_stock");
     }
 
-    /// M12 T4.3. Off is the two-call chat turn every deployment has today,
-    /// so an absent key and an explicit `false` must be the same thing, and
-    /// the key has to survive being written down.
+    /// M13. On is the one-call chat turn the 2026-09-12 run measured at 1.80,
+    /// so an absent key and an absent `[llm]` table must both be `true`, an
+    /// explicit `false` must still buy the two-call turn back, and the key
+    /// has to survive being written down.
+    ///
+    /// The every-tier knob is the other way round: absent means Chat only,
+    /// which is what M12 shipped.
     #[test]
     fn chat_act_or_answer_defaults_to_on_and_round_trips() {
         assert!(AppConfig::parse("").unwrap().llm.chat_act_or_answer);
-        assert!(AppConfig::parse("[llm]\ncapability = \"strong\"")
-            .unwrap()
-            .llm
-            .chat_act_or_answer);
+        assert!(
+            AppConfig::parse("[llm]\ncapability = \"strong\"")
+                .unwrap()
+                .llm
+                .chat_act_or_answer
+        );
         assert!(
             !AppConfig::parse("[llm]\nchat_act_or_answer = false")
                 .unwrap()
                 .llm
                 .chat_act_or_answer
         );
-        assert!(AppConfig::parse("[llm]\nchat_act_or_answer = true")
-            .unwrap()
-            .llm
-            .chat_act_or_answer);
+        assert!(
+            AppConfig::parse("[llm]\nchat_act_or_answer = true")
+                .unwrap()
+                .llm
+                .chat_act_or_answer
+        );
+        assert!(!AppConfig::parse("").unwrap().llm.act_or_answer_every_tier);
+        assert!(
+            AppConfig::parse("[llm]\nact_or_answer_every_tier = true")
+                .unwrap()
+                .llm
+                .act_or_answer_every_tier
+        );
     }
 
     /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an

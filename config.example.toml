@@ -59,6 +59,15 @@ provider = "openrouter"
 # call, 0 grounding flags on those, 0 rejections, 0 text fallbacks.
 # Set it false to buy back the two-call chat turn, byte for byte.
 #   chat_act_or_answer = false
+# Make the same offer on Task and Deep, so every iteration of the loop is the
+# model choosing between the next tool and the reply, and the turn ends when
+# it says it is done rather than when it names the action that says so. Off
+# by default: what the second call buys on a task turn is a reading of the
+# trace by a model that did not choose the actions, worth a request on a long
+# task and not on a short one. First reading 2026-09-12, 4 non-chat turns
+# with the desktop parked: 5 requests, 4 of 4 answered in the emitter call,
+# the one extra request a grounding regeneration on a false positive.
+#   act_or_answer_every_tier = true
 
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the

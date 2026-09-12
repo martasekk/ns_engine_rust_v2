@@ -44,13 +44,29 @@ pub struct EngineConfig {
     /// answer, and take its answer as the reply. Off by default, and off is
     /// today's two-call chat turn, request for request and event for event.
     ///
-    /// Chat only. On Task and Deep the emitter/replier split is doing real
-    /// work — one model chooses, the other narrates what happened — and a
-    /// model that answers mid-loop would be answering before the turn is
-    /// over. A chat turn has no loop to speak of: its emitter call exists to
-    /// say "no tool applies", which is a sentence the same call could have
-    /// spent on the user instead.
+    /// Chat only unless [`Self::act_or_answer_every_tier`] is on. A chat turn
+    /// has no loop to speak of: its emitter call exists to say "no tool
+    /// applies", which is a sentence the same call could have spent on the
+    /// user instead.
     pub chat_act_or_answer: bool,
+    /// M13 T2.1: make the offer on every tier, so each iteration of the loop
+    /// is the model's own choice between calling the next tool and writing
+    /// the reply. Off by default; off is the chat-only offer above.
+    ///
+    /// M12 kept this to Chat on the argument that the split is doing real
+    /// work on Task and Deep — one model chooses, the other narrates what
+    /// happened — and that a model answering mid-loop would be answering
+    /// before the turn is over. The counter-argument, and the reason this
+    /// knob exists: the emitter is holding the same trace the replier would
+    /// narrate from, so "the turn is over" is a judgement it is in a position
+    /// to make, and `respond_directly` was always that judgement in the shape
+    /// of a tool call. What it costs is the second reading of the trace by a
+    /// model that did not choose the actions, which is a real check on a long
+    /// task and dead weight on a short one.
+    ///
+    /// Only ever read beside `chat_act_or_answer`: on its own it offers
+    /// nothing, because the offer itself is that knob.
+    pub act_or_answer_every_tier: bool,
     /// Reporting threshold, not a gate: a draft at or over this fraction of
     /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
     /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
@@ -250,6 +266,7 @@ impl Default for EngineConfig {
             reply_grounding_check: true,
             reply_regenerate: true,
             chat_act_or_answer: false,
+            act_or_answer_every_tier: false,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
@@ -1564,7 +1581,12 @@ impl Engine {
             // after the fit and the ablation, so `memory_silent` is a
             // statement about the context as sent rather than as composed —
             // the same thing the replier's silence line says.
-            let offered_answer = self.cfg.chat_act_or_answer && tier == nscore::Tier::Chat;
+            // M13 T2.1: on every tier the offer is the same sentence — call
+            // the next tool or write the reply — so the loop ends when the
+            // model says it is done rather than when it names the action that
+            // says so.
+            let offered_answer = self.cfg.chat_act_or_answer
+                && (self.cfg.act_or_answer_every_tier || tier == nscore::Tier::Chat);
             if offered_answer {
                 let reply_guidance = if self.cfg.archive_foreign_notes {
                     rules.guidance_for_reply_model(self.cfg.learning_model.as_deref())

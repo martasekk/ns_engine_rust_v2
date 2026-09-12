@@ -436,6 +436,35 @@ measured 12,601 and reported the gap as `estimate_tokens` rounding. `ContextMani
 now carries `answer_offered`, skipped when false so no `ModelCall` written before M13
 changes a byte, and the table adds the tool back only where the request carried it.
 
+### M13 T2.1 — the loop decides when it is over
+
+M12 held act-or-answer to the chat tier, on the argument that Task and Deep give the
+split real work: one model chooses, the other narrates, and a model answering mid-loop
+would be answering before the turn is over. `[llm] act_or_answer_every_tier` (default
+`false`, and inert unless `chat_act_or_answer` is on) takes the other side of that
+argument. The emitter is already holding the trace the replier would narrate from, so
+whether the turn is over is a judgement it is in a position to make — and
+`respond_directly` was always that judgement wearing a tool call. Every iteration then
+reads as one sentence: call the next tool, or write the reply.
+
+What it gives up is the second reading of the trace by a model that did not choose the
+actions. That is a real check on a long task and dead weight on a short one, which is
+why the default stays where M12 put it until a task-tier run says where the line falls.
+
+First reading, 2026-09-12, session `m13-tiers`, 4 non-chat turns (two Deep, two Task)
+on `google/gemini-3.8-flash` with the desktop parked: **5 requests, 1.25 per turn, 4 of
+4 answered in the emitter call, 0 rejections, 0 text fallbacks.** The fifth request is
+the grounding path doing its job — turn 2's emitted answer was flagged on the span
+`Windows` in "Windows key + I", a false positive of the same family as M12's `Recycle
+Bin`, and the one regeneration it is allowed went to the replier.
+
+A weak reading of the thing it is actually for: with the desktop parked there were no
+pointer tools, so no turn ran a chain of actions. What it does establish is that the
+offer is made on every iteration, that a turn can act and then answer inside the loop
+(`a_task_turn_can_act_then_answer_in_the_loop`), and that the default still leaves
+every task turn exactly as M12 shipped it
+(`a_task_turn_is_not_offered_the_answer_by_default`).
+
 ### Status after M12
 
 Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on

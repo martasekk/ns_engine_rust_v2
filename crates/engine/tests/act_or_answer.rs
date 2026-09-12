@@ -23,17 +23,6 @@ impl Channel for NullChannel {
     }
 }
 
-struct ChatRouter;
-impl nsengine::router::Router for ChatRouter {
-    fn route(&self, _input: &nsengine::router::RouteInput<'_>) -> nsengine::router::Route {
-        nsengine::router::Route {
-            tier: Tier::Chat,
-            cues: vec!["fixed".into()],
-            tools: None,
-        }
-    }
-}
-
 /// Records whether each call was offered the answer blocks, and books a
 /// nominal cost so the call leaves a `ModelCall` — a scripted emitter
 /// records none, and P2's `ArrayProbe` solved this the same way.
@@ -152,7 +141,24 @@ fn acts(action: &str, args: serde_json::Value) -> Emission {
     }
 }
 
+/// A router pinned to one tier, so a test says which tier it is about
+/// instead of arranging cues that happen to land there.
+struct FixedRouter(Tier);
+impl nsengine::router::Router for FixedRouter {
+    fn route(&self, _input: &nsengine::router::RouteInput<'_>) -> nsengine::router::Route {
+        nsengine::router::Route {
+            tier: self.0,
+            cues: vec!["fixed".into()],
+            tools: None,
+        }
+    }
+}
+
 async fn run(name: &str, emissions: Vec<Emission>, cfg: EngineConfig) -> Run {
+    run_at(Tier::Chat, name, emissions, cfg).await
+}
+
+async fn run_at(tier: Tier, name: &str, emissions: Vec<Emission>, cfg: EngineConfig) -> Run {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId(name.into());
     let answer_offered = Arc::new(Mutex::new(Vec::new()));
@@ -170,7 +176,7 @@ async fn run(name: &str, emissions: Vec<Emission>, cfg: EngineConfig) -> Run {
     let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
-            router: Some(Arc::new(ChatRouter)),
+            router: Some(Arc::new(FixedRouter(tier))),
             ..cfg
         },
         Box::new(|| Timestamp(42)),
@@ -232,6 +238,61 @@ async fn an_emitted_answer_is_the_reply_and_costs_one_request() {
         EventKind::Proposed { proposal }
             if proposal.rationale.starts_with(nscore::ANSWERED_IN_EMITTER_PREFIX)
     )));
+}
+
+/// M13 T2.1. The loop's exit becomes the model's own call: act, see the
+/// result, then decide the turn is over and write the reply — two requests
+/// for a task turn that used to cost three, and the replier never runs.
+#[tokio::test]
+async fn a_task_turn_can_act_then_answer_in_the_loop() {
+    let cfg = EngineConfig {
+        act_or_answer_every_tier: true,
+        ..on()
+    };
+    let r = run_at(
+        Tier::Task,
+        "aoa-task",
+        vec![
+            acts("echo", serde_json::json!({"text": "10:41"})),
+            answers("It is 10:41."),
+        ],
+        cfg,
+    )
+    .await;
+    assert_eq!(r.reply, "It is 10:41.");
+    assert_eq!(r.reply_calls, 0, "the replier was called anyway");
+    assert_eq!(r.model_calls(), 2, "{:?}", r.kinds());
+    // Both iterations were offered the choice, including the one that acted.
+    assert_eq!(r.answer_offered, vec![true, true]);
+    assert!(r.events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::Settled {
+            policy: ReplyPolicy::Generate
+        }
+    )));
+    assert!(r
+        .events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::ToolReturned { .. })));
+}
+
+/// And the boundary M12 drew is still the default: a task turn is not
+/// offered the answer unless this deployment asked for it, so the shape of
+/// every task turn that ships today is unchanged.
+#[tokio::test]
+async fn a_task_turn_is_not_offered_the_answer_by_default() {
+    let r = run_at(
+        Tier::Task,
+        "aoa-task-off",
+        vec![
+            acts("echo", serde_json::json!({"text": "10:41"})),
+            answers("It is 10:41."),
+        ],
+        on(),
+    )
+    .await;
+    assert_eq!(r.answer_offered, vec![false, false]);
+    assert_eq!(r.reply_calls, 1, "the replier still narrates the task turn");
 }
 
 /// An emitted answer is a draft like any other and is owed the same check:
