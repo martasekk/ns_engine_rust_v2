@@ -513,6 +513,7 @@ pub(crate) fn emitter_manifest(
         // M13 T1.2: what this says about the call is that its array carried
         // no `respond_directly`, which only the emitter's own context knows.
         answer_offered: ctx.answer.is_some(),
+        reply_arg: ctx.answer.as_ref().is_some_and(|a| a.with_action),
         fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
         summary_through: ctx.summary.as_ref().map(|s| s.through_turn),
         window: window_range(&ctx.window),
@@ -561,6 +562,7 @@ pub(crate) fn reply_manifest(
         clipped_chars,
         // The replier is never offered the choice; it carries no array at all.
         answer_offered: false,
+        reply_arg: false,
         tools: 0,
         tool_names: Vec::new(),
         guidance: ctx.guidance.len(),

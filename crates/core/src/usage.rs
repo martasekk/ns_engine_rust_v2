@@ -190,6 +190,11 @@ pub struct ContextManifest {
     /// reads `false`, which is what every call before M13 was.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_offered: bool,
+    /// M13 T3.2: every tool in this call's array carried the `_reply`
+    /// property, so a report pricing the array has to include it. Skipped
+    /// when false, for the reason above.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reply_arg: bool,
     #[serde(default)]
     pub tier: Option<crate::router::Tier>,
     #[serde(default)]
@@ -302,6 +307,7 @@ mod tests {
     fn manifest_round_trips_and_old_rows_still_parse() {
         let m = ContextManifest {
             answer_offered: false,
+            reply_arg: false,
             fact_keys: vec!["user.name".into()],
             summary_through: Some(4),
             window: Some((5, 10)),

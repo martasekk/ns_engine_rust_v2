@@ -101,6 +101,10 @@ pub struct AnswerBlocks {
     /// Whether every reference block is empty, decided the way the replier
     /// decides its silence line.
     pub memory_silent: bool,
+    /// M13 T3.1: this call may do both — call an action and write the line
+    /// that tells the user what it is doing. `false` keeps M12's rule, where
+    /// a tool call wins and any text beside it becomes rationale.
+    pub with_action: bool,
 }
 
 /// What one emitter call produced: the proposal the loop acts on, and — on

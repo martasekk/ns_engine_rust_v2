@@ -76,8 +76,37 @@ pub fn build_tools(legal: &LegalActionSet) -> serde_json::Value {
 /// May be empty. That is not a degenerate case to guard against - a chat
 /// turn whose tier carries no tool has nothing to offer, and a request with
 /// no `tools` key at all is the cheapest correct form of it.
-pub fn build_action_tools(legal: &LegalActionSet) -> serde_json::Value {
-    serde_json::Value::Array(legal.actions.iter().map(tool_schema).collect())
+pub fn build_action_tools(legal: &LegalActionSet, with_reply: bool) -> serde_json::Value {
+    serde_json::Value::Array(
+        legal
+            .actions
+            .iter()
+            .map(|s| tool_schema_with(s, with_reply))
+            .collect(),
+    )
+}
+
+/// The user-facing line an action may carry with it (M13 T3.2).
+///
+/// An argument rather than message content, because two models measured on
+/// 2026-09-12 — `openai/gpt-5.6-luna` and `google/gemini-3.8-flash` — never
+/// once returned `content` beside `tool_calls` on the chat-completions shape,
+/// over 8 turns each where doing so was exactly what the closing instruction
+/// asked for. An argument is inside the one thing these models do return.
+///
+/// `_` for the same reason `_rationale` has it: properties serialize
+/// alphabetically here, and `_rationale` must stay first, which it does —
+/// `a` sorts before `e`.
+pub const REPLY: &str = "_reply";
+
+/// Nullable, not absent: strict mode requires every property to be in
+/// `required`, so "nothing to say yet" is `null` rather than an omission.
+fn reply_prop() -> serde_json::Value {
+    serde_json::json!({
+        "type": ["string", "null"],
+        "description": "The reply to show the user now, when it does not depend on what this \
+    action returns. null when your reply must report the result."
+    })
 }
 
 /// One spec compiled to the one element `build_tools` would put in the
@@ -86,12 +115,23 @@ pub fn build_action_tools(legal: &LegalActionSet) -> serde_json::Value {
 /// that re-derived the envelope would drift from the array the moment the
 /// compiler changed, which is the change M10 P1 is about to make.
 pub fn tool_schema(spec: &nscore::ActionSpec) -> serde_json::Value {
+    tool_schema_with(spec, false)
+}
+
+/// The same, with the optional `_reply` property (M13 T3.2). `false` is
+/// [`tool_schema`] byte for byte, which is what every caller that prices a
+/// tool or builds a proposing array still gets.
+pub fn tool_schema_with(spec: &nscore::ActionSpec, with_reply: bool) -> serde_json::Value {
     let mut schema = spec.args_schema.clone();
     let obj = schema.as_object_mut().expect("args_schema is an object");
     obj.entry("type").or_insert(serde_json::json!("object"));
     obj.entry("properties").or_insert(serde_json::json!({}));
     obj["properties"][RATIONALE] = rationale_prop();
     let mut required = vec![serde_json::json!(RATIONALE)];
+    if with_reply {
+        obj["properties"][REPLY] = reply_prop();
+        required.push(serde_json::json!(REPLY));
+    }
     if let Some(existing) = obj.get("required").and_then(|r| r.as_array()) {
         required.extend(existing.iter().cloned());
     }
@@ -138,7 +178,14 @@ pub fn respond_directly_tool() -> serde_json::Value {
 /// lands within a token or so of the call's `tools_tokens`, and that gap is
 /// the floor in `estimate_tokens` plus those separators.
 pub fn schema_tokens(spec: &nscore::ActionSpec) -> u32 {
-    nscore::estimate_tokens(tool_schema(spec).to_string().len())
+    schema_tokens_with(spec, false)
+}
+
+/// The same for an array that carries `_reply` (M13 T3.2), so the per-tool
+/// table prices the bytes the request really sent rather than the bytes it
+/// would have sent with the knob off.
+pub fn schema_tokens_with(spec: &nscore::ActionSpec, with_reply: bool) -> u32 {
+    nscore::estimate_tokens(tool_schema_with(spec, with_reply).to_string().len())
 }
 
 /// `schema_tokens` for the always-appended tool, which has no spec.

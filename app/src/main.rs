@@ -985,6 +985,8 @@ async fn main() {
         chat_act_or_answer: cfg.llm.chat_act_or_answer,
         // M13 T2.1: and the same offer on Task and Deep, off unless asked.
         act_or_answer_every_tier: cfg.llm.act_or_answer_every_tier,
+        // M13 T3.1: and the third branch, act *and* answer, likewise.
+        act_and_answer: cfg.llm.act_and_answer,
         max_echo_ratio: cfg.memory.max_echo_ratio,
         scope_for,
         remember_residual,

@@ -67,6 +67,19 @@ pub struct EngineConfig {
     /// Only ever read beside `chat_act_or_answer`: on its own it offers
     /// nothing, because the offer itself is that knob.
     pub act_or_answer_every_tier: bool,
+    /// M13 T3.1: let one call do both — run the action *and* speak the text
+    /// it came with, instead of the text becoming rationale and the turn
+    /// buying a second call to say what it just did. Off by default, and
+    /// inert unless the offer above is being made at all.
+    ///
+    /// "Act" and "answer" were alternatives, which left the commonest task
+    /// turn there is — do this, and tell me you did — costing two requests to
+    /// express. This is the third branch: act, and say so, in one.
+    ///
+    /// The text is written before the outcome is known, so it can say what is
+    /// being done and never what came back. A reply that needs the result is
+    /// one the model has to write on a later iteration, and it still can.
+    pub act_and_answer: bool,
     /// Reporting threshold, not a gate: a draft at or over this fraction of
     /// one verbatim run out of its own prompt (`echo::echo_ratio`) is logged
     /// as `ReplyEchoed` and then sent as-is. Measured, never acted on — see
@@ -267,6 +280,7 @@ impl Default for EngineConfig {
             reply_regenerate: true,
             chat_act_or_answer: false,
             act_or_answer_every_tier: false,
+            act_and_answer: false,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
             remember_residual: RememberResidual::Flag,
@@ -379,6 +393,28 @@ fn explain_error(detail: &str) -> String {
         "couldn't reach the model provider ({})",
         truncate_chars(detail, 120)
     )
+}
+
+/// M13 T3.1: did the proposal this turn most recently decided on actually
+/// run? Read backwards over this turn's own events and stop at the first
+/// thing that answers it: a `ToolReturned` means it ran, a `Rejected` means a
+/// guard refused it. Neither means nothing was decided yet.
+///
+/// Asked of the log rather than tracked in a local, because "the action ran"
+/// is true at six different places in the loop — one per builtin plus the
+/// registered-tool path — and a flag set at six sites is a flag that is
+/// eventually set at five.
+fn last_proposal_ran(events: &[nscore::Event], turn: u32) -> bool {
+    events
+        .iter()
+        .rev()
+        .take_while(|e| e.turn == turn)
+        .find_map(|e| match &e.kind {
+            EventKind::ToolReturned { .. } => Some(true),
+            EventKind::Rejected { .. } => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Every action the engine itself puts in a legal set, in one list.
@@ -1394,8 +1430,34 @@ impl Engine {
         // the turn settled on an answer rather than an action. `None` is
         // every turn before M12 and every turn with the knob off.
         let mut pre_draft: Option<String> = None;
+        // M13 T3.1: an answer that arrived *beside* an action, held until the
+        // action has actually run. It cannot be settled on at proposal time:
+        // a guard may still refuse the call, and a reply saying "opening it
+        // now" on a turn that opened nothing is worse than a second request.
+        let mut answer_with_action: Option<String> = None;
 
         for _ in 0..self.cfg.max_iterations {
+            // M13 T3.1: the held answer, collected one iteration later so the
+            // log can say whether the action it was written beside happened.
+            // A refused proposal leaves a `Rejected` last, not a
+            // `ToolReturned`, and the answer is dropped with it.
+            if let Some(text) = answer_with_action.take() {
+                if last_proposal_ran(log.events(), turn) {
+                    pre_draft = Some(text);
+                    let e = log.append(
+                        turn,
+                        now(),
+                        EventKind::Settled {
+                            policy: ReplyPolicy::Generate,
+                        },
+                    );
+                    settled = Some(match &e.kind {
+                        EventKind::Settled { policy } => policy.clone(),
+                        _ => unreachable!(),
+                    });
+                    break;
+                }
+            }
             // a. project
             let state = fold(log.events());
             // A pending confirmation is active only on the turn immediately
@@ -1599,6 +1661,7 @@ impl Engine {
                     memory_silent: ctx.facts.is_empty()
                         && ctx.summary.is_none()
                         && !ctx.trace_so_far.iter().any(|l| l.contains("recall")),
+                    with_action: self.cfg.act_and_answer,
                 });
             }
             // Cut to what survived: nothing drops guidance from the middle,
@@ -1717,6 +1780,22 @@ impl Engine {
                     _ => unreachable!(),
                 });
                 break;
+            }
+
+            // e2. M13 T3.1: an answer beside a real action. The model said
+            // both what it is doing and that it is doing it, which is the one
+            // turn shape act-or-answer could not express: "act" and "answer"
+            // were alternatives, so a turn that did something always bought a
+            // second call to say so.
+            //
+            // Held rather than settled, because the action has not run yet
+            // (the check at the top of the next iteration collects it), and
+            // the text is written *before* the outcome is known. That is the
+            // real limit of this knob: the reply can say what is being done
+            // and never what came back. An answer that needs the result is
+            // one the model must write on a later iteration.
+            if self.cfg.act_and_answer {
+                answer_with_action = emitted_answer.take();
             }
 
             // f. legality
@@ -2646,6 +2725,29 @@ impl Engine {
                 self.flush(&sid, &log, n_loaded).await;
             }
             // loop: the emitter decides what happens next (typically respond_directly)
+        }
+
+        // M13 T3.1: the iteration budget ran out holding an answer written
+        // beside the last action, and that action ran. It is a reply to a
+        // turn that did what it said; the fallback below would throw it away
+        // and tell the user the loop ran out of steps.
+        if settled.is_none() {
+            if let Some(text) = answer_with_action.take() {
+                if last_proposal_ran(log.events(), turn) {
+                    pre_draft = Some(text);
+                    let e = log.append(
+                        turn,
+                        now(),
+                        EventKind::Settled {
+                            policy: ReplyPolicy::Generate,
+                        },
+                    );
+                    settled = Some(match &e.kind {
+                        EventKind::Settled { policy } => policy.clone(),
+                        _ => unreachable!(),
+                    });
+                }
+            }
         }
 
         // 3. fallback settle (a registered cant_help template wins). The

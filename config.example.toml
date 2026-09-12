@@ -68,6 +68,17 @@ provider = "openrouter"
 # with the desktop parked: 5 requests, 4 of 4 answered in the emitter call,
 # the one extra request a grounding regeneration on a false positive.
 #   act_or_answer_every_tier = true
+# Let one call do both: run the action and speak the line it came with, so
+# "do this, and tell me you did" stops costing two requests. The line travels
+# in a `_reply` argument added to every tool, because no model measured here
+# returns message text beside a tool call — luna and gemini-3.8-flash both
+# refused to, 8 turns each, with the instruction asking for exactly that.
+# Null `_reply` means "I have to see the result first", which is how a time
+# question still takes two calls and a memory write takes one. Off by
+# default; it adds roughly 20 tokens to each tool's schema. Measured
+# 2026-09-12 on gemini-3.8-flash over the same 6 messages: 7 requests
+# against 10, 1.2 per turn against 1.7, 5 actions all executed, 0 rejections.
+#   act_and_answer = true
 
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the

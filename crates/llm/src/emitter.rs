@@ -234,6 +234,18 @@ const PROPOSE_LINE: &str = "Propose the next action.";
 const ACT_OR_ANSWER_CLOSING: &str = "Propose the next action, or, if the context already \
 answers and no tool applies, answer the user in plain text.";
 
+/// How it closes when the call may do both (M13 T3.1).
+///
+/// Still one sentence and still both options, with the third the other two
+/// could not express: acting and saying so. The warning is the load-bearing
+/// half — text written beside an action is written before the action runs,
+/// and a model that reports the result it has not seen yet is inventing it.
+const ACT_AND_ANSWER_CLOSING: &str = "Propose the next action, or answer the user in plain \
+text. When the action needs no result to talk about \u{2014} storing something the user just told \
+you, or acknowledging a request \u{2014} do both at once by putting the user's reply in that \
+action's `_reply` argument, and the turn ends there. Leave `_reply` null when your reply has \
+to report what the action returns. Never state a result you have not been shown.";
+
 /// The chat-tier act-or-answer user message (M12 T4.2).
 ///
 /// The stable half is replaced by the replier's fenced `<reference>` block,
@@ -281,7 +293,11 @@ fn render_act_or_answer(ctx: &EmitterContext, answer: &nscore::AnswerBlocks) -> 
         s.push('\n');
     }
     s.push('\n');
-    s.push_str(ACT_OR_ANSWER_CLOSING);
+    s.push_str(if answer.with_action {
+        ACT_AND_ANSWER_CLOSING
+    } else {
+        ACT_OR_ANSWER_CLOSING
+    });
     s
 }
 
@@ -325,6 +341,7 @@ impl CloudEmitter {
         // cheapest correct form, and the only one that spends nothing at all
         // on schema.
         let answering = ctx.answer.is_some();
+        let with_reply = ctx.answer.as_ref().is_some_and(|a| a.with_action);
         let system = if answering {
             answering_system_prompt(self.capability)
         } else {
@@ -340,7 +357,7 @@ impl CloudEmitter {
         // An empty array is never sent: providers disagree on what one means,
         // and there is nothing to choose from either way.
         let tools = if answering {
-            build_action_tools(legal)
+            build_action_tools(legal, with_reply)
         } else {
             build_tools(legal)
         };
@@ -475,8 +492,39 @@ impl CloudEmitter {
         // Gated on the act-or-answer call, not merely on there being text:
         // with the knob off every event in the log must read as it did
         // before M12, and a rationale is an event.
-        if ctx.answer.is_some() && !content.is_empty() {
-            let mut said = format!("model said: {content}");
+        // M13 T3.1. Unless this call was told it may do both, in which case
+        // the text is not the reason for the action, it is the line the user
+        // is owed about it: the action runs and the text is the reply. The
+        // rationale still carries it, because the counter that reports how
+        // many turns were answered in the emitter call reads the prefix off
+        // the `Proposed` event and nothing else.
+        // M13 T3.2: the line the action carries, lifted out of the arguments
+        // before anything else sees them — `call_key` hashes `action + args`
+        // for the repeat gate, and two calls that differ only in what they
+        // said to the user are the same call.
+        let carried_reply = ctx
+            .answer
+            .as_ref()
+            .filter(|a| a.with_action)
+            .and_then(|_| input.remove(crate::schema::REPLY))
+            .and_then(|v| v.as_str().map(str::trim).map(String::from))
+            .filter(|s| !s.is_empty());
+        // The argument wins over loose content: it is the field that was
+        // asked for, and a model that fills both meant the one it was given
+        // a slot for.
+        let answer = carried_reply.or_else(|| {
+            ctx.answer
+                .as_ref()
+                .filter(|a| a.with_action && !content.is_empty())
+                .map(|_| content.to_string())
+        });
+        if ctx.answer.is_some() && (!content.is_empty() || answer.is_some()) {
+            let spoken = answer.as_deref().unwrap_or(content);
+            let mut said = if answer.is_some() {
+                format!("{} {spoken}", nscore::ANSWERED_IN_EMITTER_PREFIX)
+            } else {
+                format!("model said: {content}")
+            };
             truncate_chars(&mut said, 300);
             rationale = if rationale.is_empty() {
                 said
@@ -490,7 +538,7 @@ impl CloudEmitter {
                 action,
                 args: serde_json::Value::Object(input),
             },
-            answer: None,
+            answer,
         })
     }
 }
@@ -671,6 +719,7 @@ mod tests {
             persona: "You are Tomáš.".into(),
             reply_guidance: vec!["keep it short".into()],
             memory_silent: false,
+            with_action: false,
         }
     }
 
@@ -862,6 +911,7 @@ mod tests {
             persona: "You are Tomáš.".into(),
             reply_guidance: vec!["keep it short".into()],
             memory_silent: false,
+            with_action: false,
         });
         emitter(mock.clone())
             .propose_or_answer(c, &legal())
@@ -931,6 +981,7 @@ mod tests {
             persona: String::new(),
             reply_guidance: vec![],
             memory_silent: true,
+            with_action: false,
         });
         let e = emitter(mock).propose_or_answer(c, &legal()).await.unwrap();
         assert_eq!(e.answer, None, "a tool call is never an answer");
@@ -962,6 +1013,7 @@ mod tests {
             persona: "p".into(),
             reply_guidance: vec![],
             memory_silent: false,
+            with_action: false,
         });
         let e = emitter(mock).propose_or_answer(c, &legal()).await.unwrap();
         assert_eq!(e.answer.as_deref(), Some("Je deset čtyřicet jedna."));
@@ -1187,6 +1239,83 @@ mod tests {
         );
         let system = req["messages"][0]["content"].as_str().unwrap();
         assert!(!system.contains("Guidance"));
+    }
+
+    /// M13 T3.2. The line rides in the action's own `_reply` argument, and
+    /// is lifted out of the arguments before anything sees them: `call_key`
+    /// hashes action plus args for the repeat gate, and two calls that differ
+    /// only in what they said to the user are the same call.
+    #[tokio::test]
+    async fn a_reply_argument_is_the_answer_and_leaves_the_args_alone() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"text": "hi", "_reply": "Sending that now."}),
+        )]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            with_action: true,
+            ..answer_blocks()
+        });
+        let e = emitter(mock.clone())
+            .propose_or_answer(c, &legal())
+            .await
+            .unwrap();
+        assert_eq!(e.proposal.action, "echo", "the action still runs");
+        assert_eq!(e.answer.as_deref(), Some("Sending that now."));
+        assert_eq!(e.proposal.args, serde_json::json!({"text": "hi"}));
+        assert!(
+            e.proposal
+                .rationale
+                .starts_with(nscore::ANSWERED_IN_EMITTER_PREFIX),
+            "{}",
+            e.proposal.rationale
+        );
+        // The array offered the field, and the closing instruction names it.
+        let reqs = mock.requests.lock().unwrap();
+        let props = &reqs[0]["tools"][0]["function"]["parameters"]["properties"];
+        assert!(props.get("_reply").is_some(), "{props}");
+        let text = reqs[0]["messages"][1]["content"].as_str().unwrap();
+        assert!(text.ends_with(ACT_AND_ANSWER_CLOSING), "{text}");
+        assert!(text.contains("`_reply` argument"), "{text}");
+        assert!(
+            text.contains("Never state a result you have not been shown"),
+            "{text}"
+        );
+        assert!(!text.contains(ACT_OR_ANSWER_CLOSING), "{text}");
+    }
+
+    /// Null is the wait: the model has an action whose result the reply needs,
+    /// and the turn keeps looping rather than settling on an empty line.
+    #[tokio::test]
+    async fn a_null_reply_argument_is_not_an_answer() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"text": "hi", "_reply": serde_json::Value::Null}),
+        )]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            with_action: true,
+            ..answer_blocks()
+        });
+        let e = emitter(mock).propose_or_answer(c, &legal()).await.unwrap();
+        assert_eq!(e.answer, None);
+        assert_eq!(e.proposal.args, serde_json::json!({"text": "hi"}));
+    }
+
+    /// And with the knob off the field is not offered at all, so the array is
+    /// the one M13 T1.1 measured.
+    #[tokio::test]
+    async fn without_act_and_answer_no_reply_field_is_offered() {
+        let mock = MockTransport::ok(vec![text_response("hi")]);
+        let mut c = ctx();
+        c.answer = Some(answer_blocks());
+        emitter(mock.clone())
+            .propose_or_answer(c, &legal())
+            .await
+            .unwrap();
+        let reqs = mock.requests.lock().unwrap();
+        let props = &reqs[0]["tools"][0]["function"]["parameters"]["properties"];
+        assert!(props.get("_reply").is_none(), "{props}");
     }
 
     /// M13 T1.1. The saving M12 measured and could not collect: with both on

@@ -465,6 +465,50 @@ offer is made on every iteration, that a turn can act and then answer inside the
 every task turn exactly as M12 shipped it
 (`a_task_turn_is_not_offered_the_answer_by_default`).
 
+### M13 T3 — act *and* answer, and why it had to be an argument
+
+Act-or-answer named two branches and the commonest task turn there is needs a third:
+do this, and tell me you did. Under T2.1 that turn costs two requests — one for the
+action, one to say what it did — because acting and answering were alternatives.
+
+**T3.1, the branch.** `[llm] act_and_answer` (default `false`) lets one call carry both:
+the engine holds the text until the action has actually run and only then settles on it,
+because a guard may still refuse the call and a reply saying "opening it now" on a turn
+that opened nothing is worse than a second request. `last_proposal_ran` asks the log
+rather than tracking a flag at the six places an action can run.
+
+**It did not work.** Two live runs, `openai/gpt-5.6-luna` then `google/gemini-3.8-flash`,
+6 messages each with 4 chances per run: **not once** did either model return `content`
+beside `tool_calls`. Sharpening the closing instruction from "you may do both" to a rule
+saying exactly when to, changed nothing — 10 requests both times, identical turn shapes.
+The chat-completions shape these models are served under does not put prose and a tool
+call in one message, and no prompt makes it.
+
+**T3.2, the argument.** So the line travels inside the one thing they do return.
+`_reply` is injected into every tool of an act-or-answer array when the knob is on:
+nullable (strict mode requires every property in `required`, so "nothing to say yet" is
+`null`, not an omission), sorted after `_rationale` and before every real argument, and
+lifted out of the arguments before anything else sees them — `call_key` hashes action
+plus args for the repeat gate, and two calls differing only in what they said to the
+user are the same call.
+
+**The reading**, same 6 messages, `gemini-3.8-flash`, 2026-09-12:
+
+| | T2.1 (no `_reply`) | T3.2 (`_reply`) |
+|---|---|---|
+| requests, 6 turns | 10 | **7** |
+| requests per turn | 1.67 | **1.17** |
+| turns costing one request | 2 of 6 | **5 of 6** |
+| actions executed | 5 | 5 |
+| `Rejected`, text fallbacks | 0, 0 | 0, 0 |
+
+The three `remember_fact` turns each fell from two requests to one and still wrote their
+fact. The time question still costs two, which is the design working: its reply has to
+report a result, so `_reply` came back null and the loop went round. Prompt tokens fell
+too, 6,217 to 5,714, because three whole calls went away and the `_reply` property costs
+about 20 tokens per tool. `ContextManifest.reply_arg` records which arrays carried it so
+`ns-app budget` prices the real bytes.
+
 ### Status after M12
 
 Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on

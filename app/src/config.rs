@@ -957,6 +957,18 @@ pub struct LlmConfig {
     /// not on a short one, and no reading yet says where the line falls.
     #[serde(default)]
     pub act_or_answer_every_tier: bool,
+    /// M13 T3.1: let one call run the action *and* speak the line it came
+    /// with, instead of that text becoming rationale and the turn buying a
+    /// second call to say what it just did. Default **false**, and inert
+    /// unless `chat_act_or_answer` is on.
+    ///
+    /// Acting and answering were alternatives, which left the commonest task
+    /// turn there is — do this, and tell me you did — costing two requests to
+    /// express. The limit is that the text is written before the action runs,
+    /// so it can say what is being done and never what came back; the closing
+    /// instruction says so in as many words.
+    #[serde(default)]
+    pub act_and_answer: bool,
     #[serde(default)]
     pub emitter: RoleSection,
     #[serde(default)]

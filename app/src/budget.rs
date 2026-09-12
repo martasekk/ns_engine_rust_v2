@@ -539,9 +539,11 @@ fn render_tool_table(events: &[Event], specs: &[nscore::ActionSpec]) -> String {
             let tokens = if name == nsllm::schema::RESPOND_DIRECTLY {
                 Some(u64::from(nsllm::schema::respond_directly_tokens()))
             } else {
-                by_name
-                    .get(name)
-                    .map(|s| u64::from(nsllm::schema::schema_tokens(s)))
+                by_name.get(name).map(|s| {
+                    // M13 T3.2: priced with `_reply` where the array carried
+                    // it, so the row is the request's bytes either way.
+                    u64::from(nsllm::schema::schema_tokens_with(s, manifest.reply_arg))
+                })
             };
             match rows.iter_mut().find(|r| r.name == name) {
                 Some(row) => {

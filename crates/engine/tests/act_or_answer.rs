@@ -240,6 +240,82 @@ async fn an_emitted_answer_is_the_reply_and_costs_one_request() {
     )));
 }
 
+/// M13 T3.1: one call that does both. The action is the proposal, the text
+/// rides beside it.
+fn acts_and_answers(action: &str, args: serde_json::Value, text: &str) -> Emission {
+    Emission {
+        proposal: Proposal {
+            rationale: format!("{} {text}", nscore::ANSWERED_IN_EMITTER_PREFIX),
+            action: action.into(),
+            args,
+        },
+        answer: Some(text.into()),
+    }
+}
+
+fn both() -> EngineConfig {
+    EngineConfig {
+        act_or_answer_every_tier: true,
+        act_and_answer: true,
+        ..on()
+    }
+}
+
+/// M13 T3.1. "Do this, and tell me you did" is the commonest task turn there
+/// is, and act-or-answer could not express it: one call for the action, a
+/// second to say what the first did. One call now buys both.
+#[tokio::test]
+async fn an_action_and_an_answer_in_one_call_cost_one_request() {
+    let r = run_at(
+        Tier::Task,
+        "aoa-both",
+        vec![acts_and_answers(
+            "echo",
+            serde_json::json!({"text": "hi"}),
+            "Sending that now.",
+        )],
+        both(),
+    )
+    .await;
+    assert_eq!(r.reply, "Sending that now.");
+    assert_eq!(r.reply_calls, 0, "the replier was called anyway");
+    assert_eq!(r.model_calls(), 1, "{:?}", r.kinds());
+    // The action really ran, and the turn settled after it rather than on
+    // the strength of the text alone.
+    assert!(r
+        .events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::ToolReturned { .. })));
+    let order = r.kinds();
+    let returned = order.iter().position(|k| *k == "ToolReturned").unwrap();
+    let settled = order.iter().position(|k| *k == "Settled").unwrap();
+    assert!(returned < settled, "{order:?}");
+}
+
+/// And the guard rail on it: the text was written before the action ran, so
+/// a refused action must take its sentence with it. Otherwise the user is
+/// told something happened that did not.
+#[tokio::test]
+async fn an_answer_beside_a_refused_action_is_dropped() {
+    let r = run_at(
+        Tier::Task,
+        "aoa-both-refused",
+        vec![
+            acts_and_answers("no_such_tool", serde_json::json!({}), "Done, all sorted."),
+            answers("I could not do that."),
+        ],
+        both(),
+    )
+    .await;
+    assert_eq!(r.reply, "I could not do that.");
+    assert_ne!(r.reply, "Done, all sorted.");
+    assert_eq!(r.model_calls(), 2, "{:?}", r.kinds());
+    assert!(r
+        .events
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::Rejected { .. })));
+}
+
 /// M13 T2.1. The loop's exit becomes the model's own call: act, see the
 /// result, then decide the turn is over and write the reply — two requests
 /// for a task turn that used to cost three, and the replier never runs.
