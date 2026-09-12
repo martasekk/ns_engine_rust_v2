@@ -73,9 +73,9 @@ provider = "openrouter"
 # in a `_reply` argument added to every tool, because no model measured here
 # returns message text beside a tool call — luna and gemini-3.8-flash both
 # refused to, 8 turns each, with the instruction asking for exactly that.
-# Null `_reply` means "I have to see the result first", which is how a time
-# question still takes two calls and a memory write takes one. Off by
-# default; it adds roughly 20 tokens to each tool's schema. Measured
+# An empty `_reply` means "I have to see the result first", which is how a
+# time question still takes two calls and a memory write takes one. Off by
+# default. Measured
 # 2026-09-12 on gemini-3.8-flash over the same 6 messages: 7 requests
 # against 10, 1.2 per turn against 1.7, 5 actions all executed, 0 rejections.
 # It also carries the other half of the pair: `_speak`, a line delivered to
