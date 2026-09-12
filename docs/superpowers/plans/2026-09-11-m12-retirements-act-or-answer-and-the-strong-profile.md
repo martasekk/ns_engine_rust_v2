@@ -509,6 +509,24 @@ too, 6,217 to 5,714, because three whole calls went away and the `_reply` proper
 about 20 tokens per tool. `ContextManifest.reply_arg` records which arrays carried it so
 `ns-app budget` prices the real bytes.
 
+**Confirmed on Luna, 2026-09-12**, session `luna-live`, the same 6 messages under
+`openai/gpt-5.6-luna` in all three roles and `capability = "strong"`: **7 requests, 1.17
+per turn, 5 of 6 turns on one call, requests per chat turn 1.00, 5 of 5 actions
+executed, 0 rejections, 0 text fallbacks.** So the argument is what the two models
+differ on least: Luna would not put prose beside a tool call either, and fills `_reply`
+just as readily as gemini does. Completion tokens are a quarter of gemini's (496 against
+1,918) for the same six replies, which is most of what `strong` is for.
+
+The one flag stood rather than regenerating, and cost no request: `strong` turns
+`reply_regenerate` off, and turn 4's two calls are `get_time` and the answer that
+reports it, not a second draft.
+
+Cost, at M11's $0.20 / $1.20 per MTok: 5,890 prompt + 496 completion is about **$0.002
+for the six turns**, near $0.0003 a turn. Tokens are the meter now, not requests, which
+moves `prompt_cache_emitter` from a lever without a reading to the next thing worth one
+— the array alone is 708 tokens against the 1,024-token breakpoint floor, so the probe
+M12 queued is the way to settle it.
+
 ### Status after M12
 
 Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on
