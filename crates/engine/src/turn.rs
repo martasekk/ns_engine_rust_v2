@@ -1688,10 +1688,11 @@ impl Engine {
             manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose_or_answer(ctx, &legal).await;
             self.record_model_calls(&usage, &mut log, turn, &manifest);
-            // Carried only as far as the `respond_directly` branch below:
-            // an answer that arrives beside any other action is not an
-            // answer to this turn, and a stale one must not reach the reply.
+            // Carried as far as the `respond_directly` branch below, or to
+            // the top of the next iteration when it rode beside an action.
             let mut emitted_answer: Option<String>;
+            // M13 T4.1: the line to say now, before the action runs.
+            let mut emitted_say: Option<String>;
             let mut proposal = match proposed {
                 Ok(e) => {
                     // An answer is only ever taken from a call that was
@@ -1699,6 +1700,7 @@ impl Engine {
                     // with the knob off this turn must be the turn it was
                     // before M12, event for event.
                     emitted_answer = offered_answer.then_some(e.answer).flatten();
+                    emitted_say = offered_answer.then_some(e.say).flatten();
                     e.proposal
                 }
                 Err(e) => {
@@ -1796,6 +1798,30 @@ impl Engine {
             // one the model must write on a later iteration.
             if self.cfg.act_and_answer {
                 answer_with_action = emitted_answer.take();
+            }
+
+            // e3. M13 T4.1: and the other half of that pair — a line said
+            // now, with the turn carrying on. "Let me check the database for
+            // that product" is not an answer and silence is not a reply, and
+            // this is the only branch that can be either.
+            //
+            // Sent *before* the action, because being told you are about to
+            // wait is the whole value of it. Nothing can hold it back, so a
+            // guard refusing the action afterwards leaves the user told about
+            // a check that did not happen — the loop still goes round and
+            // still owes them an answer, which is the honest trade for not
+            // narrating after the fact.
+            if let Some(text) = emitted_say.take() {
+                // The channel, not the return value: the turn's one reply is
+                // still to come, and `send` is documented for exactly this.
+                if let Err(e) = self.parts.channel.send(&sid, &text).await {
+                    eprintln!("said: {e}");
+                }
+                log.append(turn, now(), EventKind::Said { text });
+                // Flushed like a side effect, because it is one: it has left
+                // the machine, and a crash before the next flush must not
+                // lose the record of what the user was told.
+                self.flush(&sid, &log, n_loaded).await;
             }
 
             // f. legality

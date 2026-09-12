@@ -401,6 +401,10 @@ pub fn render_turn(events: &[Event], turn: u32) -> String {
                 unreachable!("filtered above")
             }
             EventKind::UserSaid { text } => format!("UserSaid: {text}"),
+            // M13 T4.1: part of what the turn did, and worth mining — a turn
+            // that told the user it was about to look something up is a
+            // pattern, not noise.
+            EventKind::Said { text } => format!("Said: {text}"),
             EventKind::Proposed { proposal } => {
                 format!("Proposed: {} {}", proposal.action, proposal.args)
             }

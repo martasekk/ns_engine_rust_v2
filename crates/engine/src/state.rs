@@ -207,6 +207,14 @@ pub fn fold(events: &[Event]) -> SessionState {
                 s.summary = Some(summary.clone());
                 s.summaries += 1;
             }
+            // M13 T4.1: a line the model said mid-turn goes into this turn's
+            // `did` list, not into `history`. The window is a record of turns
+            // and a turn has one reply; what this is, to the next iteration,
+            // is an action already taken — which is exactly what stops the
+            // model announcing the same check twice.
+            EventKind::Said { text } => {
+                push_line(&mut current, format!("said to the user: {text}"));
+            }
             EventKind::Replied { text } => {
                 s.history.push(("assistant".into(), text.clone()));
                 if let Some(mut r) = current.take() {

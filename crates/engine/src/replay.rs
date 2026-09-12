@@ -64,6 +64,11 @@ fn normalize_kind(kind: &EventKind) -> String {
             unreachable!("filtered by normalize")
         }
         EventKind::UserSaid { text } => format!("UserSaid {text}"),
+        // M13 T4.1: part of the replayed shape, not infrastructure. What the
+        // model chose to tell the user mid-turn is behaviour, so a candidate
+        // that changes whether a turn narrates itself has changed the turn
+        // and has to fail replay rather than pass it quietly.
+        EventKind::Said { text } => format!("Said {text}"),
         EventKind::Proposed { proposal } => format!("Proposed {}", proposal.action),
         EventKind::Rejected { reason, .. } => {
             let variant = match reason {

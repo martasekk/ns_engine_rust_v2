@@ -1554,6 +1554,7 @@ pub async fn answering_chat_turn(run: Run) -> (String, usize) {
                     args: serde_json::json!({}),
                 },
                 answer: Some(answer.into()),
+                say: None,
             }],
         )
         .await;
@@ -1600,6 +1601,7 @@ mod tests {
                         args: serde_json::json!({}),
                     },
                     answer: Some("Je deset čtyřicet jedna.".into()),
+                    say: None,
                 }],
             )
             .await;

@@ -45,6 +45,23 @@ pub enum EventKind {
     Settled {
         policy: crate::action::ReplyPolicy,
     },
+    /// M13 T4.1: something the model told the user *during* the turn, before
+    /// the turn had an answer — "let me check the database for that product",
+    /// said while it checks.
+    ///
+    /// Not a `Replied`. A turn has exactly one answer and every counter, the
+    /// verbatim window and the grader all rest on that; a second `Replied`
+    /// would make a turn that spoke twice read as two turns that each
+    /// answered once. This is the turn talking, not the turn ending, and the
+    /// loop goes round after it.
+    ///
+    /// Already delivered by the time it is logged, which is the point of it:
+    /// it is sent before the action it announces runs, so the user is not
+    /// watching silence. That also means no check can hold it back — see the
+    /// grounding note in the M13 plan.
+    Said {
+        text: String,
+    },
     Replied {
         text: String,
     },

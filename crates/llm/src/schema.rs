@@ -99,13 +99,52 @@ pub fn build_action_tools(legal: &LegalActionSet, with_reply: bool) -> serde_jso
 /// `a` sorts before `e`.
 pub const REPLY: &str = "_reply";
 
-/// Nullable, not absent: strict mode requires every property to be in
-/// `required`, so "nothing to say yet" is `null` rather than an omission.
+/// An empty string, not a null and not an omission.
+///
+/// Strict mode requires every property to be in `required`, so "nothing to
+/// say" needs a value. `["string","null"]` is the documented spelling and it
+/// works for one such field; with two, OpenRouter answered every call with
+/// `Invalid schema for function 'ask_clarification': ... Extra required key
+/// '_say' supplied` for an array whose `properties` and `required` matched
+/// exactly (measured 2026-09-12, and the sent bytes were checked). Something
+/// between here and the model drops the second nullable union from
+/// `properties` and leaves it in `required`. A plain string has no union to
+/// drop, and the emitter already treats empty as absent.
 fn reply_prop() -> serde_json::Value {
     serde_json::json!({
-        "type": ["string", "null"],
-        "description": "The reply to show the user now, when it does not depend on what this \
-    action returns. null when your reply must report the result."
+        "type": "string",
+        "description": "Your final answer, when it does not depend on what this action \
+    returns. The turn ends here. Empty string if you still need the result."
+    })
+}
+
+/// The other half of the pair (M13 T4.1): a line said *during* the turn.
+///
+/// Two fields rather than one field and a flag, because what separates them
+/// is not a property of the text, it is whether the turn is over — and a
+/// model reading two named slots picks the right one more reliably than one
+/// reading a boolean it has to reason about. The cost is roughly 30 tokens
+/// per tool, against a whole request saved whenever either fires.
+///
+/// **The name is load-bearing and the reason is not ours.** Called `_say`,
+/// every request came back `Invalid schema for function
+/// 'ask_clarification': ... Extra required key '_say' supplied` — for an
+/// array whose `properties` and `required` matched exactly, which was
+/// checked by parsing the bytes actually sent. Renaming it to `_speak`, one
+/// character of description otherwise unchanged, fixed it outright
+/// (2026-09-12, openai/gpt-5.6-luna through OpenRouter). Something between
+/// here and the model strips a property called `_say` from `properties` and
+/// leaves it in `required`. If this ever needs renaming again, run one live
+/// turn and read the error body — the schema this file emits is valid, so a
+/// schema complaint is about the transport, not about us.
+pub const SAY: &str = "_speak";
+
+fn say_prop() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "description": "Something to tell the user right now, before this action runs, when \
+    they would otherwise wait in silence - that you are about to look something up, say. You \
+    keep working afterwards and answer from the result. Empty string for nothing."
     })
 }
 
@@ -130,7 +169,9 @@ pub fn tool_schema_with(spec: &nscore::ActionSpec, with_reply: bool) -> serde_js
     let mut required = vec![serde_json::json!(RATIONALE)];
     if with_reply {
         obj["properties"][REPLY] = reply_prop();
+        obj["properties"][SAY] = say_prop();
         required.push(serde_json::json!(REPLY));
+        required.push(serde_json::json!(SAY));
     }
     if let Some(existing) = obj.get("required").and_then(|r| r.as_array()) {
         required.extend(existing.iter().cloned());

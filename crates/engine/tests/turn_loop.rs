@@ -195,6 +195,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Confirmed { .. } => "Confirmed",
         EventKind::Corrected { .. } => "Corrected",
         EventKind::Settled { .. } => "Settled",
+        EventKind::Said { .. } => "Said",
         EventKind::Replied { .. } => "Replied",
         EventKind::ReplyFailed { .. } => "ReplyFailed",
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",

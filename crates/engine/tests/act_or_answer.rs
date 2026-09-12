@@ -12,6 +12,21 @@ use nsengine::turn::{Engine, EngineConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Records what the engine pushed to the user before the turn returned
+/// (M13 T4.1). A discarding channel cannot tell an interim line that was
+/// delivered from one that was only logged.
+struct RecordingChannel(Arc<Mutex<Vec<String>>>);
+#[async_trait::async_trait]
+impl Channel for RecordingChannel {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        Err(ChannelError::Closed)
+    }
+    async fn send(&self, _s: &SessionId, t: &str) -> Result<(), ChannelError> {
+        self.0.lock().expect("sent").push(t.to_string());
+        Ok(())
+    }
+}
+
 struct NullChannel;
 #[async_trait::async_trait]
 impl Channel for NullChannel {
@@ -83,6 +98,8 @@ struct Run {
     events: Vec<Event>,
     answer_offered: Vec<bool>,
     reply_calls: usize,
+    /// Lines the engine pushed mid-turn, in order.
+    sent: Vec<String>,
 }
 
 impl Run {
@@ -108,6 +125,7 @@ fn kind_name(k: &EventKind) -> &'static str {
         EventKind::Confirmed { .. } => "Confirmed",
         EventKind::Corrected { .. } => "Corrected",
         EventKind::Settled { .. } => "Settled",
+        EventKind::Said { .. } => "Said",
         EventKind::Replied { .. } => "Replied",
         EventKind::ReplyFailed { .. } => "ReplyFailed",
         EventKind::ReplyFlagged { .. } => "ReplyFlagged",
@@ -127,6 +145,7 @@ fn answers(text: &str) -> Emission {
             args: serde_json::json!({}),
         },
         answer: Some(text.into()),
+        say: None,
     }
 }
 
@@ -138,6 +157,7 @@ fn acts(action: &str, args: serde_json::Value) -> Emission {
             args,
         },
         answer: None,
+        say: None,
     }
 }
 
@@ -170,7 +190,8 @@ async fn run_at(tier: Tier, name: &str, emissions: Vec<Emission>, cfg: EngineCon
     }));
     b.set_replier(Box::new(CountingReplier(Arc::clone(&reply_calls))));
     b.set_memory(store.clone());
-    b.set_channel(Box::new(NullChannel));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    b.set_channel(Box::new(RecordingChannel(Arc::clone(&sent))));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
     let e = Engine::with_clock(
@@ -189,11 +210,13 @@ async fn run_at(tier: Tier, name: &str, emissions: Vec<Emission>, cfg: EngineCon
         .await
         .unwrap();
     let taken = answer_offered.lock().expect("answer_offered").clone();
+    let delivered = sent.lock().expect("sent").clone();
     Run {
         reply,
         events: store.load(&sid).await.unwrap(),
         answer_offered: taken,
         reply_calls: reply_calls.load(Ordering::SeqCst),
+        sent: delivered,
     }
 }
 
@@ -250,6 +273,20 @@ fn acts_and_answers(action: &str, args: serde_json::Value, text: &str) -> Emissi
             args,
         },
         answer: Some(text.into()),
+        say: None,
+    }
+}
+
+/// M13 T4.1: an action with a line said now, the turn carrying on.
+fn says_and_acts(action: &str, args: serde_json::Value, say: &str) -> Emission {
+    Emission {
+        proposal: Proposal {
+            rationale: "checking first".into(),
+            action: action.into(),
+            args,
+        },
+        answer: None,
+        say: Some(say.into()),
     }
 }
 
@@ -290,6 +327,87 @@ async fn an_action_and_an_answer_in_one_call_cost_one_request() {
     let returned = order.iter().position(|k| *k == "ToolReturned").unwrap();
     let settled = order.iter().position(|k| *k == "Settled").unwrap();
     assert!(returned < settled, "{order:?}");
+}
+
+/// M13 T4.1. "Wait, let me check the database for that product" — said now,
+/// the turn carrying on, the answer written afterwards from what came back.
+/// The case neither an answer nor a bare action could express.
+#[tokio::test]
+async fn a_said_line_reaches_the_user_and_the_turn_keeps_looping() {
+    let r = run_at(
+        Tier::Task,
+        "aoa-say",
+        vec![
+            says_and_acts(
+                "echo",
+                serde_json::json!({"text": "10:41"}),
+                "Hold on, let me check that.",
+            ),
+            answers("It is 10:41."),
+        ],
+        both(),
+    )
+    .await;
+    // The user heard the interim line first and the answer second.
+    assert_eq!(r.sent, vec!["Hold on, let me check that."]);
+    assert_eq!(r.reply, "It is 10:41.");
+    // Said, then the action, then the answer: the loop went round.
+    assert_eq!(
+        r.kinds(),
+        vec![
+            "UserSaid",
+            "ModelCall",
+            "Proposed",
+            "Said",
+            "ToolCalled",
+            "ToolReturned",
+            "ModelCall",
+            "Proposed",
+            "Settled",
+            "Replied",
+        ]
+    );
+    // It is not a second reply. One turn, one answer, whatever else was said.
+    assert_eq!(
+        r.events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Replied { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(r.reply_calls, 0);
+    assert_eq!(r.model_calls(), 2);
+}
+
+/// And the next iteration can see it was said, so the model does not
+/// announce the same check twice.
+#[tokio::test]
+async fn a_said_line_enters_the_turns_own_trace() {
+    let r = run_at(
+        Tier::Task,
+        "aoa-say-trace",
+        vec![
+            says_and_acts(
+                "echo",
+                serde_json::json!({"text": "10:41"}),
+                "Checking now.",
+            ),
+            answers("Done."),
+        ],
+        both(),
+    )
+    .await;
+    let folded = nsengine::state::fold(&r.events);
+    let did: Vec<&String> = folded
+        .records
+        .iter()
+        .flat_map(|rec| rec.did.iter())
+        .collect();
+    assert!(
+        did.iter()
+            .any(|l| l.contains("said to the user: Checking now.")),
+        "{did:?}"
+    );
 }
 
 /// And the guard rail on it: the text was written before the action ran, so
@@ -432,6 +550,7 @@ async fn a_chat_turn_that_proposes_a_tool_still_costs_two_calls() {
                     args: serde_json::json!({}),
                 },
                 answer: None,
+                say: None,
             },
         ],
         on(),

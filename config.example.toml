@@ -78,6 +78,14 @@ provider = "openrouter"
 # default; it adds roughly 20 tokens to each tool's schema. Measured
 # 2026-09-12 on gemini-3.8-flash over the same 6 messages: 7 requests
 # against 10, 1.2 per turn against 1.7, 5 actions all executed, 0 rejections.
+# It also carries the other half of the pair: `_speak`, a line delivered to
+# the user immediately, before the action runs, with the turn carrying on and
+# the answer written later from the result - "let me check the clock", then
+# the time. Logged as `Said`, which is not a second reply: a turn still has
+# exactly one answer. Measured 2026-09-12 on luna, 4 turns: 6 requests, 0
+# replier calls, and the two turns whose answer needed a tool result each
+# narrated first. The pair costs ~60 tokens per tool, which took the schema
+# share of the prompt from 75% to 88% - fewer requests, fatter requests.
 #   act_and_answer = true
 
 # ── Per-role request shape ────────────────────────────────────────────────

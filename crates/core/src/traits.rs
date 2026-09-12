@@ -115,6 +115,14 @@ pub struct Emission {
     /// is skipped; the proposal is `respond_directly` and exists so the log
     /// and the replay path are unchanged.
     pub answer: Option<String>,
+    /// M13 T4.1: a line to tell the user *now*, with the turn continuing.
+    /// Sent before the proposal's action runs and logged as `Said`; the
+    /// answer still comes later, from a call that has seen the result.
+    ///
+    /// Independent of `answer`. A model may narrate and then keep looping,
+    /// which is the case neither `answer` nor a plain action could express:
+    /// "let me check that" is not an answer, and silence is not a reply.
+    pub say: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +178,7 @@ pub trait Emitter: Send + Sync {
         Ok(Emission {
             proposal: self.propose(ctx, legal).await?,
             answer: None,
+            say: None,
         })
     }
 }

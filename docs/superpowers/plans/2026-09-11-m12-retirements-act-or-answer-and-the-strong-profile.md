@@ -527,6 +527,54 @@ moves `prompt_cache_emitter` from a lever without a reading to the next thing wo
 — the array alone is 708 tokens against the 1,024-token breakpoint floor, so the probe
 M12 queued is the way to settle it.
 
+### M13 T4 — speaking without settling
+
+T3.2 gave a turn two endings and no middle. "Wait, let me check the database for that
+product" is neither: not an answer, and silence is not a reply either. So every tool now
+carries a second line beside `_reply`. `_speak` is delivered to the channel immediately,
+*before* the action runs, logged as a new `Said` event, and the loop carries on — the
+answer comes from a later call that has seen the result.
+
+`Said` is not a second `Replied`. A turn has exactly one answer and the verbatim window,
+every counter and the grader all rest on that; two would make one turn read as two. The
+fold puts it in the turn's own `did` list instead, which is also what stops the model
+announcing the same check twice, and `replay` treats it as behaviour rather than
+infrastructure: a candidate that changes whether a turn narrates itself has changed the
+turn and should fail replay.
+
+Nothing can hold it back, which is the honest cost. It is sent before the action, so a
+guard refusing that action afterwards leaves the user told about a check that did not
+happen. The loop still owes them an answer and still produces one; the alternative was
+narrating after the fact, which is not narration.
+
+**The name is load-bearing, and not for a reason of ours.** Called `_say`, every single
+request came back `Invalid schema for function 'ask_clarification': ... Extra required
+key '_say' supplied` — for an array whose `properties` and `required` matched exactly,
+verified by parsing the bytes actually sent, with `completion_tokens: 1` on all seven
+calls of the run. Renaming the property to `_speak`, everything else identical, fixed it
+outright. Something between this workspace and the model strips a property called `_say`
+from `properties` and leaves it in `required`. Two hours of that was spent reading a
+schema that was never wrong, so: if a provider complains about a schema this file emits,
+print the response body first.
+
+**Measured live**, session `say-live`, Luna, 4 messages:
+
+| Turn | What happened | Requests |
+|---|---|---|
+| remember my sister is Marie | `_reply` on the store: one call | 1 |
+| check the clock, hours until midnight | **`_speak` then the answer from the result** | 2 |
+| what time is it right now | **`_speak` then the answer** | 2 |
+| co jsem ti řekl o sestře | answered from memory | 1 |
+
+Six requests over four turns, **zero replier calls**, two `Said` events, both on exactly
+the turns whose answer depended on a tool result. The user saw "I'll check the current
+time" and then "There are 10 hours and 40 minutes left until midnight."
+
+One number to watch: the two injected properties took the schema share to **88% of the
+prompt** on this run, against 75% with `_reply` alone. On a per-token meter that is the
+real price of the pair, and the two descriptions are long enough to halve. Fewer requests,
+fatter requests — worth re-reading once prompt caching has a number.
+
 ### Status after M12
 
 Built and green: 742 tests across 35 binaries, 0 failed. Executed 2026-09-11 on

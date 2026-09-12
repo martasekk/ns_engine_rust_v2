@@ -241,10 +241,12 @@ answers and no tool applies, answer the user in plain text.";
 /// half — text written beside an action is written before the action runs,
 /// and a model that reports the result it has not seen yet is inventing it.
 const ACT_AND_ANSWER_CLOSING: &str = "Propose the next action, or answer the user in plain \
-text. When the action needs no result to talk about \u{2014} storing something the user just told \
-you, or acknowledging a request \u{2014} do both at once by putting the user's reply in that \
-action's `_reply` argument, and the turn ends there. Leave `_reply` null when your reply has \
-to report what the action returns. Never state a result you have not been shown.";
+text. Every action also takes two optional lines. Put your answer in `_reply` when the \
+action needs no result to talk about \u{2014} storing something the user just told you, \
+acknowledging a request \u{2014} and the turn ends there. Put a line in `_speak` instead when you \
+do need the result: it reaches the user immediately, before the action runs, and you keep \
+working and answer afterwards from what comes back. Never state a result you have not been \
+shown.";
 
 /// The chat-tier act-or-answer user message (M12 T4.2).
 ///
@@ -400,6 +402,7 @@ impl CloudEmitter {
                         args: serde_json::json!({}),
                     },
                     answer: Some(content.to_string()),
+                    say: None,
                 });
             }
             None => {
@@ -421,6 +424,7 @@ impl CloudEmitter {
                             args: serde_json::json!({}),
                         },
                         answer: None,
+                        say: None,
                     });
                 }
                 // Neither a tool call nor text. Seen live with Ollama: the
@@ -443,6 +447,7 @@ impl CloudEmitter {
                         args: serde_json::json!({}),
                     },
                     answer: None,
+                    say: None,
                 });
             }
         };
@@ -502,13 +507,16 @@ impl CloudEmitter {
         // before anything else sees them — `call_key` hashes `action + args`
         // for the repeat gate, and two calls that differ only in what they
         // said to the user are the same call.
-        let carried_reply = ctx
-            .answer
-            .as_ref()
-            .filter(|a| a.with_action)
-            .and_then(|_| input.remove(crate::schema::REPLY))
-            .and_then(|v| v.as_str().map(str::trim).map(String::from))
-            .filter(|s| !s.is_empty());
+        let with_action = ctx.answer.as_ref().is_some_and(|a| a.with_action);
+        let mut lift = |key: &str| {
+            with_action
+                .then(|| input.remove(key))
+                .flatten()
+                .and_then(|v| v.as_str().map(str::trim).map(String::from))
+                .filter(|s| !s.is_empty())
+        };
+        let carried_reply = lift(crate::schema::REPLY);
+        let carried_say = lift(crate::schema::SAY);
         // The argument wins over loose content: it is the field that was
         // asked for, and a model that fills both meant the one it was given
         // a slot for.
@@ -539,6 +547,7 @@ impl CloudEmitter {
                 args: serde_json::Value::Object(input),
             },
             answer,
+            say: carried_say,
         })
     }
 }
@@ -1276,7 +1285,8 @@ mod tests {
         assert!(props.get("_reply").is_some(), "{props}");
         let text = reqs[0]["messages"][1]["content"].as_str().unwrap();
         assert!(text.ends_with(ACT_AND_ANSWER_CLOSING), "{text}");
-        assert!(text.contains("`_reply` argument"), "{text}");
+        assert!(text.contains("`_reply`"), "{text}");
+        assert!(text.contains("`_speak`"), "{text}");
         assert!(
             text.contains("Never state a result you have not been shown"),
             "{text}"
@@ -1284,13 +1294,43 @@ mod tests {
         assert!(!text.contains(ACT_OR_ANSWER_CLOSING), "{text}");
     }
 
-    /// Null is the wait: the model has an action whose result the reply needs,
-    /// and the turn keeps looping rather than settling on an empty line.
+    /// M13 T4.1. The other slot: a line said now, the turn carrying on. Both
+    /// come out of the arguments, and neither reaches the repeat gate's hash.
     #[tokio::test]
-    async fn a_null_reply_argument_is_not_an_answer() {
+    async fn a_say_argument_is_an_interim_line_not_an_answer() {
         let mock = MockTransport::ok(vec![tool_call_response(
             "echo",
-            serde_json::json!({"text": "hi", "_reply": serde_json::Value::Null}),
+            serde_json::json!({
+                "text": "hi",
+                "_reply": "",
+                "_speak": "Hold on, let me look that up."
+            }),
+        )]);
+        let mut c = ctx();
+        c.answer = Some(nscore::AnswerBlocks {
+            with_action: true,
+            ..answer_blocks()
+        });
+        let e = emitter(mock.clone())
+            .propose_or_answer(c, &legal())
+            .await
+            .unwrap();
+        assert_eq!(e.proposal.action, "echo");
+        assert_eq!(e.say.as_deref(), Some("Hold on, let me look that up."));
+        assert_eq!(e.answer, None, "an interim line does not end the turn");
+        assert_eq!(e.proposal.args, serde_json::json!({"text": "hi"}));
+        let reqs = mock.requests.lock().unwrap();
+        let props = &reqs[0]["tools"][0]["function"]["parameters"]["properties"];
+        assert!(props.get("_speak").is_some(), "{props}");
+    }
+
+    /// Empty is the wait: the model has an action whose result the reply
+    /// needs, and the turn loops rather than settling on a blank line.
+    #[tokio::test]
+    async fn an_empty_reply_argument_is_not_an_answer() {
+        let mock = MockTransport::ok(vec![tool_call_response(
+            "echo",
+            serde_json::json!({"text": "hi", "_reply": ""}),
         )]);
         let mut c = ctx();
         c.answer = Some(nscore::AnswerBlocks {

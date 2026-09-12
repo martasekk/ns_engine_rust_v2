@@ -22,6 +22,7 @@ impl ScriptedEmitter {
                 .map(|proposal| Emission {
                     proposal,
                     answer: None,
+                    say: None,
                 })
                 .collect(),
         )
@@ -49,6 +50,7 @@ impl ScriptedEmitter {
                 args: serde_json::json!({}),
             },
             answer: None,
+            say: None,
         })
     }
 }
@@ -248,6 +250,7 @@ mod tests {
                 args: serde_json::json!({}),
             },
             answer: Some("it is 10:41".into()),
+            say: None,
         }]);
         let first = e.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(first.answer.as_deref(), Some("it is 10:41"));
