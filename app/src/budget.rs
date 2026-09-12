@@ -472,10 +472,32 @@ fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::Acti
         nscore::estimate_tokens(strong.len()),
     ));
     out.push_str(&render_tool_table(events, specs));
-    out.push_str(&format!(
-        "the free tier meters requests, not tokens: 50 a day on openrouter/free, {} spent here\n",
-        total.requests
-    ));
+    // M13 T3.3: only where it is true. OpenRouter's daily allowance counts
+    // requests to model ids ending in `:free` and nothing else, so printing
+    // it under a session run on a per-token model says the scarce resource
+    // is requests when it is tokens — which is exactly the wrong thing to
+    // optimise, and this line was read that way for two days.
+    let free_calls = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ModelCall { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .filter(|u| u.model.ends_with(":free"))
+        .count();
+    out.push_str(&if free_calls > 0 {
+        format!(
+            "the free tier meters requests, not tokens: 50 a day on openrouter :free models, \
+             {free_calls} of this session's {} calls were on one\n",
+            total.requests
+        )
+    } else {
+        format!(
+            "no :free model in this session, so nothing here counted against the 50-a-day \
+             allowance; {} requests, billed by token\n",
+            total.requests
+        )
+    });
     if total.estimated {
         out.push_str(
             "\n~ the provider returned no usage block for at least one call in that turn; \
