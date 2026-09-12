@@ -6,20 +6,18 @@
 //! happen, and the phases they call into live in this module's siblings.
 
 use super::accounting::last_proposal_ran;
+use super::builtins::{Bookkeeping, Ctx, Step};
 use super::diagnostics::explain_error;
-use super::config::RememberResidual;
 use super::gate::classify;
 use super::reply::{render_template, FALLBACK_REPLY};
 use super::specs::*;
 use super::{Engine, EngineError};
 use crate::state::fold;
 use crate::trace::{
-    clipped_results, emitter_manifest, inspect_page, parse_result_handle, result_handle,
-    result_text, result_trust, result_window, trace_for_prompt,
+    clipped_results, emitter_manifest, result_handle, trace_for_prompt,
 };
 use nscore::{
-    ClassifiedProposal, EventKind, EventLog, Incoming, LegalActionSet, RejectReason, ReplyPolicy,
-    Timestamp, ToolCtx, ToolOutcome, Verdict,
+    ClassifiedProposal, EventKind, EventLog, Incoming, LegalActionSet, RejectReason, ReplyPolicy, ToolCtx, ToolOutcome, Verdict,
 };
 
 
@@ -176,11 +174,10 @@ impl Engine {
                 }
         };
 
-        let mut rejections_this_turn: Vec<String> = Vec::new();
-        let mut denied_this_turn: std::collections::HashSet<String> = Default::default();
-        let mut calls_this_turn: std::collections::HashSet<String> = Default::default();
-        let mut never_residual_this_turn = false;
-        let mut forget_misses: u32 = 0;
+        // What this turn accumulates as it goes: the refusals the emitter is
+        // shown, the actions it may no longer propose, the calls that really
+        // ran (see `builtins::Bookkeeping`).
+        let mut book = Bookkeeping::default();
         let mut emit_failures: u32 = 0;
         let mut last_emit_error: Option<String> = None;
         // Whether the emitter ever produced a proposal this turn; decides
@@ -227,7 +224,7 @@ impl Engine {
                 state.pending_turn == Some(turn)
                     || state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false)
             });
-            let legal = if never_residual_this_turn {
+            let legal = if book.never_residual {
                 // Forced clarification (spec §5.1): a NeverResidual rejection
                 // occurred and nothing grounds the arg — the only way forward
                 // is to ask (respond_directly stays available at schema level).
@@ -253,7 +250,7 @@ impl Engine {
                         .tools
                         .iter()
                         .map(|t| t.spec().clone())
-                        .filter(|s| !denied_this_turn.contains(&s.name))
+                        .filter(|s| !book.denied.contains(&s.name))
                         // M10 T2.1. A *turn*-level decision consulted here
                         // rather than re-taken here: `selected_tools` is
                         // fixed for the loop except when escalation widens
@@ -269,16 +266,16 @@ impl Engine {
                     Vec::new()
                 };
                 actions.push(ask_clarification_spec(self.cfg.schema_profile));
-                if !denied_this_turn.contains(REMEMBER_FACT) {
+                if !book.denied.contains(REMEMBER_FACT) {
                     actions.push(remember_fact_spec(self.cfg.schema_profile));
                 }
-                if !denied_this_turn.contains(RECALL) && recall_applies {
+                if !book.denied.contains(RECALL) && recall_applies {
                     actions.push(recall_spec(self.cfg.schema_profile));
                 }
                 // Offered only while there is something to inspect. An
                 // action in the schema that can only fail is a way for a
                 // small model to spend an iteration discovering that.
-                if !denied_this_turn.contains(INSPECT_RESULT)
+                if !book.denied.contains(INSPECT_RESULT)
                     && !clipped_results(log.events(), turn, self.cfg.tool_result_max_chars).is_empty()
                 {
                     actions.push(inspect_result_spec(self.cfg.schema_profile));
@@ -289,15 +286,11 @@ impl Engine {
                 // not after a forget already ran. Both are this turn's own
                 // events, so replay reproduces them; store state ("any facts
                 // at all?") must never decide legality.
-                let wrote_fact = calls_this_turn
-                    .iter()
-                    .any(|k| k.starts_with(&format!("{REMEMBER_FACT}\u{0}")));
-                let forgot = calls_this_turn.iter().any(|k| k.starts_with("forget_"));
-                if !wrote_fact && !forgot && scope_holds_facts {
-                    if !denied_this_turn.contains(FORGET_FACT) {
+                if !book.wrote_fact() && !book.forgot() && scope_holds_facts {
+                    if !book.denied.contains(FORGET_FACT) {
                         actions.push(forget_fact_spec(self.cfg.schema_profile));
                     }
-                    if !denied_this_turn.contains(FORGET_ALL) {
+                    if !book.denied.contains(FORGET_ALL) {
                         actions.push(forget_all_spec(self.cfg.schema_profile));
                     }
                 }
@@ -363,7 +356,7 @@ impl Engine {
                 obligations: nscore::obligations_for(&incoming.text, self.cfg.obligations_max),
                 trace_so_far,
                 pending_confirmation: active_pending.is_some(),
-                rejections_this_turn: rejections_this_turn.clone(),
+                rejections_this_turn: book.rejections.clone(),
                 guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
                 budget_line: None,
                 usage: Some(usage.clone()),
@@ -489,7 +482,7 @@ impl Engine {
                             reason,
                         },
                     );
-                    rejections_this_turn.push(match &e {
+                    book.rejections.push(match &e {
                         nscore::EmitError::Provider { status, .. } => {
                             format!("provider unavailable: HTTP {status}")
                         }
@@ -616,7 +609,7 @@ impl Engine {
                 // A tool already refused this turn is excluded: widening
                 // would not make it legal, and the loop would spin.
                 let withheld = registered
-                    && !denied_this_turn.contains(&proposal.action)
+                    && !book.denied.contains(&proposal.action)
                     && selected_tools
                         .as_ref()
                         .is_some_and(|sel| !sel.contains(&proposal.action));
@@ -633,7 +626,7 @@ impl Engine {
                         // the log rather than from a counter nothing
                         // persists.
                         //
-                        // Recorded but *not* denied: `denied_this_turn`
+                        // Recorded but *not* denied: the denied set
                         // would keep the tool illegal for the rest of the
                         // turn, which is exactly what the widening just
                         // undid. It differs from the tier's escalation
@@ -645,7 +638,7 @@ impl Engine {
                         // reaches the emitter through the trace, and it is
                         // true: that proposal was refused on that
                         // iteration. It is left out of
-                        // `rejections_this_turn` so it is said once.
+                        // the rejection lines so it is said once.
                         log.append(
                             turn,
                             now(),
@@ -670,8 +663,8 @@ impl Engine {
                         reason,
                     },
                 );
-                rejections_this_turn.push(format!("illegal action: {}", proposal.action));
-                denied_this_turn.insert(proposal.action.clone());
+                book.rejections.push(format!("illegal action: {}", proposal.action));
+                book.denied.insert(proposal.action.clone());
                 continue;
             }
 
@@ -687,7 +680,7 @@ impl Engine {
             // for. It cannot run away either: the pages end, and an
             // exhausted result leaves the schema.
             if proposal.action != INSPECT_RESULT
-                && calls_this_turn.contains(&Self::call_key(&proposal))
+                && book.calls.contains(&Self::call_key(&proposal))
             {
                 let reason = format!(
                     "identical call to '{}' already executed this turn",
@@ -704,8 +697,8 @@ impl Engine {
                         },
                     },
                 );
-                rejections_this_turn.push(format!("guard repeat_gate: {reason}"));
-                denied_this_turn.insert(proposal.action.clone());
+                book.rejections.push(format!("guard repeat_gate: {reason}"));
+                book.denied.insert(proposal.action.clone());
                 continue;
             }
 
@@ -752,613 +745,42 @@ impl Engine {
                                 },
                             },
                         );
-                        rejections_this_turn.push("broken confirmation chain".into());
+                        book.rejections.push("broken confirmation chain".into());
                         continue;
                     }
                 }
             }
 
-            // f2. clarification: the question IS the reply (spec §5.1). Runs
-            // through classification and guards — TaintPolicy applies to
-            // questions; a gated question is re-emitted, not asked.
-            if proposal.action == ASK_CLARIFICATION {
-                let question = proposal
-                    .args
-                    .get("question")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let Some(question) = question else {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: "ask_clarification without question".into(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push("ask_clarification missing question".into());
-                    continue;
-                };
-                let ask_spec = ask_clarification_spec(self.cfg.schema_profile);
-                let classified_args = classify(log.events(), &proposal.args, &ask_spec, turn);
-                let classified = ClassifiedProposal {
-                    proposal: proposal.clone(),
-                    args: classified_args,
-                };
-                let guard_ctx = nscore::GuardCtx {
-                    spec: &ask_spec,
+            // f2-f8. the actions the engine answers itself (`builtins.rs`).
+            // Each one either settles the turn or leaves the emitter another
+            // iteration; a proposal naming a registered tool falls through to
+            // `g0` below.
+            {
+                let mut cx = Ctx {
+                    log: &mut log,
+                    book: &mut book,
+                    state: &state,
+                    proposal: &proposal,
+                    pid,
                     turn,
-                    confirmed_this_turn: state.confirmed_this_turn_of == Some(turn),
-                    fired_actions: &state.fired_tags,
-                    pending_confirmation: None,
+                    sid: &sid,
+                    scope: &scope,
+                    tier,
+                    n_loaded,
+                    confirmed_now,
+                    at: now(),
                 };
-                let mut denied: Option<(String, String)> = None;
-                for g in self.builtin_guards.iter().chain(self.parts.guards.iter()) {
-                    match g.check(&classified, &guard_ctx) {
-                        Verdict::Allow => continue,
-                        Verdict::Deny { reason } => {
-                            denied = Some((g.name().to_string(), reason));
-                            break;
-                        }
-                        Verdict::NeedsConfirmation { prompt } => {
-                            denied = Some((g.name().to_string(), prompt));
+                if let Some(step) = self.run_builtin(&mut cx).await {
+                    match step {
+                        Step::Again => continue,
+                        Step::Settled(policy) => {
+                            settled = Some(policy);
                             break;
                         }
                     }
                 }
-                if let Some((guard, reason)) = denied {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::GuardDenied {
-                                guard: guard.clone(),
-                                reason: reason.clone(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push(format!("guard {guard}: {reason}"));
-                    denied_this_turn.insert(ASK_CLARIFICATION.to_string());
-                    continue;
-                }
-                let policy = ReplyPolicy::Verbatim { text: question };
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::Settled {
-                        policy: policy.clone(),
-                    },
-                );
-                settled = Some(policy);
-                break;
             }
 
-            // f4. remember_fact: classify (the stored provenance IS the
-            // classification of the value), write the fact, log the paper
-            // trail, and let the emitter decide what happens next.
-            if proposal.action == REMEMBER_FACT {
-                let key = proposal
-                    .args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let value = proposal
-                    .args
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let (Some(key), Some(value)) = (key, value) else {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: "remember_fact needs string key and value".into(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push("remember_fact missing key/value".into());
-                    continue;
-                };
-                // Keys are dotted identifiers (spec of the action). Normalize
-                // stray edge punctuation first (seen live: a model reliably
-                // emitting ":user.name" — same spirit as the trim normalizer),
-                // then reject what remains degenerate (seen live: key ", ").
-                let key = key
-                    .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .to_string();
-                let key_ok = !key.is_empty()
-                    && key
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
-                if !key_ok || value.trim().is_empty() {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: format!(
-                                    "remember_fact key must be a dotted identifier and value \
-                                     non-empty (got key {key:?})"
-                                ),
-                            },
-                        },
-                    );
-                    rejections_this_turn
-                        .push(format!("remember_fact rejected malformed key {key:?}"));
-                    continue;
-                }
-                let fact_spec = remember_fact_spec(self.cfg.schema_profile);
-                let classified_args = classify(log.events(), &proposal.args, &fact_spec, turn);
-                let prov = classified_args
-                    .iter()
-                    .find(|(k, _)| k == "value")
-                    .map(|(_, tv)| tv.prov.clone())
-                    .unwrap_or(nscore::Provenance::Residual);
-                // Lifecycle merge (M6 §6.1): a restatement keeps the usage
-                // count and re-validates; the same value gains confidence,
-                // a new value replaces it at full confidence. Seen live: every
-                // re-remember reset `uses` to 0, erasing the consolidation
-                // pass's only signal.
-                let value_json = serde_json::json!(value);
-                let value_trust = classified_args
-                    .iter()
-                    .find(|(k, _)| k == "value")
-                    .map(|(_, tv)| tv.trust)
-                    .unwrap_or(nscore::Trust::System);
-                let residual = crate::guards::contains_residual(&prov);
-                // M6 §6.3: a value nothing grounds is either flagged
-                // (stored at half confidence, shown as unverified) or, for
-                // deployments where facts drive side effects, refused.
-                if residual && self.cfg.remember_residual == RememberResidual::Never {
-                    let reason = "NeverResidual: arg 'value' has no grounding in this session";
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::GuardDenied {
-                                guard: "residual_policy".into(),
-                                reason: reason.into(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push(format!("guard residual_policy: {reason}"));
-                    never_residual_this_turn = true;
-                    denied_this_turn.insert(REMEMBER_FACT.to_string());
-                    continue;
-                }
-                let grounded_confidence = if residual { 0.5 } else { 1.0 };
-                // Key canonicalization (M6 §6.1): a spelling variant of an
-                // existing key is that key (seen live: memory_reset_requested
-                // next to memory.reset.requested).
-                let current = self
-                    .parts
-                    .memory
-                    .facts(&scope, "")
-                    .await
-                    .unwrap_or_default();
-                let key = match current.iter().find(|f| f.key == key) {
-                    Some(_) => key,
-                    None => current
-                        .iter()
-                        .find(|f| nscore::squash(&f.key) == nscore::squash(&key))
-                        .map(|f| f.key.clone())
-                        .unwrap_or(key),
-                };
-                let existing = current.into_iter().find(|f| f.key == key);
-                // A new version must sort after the one it supersedes even
-                // under a coarse clock.
-                let version_at = |prev: &nscore::Fact| {
-                    let t = now();
-                    if t > prev.valid_from {
-                        t
-                    } else {
-                        Timestamp(prev.valid_from.0 + 1)
-                    }
-                };
-                let fact = match existing {
-                    Some(prev) if prev.value == value_json => nscore::Fact {
-                        confidence: if residual {
-                            (prev.confidence + 0.1).min(1.0)
-                        } else {
-                            1.0
-                        },
-                        last_validated: now(),
-                        prov,
-                        trust: value_trust,
-                        // a restated cold fact is current again (M6 §6.2)
-                        state: nscore::FactState::Current,
-                        ..prev
-                    },
-                    Some(prev) => nscore::Fact {
-                        key: key.clone(),
-                        value: value_json,
-                        confidence: grounded_confidence,
-                        uses: prev.uses,
-                        last_validated: now(),
-                        prov,
-                        scope: scope.clone(),
-                        trust: value_trust,
-                        valid_from: version_at(&prev),
-                        valid_to: None,
-                        state: nscore::FactState::Current,
-                        last_used: prev.last_used,
-                        // M9 T4.1: a new *value* is a new version, and it has
-                        // not been shown to anything yet. The counters stay
-                        // with the version whose exposures earned them —
-                        // inheriting them would credit "Peter" for the calls
-                        // that showed "Martin". The restatement arm above
-                        // keeps them, via `..prev`, because there the version
-                        // is the same one.
-                        exposures: 0,
-                        credits: 0,
-                    },
-                    None => nscore::Fact {
-                        key: key.clone(),
-                        value: value_json,
-                        confidence: grounded_confidence,
-                        uses: 0,
-                        last_validated: now(),
-                        prov,
-                        scope: scope.clone(),
-                        trust: value_trust,
-                        valid_from: now(),
-                        ..Default::default()
-                    },
-                };
-                let call_id = log
-                    .append(
-                        turn,
-                        now(),
-                        EventKind::ToolCalled {
-                            action: REMEMBER_FACT.into(),
-                            args: classified_args,
-                        },
-                    )
-                    .id;
-                calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = match self.parts.memory.put_fact(fact).await {
-                    Ok(()) => ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: format!("remembered {key}"),
-                            artifact: None,
-                            trust: nscore::Trust::System,
-                        },
-                    },
-                    Err(e) => ToolOutcome::Err {
-                        kind: "store".into(),
-                        detail: e.to_string(),
-                    },
-                };
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ToolReturned {
-                        call: call_id,
-                        outcome,
-                    },
-                );
-                self.flush(&sid, &log, n_loaded).await;
-                continue;
-            }
-
-            // f7. recall (M6 §7): progressive disclosure. Verbatim turns
-            // beyond the window first, then live facts; results become
-            // CopiedOutput sources with the lowest trust among them.
-            if proposal.action == RECALL {
-                let query = proposal
-                    .args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|q| !q.is_empty())
-                    .map(String::from);
-                let Some(query) = query else {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: "recall needs a non-empty query".into(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push("recall missing query".into());
-                    continue;
-                };
-                let spec = recall_spec(self.cfg.schema_profile);
-                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
-                let call_id = log
-                    .append(
-                        turn,
-                        now(),
-                        EventKind::ToolCalled {
-                            action: RECALL.into(),
-                            args: classified_args,
-                        },
-                    )
-                    .id;
-                calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = self.recall_outcome(&sid, &scope, &query, turn, tier).await;
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ToolReturned {
-                        call: call_id,
-                        outcome,
-                    },
-                );
-                continue;
-            }
-
-            // f8. inspect_result (M7 T1.2): the other half of the cap. The
-            // whole result is in the log; this pages through it without
-            // running the tool again, which on a desktop is neither free nor
-            // guaranteed to return the same screen.
-            if proposal.action == INSPECT_RESULT {
-                let raw_id = proposal.args.get("id").and_then(|v| v.as_str());
-                let query = proposal
-                    .args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|q| !q.is_empty());
-                let handle = raw_id.and_then(parse_result_handle);
-                let available =
-                    clipped_results(log.events(), turn, self.cfg.tool_result_max_chars);
-                let Some(id) = handle.filter(|id| available.contains(id)) else {
-                    let known: Vec<String> = available.iter().map(|i| result_handle(*i)).collect();
-                    let detail = format!(
-                        "no clipped result named {:?} this turn; available: {}",
-                        raw_id.unwrap_or(""),
-                        if known.is_empty() {
-                            "none".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    );
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: format!("{INSPECT_RESULT}: {detail}"),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push(format!("{INSPECT_RESULT}: {detail}"));
-                    denied_this_turn.insert(INSPECT_RESULT.to_string());
-                    continue;
-                };
-                let spec = inspect_result_spec(self.cfg.schema_profile);
-                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
-                let page = inspect_page(log.events(), turn, id);
-                let call_id = log
-                    .append(
-                        turn,
-                        now(),
-                        EventKind::ToolCalled {
-                            action: INSPECT_RESULT.into(),
-                            args: classified_args,
-                        },
-                    )
-                    .id;
-                calls_this_turn.insert(Self::call_key(&proposal));
-                let text = result_text(log.events(), turn, id).unwrap_or_default();
-                let total = text.chars().count();
-                let (window, start, end) = result_window(&text, query, page, self.cfg.tool_result_max_chars);
-                let outcome = if window.is_empty() {
-                    // Either the query matched nothing or the pages ran out.
-                    // Both are answers, and both mean asking again is a
-                    // wasted iteration — so the action leaves the schema.
-                    denied_this_turn.insert(INSPECT_RESULT.to_string());
-                    ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: match query {
-                                Some(q) => format!("{} has no match for {q:?}", result_handle(id)),
-                                None => format!("no more of {}", result_handle(id)),
-                            },
-                            artifact: None,
-                            trust: result_trust(log.events(), turn, id),
-                        },
-                    }
-                } else {
-                    ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: format!(
-                                "{} chars {start}-{end} of {total}: {window}",
-                                result_handle(id)
-                            ),
-                            artifact: None,
-                            trust: result_trust(log.events(), turn, id),
-                        },
-                    }
-                };
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ToolReturned {
-                        call: call_id,
-                        outcome,
-                    },
-                );
-                continue;
-            }
-
-            // f5. forget_fact (M6 §6.2): soft-delete one current fact. An
-            // unknown key is malformed so the emitter can retry or ask.
-            if proposal.action == FORGET_FACT {
-                let key = proposal
-                    .args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .map(|k| {
-                        k.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                            .to_string()
-                    })
-                    .filter(|k| !k.is_empty());
-                let Some(key) = key else {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: "forget_fact needs a string key".into(),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push("forget_fact missing key".into());
-                    continue;
-                };
-                let current = self
-                    .parts
-                    .memory
-                    .facts(&scope, "")
-                    .await
-                    .unwrap_or_default();
-                let key = current
-                    .iter()
-                    .find(|f| f.key == key || nscore::squash(&f.key) == nscore::squash(&key))
-                    .map(|f| f.key.clone())
-                    .unwrap_or(key);
-                if !current.iter().any(|f| f.key == key) {
-                    let detail = format!("no current fact named {key}");
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::Malformed {
-                                detail: format!("forget_fact: {detail}"),
-                            },
-                        },
-                    );
-                    rejections_this_turn.push(format!("forget_fact: {detail}"));
-                    // One miss may be a fixable key; a second one is a loop
-                    // (seen live: the same wrong key three times).
-                    forget_misses += 1;
-                    if forget_misses >= 2 {
-                        denied_this_turn.insert(FORGET_FACT.to_string());
-                    }
-                    continue;
-                }
-                let spec = forget_fact_spec(self.cfg.schema_profile);
-                let classified_args = classify(log.events(), &proposal.args, &spec, turn);
-                let call_id = log
-                    .append(
-                        turn,
-                        now(),
-                        EventKind::ToolCalled {
-                            action: FORGET_FACT.into(),
-                            args: classified_args,
-                        },
-                    )
-                    .id;
-                calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = match self.parts.memory.forget_fact(&scope, &key, now()).await {
-                    Ok(_) => ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: format!("forgot {key}"),
-                            artifact: None,
-                            trust: nscore::Trust::System,
-                        },
-                    },
-                    Err(e) => ToolOutcome::Err {
-                        kind: "store".into(),
-                        detail: e.to_string(),
-                    },
-                };
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ToolReturned {
-                        call: call_id,
-                        outcome,
-                    },
-                );
-                self.flush(&sid, &log, n_loaded).await;
-                continue;
-            }
-
-            // f6. forget_all (M6 §6.2): irreversible, so it is staged behind
-            // the same two-turn confirmation as any irreversible tool, and
-            // purges the scope once confirmed.
-            if proposal.action == FORGET_ALL {
-                let confirmed = confirmed_now || state.confirmed_this_turn_of == Some(turn);
-                if !confirmed {
-                    // No count in the prompt: replay runs from a fresh store
-                    // and a Verbatim reply must be reproducible from the log.
-                    let description =
-                        format!("This will forget every stored fact in scope {scope}.");
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::PendingConfirmation {
-                            proposal_of: pid,
-                            staged: Some(nscore::StagedEffect {
-                                description: description.clone(),
-                            }),
-                        },
-                    );
-                    let policy = ReplyPolicy::Verbatim {
-                        text: format!(
-                            "'{FORGET_ALL}' is irreversible. Confirm to proceed.\nPlanned: {description}"
-                        ),
-                    };
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Settled {
-                            policy: policy.clone(),
-                        },
-                    );
-                    settled = Some(policy);
-                    break;
-                }
-                let call_id = log
-                    .append(
-                        turn,
-                        now(),
-                        EventKind::ToolCalled {
-                            action: FORGET_ALL.into(),
-                            args: vec![],
-                        },
-                    )
-                    .id;
-                calls_this_turn.insert(Self::call_key(&proposal));
-                let outcome = match self.parts.memory.purge_facts(&scope).await {
-                    Ok(n) => ToolOutcome::Ok {
-                        output: nscore::ToolOutput {
-                            summary: format!("forgot {n} facts"),
-                            artifact: None,
-                            trust: nscore::Trust::System,
-                        },
-                    },
-                    Err(e) => ToolOutcome::Err {
-                        kind: "store".into(),
-                        detail: e.to_string(),
-                    },
-                };
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ToolReturned {
-                        call: call_id,
-                        outcome,
-                    },
-                );
-                self.flush(&sid, &log, n_loaded).await;
-                continue;
-            }
 
             // g0. find the tool (legality guaranteed it exists)
             let tool = self
@@ -1383,7 +805,7 @@ impl Engine {
                         },
                     },
                 );
-                rejections_this_turn
+                book.rejections
                     .push(format!("malformed args for {}: {detail}", proposal.action));
                 continue;
             }
@@ -1429,11 +851,11 @@ impl Engine {
                             },
                         },
                     );
-                    rejections_this_turn.push(format!("guard {guard_name}: {reason}"));
+                    book.rejections.push(format!("guard {guard_name}: {reason}"));
                     if reason.contains("NeverResidual") {
-                        never_residual_this_turn = true;
+                        book.never_residual = true;
                     }
-                    denied_this_turn.insert(proposal.action.clone());
+                    book.denied.insert(proposal.action.clone());
                     continue;
                 }
                 Verdict::NeedsConfirmation { prompt } => {
@@ -1484,7 +906,7 @@ impl Engine {
                     },
                 )
                 .id;
-            calls_this_turn.insert(Self::call_key(&proposal));
+            book.calls.insert(Self::call_key(&proposal));
             let outcome = match tool
                 .call(
                     &proposal.args,
@@ -1555,7 +977,7 @@ impl Engine {
                     "ran out of steps after {} actions without reaching an answer",
                     self.cfg.max_iterations
                 );
-                if let Some(last) = rejections_this_turn.last() {
+                if let Some(last) = book.rejections.last() {
                     r.push_str(&format!("; last problem: {last}"));
                 }
                 r

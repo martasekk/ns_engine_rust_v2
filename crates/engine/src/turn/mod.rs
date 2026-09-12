@@ -17,6 +17,7 @@
 //! | [`diagnostics`]| turning a failure into a sentence                  |
 
 mod accounting;
+mod builtins;
 pub mod config;
 mod diagnostics;
 mod gate;
