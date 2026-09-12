@@ -868,7 +868,19 @@ pub struct RoleSection {
     pub thinking: Option<bool>,
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+/// An absent `[llm]` table must mean exactly what an empty one means, and
+/// since M13 one field's default is no longer `bool::default()`. Deserializing
+/// nothing is the only spelling of that which cannot drift from the
+/// `#[serde(default = ...)]` attributes below: a derived `Default` would
+/// quietly disagree with them, and the disagreement would surface as a
+/// deployment that reads its own config back wrong.
+impl Default for LlmConfig {
+    fn default() -> Self {
+        toml::from_str("").expect("an empty table is the serde defaults")
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct LlmConfig {
     /// Named preset — `ns-app providers` lists them. Supplies base_url,
     /// api_key_env, a default model, the provider's rate limit and whether
@@ -915,14 +927,23 @@ pub struct LlmConfig {
     #[serde(default)]
     pub capability: Option<String>,
     /// M12 T4.3: on a chat-tier turn, let the one emitter call either act or
-    /// answer, and take its answer as the reply. Default **false**, and
-    /// false is today's two-call chat turn byte for byte.
+    /// answer, and take its answer as the reply. Default **true** since M13,
+    /// the first default here that is not the behaviour which shipped before
+    /// its knob existed.
+    ///
+    /// It moved on the rule M12 wrote for it: a live reading below 2.00
+    /// requests per chat turn. M12 read exactly 2.00 and left it off, because
+    /// the array it sent still carried `respond_directly` and the model kept
+    /// calling it. With that tool gone (M13 T1.1) the same shape of script
+    /// read **1.80** over 10 chat-tier turns, 10 of 10 answered in the
+    /// emitter call, no grounding flag on any of them, 0 rejections, 0 text
+    /// fallbacks. `false` still buys the two-call chat turn byte for byte.
     ///
     /// Chat only, and only where a router is configured — the tier is what
     /// decides it. On Task and Deep the emitter/replier split is doing real
     /// work; on Chat the emitter call exists to say "no tool applies", which
     /// is a sentence the same call could have spent on the user.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub chat_act_or_answer: bool,
     #[serde(default)]
     pub emitter: RoleSection,
@@ -1455,9 +1476,9 @@ mod tests {
     /// so an absent key and an explicit `false` must be the same thing, and
     /// the key has to survive being written down.
     #[test]
-    fn chat_act_or_answer_defaults_to_off_and_round_trips() {
-        assert!(!AppConfig::parse("").unwrap().llm.chat_act_or_answer);
-        assert!(!AppConfig::parse("[llm]\ncapability = \"strong\"")
+    fn chat_act_or_answer_defaults_to_on_and_round_trips() {
+        assert!(AppConfig::parse("").unwrap().llm.chat_act_or_answer);
+        assert!(AppConfig::parse("[llm]\ncapability = \"strong\"")
             .unwrap()
             .llm
             .chat_act_or_answer);

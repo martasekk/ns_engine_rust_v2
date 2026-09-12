@@ -397,10 +397,44 @@ nowhere in the request. Workspace green, 745 tests, 0 failed. The scripted fixtu
 corpus is unmoved by design: it drives `ScriptedEmitter`, and this change is in
 the request `CloudEmitter` builds.
 
-Not yet measured live. The number M12 asked for is requests per chat turn below
-2.00 against its 2.00, expected 1.67, and it needs a metered run
-(`--max-requests`) on the 20-message script to read it. `[llm] chat_act_or_answer`
-stays `false` by default until that run; it is on in the live `ns-run/config.toml`.
+**Measured live, 2026-09-12**, session `m13-live` on the live store: 20 messages of
+M11's shape (cs and en, a stated fact, paraphrased recalls, a knowledge update, an
+unanswerable question, two time questions, a summary request, small talk), all three
+roles on `google/gemini-3.8-flash`, `--max-requests 40`, desktop parked. The cap
+stopped it after 41 requests on turn 19 of 20.
+
+| Number | M12 (Luna) | M13 (gemini-3.8-flash) |
+|---|---|---|
+| requests per **chat** turn | 2.00 | **1.80** |
+| chat turns answered in the emitter call | 6 of 12 | **10 of 10** |
+| requests per turn, whole session | 2.10 | 2.16 (41 / 19) |
+| grounding flags on emitted answers | 0 of 6 | **0 of 10** |
+| `Rejected` | 0 | 0 |
+| text fallbacks | 0 | 0 |
+| `cached` share | 0, not observed | 0, not observed |
+
+Eight turns spent no replier call at all. The whole-session figure is not comparable
+with M12's: this script routes more turns to Deep, and a Deep turn buys a recall
+before it proposes. The number the rule is written against is the chat-tier one, and
+it is below 2.00, so **`[llm] chat_act_or_answer` now defaults to `true`** — the first
+default in that section that is not the behaviour which shipped before its knob
+existed. `LlmConfig` gained a hand-written `Default` that deserializes an empty table,
+so an absent `[llm]` and an empty one cannot drift apart.
+
+Four flags in 19 turns, all on replier drafts: `September` on a time answer, `Earth`
+and `Canberra` on two knowledge answers, and one on turn 17. Canberra is M12's flag
+again, and under `small` it was regenerated rather than left standing. One miss worth
+recording and not fixed here: turn 8 answered that the user's sister "má narozeniny
+15. března", a date no message ever supplied, and the check passed it while citing
+`fact:user.sister_name` and `window:5`. An invented date beside a grounded name is a
+shape the claim extractor does not catch.
+
+T1.2, from the same run: `ns-app budget` was adding `respond_directly` back to every
+emitter call's per-tool row, which is right for `build_tools` and wrong for the array
+an act-or-answer call is sent. It over-priced the table by 1,112 tokens against the
+measured 12,601 and reported the gap as `estimate_tokens` rounding. `ContextManifest`
+now carries `answer_offered`, skipped when false so no `ModelCall` written before M13
+changes a byte, and the table adds the tool back only where the request carried it.
 
 ### Status after M12
 

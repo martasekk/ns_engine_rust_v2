@@ -181,6 +181,15 @@ pub struct ContextManifest {
     /// looks like a model that would not act — and because the tools
     /// fraction only means anything per tier: schemas are most of a `Task`
     /// prompt and none of a `Chat` one.
+    /// M13 T1.2: this call was offered the answer, so its array carried no
+    /// `respond_directly` and a report must not add one back.
+    ///
+    /// `skip_serializing_if` for the reason `tool_names` has it: a `false`
+    /// that serialized would change the bytes of every `ModelCall` ever
+    /// written, and `verify_chain` recomputes the chain over them. Absent
+    /// reads `false`, which is what every call before M13 was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_offered: bool,
     #[serde(default)]
     pub tier: Option<crate::router::Tier>,
     #[serde(default)]
@@ -292,6 +301,7 @@ mod tests {
     #[test]
     fn manifest_round_trips_and_old_rows_still_parse() {
         let m = ContextManifest {
+            answer_offered: false,
             fact_keys: vec!["user.name".into()],
             summary_through: Some(4),
             window: Some((5, 10)),

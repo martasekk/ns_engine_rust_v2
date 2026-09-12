@@ -47,16 +47,18 @@ provider = "openrouter"
 #   capability = "strong"
 # On a chat-tier turn only, let the one emitter call either act or answer,
 # and take its answer as the reply — a chat turn for one request instead of
-# two. Off by default, and needs a router, because the tier decides it.
-# Measured 2026-09-11 on Luna (M12 P6): 2.10 requests per turn against 2.90
-# without it, 6 of 12 chat turns answered in one call, no flag on any emitted
-# answer; requests per chat turn read exactly 2.00, because on 4 of 12 turns
-# the model called the respond_directly tool instead of answering in text.
-# M13 T1.1 took that tool out of the array a call like this is offered, so
-# plain text is now the only way to say "no tool applies", and a chat turn
-# whose tier carries no tool sends no tool array at all. The default is
-# still off; the reading that would move it is below 2.00 on a live run.
-#   chat_act_or_answer = true
+# two. On by default since M13, and needs a router, because the tier decides
+# it. Measured 2026-09-11 on Luna (M12 P6): 2.10 requests per turn against
+# 2.90 without it, but requests per chat turn read exactly 2.00, because on
+# 4 of 12 turns the model called the respond_directly tool instead of
+# answering in text. M13 T1.1 took that tool out of the array a call like
+# this is offered, so plain text is the only way left to say "no tool
+# applies", and a chat turn whose tier carries no tool now sends no tool
+# array at all. Re-measured 2026-09-12 on gemini-3.8-flash, 19 turns:
+# 1.80 requests per chat turn, 10 of 10 chat turns answered in the emitter
+# call, 0 grounding flags on those, 0 rejections, 0 text fallbacks.
+# Set it false to buy back the two-call chat turn, byte for byte.
+#   chat_act_or_answer = false
 
 # ── Per-role request shape ────────────────────────────────────────────────
 # Four optional fields per role; every one unset (the default) sends the

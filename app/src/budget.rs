@@ -522,11 +522,19 @@ fn render_tool_table(events: &[Event], specs: &[nscore::ActionSpec]) -> String {
         }
         calls_with_names += 1;
         measured += u64::from(usage.tools_tokens);
+        // M13 T1.2: `build_tools` appends `respond_directly` to every array
+        // except the one an act-or-answer call is sent, where plain text is
+        // that tool. Adding it back on those calls would price bytes the
+        // request never carried, and the reconciliation line below would
+        // report the gap as rounding.
+        let appended = (!manifest.answer_offered)
+            .then_some(nsllm::schema::RESPOND_DIRECTLY)
+            .into_iter();
         for name in manifest
             .tool_names
             .iter()
             .map(String::as_str)
-            .chain(std::iter::once(nsllm::schema::RESPOND_DIRECTLY))
+            .chain(appended)
         {
             let tokens = if name == nsllm::schema::RESPOND_DIRECTLY {
                 Some(u64::from(nsllm::schema::respond_directly_tokens()))
