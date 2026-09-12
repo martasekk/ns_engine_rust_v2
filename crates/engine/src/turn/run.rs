@@ -9,15 +9,14 @@ use super::accounting::last_proposal_ran;
 use super::builtins::{Bookkeeping, Ctx, Step};
 use super::diagnostics::explain_error;
 use super::gate::classify;
+use super::legal::Offer;
+use super::prompt::{Compose, Prompt};
 use super::reply::{render_template, FALLBACK_REPLY};
 use super::specs::*;
 use super::{Engine, EngineError};
 use crate::state::fold;
-use crate::trace::{
-    clipped_results, emitter_manifest, result_handle, trace_for_prompt,
-};
 use nscore::{
-    EventKind, EventLog, Incoming, LegalActionSet, RejectReason, ReplyPolicy,
+    EventKind, EventLog, Incoming, RejectReason, ReplyPolicy,
 };
 
 
@@ -224,222 +223,44 @@ impl Engine {
                 state.pending_turn == Some(turn)
                     || state.pending_turn.map(|pt| pt + 1 == turn).unwrap_or(false)
             });
-            let legal = if book.never_residual {
-                // Forced clarification (spec §5.1): a NeverResidual rejection
-                // occurred and nothing grounds the arg — the only way forward
-                // is to ask (respond_directly stays available at schema level).
-                LegalActionSet {
-                    actions: vec![ask_clarification_spec(self.cfg.schema_profile)],
-                }
-            } else {
-                // Narrowed schema (spec §2): actions rejected this turn are
-                // removed from the set the emitter sees next.
-                // A `Chat` turn carries no tool schemas at all. With a desktop
-                // wired in that is ten of the seventeen schemas the emitter
-                // would otherwise re-send on every iteration of a turn that
-                // was never going to click anything. The synthetic actions
-                // stay legal at every tier: they are how a turn ends.
-                //
-                // M12 T2.1: unless the route selected some. A chat turn that
-                // asked the time carries exactly the tools its own cue named
-                // (`[router] chat_tools`) and nothing else — the selection is
-                // the whole allowance there, so the filter below narrows to
-                // it the same way, once per turn.
-                let mut actions: Vec<_> = if tier.allows_tools() || selected_tools.is_some() {
-                    self.parts
-                        .tools
-                        .iter()
-                        .map(|t| t.spec().clone())
-                        .filter(|s| !book.denied.contains(&s.name))
-                        // M10 T2.1. A *turn*-level decision consulted here
-                        // rather than re-taken here: `selected_tools` is
-                        // fixed for the loop except when escalation widens
-                        // it, so this filter yields the same names on every
-                        // iteration and the array's bytes do not move.
-                        .filter(|s| {
-                            selected_tools
-                                .as_ref()
-                                .map_or(true, |sel| sel.contains(&s.name))
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                actions.push(ask_clarification_spec(self.cfg.schema_profile));
-                if !book.denied.contains(REMEMBER_FACT) {
-                    actions.push(remember_fact_spec(self.cfg.schema_profile));
-                }
-                if !book.denied.contains(RECALL) && recall_applies {
-                    actions.push(recall_spec(self.cfg.schema_profile));
-                }
-                // Offered only while there is something to inspect. An
-                // action in the schema that can only fail is a way for a
-                // small model to spend an iteration discovering that.
-                if !book.denied.contains(INSPECT_RESULT)
-                    && !clipped_results(log.events(), turn, self.cfg.tool_result_max_chars).is_empty()
-                {
-                    actions.push(inspect_result_spec(self.cfg.schema_profile));
-                }
-                // Forgetting is legal only while it can mean something: not
-                // after a fact was written this turn (seen live: "my name is
-                // now Peter" ended in forget_fact + a staged forget_all) and
-                // not after a forget already ran. Both are this turn's own
-                // events, so replay reproduces them; store state ("any facts
-                // at all?") must never decide legality.
-                if !book.wrote_fact() && !book.forgot() && scope_holds_facts {
-                    if !book.denied.contains(FORGET_FACT) {
-                        actions.push(forget_fact_spec(self.cfg.schema_profile));
-                    }
-                    if !book.denied.contains(FORGET_ALL) {
-                        actions.push(forget_all_spec(self.cfg.schema_profile));
-                    }
-                }
-                if active_pending.is_some() {
-                    actions.push(confirm_pending_spec(self.cfg.schema_profile));
-                }
-                LegalActionSet { actions }
-            };
+            // Which actions the emitter is offered, and why each is or is not
+            // in the array (`legal.rs`).
+            let legal = self.legal_actions(&Offer {
+                book: &book,
+                events: log.events(),
+                turn,
+                tier,
+                selected_tools: selected_tools.as_ref(),
+                recall_applies,
+                scope_holds_facts,
+                active_pending: active_pending.is_some(),
+            });
 
-            // b. emitter context (M6 §4.2): the same projection of the log
-            // the replier sees. The emitter must see what this turn has
-            // already done — otherwise it re-proposes completed actions until
-            // max_iterations exhausts — and the standing facts, or it
-            // re-remembers them every turn (seen live).
-            // Clipped: this is the line that is re-sent on every iteration,
-            // so an uncapped tool result is paid for again at every step
-            // after it.
-            let (trace_so_far, clipped_chars) =
-                trace_for_prompt(
-                    log.events(),
+            // b. emitter context: what the model is shown, and the manifest
+            // that says what it cost (`prompt.rs`).
+            let Prompt {
+                ctx,
+                manifest,
+                offered_answer,
+            } = self
+                .compose_prompt(&Compose {
+                    events: log.events(),
+                    state: &state,
+                    legal: &legal,
+                    rules: &rules,
+                    usage: &usage,
+                    rejections: &book.rejections,
+                    route_cues: &routed.cues,
+                    user_text: &incoming.text,
+                    scope: &scope,
                     turn,
-                    self.cfg.trace_verbatim_lines,
-                    self.cfg.tool_result_max_chars,
-                );
-            // The pinned core is shown at every tier — it is what stops the
-            // emitter asking again for a name it already has (M6 F2). The
-            // query-relevant slice is what a `Chat` turn does without.
-            let selected = if tier.allows_relevant_facts() {
-                // M11 T1.1 follow-up: the same gate `recall_outcome` takes.
-                // Read here rather than bound once above because `tier` is
-                // still mutable at this point — a tool-cued turn is upgraded
-                // to `Task` mid-loop, and the next iteration must see it.
-                self.select_facts(
-                    &scope,
-                    &incoming.text,
-                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
-                )
-                .await
-            } else {
-                self.pinned_facts(&scope).await
-            };
-            let facts = self.fact_views(&scope, &selected).await;
-            let legal_names: Vec<String> = legal.actions.iter().map(|a| a.name.clone()).collect();
-            // Notes and their hashes together, so the manifest can say which
-            // note sat in this prompt (M9 T0.3). The texts go into the
-            // context; the hashes are cut to whatever survived to be sent.
-            // M12 T3.2: with the archive knob on, a note learned on another
-            // emitter never reaches this prompt.
-            let guidance_notes = if self.cfg.archive_foreign_notes {
-                rules.guidance_notes_for_model(&legal_names, self.cfg.learning_model.as_deref())
-            } else {
-                rules.guidance_notes_for(&legal_names)
-            };
-            let mut ctx = nscore::EmitterContext {
-                facts,
-                summary: state.summary.clone(),
-                window: state.window(self.cfg.window_turns),
-                caps: self.cfg.caps,
-                user_text: incoming.text.clone(),
-                // M9 T2.1: a pure function of the message, recomputed each
-                // iteration rather than carried, for the same reason the
-                // trace is — nothing per-turn is persisted as a column.
-                obligations: nscore::obligations_for(&incoming.text, self.cfg.obligations_max),
-                trace_so_far,
-                pending_confirmation: active_pending.is_some(),
-                rejections_this_turn: book.rejections.clone(),
-                guidance: guidance_notes.iter().map(|(_, t)| t.clone()).collect(),
-                budget_line: None,
-                usage: Some(usage.clone()),
-                answer: None,
-            };
+                    tier,
+                    active_pending: active_pending.is_some(),
+                })
+                .await;
 
             // c. propose
             let mut confirmed_now = false;
-            // The budget runs before the manifest, so the manifest describes
-            // the context as sent rather than as composed (M7 T2.1). Under
-            // the default `report` mode nothing is dropped and the two are
-            // the same; the report still says what enforcing would have cost.
-            let budget = nscore::fit_emitter(
-                &mut ctx,
-                tier.budget(self.cfg.prompt_budget_tokens),
-                self.cfg.budget_mode,
-                &self.cfg.pinned_prefixes,
-                self.cfg.guidance_max,
-            );
-            if self.cfg.show_budget_line {
-                let clipped: Vec<String> =
-                    clipped_results(log.events(), turn, self.cfg.tool_result_max_chars)
-                    .into_iter()
-                    .map(result_handle)
-                    .collect();
-                ctx.budget_line = Some(budget.line(&clipped));
-            }
-            // M9 T0.4. After the fit, so the budget report above still
-            // counts the block as it was composed and the ablation shows up
-            // only in what was rendered and in the manifest's keys.
-            match self.cfg.ablate {
-                Some(nscore::Ablate::Facts) => ctx.facts.clear(),
-                Some(nscore::Ablate::Summary) => ctx.summary = None,
-                Some(nscore::Ablate::Guidance) => ctx.guidance.clear(),
-                None => {}
-            }
-            // M12 T4.3: chat-tier only, and only with the knob on. Filled
-            // after the fit and the ablation, so `memory_silent` is a
-            // statement about the context as sent rather than as composed —
-            // the same thing the replier's silence line says.
-            // M13 T2.1: on every tier the offer is the same sentence — call
-            // the next tool or write the reply — so the loop ends when the
-            // model says it is done rather than when it names the action that
-            // says so.
-            let offered_answer = self.cfg.chat_act_or_answer
-                && (self.cfg.act_or_answer_every_tier || tier == nscore::Tier::Chat);
-            if offered_answer {
-                let reply_guidance = if self.cfg.archive_foreign_notes {
-                    rules.guidance_for_reply_model(self.cfg.learning_model.as_deref())
-                } else {
-                    rules.guidance_for_reply()
-                };
-                ctx.answer = Some(nscore::AnswerBlocks {
-                    persona: self.cfg.persona.clone(),
-                    reply_guidance,
-                    memory_silent: ctx.facts.is_empty()
-                        && ctx.summary.is_none()
-                        && !ctx.trace_so_far.iter().any(|l| l.contains("recall")),
-                    with_action: self.cfg.act_and_answer,
-                });
-            }
-            // Cut to what survived: nothing drops guidance from the middle,
-            // so a prefix is exact, and it keeps `note_hashes.len() ==
-            // guidance` true whether the list was clamped or blanked.
-            let note_hashes: Vec<String> = guidance_notes
-                .iter()
-                .take(ctx.guidance.len())
-                .map(|(h, _)| h.clone())
-                .collect();
-            // The names, not just the count (M10 T0.1): `tools_tokens` says
-            // what the array cost and nothing about which tool carried it,
-            // and the whole of P1 is a decision about which text to cut.
-            // `respond_directly` is absent because it is not in the legal
-            // set — `build_tools` appends it, and a report adds it back the
-            // same way.
-            let tool_names: Vec<String> =
-                legal.actions.iter().map(|s| s.name.clone()).collect();
-            let mut manifest =
-                emitter_manifest(&scope, &ctx, tool_names, clipped_chars, note_hashes);
-            manifest.budget = Some(budget);
-            manifest.ablated = self.cfg.ablate;
-            manifest.tier = self.cfg.router.is_some().then_some(tier);
-            manifest.route_cues = routed.cues.clone();
             let proposed = self.parts.emitter.propose_or_answer(ctx, &legal).await;
             self.record_model_calls(&usage, &mut log, turn, &manifest);
             // Carried as far as the `respond_directly` branch below, or to

@@ -3,25 +3,35 @@
 //! This file is the map. `Engine` and how it is built live here; everything
 //! a turn actually does lives in a sibling named after the step:
 //!
-//! | module         | the step it owns                                  |
-//! |----------------|---------------------------------------------------|
-//! | [`run`]        | the turn loop, start to reply                     |
-//! | [`routing`]    | what kind of turn this is                         |
-//! | [`memory`]     | which facts it sees, and the running summary      |
-//! | [`retrieval`]  | the searches the engine runs for itself           |
-//! | [`gate`]       | provenance and the guard chain                    |
-//! | [`reply`]      | writing the sentence the user reads               |
-//! | [`accounting`] | what it spent, and persisting what it did         |
-//! | [`specs`]      | the actions the engine itself owns                |
-//! | [`config`]     | every knob, and the defaults                      |
-//! | [`diagnostics`]| turning a failure into a sentence                  |
+//! | module          | the step it owns                                  |
+//! |-----------------|---------------------------------------------------|
+//! | [`run`]         | the turn loop, start to reply                     |
+//! | [`routing`]     | what kind of turn this is                         |
+//! | [`legal`]       | which actions the emitter is offered              |
+//! | [`prompt`]      | what the emitter is shown, and what it cost        |
+//! | [`builtins`]    | the actions the engine answers itself             |
+//! | [`tools`]       | running an action the deployment registered       |
+//! | [`memory`]      | which facts it sees, and the running summary      |
+//! | [`retrieval`]   | the searches the engine runs for itself           |
+//! | [`gate`]        | provenance and the guard chain                    |
+//! | [`reply`]       | writing the sentence the user reads               |
+//! | [`accounting`]  | what it spent, and persisting what it did         |
+//! | [`specs`]       | the actions the engine itself owns                |
+//! | [`config`]      | every knob, and the defaults                      |
+//! | [`diagnostics`] | turning a failure into a sentence                 |
+//!
+//! One iteration of the loop reads as that list, in order: project the log,
+//! decide the legal set, compose the prompt, ask for a proposal, then either
+//! settle the turn or run what was proposed — a builtin or a registered tool.
 
 mod accounting;
 mod builtins;
 pub mod config;
 mod diagnostics;
 mod gate;
+mod legal;
 mod memory;
+mod prompt;
 mod reply;
 mod retrieval;
 mod routing;
