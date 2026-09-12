@@ -113,7 +113,7 @@ async fn two_sessions_each_receive_only_their_own_replies() {
     a.say("from a").await;
     b.say("from b").await;
 
-    let mut got = vec![recv(&ch).await, recv(&ch).await];
+    let mut got = [recv(&ch).await, recv(&ch).await];
     got.sort_by(|x, y| x.session.0.cmp(&y.session.0));
     assert_eq!(got[0].session, sid("a"));
     assert_eq!(got[0].text, "from a");

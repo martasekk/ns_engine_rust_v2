@@ -12,6 +12,30 @@ use nscore::{EventKind, EventLog, ReplyContext};
 
 pub const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
 
+/// What the turn hands the replier.
+///
+/// Eight arguments before this, which is past the point where a call site
+/// says what it is passing. The one thing that is *not* here is the log: the
+/// replier appends to it, so it stays a separate `&mut`.
+pub(super) struct Draft<'a> {
+    pub scope: &'a str,
+    pub user_text: &'a str,
+    /// This turn's one rules snapshot.
+    pub rules: &'a nscore::LearnedRules,
+    pub turn: u32,
+    /// Where this call's token counts are collected.
+    pub usage: &'a std::sync::Arc<nscore::UsageSink>,
+    /// Whether this turn's tier and config allow the hybrid fact path
+    /// (M11 T1.1 follow-up). Passed in rather than re-derived: the tier is
+    /// the caller's, and it may have been upgraded mid-turn.
+    pub hybrid_facts: bool,
+    /// M12 T4.3: the answer the emitter call already produced. `Some` skips
+    /// the replier and its `ModelCall` — the turn costs one request — and
+    /// then runs the identical echo, grounding, obligation and citation
+    /// block on the text, because an emitted answer is a draft like any
+    /// other and is not owed a lighter check.
+    pub pre_draft: Option<String>,
+}
 
 impl Engine {
     /// Draft the user-facing reply from the trace of what happened.
@@ -21,25 +45,16 @@ impl Engine {
     /// it selects facts, fits a budget, calls a model, and may call it a
     /// second time when the grounding check fires — the only place besides
     /// the emitter loop that spends a request.
-    pub(super) async fn generate_reply(
-        &self,
-        scope: &str,
-        user_text: &str,
-        rules: &nscore::LearnedRules,
-        log: &mut EventLog,
-        turn: u32,
-        usage: &std::sync::Arc<nscore::UsageSink>,
-        // Whether this turn's tier and config allow the hybrid fact path
-        // (M11 T1.1 follow-up). Passed in rather than re-derived: the tier
-        // is the caller's, and it may have been upgraded mid-turn.
-        hybrid_facts: bool,
-        // M12 T4.3: the answer the emitter call already produced. `Some`
-        // skips the replier and its `ModelCall` — the turn costs one
-        // request — and then runs the identical echo, grounding, obligation
-        // and citation block on the text, because an emitted answer is a
-        // draft like any other and is not owed a lighter check.
-        pre_draft: Option<String>,
-    ) -> String {
+    pub(super) async fn generate_reply(&self, d: Draft<'_>, log: &mut EventLog) -> String {
+        let Draft {
+            scope,
+            user_text,
+            rules,
+            turn,
+            usage,
+            hybrid_facts,
+            pre_draft,
+        } = d;
         let now = &self.clock;
         let state = fold(log.events());
         // Clipped for the same reason, though this one is built once
@@ -47,13 +62,12 @@ impl Engine {
         // stays uncapped: `render_echo` measures the reply against the
         // full material, and capping there would change what that
         // number means.
-        let (trace_lines, reply_clipped_chars) =
-            trace_for_prompt(
-                log.events(),
-                turn,
-                self.cfg.trace_verbatim_lines,
-                self.cfg.tool_result_max_chars,
-            );
+        let (trace_lines, reply_clipped_chars) = trace_for_prompt(
+            log.events(),
+            turn,
+            self.cfg.trace_verbatim_lines,
+            self.cfg.tool_result_max_chars,
+        );
         let trace = trace_lines.join("\n");
         // Implicit recall (spec §5): standing facts enter the reply
         // context; each recall bumps `uses` (lifecycle metadata for
@@ -81,26 +95,25 @@ impl Engine {
         // `extra_guidance` is how the obligation interceptor speaks to the
         // second draft: one added note, the shape `do_not_state` already has
         // on the grounding path.
-        let make_ctx = |do_not_state: Vec<String>,
-                        do_not_repeat: Vec<String>,
-                        extra_guidance: Vec<String>| {
-            let mut notes = guidance.clone();
-            notes.extend(extra_guidance);
-            ReplyContext {
-                persona: self.cfg.persona.clone(),
-                facts: facts.clone(),
-                summary: state.summary.clone(),
-                window: window.clone(),
-                caps: self.cfg.caps,
-                user_text: user_text.to_string(),
-                obligations: obligations.clone(),
-                turn_trace: trace.clone(),
-                guidance: notes,
-                do_not_state,
-                do_not_repeat,
-                usage: Some(usage.clone()),
-            }
-        };
+        let make_ctx =
+            |do_not_state: Vec<String>, do_not_repeat: Vec<String>, extra_guidance: Vec<String>| {
+                let mut notes = guidance.clone();
+                notes.extend(extra_guidance);
+                ReplyContext {
+                    persona: self.cfg.persona.clone(),
+                    facts: facts.clone(),
+                    summary: state.summary.clone(),
+                    window: window.clone(),
+                    caps: self.cfg.caps,
+                    user_text: user_text.to_string(),
+                    obligations: obligations.clone(),
+                    turn_trace: trace.clone(),
+                    guidance: notes,
+                    do_not_state,
+                    do_not_repeat,
+                    usage: Some(usage.clone()),
+                }
+            };
         // The reply context is fitted too, and reported on the same
         // way. Its `turn_trace` is exempt: it is the material the
         // reply narrates from, and the grounding interceptor flags a
@@ -193,8 +206,11 @@ impl Engine {
                     // weak, the draft stands and falls through to the same
                     // obligations and citation path any draft takes.
                     if self.cfg.reply_regenerate {
-                        let regenerated =
-                            self.parts.replier.reply(make_ctx(spans, vec![], vec![])).await;
+                        let regenerated = self
+                            .parts
+                            .replier
+                            .reply(make_ctx(spans, vec![], vec![]))
+                            .await;
                         // The regeneration is a second billed call, and
                         // the point of counting it is to know what the
                         // grounding check costs.

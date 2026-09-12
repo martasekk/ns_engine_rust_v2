@@ -777,27 +777,31 @@ mod tests {
             .propose(ctx(), &legal())
             .await
             .unwrap();
-        let reqs = on.requests.lock().unwrap();
-        let parts = reqs[0]["messages"][1]["content"]
-            .as_array()
-            .expect("content-parts form");
-        assert_eq!(parts.len(), 2);
-        let head = parts[0]["text"].as_str().unwrap();
-        let tail = parts[1]["text"].as_str().unwrap();
-        assert_eq!(
-            parts[0]["cache_control"],
-            serde_json::json!({"type": "ephemeral"}),
-            "the breakpoint is on the part that ends the window"
-        );
-        assert!(parts[1].get("cache_control").is_none());
-        assert!(head.contains("Facts:"), "{head}");
-        assert!(head.contains("Recent turns:"), "{head}");
-        assert!(head.ends_with("\n"), "the window block ends it: {head:?}");
-        assert!(!head.contains("Current turn:"), "{head}");
-        assert!(tail.starts_with("Current turn:"), "{tail}");
-        assert!(tail.contains("This turn so far:"), "{tail}");
-        let joined = format!("{head}{tail}");
-        drop(reqs);
+        // The guard lives in this block and not a statement longer: the second
+        // half of the test awaits, and a `std` guard held across an await is
+        // one that can deadlock whatever else wants the same mock.
+        let joined = {
+            let reqs = on.requests.lock().unwrap();
+            let parts = reqs[0]["messages"][1]["content"]
+                .as_array()
+                .expect("content-parts form");
+            assert_eq!(parts.len(), 2);
+            let head = parts[0]["text"].as_str().unwrap();
+            let tail = parts[1]["text"].as_str().unwrap();
+            assert_eq!(
+                parts[0]["cache_control"],
+                serde_json::json!({"type": "ephemeral"}),
+                "the breakpoint is on the part that ends the window"
+            );
+            assert!(parts[1].get("cache_control").is_none());
+            assert!(head.contains("Facts:"), "{head}");
+            assert!(head.contains("Recent turns:"), "{head}");
+            assert!(head.ends_with("\n"), "the window block ends it: {head:?}");
+            assert!(!head.contains("Current turn:"), "{head}");
+            assert!(tail.starts_with("Current turn:"), "{tail}");
+            assert!(tail.contains("This turn so far:"), "{tail}");
+            format!("{head}{tail}")
+        };
 
         let off = MockTransport::ok(vec![tool_call_response(
             "respond_directly",

@@ -60,9 +60,27 @@ fn vector_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn blob_vector(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // `as_chunks` gives `&[u8; 4]` directly, so `from_le_bytes` takes the
+    // array rather than one rebuilt element by element behind four bounds
+    // checks. A trailing partial chunk is a truncated blob and is dropped,
+    // which is what `chunks_exact` did.
+    let (whole, _tail) = b.as_chunks::<4>();
+    whole.iter().copied().map(f32::from_le_bytes).collect()
+}
+
+/// One stored turn vector, with the line it belongs to.
+///
+/// A six-field tuple before this, read back as `r.1`, `r.3`, `r.4` at four
+/// call sites — including the one that builds a `TurnHit` out of it, where
+/// every field is positional and none is named.
+struct TurnVector {
+    /// The `events` rowid the vector was stored against.
+    row: i64,
+    session: SessionId,
+    turn: u32,
+    speaker: &'static str,
+    text: String,
+    vector: Vec<f32>,
 }
 
 /// What a digest is embedded as: the same three fields its FTS index covers,
@@ -534,12 +552,11 @@ impl SqliteStore {
     /// cheap half of a 509 ms round trip cheaper. When a scope grows to where
     /// this shows up beside `/rerank`, that is the measurement that justifies
     /// one.
-    #[allow(clippy::type_complexity)]
     async fn turn_vectors(
         &self,
         sessions: &[SessionId],
         model: &str,
-    ) -> Result<Vec<(i64, SessionId, u32, &'static str, String, Vec<f32>)>, StoreError> {
+    ) -> Result<Vec<TurnVector>, StoreError> {
         if sessions.is_empty() {
             return Ok(vec![]);
         }
@@ -574,14 +591,14 @@ impl SqliteStore {
         for row in rows {
             let (rowid, session_id, turn, kind_json, blob) = row.map_err(io_err)?;
             if let Some((speaker, text)) = turn_text(&kind_json) {
-                out.push((
-                    rowid,
-                    SessionId(session_id),
+                out.push(TurnVector {
+                    row: rowid,
+                    session: SessionId(session_id),
                     turn,
                     speaker,
                     text,
-                    blob_vector(&blob),
-                ));
+                    vector: blob_vector(&blob),
+                });
             }
         }
         Ok(out)
@@ -741,7 +758,7 @@ impl SqliteStore {
 
         let mut scored: Vec<(i64, f32)> = stored
             .iter()
-            .filter_map(|(rowid, _, _, _, _, v)| nscore::cosine(&q, v).map(|c| (*rowid, c)))
+            .filter_map(|t| nscore::cosine(&q, &t.vector).map(|c| (t.row, c)))
             .collect();
         // A dimension mismatch on every row is a model change the primary key
         // should have prevented; treat it as "no vector arm" rather than as a
@@ -758,15 +775,17 @@ impl SqliteStore {
             .into_iter()
             .take(coarse)
             .collect();
-        let by_row: std::collections::HashMap<i64, &(i64, SessionId, u32, &'static str, String, Vec<f32>)> =
-            stored.iter().map(|r| (r.0, r)).collect();
-        let rows: Vec<&(i64, SessionId, u32, &'static str, String, Vec<f32>)> =
-            fused.iter().filter_map(|r| by_row.get(r).copied()).collect();
+        let by_row: std::collections::HashMap<i64, &TurnVector> =
+            stored.iter().map(|t| (t.row, t)).collect();
+        let rows: Vec<&TurnVector> = fused
+            .iter()
+            .filter_map(|r| by_row.get(r).copied())
+            .collect();
         if rows.is_empty() {
             return Ok(None);
         }
 
-        let docs: Vec<String> = rows.iter().map(|r| r.4.clone()).collect();
+        let docs: Vec<String> = rows.iter().map(|t| t.text.clone()).collect();
         let ranked = enc.rerank(query, &docs, k).await?;
         if started.elapsed() > budget {
             return Err(over("rerank"));
@@ -776,11 +795,11 @@ impl SqliteStore {
                 .into_iter()
                 .take(k)
                 .filter_map(|(i, score)| {
-                    rows.get(i).map(|r| nscore::TurnHit {
-                        session: r.1.clone(),
-                        turn: r.2,
-                        speaker: r.3,
-                        text: r.4.clone(),
+                    rows.get(i).map(|t| nscore::TurnHit {
+                        session: t.session.clone(),
+                        turn: t.turn,
+                        speaker: t.speaker,
+                        text: t.text.clone(),
                         score: score as f64,
                     })
                 })

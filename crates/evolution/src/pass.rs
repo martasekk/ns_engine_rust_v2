@@ -6,7 +6,7 @@ use crate::evaluate::{evaluate, EvaluateConfig, Evaluator, SymbolicEvaluator};
 use crate::files::{load_rules, save_rules_atomic, FileError};
 use crate::ledger::{Evidence, Ledger, LedgerEntry, Verdict};
 use crate::mine::{mine, render_turn, Signature, SignatureKind};
-use crate::notes::{verify_note, NoteProposer, ProbeRunner};
+use crate::notes::{verify_note, Corpus, NoteProposer, ProbeRunner};
 use crate::symbolic::{propose_patches, verify_patch, Recorded};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -1020,10 +1020,11 @@ impl EvolutionPass {
             report.skipped_lanes.push("notes proposer".into());
             report.skipped_lanes.push("probes".into());
         }
-        let lane = self
-            .may_spend()
-            .then_some((&self.probe, &self.proposer))
-            .unwrap_or((&None, &None));
+        let lane = if self.may_spend() {
+            (&self.probe, &self.proposer)
+        } else {
+            (&None, &None)
+        };
         if let (Some(probe), Some(proposer)) = lane {
             let mut budget = self.cfg.probe_budget_turns;
             let clean: Vec<&Recorded> = sessions
@@ -1069,8 +1070,10 @@ impl EvolutionPass {
                     .collect();
                 let v = verify_note(
                     &note,
-                    &positives,
-                    &negatives,
+                    Corpus {
+                        positives: &positives,
+                        negatives: &negatives,
+                    },
                     &working,
                     probe.as_ref(),
                     self.cfg.regression_budget,

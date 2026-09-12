@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn fusing_one_list_returns_it_unchanged() {
         let one = vec!["a", "b", "c"];
-        assert_eq!(rrf_fuse(&[one.clone()]), one);
+        assert_eq!(rrf_fuse(std::slice::from_ref(&one)), one);
         assert!(rrf_fuse::<&str>(&[]).is_empty());
     }
 

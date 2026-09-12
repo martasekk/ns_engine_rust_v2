@@ -260,11 +260,10 @@ fn views(events: &[Event]) -> Vec<SessionTurn> {
         match &e.kind {
             EventKind::Replied { text } => v.reply = Some(text.clone()),
             EventKind::ToolCalled { .. } => v.tool_calls += 1,
-            EventKind::ToolReturned { outcome, .. } => {
-                if let nscore::ToolOutcome::Ok { output } = outcome {
-                    v.shown.push(output.summary.clone());
-                }
-            }
+            EventKind::ToolReturned {
+                outcome: nscore::ToolOutcome::Ok { output },
+                ..
+            } => v.shown.push(output.summary.clone()),
             EventKind::Proposed { proposal } => {
                 if !SYNTHETIC_ACTIONS.contains(&proposal.action.as_str()) {
                     v.real_proposals += 1;

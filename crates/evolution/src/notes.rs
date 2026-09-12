@@ -351,10 +351,21 @@ impl NoteGate {
     }
 }
 
+/// The recorded sessions a note is judged against.
+///
+/// Always passed together — a lift is the difference between the two — so
+/// they travel as one argument rather than as two that could be swapped for
+/// each other silently.
+pub struct Corpus<'a> {
+    /// Sessions the note is meant to improve.
+    pub positives: &'a [Vec<Event>],
+    /// Sessions it must not make worse.
+    pub negatives: &'a [Vec<Event>],
+}
+
 pub async fn verify_note(
     note: &Note,
-    positives: &[Vec<Event>],
-    negatives: &[Vec<Event>],
+    corpus: Corpus<'_>,
     base: &LearnedRules,
     probe: &dyn ProbeRunner,
     regression_budget: u32,
@@ -381,8 +392,8 @@ pub async fn verify_note(
     // sessions being probed there is nothing for `score` to move. Spending
     // the probe budget to find that out would be worse than saying so.
     if gate.require_graded
-        && !any_graded(positives, &gate.authoritative)
-        && !any_graded(negatives, &gate.authoritative)
+        && !any_graded(corpus.positives, &gate.authoritative)
+        && !any_graded(corpus.negatives, &gate.authoritative)
     {
         v.unverified = true;
         v.detail = format!(
@@ -404,10 +415,11 @@ pub async fn verify_note(
         Some(cost)
     };
 
-    let queue = positives
+    let queue = corpus
+        .positives
         .iter()
         .map(|e| (true, e))
-        .chain(negatives.iter().map(|e| (false, e)));
+        .chain(corpus.negatives.iter().map(|e| (false, e)));
     for (is_positive, events) in queue {
         let Some(cost) = probe_pair(events) else {
             v.detail.push_str("budget exhausted; ");
@@ -637,8 +649,10 @@ mod tests {
         let mut budget = 40;
         let v = verify_note(
             &note,
-            &[session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -656,8 +670,10 @@ mod tests {
         let mut budget = 40;
         let v = verify_note(
             &note,
-            &[graded_session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[graded_session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -690,8 +706,10 @@ mod tests {
         let mut budget = 40;
         let v = verify_note(
             &note,
-            &[session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -747,8 +765,10 @@ mod tests {
         let mut budget = 40;
         let accepted = verify_note(
             &note,
-            &positives,
-            &negatives,
+            Corpus {
+                positives: &positives,
+                negatives: &negatives,
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -770,8 +790,10 @@ mod tests {
         let mut budget = 40;
         let rejected = verify_note(
             &note,
-            &positives,
-            &negatives,
+            Corpus {
+                positives: &positives,
+                negatives: &negatives,
+            },
             &LearnedRules::default(),
             &regressing,
             0,
@@ -788,8 +810,10 @@ mod tests {
         let mut budget = 40;
         let as_failure = verify_note(
             &note,
-            &positives,
-            &negatives,
+            Corpus {
+                positives: &positives,
+                negatives: &negatives,
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -814,8 +838,10 @@ mod tests {
         let mut budget = 40;
         let v = verify_note(
             &note,
-            &[session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -841,8 +867,10 @@ mod tests {
         let mut b = 40;
         let v0 = verify_note(
             &note,
-            &[session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             0,
@@ -854,8 +882,10 @@ mod tests {
         let mut b = 40;
         let v1 = verify_note(
             &note,
-            &[session("positive")],
-            &[session("negative")],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[session("negative")],
+            },
             &LearnedRules::default(),
             &probe,
             1,
@@ -878,8 +908,10 @@ mod tests {
         let mut budget = 1;
         let v = verify_note(
             &note,
-            &[session("positive")],
-            &[],
+            Corpus {
+                positives: &[session("positive")],
+                negatives: &[],
+            },
             &LearnedRules::default(),
             &probe,
             0,

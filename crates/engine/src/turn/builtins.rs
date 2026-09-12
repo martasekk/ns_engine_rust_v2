@@ -437,7 +437,7 @@ impl Engine {
         };
         cx.returned(call_id, outcome);
         self.flush(cx.sid, cx.log, cx.n_loaded).await;
-        return Step::Again;
+        Step::Again
     }
 
     // f7. recall (M6 §7): progressive disclosure. Verbatim turns
@@ -462,7 +462,7 @@ impl Engine {
             .recall_outcome(cx.sid, cx.scope, &query, cx.turn, cx.tier)
             .await;
         cx.returned(call_id, outcome);
-        return Step::Again;
+        Step::Again
     }
 
     // f8. inspect_result (M7 T1.2): the other half of the cap. The
@@ -533,7 +533,7 @@ impl Engine {
             }
         };
         cx.returned(call_id, outcome);
-        return Step::Again;
+        Step::Again
     }
 
     // f5. forget_fact (M6 §6.2): soft-delete one current fact. An
@@ -607,7 +607,7 @@ impl Engine {
         };
         cx.returned(call_id, outcome);
         self.flush(cx.sid, cx.log, cx.n_loaded).await;
-        return Step::Again;
+        Step::Again
     }
 
     // f6. forget_all (M6 §6.2): irreversible, so it is staged behind
@@ -652,6 +652,6 @@ impl Engine {
         };
         cx.returned(call_id, outcome);
         self.flush(cx.sid, cx.log, cx.n_loaded).await;
-        return Step::Again;
+        Step::Again
     }
 }

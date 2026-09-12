@@ -437,7 +437,9 @@ async fn summary_chars_of(h: &Harness, sid: &SessionId) -> usize {
             }
             _ => None,
         })
-        .last()
+        // The newest summary, found from the back: `last()` walked every
+        // event in the session to arrive at the same one.
+        .next_back()
         .unwrap_or(0)
 }
 

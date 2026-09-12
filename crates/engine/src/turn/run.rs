@@ -11,7 +11,7 @@ use super::diagnostics::explain_error;
 use super::gate::classify;
 use super::legal::Offer;
 use super::prompt::{Compose, Prompt};
-use super::reply::{render_template, FALLBACK_REPLY};
+use super::reply::{render_template, Draft, FALLBACK_REPLY};
 use super::specs::*;
 use super::{Engine, EngineError};
 use crate::state::fold;
@@ -676,14 +676,16 @@ impl Engine {
             },
             ReplyPolicy::Generate => {
                 self.generate_reply(
-                    &scope,
-                    &incoming.text,
-                    &rules,
+                    Draft {
+                        scope: &scope,
+                        user_text: &incoming.text,
+                        rules: &rules,
+                        turn,
+                        usage: &usage,
+                        hybrid_facts: self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
+                        pre_draft,
+                    },
                     &mut log,
-                    turn,
-                    &usage,
-                    self.cfg.recall_hybrid && tier != nscore::Tier::Chat,
-                    pre_draft,
                 )
                 .await
             }
