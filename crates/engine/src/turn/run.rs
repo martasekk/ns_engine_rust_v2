@@ -17,7 +17,7 @@ use crate::trace::{
     clipped_results, emitter_manifest, result_handle, trace_for_prompt,
 };
 use nscore::{
-    ClassifiedProposal, EventKind, EventLog, Incoming, LegalActionSet, RejectReason, ReplyPolicy, ToolCtx, ToolOutcome, Verdict,
+    EventKind, EventLog, Incoming, LegalActionSet, RejectReason, ReplyPolicy,
 };
 
 
@@ -751,189 +751,39 @@ impl Engine {
                 }
             }
 
-            // f2-f8. the actions the engine answers itself (`builtins.rs`).
-            // Each one either settles the turn or leaves the emitter another
-            // iteration; a proposal naming a registered tool falls through to
-            // `g0` below.
-            {
-                let mut cx = Ctx {
-                    log: &mut log,
-                    book: &mut book,
-                    state: &state,
-                    proposal: &proposal,
-                    pid,
-                    turn,
-                    sid: &sid,
-                    scope: &scope,
-                    tier,
-                    n_loaded,
-                    confirmed_now,
-                    at: now(),
-                };
-                if let Some(step) = self.run_builtin(&mut cx).await {
-                    match step {
-                        Step::Again => continue,
-                        Step::Settled(policy) => {
-                            settled = Some(policy);
-                            break;
-                        }
-                    }
-                }
-            }
-
-
-            // g0. find the tool (legality guaranteed it exists)
-            let tool = self
-                .parts
-                .tools
-                .iter()
-                .find(|t| t.spec().name == proposal.action)
-                .expect("legality checked above")
-                .clone();
-
-            // g1. schema validation (spec M5 §3.2): malformed args are
-            // rejected before classification; the action stays legal so the
-            // emitter can retry with repaired args.
-            if let Err(detail) = nscore::validate_args(&tool.spec().args_schema, &proposal.args) {
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::Rejected {
-                        proposal_of: pid,
-                        reason: RejectReason::Malformed {
-                            detail: format!("{}: {detail}", proposal.action),
-                        },
-                    },
-                );
-                book.rejections
-                    .push(format!("malformed args for {}: {detail}", proposal.action));
-                continue;
-            }
-
-            // g. classify args against the session's history (spec §5.4)
-            let classified_args = classify(log.events(), &proposal.args, tool.spec(), turn);
-            let classified = ClassifiedProposal {
-                proposal: proposal.clone(),
-                args: classified_args.clone(),
-            };
-
-            // h. guards
-            let guard_ctx = nscore::GuardCtx {
-                spec: tool.spec(),
+            // f2-i. run it.
+            //
+            // Two kinds of action and one shape: the engine's own
+            // (`builtins.rs`) and the deployment's (`tools.rs`). Either
+            // settles the turn or leaves the emitter another iteration to
+            // decide what follows, which is the only thing the loop needs to
+            // know about what just happened.
+            let mut cx = Ctx {
+                log: &mut log,
+                book: &mut book,
+                state: &state,
+                proposal: &proposal,
+                pid,
                 turn,
-                confirmed_this_turn: confirmed_now || state.confirmed_this_turn_of == Some(turn),
-                fired_actions: &state.fired_tags,
-                pending_confirmation: active_pending,
+                sid: &sid,
+                scope: &scope,
+                tier,
+                n_loaded,
+                confirmed_now,
+                active_pending,
+                at: now(),
             };
-            let mut verdict = Verdict::Allow;
-            let mut guard_name = String::new();
-            for g in self.builtin_guards.iter().chain(self.parts.guards.iter()) {
-                match g.check(&classified, &guard_ctx) {
-                    Verdict::Allow => continue,
-                    v => {
-                        guard_name = g.name().to_string();
-                        verdict = v;
-                        break;
-                    }
-                }
-            }
-            match verdict {
-                Verdict::Allow => {}
-                Verdict::Deny { reason } => {
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Rejected {
-                            proposal_of: pid,
-                            reason: RejectReason::GuardDenied {
-                                guard: guard_name.clone(),
-                                reason: reason.clone(),
-                            },
-                        },
-                    );
-                    book.rejections.push(format!("guard {guard_name}: {reason}"));
-                    if reason.contains("NeverResidual") {
-                        book.never_residual = true;
-                    }
-                    book.denied.insert(proposal.action.clone());
-                    continue;
-                }
-                Verdict::NeedsConfirmation { prompt } => {
-                    // Dry-run when the tool supports it; show the user what
-                    // would happen (spec §5.4, §9).
-                    let staged = tool
-                        .stage(
-                            &proposal.args,
-                            &ToolCtx {
-                                session: sid.clone(),
-                                artifacts: Some(self.parts.memory.clone()),
-                            },
-                        )
-                        .await;
-                    let mut text = prompt;
-                    if let Some(s) = &staged {
-                        text.push_str(&format!("\nPlanned: {}", s.description));
-                    }
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::PendingConfirmation {
-                            proposal_of: pid,
-                            staged,
-                        },
-                    );
-                    let policy = ReplyPolicy::Verbatim { text };
-                    log.append(
-                        turn,
-                        now(),
-                        EventKind::Settled {
-                            policy: policy.clone(),
-                        },
-                    );
+            let step = match self.run_builtin(&mut cx).await {
+                Some(step) => step,
+                None => self.run_tool(&mut cx).await,
+            };
+            match step {
+                Step::Again => continue,
+                Step::Settled(policy) => {
                     settled = Some(policy);
                     break;
                 }
             }
-
-            // i. perform
-            let call_id = log
-                .append(
-                    turn,
-                    now(),
-                    EventKind::ToolCalled {
-                        action: proposal.action.clone(),
-                        args: classified_args,
-                    },
-                )
-                .id;
-            book.calls.insert(Self::call_key(&proposal));
-            let outcome = match tool
-                .call(
-                    &proposal.args,
-                    &ToolCtx {
-                        session: sid.clone(),
-                        artifacts: Some(self.parts.memory.clone()),
-                    },
-                )
-                .await
-            {
-                Ok(output) => ToolOutcome::Ok { output },
-                Err(nscore::ToolError::Failed { kind, detail }) => {
-                    ToolOutcome::Err { kind, detail }
-                }
-            };
-            log.append(
-                turn,
-                now(),
-                EventKind::ToolReturned {
-                    call: call_id,
-                    outcome,
-                },
-            );
-            if tool.spec().side_effect != nscore::SideEffect::Pure {
-                self.flush(&sid, &log, n_loaded).await;
-            }
-            // loop: the emitter decides what happens next (typically respond_directly)
         }
 
         // M13 T3.1: the iteration budget ran out holding an answer written

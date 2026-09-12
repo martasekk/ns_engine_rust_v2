@@ -4,6 +4,31 @@
 //! runs. Both are here so "what checks a call" is one file rather than a
 //! detail of the loop.
 
+use super::Engine;
+use nscore::{ClassifiedProposal, GuardCtx, Verdict};
+
+impl Engine {
+    /// The first guard to object to a proposal, and what it said.
+    ///
+    /// The chain is always the engine's own guards followed by the harness's,
+    /// and it always stops at the first objection — a proposal refused twice
+    /// is still refused once. Written out twice in the loop before this, once
+    /// for registered tools and once for `ask_clarification`, which differ
+    /// only in whether they distinguish a denial from a confirmation prompt.
+    pub(super) fn first_objection(
+        &self,
+        classified: &ClassifiedProposal,
+        ctx: &GuardCtx,
+    ) -> Option<(String, Verdict)> {
+        self.builtin_guards
+            .iter()
+            .chain(self.parts.guards.iter())
+            .find_map(|g| match g.check(classified, ctx) {
+                Verdict::Allow => None,
+                objection => Some((g.name().to_string(), objection)),
+            })
+    }
+}
 
 /// Establish where each of a proposal's arguments came from.
 ///

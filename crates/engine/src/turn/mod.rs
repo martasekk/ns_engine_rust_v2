@@ -27,6 +27,7 @@ mod retrieval;
 mod routing;
 mod run;
 pub mod specs;
+mod tools;
 
 // The names this module was a single file under, kept exactly as they were:
 // `turn::EngineConfig` and `turn::REMEMBER_FACT` are what the app, the

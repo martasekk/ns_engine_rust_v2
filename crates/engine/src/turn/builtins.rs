@@ -118,6 +118,9 @@ pub(super) struct Ctx<'a> {
     pub n_loaded: usize,
     /// Whether `confirm_pending` unlocked the gate on this iteration.
     pub confirmed_now: bool,
+    /// The pending confirmation still in force, if one is — a staged proposal
+    /// is only confirmable on the turn after it was staged (spec §9).
+    pub active_pending: Option<nscore::EventId>,
     pub at: Timestamp,
 }
 
@@ -129,7 +132,7 @@ impl Ctx<'_> {
     }
 
     /// Refuse the proposal and go round again.
-    fn refuse(&mut self, reason: RejectReason, line: impl Into<String>) -> Step {
+    pub(super) fn refuse(&mut self, reason: RejectReason, line: impl Into<String>) -> Step {
         let at = self.at;
         self.book
             .reject(self.log, self.turn, at, self.pid, reason, line);
@@ -138,7 +141,7 @@ impl Ctx<'_> {
 
     /// Refuse it as malformed, which is the emitter's cue to fix the
     /// arguments or ask the user rather than to stop offering the action.
-    fn malformed(&mut self, detail: impl Into<String>, line: impl Into<String>) -> Step {
+    pub(super) fn malformed(&mut self, detail: impl Into<String>, line: impl Into<String>) -> Step {
         self.refuse(
             RejectReason::Malformed {
                 detail: detail.into(),
@@ -148,7 +151,7 @@ impl Ctx<'_> {
     }
 
     /// Settle the turn on a policy, recording it the way the loop does.
-    fn settle(&mut self, policy: ReplyPolicy) -> Step {
+    pub(super) fn settle(&mut self, policy: ReplyPolicy) -> Step {
         let at = self.at;
         self.log.append(
             self.turn,
@@ -162,7 +165,7 @@ impl Ctx<'_> {
 
     /// Record that an action really ran, and hand back the call's id so its
     /// outcome can be logged against it.
-    fn called(
+    pub(super) fn called(
         &mut self,
         action: &str,
         args: Vec<(String, nscore::TaggedValue)>,
@@ -184,7 +187,7 @@ impl Ctx<'_> {
     }
 
     /// Record what the call returned.
-    fn returned(&mut self, call: nscore::EventId, outcome: ToolOutcome) {
+    pub(super) fn returned(&mut self, call: nscore::EventId, outcome: ToolOutcome) {
         let at = self.at;
         self.log
             .append(self.turn, at, EventKind::ToolReturned { call, outcome });
@@ -239,38 +242,20 @@ impl Engine {
             fired_actions: &cx.state.fired_tags,
             pending_confirmation: None,
         };
-        let mut denied: Option<(String, String)> = None;
-        for g in self.builtin_guards.iter().chain(self.parts.guards.iter()) {
-            match g.check(&classified, &guard_ctx) {
-                Verdict::Allow => continue,
-                Verdict::Deny { reason } => {
-                    denied = Some((g.name().to_string(), reason));
-                    break;
-                }
-                Verdict::NeedsConfirmation { prompt } => {
-                    denied = Some((g.name().to_string(), prompt));
-                    break;
-                }
-            }
-        }
-        if let Some((guard, reason)) = denied {
-            cx.log.append(
-                cx.turn,
-                cx.now(),
-                EventKind::Rejected {
-                    proposal_of: cx.pid,
-                    reason: RejectReason::GuardDenied {
-                        guard: guard.clone(),
-                        reason: reason.clone(),
-                    },
-                },
-            );
-            cx.book.rejections.push(format!("guard {guard}: {reason}"));
+        // A question is not an action, so there is nothing to stage: whatever
+        // a guard says here, the answer is that this question is not asked.
+        // A confirmation prompt and a denial collapse to the same outcome.
+        if let Some((guard, objection)) = self.first_objection(&classified, &guard_ctx) {
+            let reason = match objection {
+                Verdict::Deny { reason } => reason,
+                Verdict::NeedsConfirmation { prompt } => prompt,
+                Verdict::Allow => unreachable!("an objection is not an allow"),
+            };
             cx.book.denied.insert(ASK_CLARIFICATION.to_string());
-            return Step::Again;
+            let line = format!("guard {guard}: {reason}");
+            return cx.refuse(RejectReason::GuardDenied { guard, reason }, line);
         }
-        let policy = ReplyPolicy::Verbatim { text: question };
-        return cx.settle(policy);
+        cx.settle(ReplyPolicy::Verbatim { text: question })
     }
 
     // f4. remember_fact: classify (the stored provenance IS the
