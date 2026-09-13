@@ -1,16 +1,13 @@
 mod budget;
 mod config;
 mod eval;
+mod factory;
 mod grade;
 mod models;
 
 use config::{AppConfig, Role, RoleTarget};
-use nscore::{HarnessBuilder, SessionId, Tool};
-use nsengine::store::NoopConsolidator;
-use nsengine::turn::{Engine, EngineConfig};
+use nscore::{SessionId, Tool};
 use std::sync::Arc;
-
-type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
 
 /// Every spec `ns-app budget` can price a recorded tool array with (M10
 /// T0.1): the engine's seven synthetic actions, the desktop set, and the one
@@ -27,108 +24,6 @@ pub(crate) fn budget_specs(profile: nscore::SchemaProfile) -> Vec<nscore::Action
             .clone(),
     );
     specs
-}
-
-async fn build_tools(cfg: &AppConfig, profile: nscore::SchemaProfile) -> Vec<Arc<dyn Tool>> {
-    let mut tools: Vec<Arc<dyn Tool>> =
-        vec![Arc::new(nscomponents_std::time_tool::GetTimeTool::new())];
-    let tool_transport = Arc::new(nscomponents_std::transport::ReqwestToolTransport::new());
-    for hc in &cfg.http_components {
-        tools.push(Arc::new(nscomponents_std::http_tool::HttpTool::new(
-            hc.clone(),
-            tool_transport.clone(),
-        )));
-    }
-    if let Some(target) = cfg.pointer_target(env_override("NS_POINTER_ADDR")) {
-        // A configured desktop with no token is a config error, like a role
-        // with no key: exit rather than run without the thing that was asked
-        // for. An unreachable one is a warning: the machine being off must
-        // not take the chat down with it, but it must be said.
-        let Some(token) = target.token() else {
-            eprintln!(
-                "{} is not set — [pointer] addr = {:?} needs the agent's token.",
-                target.token_env, target.addr
-            );
-            std::process::exit(1);
-        };
-        match connect_pointer(&target.addr, &token, profile).await {
-            Ok(more) => tools.extend(more),
-            Err(e) => eprintln!("pointer: {e}\npointer: the desktop actions are not registered."),
-        }
-    }
-    tools
-}
-
-/// Dial the agent's messages service, so the person at that machine can talk
-/// back mid-task.
-///
-/// `None` on every failure, and each one says why: the compose box is an
-/// addition to the conversation and must never be the reason there is no
-/// conversation. An agent built before the service existed simply refuses the
-/// connection, and that is worth one line, not an exit.
-async fn desktop_messages(cfg: &AppConfig) -> Option<nspointer::messages::Messages> {
-    let target = cfg.pointer_target(env_override("NS_POINTER_ADDR"))?;
-    let addr = target.messages_target()?;
-    let token = target.token()?;
-    match nspointer::messages::Messages::connect(&addr, &token).await {
-        Ok(m) => {
-            println!(
-                "desktop: reading the compose box on {addr} — press ctrl+shift+T on that \
-                 machine to type a line into this conversation."
-            );
-            Some(m)
-        }
-        Err(e) => {
-            eprintln!("desktop: no messages service on {addr} ({e});");
-            eprintln!("desktop: the compose box will not reach this session.");
-            None
-        }
-    }
-}
-
-/// Dial the ns-pointer agent and turn the connection into harness actions.
-///
-/// The same hop `ns-pointer-mcp` makes, minus the MCP layer: the engine's
-/// own gates do what that layer's `confirm` argument approximates. What the
-/// agent said in `ready` is printed here, since the engine has no
-/// `initialize` to carry it, and a session that starts not armed or with no
-/// local brake is something the person at this end should know before the
-/// emitter's first click.
-async fn connect_pointer(
-    addr: &str,
-    token: &str,
-    profile: nscore::SchemaProfile,
-) -> Result<Vec<Arc<dyn Tool>>, String> {
-    use nspointer::client::RemotePointer;
-    let dial = tokio::net::TcpStream::connect(addr);
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), dial)
-        .await
-        .map_err(|_| format!("no answer from the agent at {addr} within 5s"))?
-        .map_err(|e| format!("cannot reach the agent at {addr}: {e}"))?;
-    let _ = stream.set_nodelay(true);
-    let (r, w) = stream.into_split();
-    let pointer = RemotePointer::connect(tokio::io::BufReader::new(r), w, token)
-        .await
-        .map_err(|e| format!("agent at {addr} refused the connection: {e}"))?;
-    if !pointer.local_override() {
-        eprintln!(
-            "pointer: warning — the agent at {addr} has no local override; nobody at that \
-             machine can interrupt input sent from here by touching the mouse."
-        );
-    }
-    if pointer.armed() == Some(false) {
-        eprintln!(
-            "pointer: note — the agent at {addr} is not armed; the first click, key or text \
-             will be refused with needs_confirmation until someone presses the arming chord \
-             on the machine."
-        );
-    }
-    let shared: Arc<dyn nspointer::Pointer> = Arc::new(pointer);
-    let tools = nscomponents_std::pointer_tool::tools(shared, profile)
-        .await
-        .map_err(|e| format!("could not read the screen layout from {addr}: {e}"))?;
-    eprintln!("pointer: {} desktop actions on {addr}", tools.len());
-    Ok(tools)
 }
 
 /// `ns-app evolve [--dry-run] [--spend]` → Ok((dry_run, spend))
@@ -191,61 +86,112 @@ fn parse_repl_args(
     Ok((max_requests, session.unwrap_or_else(|| "cli".into())))
 }
 
-/// Whether driver B — the idle evolution pass — may be installed.
+/// One throttle per endpoint *and credential*: roles sharing a base URL and
+/// an API key share the pacing, so the provider sees one paced stream per
+/// account (seen live: Mistral 429s on bursts). Roles on different providers
+/// are paced independently, and so are two tenants on one provider with keys
+/// of their own — a quota each means pacing each (multi-tenant plan H8). Two
+/// tenants sharing a key still share the throttle, because they share the
+/// quota it exists to respect.
 ///
-/// It may not on a metered run. `--max-requests` is enforced inside the turn
-/// loop (`EngineConfig::max_requests`), and the idle pass runs *between*
-/// turns, on its own timer, spending real requests that the cap never sees.
-/// A run told to spend at most N would quietly spend more than N, and the
-/// whole point of the flag is that the number it prints is the number.
-fn idle_pass_allowed(max_requests: Option<u32>, enabled: bool) -> bool {
-    enabled && max_requests.is_none()
-}
-
-/// One throttle per endpoint: roles sharing a base URL share the pacing,
-/// so the provider sees one paced stream (seen live: Mistral 429s on
-/// bursts). Roles on different providers are paced independently.
-fn throttle_for(target: &RoleTarget) -> Arc<nsllm::client::Throttle> {
+/// The key is hashed rather than stored: a `DefaultHasher` is enough here
+/// because this is a partitioning key and not a security boundary — it only
+/// has to separate two different keys, not resist anyone.
+fn throttle_for(target: &RoleTarget, key: &str) -> Arc<nsllm::client::Throttle> {
+    use std::hash::{Hash, Hasher};
     type Registry =
-        std::sync::Mutex<std::collections::HashMap<String, Arc<nsllm::client::Throttle>>>;
+        std::sync::Mutex<std::collections::HashMap<(String, u64), Arc<nsllm::client::Throttle>>>;
     static THROTTLES: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
     let mut map = THROTTLES
         .get_or_init(Registry::default)
         .lock()
         .expect("throttle registry");
-    map.entry(target.base_url_or_default().to_string())
+    map.entry((target.base_url_or_default().to_string(), hasher.finish()))
         .or_insert_with(|| Arc::new(nsllm::client::Throttle::new(target.min_interval_ms)))
         .clone()
 }
 
-/// The wire log, opened once when NS_TRACE names a path. A path that cannot
-/// be opened is fatal: a trace the user asked for and did not get would let
-/// them debug against a file that is silently never written.
-fn trace_sink() -> Option<Arc<nsllm::trace::Trace>> {
-    static SINK: std::sync::OnceLock<Option<Arc<nsllm::trace::Trace>>> = std::sync::OnceLock::new();
-    SINK.get_or_init(|| {
-        let path = env_override("NS_TRACE")?;
-        match nsllm::trace::Trace::open(&path) {
-            Ok(t) => {
-                eprintln!("tracing every provider request to {path}");
-                Some(Arc::new(t))
-            }
-            Err(e) => {
-                eprintln!("NS_TRACE={path}: {e}");
-                std::process::exit(1);
-            }
-        }
-    })
-    .clone()
+/// The one tenant a process with no tenant set is: `ns-app` on its own is
+/// the company called `local` (multi-tenant plan §2).
+pub(crate) const DEFAULT_TENANT: &str = "local";
+
+/// The tenant whose wire trace this process writes, set once by `serve`
+/// before the first client is built. `None` is the CLI and every one-shot
+/// subcommand: one tenant on one box, which is what NS_TRACE has always
+/// meant.
+static TRACE_TENANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `serve`: name the tenant whose trace file this process writes, and refuse
+/// an NS_TRACE that cannot hold one file per tenant. Called at startup so a
+/// bad setting is a refusal rather than a surprise on the first request.
+pub(crate) fn set_trace_tenant(tenant: &str) -> Result<(), String> {
+    if let Some(raw) = env_override("NS_TRACE") {
+        trace_path(&raw, Some(tenant))?;
+    }
+    let _ = TRACE_TENANT.set(tenant.to_string());
+    Ok(())
 }
 
-fn client_for(
+/// Where NS_TRACE's value actually writes, for one tenant.
+///
+/// In the CLI (`tenant` is `None`) the value is the file, untouched. In
+/// serve mode it must be a directory and the tenant gets its own file inside
+/// it: one process serving twenty companies into one file would interleave
+/// every company's prompts, a disclosure the first operator to open it would
+/// cause by accident (multi-tenant plan H10).
+fn trace_path(raw: &str, tenant: Option<&str>) -> Result<String, String> {
+    let Some(tenant) = tenant else {
+        return Ok(raw.to_string());
+    };
+    let dir = std::path::Path::new(raw);
+    if dir.is_file() {
+        return Err(format!(
+            "NS_TRACE={raw} is a file; serving needs a directory to write one trace file per tenant into."
+        ));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("NS_TRACE={raw}: {e}"))?;
+    Ok(dir.join(format!("{tenant}.jsonl")).to_string_lossy().into())
+}
+
+/// The wire log, opened once per path when NS_TRACE names one. A path that
+/// cannot be opened is fatal: a trace the user asked for and did not get
+/// would let them debug against a file that is silently never written.
+fn trace_sink() -> Option<Arc<nsllm::trace::Trace>> {
+    type Sinks = std::sync::Mutex<std::collections::HashMap<String, Arc<nsllm::trace::Trace>>>;
+    static SINKS: std::sync::OnceLock<Sinks> = std::sync::OnceLock::new();
+    let raw = env_override("NS_TRACE")?;
+    let path = trace_path(&raw, TRACE_TENANT.get().map(String::as_str)).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let mut map = SINKS
+        .get_or_init(Sinks::default)
+        .lock()
+        .expect("trace registry");
+    if let Some(sink) = map.get(&path) {
+        return Some(sink.clone());
+    }
+    match nsllm::trace::Trace::open(&path) {
+        Ok(t) => {
+            eprintln!("tracing every provider request to {path}");
+            Some(map.entry(path).or_insert(Arc::new(t)).clone())
+        }
+        Err(e) => {
+            eprintln!("NS_TRACE={path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub(crate) fn client_for(
     target: &RoleTarget,
     transport: Arc<nsllm::transport::ReqwestTransport>,
     key: &str,
 ) -> nsllm::client::OpenRouterClient {
     let c = nsllm::client::OpenRouterClient::new(transport, key.to_string())
-        .with_throttle(throttle_for(target));
+        .with_throttle(throttle_for(target, key));
     let c = match &target.base_url {
         Some(url) => c.with_base_url(url.clone()),
         None => c,
@@ -256,63 +202,8 @@ fn client_for(
     }
 }
 
-/// Resolve a role, or exit: an unknown provider or a missing model must not
-/// fall back silently to someone else's endpoint.
-fn role_or_exit(cfg: &AppConfig, role: Role) -> RoleTarget {
-    match cfg.llm.role(role) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("config.toml: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Resolve one role's request shape, or exit: an unparseable `reasoning` or
-/// `sampling` must not be dropped silently — a shape that did not take looks
-/// exactly like a model that ignores the knob (M11 T0.2/T0.3).
-///
-/// The coercion line prints here, once per role at startup, so a request
-/// that quietly lost its `temperature` is never a mystery in a later 400.
-fn shape_or_exit(
-    cfg: &AppConfig,
-    target: &RoleTarget,
-    base: nsllm::provider::RequestShape,
-) -> nsllm::provider::RequestShape {
-    match cfg.llm.shape(target.role, &target.model, base) {
-        Ok((shape, note)) => {
-            if let Some(line) = note {
-                println!("{line}");
-            }
-            shape
-        }
-        Err(e) => {
-            eprintln!("config.toml: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn key_or_exit(target: &RoleTarget) -> String {
-    match target.key() {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "{} is not set — the {} role needs a provider API key.",
-                target.api_key_env,
-                target.role.as_str()
-            );
-            eprintln!(
-                "export {}=... , or switch to a local backend: NS_PROVIDER=ollama (ns-app providers).",
-                target.api_key_env
-            );
-            std::process::exit(1);
-        }
-    }
-}
-
 /// A non-empty env var, trimmed.
-fn env_override(name: &str) -> Option<String> {
+pub(crate) fn env_override(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|v| v.trim().to_string())
@@ -386,155 +277,6 @@ fn render_providers(cfg: &AppConfig) -> String {
     s
 }
 
-/// Load learned.toml (fatal when unparsable: a bad rule set must not be
-/// silently ignored — the pass would then propose against the wrong base).
-fn load_rules_or_exit(cfg: &AppConfig) -> RulesHandle {
-    match nsevolution::files::load_rules(std::path::Path::new(&cfg.evolution.learned_path)) {
-        Ok(r) => Arc::new(nsengine::arc_swap::ArcSwap::from_pointee(r)),
-        Err(e) => {
-            eprintln!("{}: {e}", cfg.evolution.learned_path);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn build_pass(
-    cfg: &AppConfig,
-    rules: RulesHandle,
-    tools: &[Arc<dyn Tool>],
-    emitter: &RoleTarget,
-    dry_run: bool,
-    spend: bool,
-) -> nsevolution::pass::EvolutionPass {
-    let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
-    let mut pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
-    // M12 T0.2: the flag the pass consults before it enters a paid lane.
-    pass_cfg.spend = spend;
-    let evaluate_cfg = pass_cfg.evaluate.clone();
-    let mut pass = nsevolution::pass::EvolutionPass::new(
-        rules,
-        specs.clone(),
-        std::path::PathBuf::from(&cfg.evolution.learned_path),
-        std::path::PathBuf::from(&cfg.evolution.ledger_path),
-        pass_cfg,
-    );
-    // M10 T5.3: the local scorer joins the always-present symbolic one when
-    // `[models] enabled`, and only then. It needs no key — that is the whole
-    // point of it — so it is added before the notes lane's key check, and a
-    // pass with no API key still grades with it.
-    //
-    // Nothing here checks whether the service is up. It should not: the lane
-    // disables itself after two unreachable calls and reports every signal
-    // `Unavailable`, so a service that is down costs two timeouts and prints
-    // `unavailable (service down)` beside its κ. A reachability probe at
-    // startup would only be a third way to learn the same thing, one pass
-    // earlier.
-    if cfg.models.enabled {
-        pass = pass.with_evaluator(std::sync::Arc::new(
-            nsevolution::local::LocalEvaluator::new(
-                nsevolution::local::LocalConfig {
-                    base_url: cfg.models.base_url.clone(),
-                    timeout_ms: cfg.models.timeout_ms,
-                    reask_cosine: cfg.models.reask_cosine,
-                    relevance_cut: cfg.models.relevance_cut,
-                    embed_model: cfg.recall.embed_model.clone(),
-                },
-                // The local scorer keeps the structural half of the symbolic
-                // checks rather than re-deriving it: I6 is two logged facts
-                // and grounding is span attribution, and an embedding
-                // improves on neither.
-                nsevolution::evaluate::SymbolicEvaluator {
-                    cfg: evaluate_cfg.clone(),
-                },
-            ),
-        ));
-    }
-    match emitter.key() {
-        None => {
-            eprintln!(
-                "{} is not set — notes lane skipped (symbolic lane needs no key).",
-                emitter.api_key_env
-            );
-            pass
-        }
-        Some(key) => {
-            let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
-            let model = emitter.model.clone();
-            // M12 T0.3: one sink per paid lane. The judge counts its own
-            // grades, but nothing counted the notes lane, which is where a
-            // pass actually spends — so each lane's client records into a
-            // sink of its own and the report sums them per run.
-            let judge_sink = Arc::new(nscore::UsageSink::new());
-            let proposer_sink = Arc::new(nscore::UsageSink::new());
-            let probe_sink = Arc::new(nscore::UsageSink::new());
-            let mut lane_sinks: Vec<(String, Arc<nscore::UsageSink>)> = Vec::new();
-            // M11 T1.3: the paid judge, and only when `[models] judge_model`
-            // names one. `for_model` is the gate — `None` in, `None` out —
-            // so an unset id cannot reach a request, and `pass` is handed
-            // back unchanged. It rides the emitter's endpoint, key and
-            // throttle because it is the same provider account; what makes
-            // it not a role is that it is added here, to the idle pass, and
-            // nowhere a turn can see it.
-            let mut pass = pass;
-            if let Some(judge) = nsevolution::client_eval::ClientEvaluator::for_model(
-                cfg.models.judge_model.as_deref(),
-                client_for(emitter, transport.clone(), &key)
-                    .with_usage_sink(judge_sink.clone(), "judge"),
-                |c| nsevolution::client_eval::JudgeConfig {
-                    // Sonnet 5's shape, and harmless on anything else: no
-                    // sampling key at all, one short reasoning block, a
-                    // 1,024-token cap on a two-field answer.
-                    unsampled: true,
-                    structured_output: nsllm::provider::for_base_url(
-                        emitter.base_url_or_default(),
-                    )
-                    .is_some_and(|p| p.structured_output),
-                    ..c
-                },
-                nsevolution::evaluate::SymbolicEvaluator { cfg: evaluate_cfg },
-            ) {
-                eprintln!(
-                    "judge: {} grades up to {} turns per idle pass, κ-gated at {:.2}.",
-                    cfg.models.judge_model.as_deref().unwrap_or_default(),
-                    cfg.models.evaluate_budget_turns,
-                    cfg.models.evaluator_min_kappa
-                );
-                pass = pass.with_evaluator(std::sync::Arc::new(judge));
-                lane_sinks.push(("judge".into(), judge_sink));
-            }
-            // The probe builds a fresh emitter per run, on the same target.
-            // Each of those clients records into the one probe sink, so a
-            // lane that builds a client per probed session is still one
-            // number in the report.
-            let factory_target = emitter.clone();
-            let factory_transport = transport.clone();
-            let factory_key = key.clone();
-            let factory_model = model.clone();
-            let factory_sink = probe_sink.clone();
-            let emitter_factory: nsevolution::notes::EmitterFactory = Arc::new(move || {
-                let c = client_for(&factory_target, factory_transport.clone(), &factory_key)
-                    .with_usage_sink(factory_sink.clone(), "probe");
-                Box::new(nsllm::emitter::CloudEmitter::new(c, factory_model.clone()))
-                    as Box<dyn nscore::Emitter>
-            });
-            let probe = nsevolution::notes::LiveProbe {
-                emitter: emitter_factory,
-                known_specs: specs,
-                persona: cfg.persona.text.clone(),
-            };
-            let proposer = nsevolution::notes::ClientNoteProposer {
-                client: client_for(emitter, transport, &key)
-                    .with_usage_sink(proposer_sink.clone(), "notes-proposer"),
-                model,
-            };
-            lane_sinks.push(("proposer".into(), proposer_sink));
-            lane_sinks.push(("probes".into(), probe_sink));
-            pass.with_notes(Box::new(probe), Box::new(proposer))
-                .with_lane_sinks(lane_sinks)
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let cfg_text = std::fs::read_to_string("config.toml").unwrap_or_default();
@@ -558,15 +300,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // M12 T1.1, resolved beside it: the emitter's preamble, the engine and
+    // M12 T1.1, checked beside it: the emitter's preamble, the engine and
     // the reply path all read the same one fact about the model in play.
-    let capability = match cfg.llm.capability() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
+    // The factory resolves it again for the tenant it builds; refusing it
+    // here keeps a bad `[llm]` a startup error for every subcommand.
+    if let Err(e) = cfg.llm.capability() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     // M10 T2.3, resolved here for the same reason: an unreadable depth is a
     // startup error, not a turn that silently runs at the default.
     if let Err(e) = cfg.router.depth() {
@@ -723,10 +464,12 @@ async fn main() {
                  (add --spend to buy them)."
             );
         }
-        let rules = load_rules_or_exit(&cfg);
-        let tools = build_tools(&cfg, schema_profile).await;
-        let emitter = role_or_exit(&cfg, Role::Emitter);
-        let pass = build_pass(&cfg, rules, &tools, &emitter, dry_run, spend);
+        let rules = factory::load_rules(&cfg).unwrap_or_else(|e| e.exit());
+        let tools = factory::build_tools(&cfg, schema_profile)
+            .await
+            .unwrap_or_else(|e| e.exit());
+        let emitter = factory::role(&cfg, Role::Emitter).unwrap_or_else(|e| e.exit());
+        let pass = factory::build_pass(&cfg, rules, &tools, &emitter, dry_run, spend);
         // M8 T3.1: `evolve` is the idle pass run by hand, and the embeddings
         // backfill is one of its steps — so this store needs the encoder the
         // running harness's does, or `ns-app evolve` would be the one place
@@ -763,300 +506,33 @@ async fn main() {
         }
     };
 
-    // Each role resolves on its own, so the emitter can sit on a local
-    // model while the replier stays in the cloud (or the other way round).
-    let emitter_target = role_or_exit(&cfg, Role::Emitter);
-    let replier_target = role_or_exit(&cfg, Role::Replier);
-    let emitter_key = key_or_exit(&emitter_target);
-    let replier_key = key_or_exit(&replier_target);
-
-    // Settled before anything is built or dialled. `build_tools` opens the
-    // pointer socket and arms an agent; failing after that on a typo in
-    // `[memory]` means the config was rejected only once it had already
-    // reached out to another machine. Every semantic check the chat path
-    // needs happens here, in one place, while the process still holds
-    // nothing.
-    let remember_residual = match cfg.memory.remember_residual() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("config.toml: {e}");
+    // The whole assembly, one tenant's worth (multi-tenant plan T1.1). It
+    // refuses rather than exits, so the shard that will host many of these
+    // survives one bad config; here, where the process is this tenant's,
+    // `exit` prints and stops exactly as the inlined version did.
+    let mode = if serve {
+        // Serving is the multi-tenant shape even at one tenant, so the wire
+        // trace is per tenant from here on (plan H10). Until Phase 3 gives
+        // the process a tenant set, that tenant is the plan's `local`.
+        if let Err(e) = set_trace_tenant(DEFAULT_TENANT) {
+            eprintln!("{e}");
             std::process::exit(1);
         }
-    };
-    let budget_mode = match cfg.memory.budget_mode() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("config.toml: {e}");
-            std::process::exit(1);
+        factory::Mode::Serve
+    } else {
+        factory::Mode::Cli {
+            session: cli_session,
         }
     };
-    let worker_slots = match cfg.engine.worker_slots() {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("config.toml: {e}");
-            std::process::exit(1);
-        }
-    };
-    // The listener too, for the same reason: a missing token or a bad
-    // address is refused here, before the pointer has been dialled.
-    let tcp = if serve {
-        let Some(token) = cfg.serve.token() else {
-            eprintln!(
-                "{} is not set — `ns-app serve` needs a token; every client presents it in \
-                 its first line.",
-                cfg.serve.token_env
-            );
-            std::process::exit(1);
-        };
-        match nschannel_tcp::TcpChannel::bind(
-            &cfg.serve.listen,
-            token,
-            cfg.serve.max_connections,
-            cfg.serve.allow_remote,
-        )
+    let engine = factory::build_engine(&cfg, mode, max_requests)
         .await
-        {
-            Ok(channel) => Some(channel),
-            Err(e) => {
-                eprintln!("serve: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
+        .unwrap_or_else(|e| e.exit());
+    // `Engine::run` consumes the engine, and the factory hands back the only
+    // handle there is, so this cannot be `None`. The `Arc` is the shape the
+    // tenant registry will hold them in (plan D3); a process that runs one
+    // tenant on stdin takes its engine back out.
+    let engine = Arc::into_inner(engine).expect("the factory returns the only engine handle");
 
-    let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
-    let rules = load_rules_or_exit(&cfg);
-    let tools = build_tools(&cfg, schema_profile).await;
-
-    // M7 T0.1: the engine hands each of its own calls a sink of its own
-    // through the call's context, so this one is only the fallback for calls
-    // made outside a turn — and it is what names the role in every record.
-    let usage = Arc::new(nscore::UsageSink::new());
-
-    let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(
-        nsllm::emitter::CloudEmitter::new(
-            client_for(&emitter_target, transport.clone(), &emitter_key)
-                .with_usage_sink(usage.clone(), "emitter"),
-            emitter_target.model.clone(),
-        )
-        .with_shape(shape_or_exit(
-            &cfg,
-            &emitter_target,
-            nsllm::emitter::default_shape(),
-        ))
-        // M10 P4. Both halves have to hold: the endpoint must forward a
-        // breakpoint at all, and the operator must have said the emitter
-        // prefix is worth one. Either off means the request is today's.
-        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter)
-        // M12 T1.1.
-        .with_capability(capability),
-    ));
-    b.set_replier(Box::new(
-        nsllm::replier::CloudReplier::new(
-            client_for(&replier_target, transport.clone(), &replier_key)
-                .with_usage_sink(usage.clone(), "replier"),
-            replier_target.model.clone(),
-        )
-        .with_shape(shape_or_exit(
-            &cfg,
-            &replier_target,
-            nsllm::replier::default_shape(),
-        ))
-        .with_prompt_cache(replier_target.prompt_cache),
-    ));
-    b.set_memory(Arc::new(models::store(&cfg)));
-    // Says whether the local model service is answering, when one is asked
-    // for. Before the channel so the line lands with the other startup
-    // reports rather than in the middle of the first turn.
-    models::announce(&cfg.models).await;
-    let serve_addr = tcp.as_ref().map(|c| c.local_addr());
-    if let Some(channel) = tcp {
-        // `serve`: the TCP channel and nothing else — no stdin, and no
-        // compose box, which joins a desktop to *one* session.
-        b.set_shared_channel(channel);
-    } else {
-        // stdin, plus the desktop's compose box when there is one to read.
-        // The agent has offered that channel since 2026-09-05 and nothing
-        // collected it; a line typed into the badge went into the outbox and
-        // stopped there.
-        let cli = nschannel_cli::CliChannel::new_stdio().with_session(cli_session.clone());
-        match desktop_messages(&cfg).await {
-            Some(client) => b.set_channel(Box::new(
-                nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
-            )),
-            None => b.set_channel(Box::new(cli)),
-        };
-    }
-    // M6 §5.1: the rolling summary runs on its own role (model, provider,
-    // key), so it can be swapped without touching the emitter or replier.
-    if cfg.memory.summary_every_turns > 0 {
-        let target = role_or_exit(&cfg, Role::Summarizer);
-        match target.key() {
-            Some(role_key) => {
-                let c = client_for(&target, transport.clone(), &role_key)
-                    .with_usage_sink(usage.clone(), "summarizer");
-                b.set_summarizer(Box::new(
-                    nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
-                        .with_shape(shape_or_exit(
-                            &cfg,
-                            &target,
-                            nsllm::summarizer::default_shape(),
-                        ))
-                        // M11 T0.5: the fixed fields as a schema, where the
-                        // endpoint the summarizer actually reaches knows the
-                        // field. The prompt keeps asking for JSON either way.
-                        .with_structured_output(
-                            nsllm::provider::for_base_url(target.base_url_or_default())
-                                .is_some_and(|p| p.structured_output),
-                        )
-                        .with_guidelines(cfg.memory.summary_guidelines.clone()),
-                ));
-            }
-            None => eprintln!(
-                "{} is not set — rolling summary disabled.",
-                target.api_key_env
-            ),
-        }
-    }
-    if idle_pass_allowed(max_requests, cfg.evolution.enabled) {
-        // Driver B: the idle timer runs this pass during quiet periods.
-        // Driver B is not a dry run, so it spends by the same rule it
-        // always did: `spend` only ever gates a dry run.
-        b.set_consolidator(Box::new(build_pass(
-            &cfg,
-            rules.clone(),
-            &tools,
-            &emitter_target,
-            false,
-            true,
-        )));
-    } else {
-        if let (Some(cap), true) = (max_requests, cfg.evolution.enabled) {
-            println!("metered run: the idle evolution pass is off (cap {cap})");
-        }
-        b.set_consolidator(Box::new(NoopConsolidator));
-    }
-    for t in &tools {
-        b.add_tool(t.clone());
-    }
-
-    // Assembly is a gate, not a formality: it refuses a missing slot, a
-    // duplicated one, two tools claiming the same name, and an action whose
-    // arguments would outrank the rationale in the compiled schema. An
-    // `expect` here reported all four as a panic with a backtrace, which is
-    // the least useful form for the only errors a user can actually fix.
-    let parts = match b.build() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ns-harness: cannot assemble the harness: {e}");
-            std::process::exit(1);
-        }
-    };
-    // M6 §6.6: the fact scope. The CLI is single-user, so every session
-    // shares `global`. `serve` is a multi-user channel, and a global scope
-    // there is a leak — what one client tells the engine would surface as a
-    // standing fact in every other client's context — so each session is
-    // its own scope. (§6.6 named the Telegram target; the TCP channel is the
-    // same shape.)
-    let scope_for: Arc<dyn Fn(&SessionId) -> String + Send + Sync> = if serve {
-        Arc::new(|sid| sid.0.clone())
-    } else {
-        Arc::new(|_| "global".to_string())
-    };
-    let engine_cfg = EngineConfig {
-        max_iterations: cfg.engine.max_iterations,
-        max_emit_retries: cfg.engine.max_emit_retries,
-        confirm_irreversible: cfg.engine.confirm_irreversible,
-        persona: cfg.persona.text.clone(),
-        templates: cfg.templates.clone(),
-        learned: rules,
-        idle_after: cfg.evolution.idle_after(),
-        window_turns: cfg.memory.window_turns,
-        caps: cfg.memory.caps(),
-        facts_in_context: cfg.memory.facts_in_context,
-        reply_grounding_check: cfg.memory.reply_grounding_check,
-        // M12 T1.2: a strong model is flagged and logged, never regenerated
-        // at — the second call buys nothing it did not already do.
-        reply_regenerate: capability != nscore::Capability::Strong,
-        // M12 T4.3: chat-tier act-or-answer, on unless `[llm]` says otherwise.
-        chat_act_or_answer: cfg.llm.chat_act_or_answer,
-        // M13 T2.1: and the same offer on Task and Deep, off unless asked.
-        act_or_answer_every_tier: cfg.llm.act_or_answer_every_tier,
-        // M13 T3.1: and the third branch, act *and* answer, likewise.
-        act_and_answer: cfg.llm.act_and_answer,
-        max_echo_ratio: cfg.memory.max_echo_ratio,
-        scope_for,
-        remember_residual,
-        pinned_prefixes: cfg.memory.pinned_prefixes.clone(),
-        pinned_max: cfg.memory.pinned_max,
-        relevant_max: cfg.memory.relevant_max,
-        activation_weight: cfg.memory.activation_weight,
-        activation_half_life_days: cfg.memory.activation_half_life_days,
-        obligations_max: cfg.memory.obligations_max,
-        obligation_check: cfg.memory.obligation_check,
-        guidance_max: cfg.memory.guidance_max,
-        // M12 T3.2: the engine has no model id of its own, so the resolved
-        // emitter target is what names the model notes are kept for.
-        archive_foreign_notes: cfg.memory.archive_foreign_notes,
-        learning_model: Some(emitter_target.model.clone()),
-        // M9 T0.4 is an evaluation knob with no config key: the live harness
-        // never ablates a block.
-        ablate: None,
-        summary_every_turns: cfg.memory.summary_every_turns,
-        summary_rebuild_every: cfg.memory.summary_rebuild_every,
-        summary_max_chars: cfg.memory.summary_max_chars,
-        summary_input_max_chars: cfg.memory.summary_input_max_chars,
-        recall_top_k: cfg.memory.recall_top_k,
-        trace_verbatim_lines: cfg.memory.trace_verbatim_lines,
-        tool_result_max_chars: cfg.memory.tool_result_max_chars,
-        recall_sessions: cfg.memory.recall_sessions,
-        schema_profile,
-        capability,
-        prune_inapplicable: true,
-        router: cfg
-            .router
-            .enabled
-            .then(|| Arc::new(cfg.router.router()) as Arc<dyn nsengine::router::Router>),
-        prompt_budget_tokens: cfg.memory.prompt_budget_tokens,
-        budget_mode,
-        show_budget_line: cfg.memory.show_budget_line,
-        worker_slots,
-        // M8 T3.2/T3.3 and M10 T3.6. Both off by default, and both inert
-        // without `[models] enabled` — the store gets no encoder, so the
-        // hybrid path *is* the lexical path and there are no digest vectors
-        // to be near.
-        recall_hybrid: cfg.recall.hybrid,
-        exemplars_max: cfg.memory.exemplars_max,
-        // M12 T6.1: no ceiling unless this run asked for one.
-        max_requests,
-    };
-    let engine = Engine::new(parts, engine_cfg);
-    println!(
-        "ns-harness — {}  |  {}",
-        emitter_target.describe(),
-        replier_target.describe()
-    );
-    if !cfg.engine.confirm_irreversible {
-        // Said out loud because it is the one thing a glance at the process
-        // cannot tell you, and because the gate it names is the one that would
-        // otherwise have asked before anything irreversible happened.
-        eprintln!(
-            "ns-harness: AUTONOMOUS — irreversible actions run without asking. \
-             Clicks and typing on the desktop happen unattended; the brakes left \
-             are on the machine itself (touch its mouse or keyboard to suspend \
-             input for 5s, or use the badge's pie menu)."
-        );
-    }
-    match serve_addr {
-        Some(addr) => println!(
-            "serving on {addr} — one session per connection, facts scoped per session  ·  \
-             `ns-app providers` lists the backends"
-        ),
-        None => println!("type text, /quit to exit  ·  `ns-app providers` lists the backends"),
-    }
     match engine.run().await {
         Ok(()) => {}
         // M12 T6.1: the ceiling this run was given, reached. A stop by
@@ -1208,19 +684,6 @@ mod tests {
         assert!(arg(&["--dry-run", "--dry-run"]).is_err());
     }
 
-    /// A cap the idle pass never sees is not a cap. Driver B runs between
-    /// turns on its own timer and spends real requests, so a metered run
-    /// turns it off entirely rather than hoping the quiet never comes.
-    #[test]
-    fn a_metered_run_installs_no_idle_evolution_pass() {
-        assert!(idle_pass_allowed(None, true), "the unmetered run keeps it");
-        assert!(!idle_pass_allowed(Some(60), true));
-        assert!(!idle_pass_allowed(Some(0), true));
-        // And evolution being off still wins, metered or not.
-        assert!(!idle_pass_allowed(None, false));
-        assert!(!idle_pass_allowed(Some(60), false));
-    }
-
     /// M12 T6.1: the two flags a metered live session is run with.
     #[test]
     fn repl_args_accept_max_requests_and_session() {
@@ -1259,52 +722,90 @@ mod tests {
         assert!(parse_repl_args(&[], Some("lots".into()), None).is_err());
     }
 
-    /// The whole client hop, against an agent that records and touches
-    /// nothing: the ten desktop actions arrive, and a bad token is refused
-    /// with the agent's reason rather than a hang.
-    #[tokio::test]
-    async fn a_configured_pointer_agent_becomes_ten_harness_actions() {
-        use nspointer::agent::{bind, serve_listener, Agent, AgentConfig, Limits, Listen};
-        use nspointer::platform::NullPlatform;
-        use nspointer::{Rect, Screen, ScreenId, Screens};
-        let platform = NullPlatform {
-            screens: Some(Screens {
-                screens: vec![Screen {
-                    id: ScreenId::from("S1"),
-                    bounds: Rect {
-                        x: 0,
-                        y: 0,
-                        w: 1920,
-                        h: 1080,
-                    },
-                    scale: 1.0,
-                    primary: true,
-                    label: "main".into(),
-                }],
-                state: 1,
-            }),
-            ..Default::default()
-        };
-        let cfg = AgentConfig {
-            token: "t0k".into(),
-            limits: Limits::default(),
-        };
-        let listener = bind(&cfg, &Listen::loopback(0)).await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let agent = Arc::new(Agent::new(platform, cfg));
-        tokio::spawn(async move {
-            let _ = serve_listener(agent, listener).await;
-        });
+    fn target(base_url: &str) -> RoleTarget {
+        RoleTarget {
+            role: Role::Emitter,
+            model: "m".into(),
+            base_url: Some(base_url.into()),
+            api_key_env: "NS_TEST_KEY".into(),
+            min_interval_ms: 100,
+            prompt_cache: false,
+            local: false,
+        }
+    }
 
-        let tools = connect_pointer(&addr, "t0k", nscore::SchemaProfile::Full).await.unwrap();
-        let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
-        assert_eq!(names.len(), 10, "{names:?}");
-        assert!(names.contains(&"pointer_click") && names.contains(&"pointer_ui_read"));
+    /// Multi-tenant plan H8: two companies on one provider, each with its
+    /// own key, have their own quota, so one's traffic must not pace the
+    /// other's.
+    #[test]
+    fn two_tenants_with_distinct_keys_get_distinct_throttles() {
+        let t = target("http://h8-distinct.invalid");
+        let acme = throttle_for(&t, "acme-key");
+        let globex = throttle_for(&t, "globex-key");
+        assert!(
+            !Arc::ptr_eq(&acme, &globex),
+            "one base URL, two keys, two quotas — the throttle must not be shared"
+        );
+    }
 
-        let err = match connect_pointer(&addr, "wrong", nscore::SchemaProfile::Full).await {
-            Err(e) => e,
-            Ok(_) => panic!("a wrong token must be refused"),
-        };
-        assert!(err.contains("refused"), "{err}");
+    /// The other half of H8: sharing a key means sharing a quota, so
+    /// sharing the pacing is the correct answer, not a leak.
+    #[test]
+    fn two_tenants_sharing_a_key_share_a_throttle() {
+        let t = target("http://h8-shared.invalid");
+        let first = throttle_for(&t, "one-account");
+        let second = throttle_for(&t, "one-account");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one key is one quota — the two tenants must share the pacing"
+        );
+        // And a role on another endpoint under the same key is still its own.
+        let elsewhere = throttle_for(&target("http://h8-elsewhere.invalid"), "one-account");
+        assert!(
+            !Arc::ptr_eq(&first, &elsewhere),
+            "one throttle per endpoint"
+        );
+    }
+
+    /// Multi-tenant plan H10: in serve mode NS_TRACE names a directory with
+    /// one file per tenant. A regular file there would interleave every
+    /// company's prompts, so it is refused before the first request.
+    #[test]
+    fn serve_mode_refuses_a_trace_path_that_is_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wire.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let raw = file.to_string_lossy().to_string();
+        let err = trace_path(&raw, Some("acme")).expect_err("a regular file is not a directory");
+        assert!(err.contains("NS_TRACE"), "names the variable: {err}");
+        assert!(err.contains("directory"), "says what it expects: {err}");
+        assert!(err.contains(&raw), "names the path given: {err}");
+        // A directory is accepted, and the file inside it is the tenant's.
+        let ok = trace_path(&dir.path().to_string_lossy(), Some("acme")).unwrap();
+        assert!(
+            ok.ends_with("acme.jsonl"),
+            "per tenant, not per process: {ok}"
+        );
+        let other = trace_path(&dir.path().to_string_lossy(), Some("globex")).unwrap();
+        assert_ne!(ok, other, "two tenants, two files");
+    }
+
+    /// The CLI is one tenant on one box: NS_TRACE keeps naming the file it
+    /// always named, byte for byte.
+    #[test]
+    fn cli_mode_still_accepts_a_trace_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wire.jsonl");
+        std::fs::write(&file, "").unwrap();
+        let raw = file.to_string_lossy().to_string();
+        assert_eq!(trace_path(&raw, None).unwrap(), raw);
+        // Not even a path that does not exist yet is inspected: the CLI
+        // hands NS_TRACE to `Trace::open` exactly as it was given.
+        let fresh = dir
+            .path()
+            .join("not-yet.jsonl")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(trace_path(&fresh, None).unwrap(), fresh);
     }
 }
