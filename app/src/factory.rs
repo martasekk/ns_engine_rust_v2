@@ -10,6 +10,7 @@
 
 use crate::config::{AppConfig, Role, RoleTarget};
 use crate::env_override;
+use crate::tenant::TenantConfig;
 use nscore::{HarnessBuilder, SessionId, Tool};
 use nsengine::store::NoopConsolidator;
 use nsengine::turn::{Engine, EngineConfig};
@@ -114,10 +115,14 @@ impl std::error::Error for StartupError {}
 /// dialled, the listener binds before the pointer socket is opened, and the
 /// three startup banners print between `Engine::new` and the first turn.
 pub(crate) async fn build_engine(
-    cfg: &AppConfig,
+    tenant: &TenantConfig,
     mode: Mode,
     max_requests: Option<u32>,
 ) -> Result<Arc<Engine>, StartupError> {
+    // The tenant's resolved config — the shared `config.toml` with this
+    // company's overlay already laid over it (plan T1.2). Everything below
+    // reads it exactly as it read the process-wide config before.
+    let cfg = &tenant.app;
     // Both were resolved in `main` before the subcommands, which is where
     // they are still reported from; re-resolving here is pure, and keeps
     // the factory a function of the tenant's config alone.
@@ -712,6 +717,92 @@ mod tests {
         // And evolution being off still wins, metered or not.
         assert!(!idle_pass_allowed(None, false));
         assert!(!idle_pass_allowed(Some(60), false));
+    }
+
+    /// Two companies, one base config, one process: each engine is built
+    /// from its own overlay, so each gets its own persona, its own HTTP tool
+    /// and its own store file (plan T1.2, D4). The base's own persona and
+    /// store reach neither.
+    #[tokio::test]
+    async fn factory_builds_two_tenants_with_different_personas_and_tools() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join(crate::tenant::TENANT_DIR)).expect("tenants dir");
+        let store = |id: &str| root.path().join(format!("ns-{id}.sqlite"));
+        // Ollama is the local provider: a key resolves without one being
+        // exported, so nothing here reaches for a network or a secret.
+        let base = format!(
+            "[llm]\nprovider = \"ollama\"\n\
+             [persona]\ntext = \"the shared persona\"\n\
+             [store]\npath = {:?}\n\
+             [evolution]\nlearned_path = {:?}\n",
+            store("base").display().to_string(),
+            root.path().join("learned.toml").display().to_string()
+        );
+        for (id, persona, tool) in [
+            ("acme", "acme's persona", "acme_orders"),
+            ("beta", "beta's persona", "beta_tickets"),
+        ] {
+            let overlay = format!(
+                "[persona]\ntext = {persona:?}\n\
+                 [store]\npath = {:?}\n\
+                 [[http_component]]\nname = {tool:?}\n\
+                 description = \"one company's own tool\"\n\
+                 url = \"https://example.invalid/{tool}\"\n\
+                 side_effect = \"Pure\"\n\
+                 args_schema = {{ type = \"object\" }}\n",
+                store(id).display().to_string()
+            );
+            std::fs::write(
+                root.path()
+                    .join(crate::tenant::TENANT_DIR)
+                    .join(format!("{id}.toml")),
+                overlay,
+            )
+            .expect("overlay");
+        }
+
+        let set = crate::tenant::load_set(&base, root.path(), "local").expect("two tenants");
+        assert_eq!(set.len(), 2);
+        for t in &set {
+            let tools = build_tools(&t.app, nscore::SchemaProfile::Full)
+                .await
+                .expect("the tenant's tools");
+            let names: Vec<&str> = tools.iter().map(|x| x.spec().name.as_str()).collect();
+            // Its own tool, and not the other company's.
+            assert!(
+                names.contains(&format!("{}_{}", t.id, tool_suffix(&t.id)).as_str()),
+                "{names:?}"
+            );
+            assert_eq!(names.len(), 2, "the time tool plus its own: {names:?}");
+            assert_eq!(t.app.persona.text, format!("{}'s persona", t.id));
+
+            let engine = build_engine(
+                t,
+                Mode::Cli {
+                    session: format!("{}-s1", t.id),
+                },
+                None,
+            )
+            .await
+            .expect("the tenant's engine");
+            // The engine is built and holds the only handle there is; what is
+            // observable from here is that it opened this tenant's store and
+            // no other.
+            assert_eq!(Arc::strong_count(&engine), 1);
+            assert!(store(&t.id).exists(), "{} has its own store", t.id);
+        }
+        assert!(
+            !store("base").exists(),
+            "the base store path belongs to no tenant once overlays name their own"
+        );
+    }
+
+    /// The tool each fixture tenant owns, by tenant id.
+    fn tool_suffix(id: &str) -> &'static str {
+        match id {
+            "acme" => "orders",
+            _ => "tickets",
+        }
     }
 
     /// The whole client hop, against an agent that records and touches

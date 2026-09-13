@@ -4,6 +4,7 @@ mod eval;
 mod factory;
 mod grade;
 mod models;
+mod tenant;
 
 use config::{AppConfig, Role, RoleTarget};
 use nscore::{SessionId, Tool};
@@ -524,7 +525,33 @@ async fn main() {
             session: cli_session,
         }
     };
-    let engine = factory::build_engine(&cfg, mode, max_requests)
+    // The tenant set this working directory serves (plan T1.2). With no
+    // `tenants/` directory that is one tenant called `local` built from
+    // `config.toml` alone, which is this process exactly as it was; the
+    // overlays are refused by name here rather than at the first turn.
+    let mut set = tenant::load_set(&cfg_text, std::path::Path::new("."), DEFAULT_TENANT)
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
+    if set.len() > 1 {
+        let ids: Vec<&str> = set.iter().map(|t| t.id.as_str()).collect();
+        eprintln!(
+            "{} tenants are configured ({}) — one process serves one tenant until the \
+             tenant registry lands (multi-tenant plan phase 3).",
+            set.len(),
+            ids.join(", ")
+        );
+        std::process::exit(1);
+    }
+    let mut tenant = set.remove(0);
+    // The same swap the base config gets: NS_PROVIDER=ollama ns-app.
+    tenant
+        .app
+        .llm
+        .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
+    let tenant = tenant;
+    let engine = factory::build_engine(&tenant, mode, max_requests)
         .await
         .unwrap_or_else(|e| e.exit());
     // `Engine::run` consumes the engine, and the factory hands back the only
