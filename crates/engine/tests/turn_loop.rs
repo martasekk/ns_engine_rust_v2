@@ -1,4 +1,5 @@
 use nscore::*;
+use nsengine::dispatch::TurnFailure;
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
@@ -5879,4 +5880,578 @@ async fn the_default_engine_names_the_global_scope() {
     for m in &manifests {
         assert_eq!(m.scope, Some("global".into()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-13 (many tenants at once) Phase 0: the property the tenant
+// boundary rests on, and the hazard it has to survive.
+
+/// T0.2. D4 puts one store behind each tenant, so isolation is a property of
+/// the store handle rather than of a key threaded through every call site.
+/// Two engines over two `InMemoryStore`s, one turn each under the *same*
+/// session id — the worst case, since a shared id is what a mapping function
+/// would have to disambiguate: each store holds only its own turn, both
+/// chains verify, and neither fact table holds the key the other engine
+/// wrote through `remember_fact`.
+#[tokio::test]
+async fn two_engines_on_separate_stores_do_not_see_each_others_events() {
+    let store_a = Arc::new(InMemoryStore::new());
+    let store_b = Arc::new(InMemoryStore::new());
+    let remember = |key: &str, value: &str| Proposal {
+        rationale: "durable".into(),
+        action: "remember_fact".into(),
+        args: serde_json::json!({ "key": key, "value": value }),
+    };
+    let engine_a = engine_with(
+        vec![remember("user.city", "Praha")],
+        vec![],
+        store_a.clone(),
+    );
+    let engine_b = engine_with(
+        vec![remember("user.name", "Bruno")],
+        vec![],
+        store_b.clone(),
+    );
+
+    // The same session id on both, so nothing but the store separates them.
+    let sid = SessionId("shared".into());
+    engine_a
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "i live in Praha".into(),
+        })
+        .await
+        .unwrap();
+    engine_b
+        .run_turn(Incoming {
+            session: sid.clone(),
+            text: "my name is Bruno".into(),
+        })
+        .await
+        .unwrap();
+
+    let events_a = store_a.load(&sid).await.unwrap();
+    let events_b = store_b.load(&sid).await.unwrap();
+    assert_eq!(
+        events_a
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::UserSaid { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["i live in Praha"],
+        "store a holds its own turn and nothing of b's"
+    );
+    assert_eq!(
+        events_b
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::UserSaid { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["my name is Bruno"],
+        "store b holds its own turn and nothing of a's"
+    );
+    assert_eq!(events_a.last().map(|e| e.turn), Some(1));
+    assert_eq!(events_b.last().map(|e| e.turn), Some(1));
+    assert!(
+        EventLog::from_events(sid.clone(), events_a)
+            .verify_chain()
+            .is_ok(),
+        "a's chain verifies"
+    );
+    assert!(
+        EventLog::from_events(sid, events_b).verify_chain().is_ok(),
+        "b's chain verifies"
+    );
+
+    let keys = |facts: Vec<Fact>| facts.into_iter().map(|f| f.key).collect::<Vec<_>>();
+    assert_eq!(
+        keys(store_a.facts("global", "user").await.unwrap()),
+        vec!["user.city".to_string()],
+        "a's fact table does not hold the key b remembered"
+    );
+    assert_eq!(
+        keys(store_b.facts("global", "user").await.unwrap()),
+        vec!["user.name".to_string()],
+        "b's fact table does not hold the key a remembered"
+    );
+}
+
+/// Answers session `a` at once; parks session `b`'s turn until released, and
+/// announces that it has parked. Ordering, not timing: `a`'s turn is the one
+/// that fails, and it must fail while `b`'s turn is in flight.
+struct ParkedUntilFailure {
+    b_parked: Arc<tokio::sync::Notify>,
+    release_b: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Emitter for ParkedUntilFailure {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        if session_of(&ctx.user_text) == "b" {
+            self.b_parked.notify_one();
+            self.release_b.notified().await;
+        } else {
+            self.b_parked.notified().await;
+        }
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// A `SessionsChannel` whose `send` fails for one session — one tenant's
+/// widget gone, the rest of the shard fine.
+struct SendFailsFor {
+    script: SessionsChannel,
+    session: &'static str,
+}
+#[async_trait::async_trait]
+impl Channel for SendFailsFor {
+    async fn recv(&self) -> Result<Incoming, ChannelError> {
+        self.script.recv().await
+    }
+    async fn send(&self, s: &SessionId, t: &str) -> Result<(), ChannelError> {
+        if s.0 == self.session {
+            return Err(ChannelError::Io("the widget went away".into()));
+        }
+        self.script.send(s, t).await
+    }
+}
+
+/// T0.4, hazard H2: *a turn error ends the process, taking every other tenant
+/// with it*. Today's behaviour, asserted so that changing it is a visible
+/// decision — `Dispatcher::reap` turns any `EngineError` from a session task
+/// into the return value of `run`, and dropping the `JoinSet` on the way out
+/// aborts every other session's turn mid-flight.
+///
+/// Session `b`'s turn is parked at its emitter until `a`'s has failed, so the
+/// assertion is about teardown and not about a scheduling race: `b`'s turn is
+/// provably in flight when the dispatcher gives up, and `b` still never
+/// reaches its log, even after the release that would have let it finish.
+///
+/// Phase 2 inverts this into
+/// `a_failing_turn_ends_its_session_not_the_dispatcher` and keeps this test as
+/// the documentation of what the failure classification prevents, the way
+/// T0.3 of the 2026-09-10 plan was kept.
+///
+/// **The plan's injector does not work.** Phase 0 T0.4 says "a scripted
+/// emitter errors on session `a`", but an `EmitError` — like a `ReplyError` —
+/// never leaves `run_turn`: it is logged and answered with the "Sorry, I
+/// couldn't complete that" fallback (`fallback_reply_explains_provider_error`
+/// above). Only `EngineError`'s three variants — store, channel, request cap
+/// — end a turn, so the failure injected here is a channel send that fails
+/// for `a` alone. D7 keeps store failures fatal on purpose, which rules the
+/// store out as the injector for a test Phase 2 has to invert.
+#[tokio::test]
+async fn a_failing_turn_ends_the_whole_dispatcher() {
+    let store = Arc::new(InMemoryStore::new());
+    let b_parked = Arc::new(tokio::sync::Notify::new());
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let mut builder = HarnessBuilder::new();
+    builder.set_emitter(Box::new(ParkedUntilFailure {
+        b_parked: b_parked.clone(),
+        release_b: release_b.clone(),
+    }));
+    builder.set_replier(Box::new(ScriptedReplier));
+    builder.set_memory(store.clone());
+    builder.set_channel(Box::new(SendFailsFor {
+        script: SessionsChannel(std::sync::Mutex::new(
+            [("b", "hello from b"), ("a", "hello from a")]
+                .into_iter()
+                .collect(),
+        )),
+        session: "a",
+    }));
+    builder.set_consolidator(Box::new(NoopConsolidator));
+    // Two slots: `b`'s parked turn holds one for as long as it is in flight.
+    let e = Engine::with_clock(
+        builder.build().unwrap(),
+        dispatcher_config(2),
+        Box::new(|| Timestamp(42)),
+    );
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), e.run())
+        .await
+        .expect("session a's failure ends the run")
+        .expect_err("one session's failed turn is fatal for the dispatcher");
+    assert!(
+        matches!(err, nsengine::turn::EngineError::Channel(_)),
+        "the session's error is what `run` returns, got: {err:?}"
+    );
+
+    // Releasing after the fact changes nothing: `b`'s task went with the
+    // dispatcher.
+    release_b.notify_waiters();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let events = store.load(&SessionId("b".into())).await.unwrap();
+    assert!(
+        events.is_empty(),
+        "session b never completed its queued turn, got: {:?}",
+        events
+            .iter()
+            .map(|ev| kind_name(&ev.kind))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plan 2026-09-13 (many tenants at once) Phase 2: failure isolation. The
+// dispatcher's `TurnFailure` policy, read once per failed session, and what
+// each of `EngineError`'s three variants costs under it.
+
+/// Builds a dispatcher-driven engine over `channel` and runs it under
+/// `policy`, with the scripted roles every test in this section shares.
+fn isolating_engine(
+    store: Arc<dyn MemoryStore>,
+    channel: Box<dyn Channel>,
+    emitter: Box<dyn Emitter>,
+    max_requests: Option<u32>,
+) -> Engine {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(emitter);
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_channel(channel);
+    b.set_consolidator(Box::new(NoopConsolidator));
+    Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_requests,
+            // Two slots, so a session parked or failing never holds up the
+            // session the assertion is about.
+            ..dispatcher_config(2)
+        },
+        Box::new(|| Timestamp(42)),
+    )
+}
+
+fn said(events: &[Event]) -> Vec<(u32, String)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::UserSaid { text } => Some((e.turn, text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// T2.1, the inversion of `a_failing_turn_ends_the_whole_dispatcher` above:
+/// the same injector, the same failure, `TurnFailure::Isolate` instead of the
+/// default. `EngineError::Channel` is one session's connection going away, so
+/// under `Isolate` it ends that session and its mailbox and nothing else —
+/// `run` returns `Ok`, and session `b` runs both of the turns queued behind
+/// `a`'s failure.
+#[tokio::test]
+async fn a_failing_turn_ends_its_session_not_the_dispatcher() {
+    let store = Arc::new(InMemoryStore::new());
+    let e = isolating_engine(
+        store.clone(),
+        Box::new(SendFailsFor {
+            script: SessionsChannel(std::sync::Mutex::new(
+                [("a", "a one"), ("b", "b one"), ("b", "b two")]
+                    .into_iter()
+                    .collect(),
+            )),
+            session: "a",
+        }),
+        Box::new(ScriptedEmitter::new(vec![])),
+        None,
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        e.run_with_policy(TurnFailure::Isolate),
+    )
+    .await
+    .expect("the dispatcher must not hang on a's failure")
+    .expect("a failed session is not the dispatcher's failure");
+
+    let events_b = store.load(&SessionId("b".into())).await.unwrap();
+    assert_eq!(
+        said(&events_b),
+        vec![(1, "b one".to_string()), (2, "b two".to_string())],
+        "session b ran both turns queued behind a's failure"
+    );
+    assert!(
+        EventLog::from_events(SessionId("b".into()), events_b)
+            .verify_chain()
+            .is_ok(),
+        "b's chain verifies"
+    );
+    // `a`'s turn itself completed — the send that failed is after
+    // `run_turn` — so what ended is the session, not the turn's record.
+    let events_a = store.load(&SessionId("a".into())).await.unwrap();
+    assert_eq!(said(&events_a), vec![(1, "a one".to_string())]);
+}
+
+/// A store that fails `append` for one session and delegates everything else,
+/// so a store failure can be injected into one session of a running
+/// dispatcher without the other sessions losing a working store.
+struct AppendFailsFor {
+    inner: Arc<InMemoryStore>,
+    session: &'static str,
+}
+
+#[async_trait::async_trait]
+impl MemoryStore for AppendFailsFor {
+    async fn append(&self, s: &SessionId, events: &[Event]) -> Result<(), StoreError> {
+        if s.0 == self.session {
+            return Err(StoreError::Io("the disk went away".into()));
+        }
+        self.inner.append(s, events).await
+    }
+    async fn load(&self, s: &SessionId) -> Result<Vec<Event>, StoreError> {
+        self.inner.load(s).await
+    }
+    async fn search_turns(
+        &self,
+        s: &SessionId,
+        q: &str,
+        k: usize,
+    ) -> Result<Vec<TurnHit>, StoreError> {
+        self.inner.search_turns(s, q, k).await
+    }
+    async fn put_session_digest(&self, d: &SessionDigest) -> Result<(), StoreError> {
+        self.inner.put_session_digest(d).await
+    }
+    async fn session_digests(&self, s: &str, n: usize) -> Result<Vec<SessionDigest>, StoreError> {
+        self.inner.session_digests(s, n).await
+    }
+    async fn search_digests(
+        &self,
+        s: &str,
+        q: &str,
+        k: usize,
+    ) -> Result<Vec<SessionDigest>, StoreError> {
+        self.inner.search_digests(s, q, k).await
+    }
+    async fn facts(&self, s: &str, p: &str) -> Result<Vec<Fact>, StoreError> {
+        self.inner.facts(s, p).await
+    }
+    async fn fact_history(&self, s: &str, k: &str) -> Result<Vec<Fact>, StoreError> {
+        self.inner.fact_history(s, k).await
+    }
+    async fn put_fact(&self, f: Fact) -> Result<(), StoreError> {
+        self.inner.put_fact(f).await
+    }
+    async fn forget_fact(&self, s: &str, k: &str, at: Timestamp) -> Result<bool, StoreError> {
+        self.inner.forget_fact(s, k, at).await
+    }
+    async fn purge_facts(&self, s: &str) -> Result<usize, StoreError> {
+        self.inner.purge_facts(s).await
+    }
+    async fn search_facts(&self, s: &str, q: &str, k: usize) -> Result<Vec<Fact>, StoreError> {
+        self.inner.search_facts(s, q, k).await
+    }
+    async fn scopes(&self) -> Result<Vec<String>, StoreError> {
+        self.inner.scopes().await
+    }
+    async fn artifact(&self, id: &ArtifactId) -> Result<Vec<u8>, StoreError> {
+        self.inner.artifact(id).await
+    }
+    async fn put_artifact(&self, c: Vec<u8>) -> Result<ArtifactId, StoreError> {
+        self.inner.put_artifact(c).await
+    }
+    async fn sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+        self.inner.sessions().await
+    }
+}
+
+/// T2.1, D7: `EngineError::Store` is fatal for the shard under *both*
+/// policies. Isolating it would be isolating the one failure that is not one
+/// tenant's — every other session here writes to a store too — so `Isolate`
+/// answers a store failure exactly as `Fatal` does.
+#[tokio::test]
+async fn a_store_error_still_ends_the_run() {
+    let inner = Arc::new(InMemoryStore::new());
+    let e = isolating_engine(
+        Arc::new(AppendFailsFor {
+            inner: inner.clone(),
+            session: "a",
+        }),
+        Box::new(SessionsChannel(std::sync::Mutex::new(
+            [("a", "a one"), ("b", "b one")].into_iter().collect(),
+        ))),
+        Box::new(ScriptedEmitter::new(vec![])),
+        None,
+    );
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        e.run_with_policy(TurnFailure::Isolate),
+    )
+    .await
+    .expect("a store failure must end the run rather than hang")
+    .expect_err("a store failure ends the run under Isolate too");
+    assert!(
+        matches!(err, nsengine::turn::EngineError::Store(_)),
+        "the store's error is what `run` returns, got: {err:?}"
+    );
+}
+
+/// T2.1: `EngineError::RequestCap` is not a fault — it is a metered run
+/// reaching its ceiling — so it ends this tenant's dispatcher and nothing
+/// wider. Under `Isolate` that is one tenant of a shard, which is why the
+/// cap must *not* be classified as one session's failure: a cap is the
+/// tenant's, and leaving the other sessions running would spend past it.
+#[tokio::test]
+async fn a_request_cap_ends_one_tenant_and_not_the_shard() {
+    let store = Arc::new(InMemoryStore::new());
+    let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut b = HarnessBuilder::new();
+    // Two requests per turn, so a cap of two lets the first turn finish and
+    // refuses the second (`the_engine_stops_at_the_request_cap`).
+    b.set_emitter(Box::new(SessionTaggedEmitter {
+        records: records.clone(),
+    }));
+    b.set_replier(Box::new(SessionTaggedReplier {
+        records: records.clone(),
+    }));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
+        [("a", "hello from a"), ("a", "hello from a")]
+            .into_iter()
+            .collect(),
+    ))));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let e = Engine::with_clock(
+        b.build().unwrap(),
+        EngineConfig {
+            max_requests: Some(2),
+            ..dispatcher_config(2)
+        },
+        Box::new(|| Timestamp(42)),
+    );
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        e.run_with_policy(TurnFailure::Isolate),
+    )
+    .await
+    .expect("the cap must end the dispatcher rather than hang")
+    .expect_err("a spent cap ends this tenant's dispatcher");
+    assert!(
+        matches!(err, nsengine::turn::EngineError::RequestCap { .. }),
+        "the cap is what `run` returns, got: {err:?}"
+    );
+    assert_eq!(
+        said(&store.load(&SessionId("a".into())).await.unwrap()),
+        vec![(1, "hello from a".to_string())],
+        "the first turn ran and the capped one did not"
+    );
+}
+
+/// An emitter that panics for one session. The turn is not "wrong" in any
+/// way the engine has a variant for — it is a bug, which is what T2.2 is
+/// about.
+struct PanicsFor {
+    session: &'static str,
+}
+#[async_trait::async_trait]
+impl Emitter for PanicsFor {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        assert!(
+            !ctx.user_text.starts_with(self.session),
+            "the emitter panicked on session {}",
+            self.session
+        );
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// T2.2: a panic inside a turn is contained at the session-task boundary
+/// under `Isolate` and reported as a failed session. Without the
+/// `catch_unwind` the panic unwinds the task, `reap` sees a `JoinError`, and
+/// the shard goes with it — which is still what happens under `Fatal`, where
+/// the panic is resumed on purpose.
+#[tokio::test]
+async fn a_panicking_turn_does_not_take_the_shard_down() {
+    let store = Arc::new(InMemoryStore::new());
+    let e = isolating_engine(
+        store.clone(),
+        Box::new(SessionsChannel(std::sync::Mutex::new(
+            [("a", "a one"), ("b", "b one"), ("b", "b two")]
+                .into_iter()
+                .collect(),
+        ))),
+        Box::new(PanicsFor { session: "a" }),
+        None,
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        e.run_with_policy(TurnFailure::Isolate),
+    )
+    .await
+    .expect("the dispatcher must not hang on a panicking session")
+    .expect("a contained panic is not the dispatcher's failure");
+
+    let events_b = store.load(&SessionId("b".into())).await.unwrap();
+    assert_eq!(
+        said(&events_b),
+        vec![(1, "b one".to_string()), (2, "b two".to_string())],
+        "session b ran both its turns beside a panicking session"
+    );
+    assert!(
+        EventLog::from_events(SessionId("b".into()), events_b)
+            .verify_chain()
+            .is_ok(),
+        "b's chain verifies"
+    );
+}
+
+/// T2.3: a session whose turn failed is not a poisoned session. The failed
+/// turn had already appended its events, so the next message on that session
+/// must fold onto them and verify — turns 1 and 2, both `UserSaid`s in
+/// order, chain intact. Appends are idempotent by event id, so this is
+/// expected to hold; the test is here to fail loudly if `append` changes.
+#[tokio::test]
+async fn a_session_whose_turn_failed_accepts_the_next_message_and_verifies() {
+    let store = Arc::new(InMemoryStore::new());
+    let e = isolating_engine(
+        store.clone(),
+        // Every send for `a` fails, so the second message lands on a session
+        // whose previous turn failed rather than on a recovered one.
+        Box::new(SendFailsFor {
+            script: SessionsChannel(std::sync::Mutex::new(
+                [("a", "a one"), ("a", "a two")].into_iter().collect(),
+            )),
+            session: "a",
+        }),
+        Box::new(ScriptedEmitter::new(vec![])),
+        None,
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        e.run_with_policy(TurnFailure::Isolate),
+    )
+    .await
+    .expect("the dispatcher must not hang on a repeatedly failing session")
+    .expect("a failed session is not the dispatcher's failure");
+
+    let sid = SessionId("a".into());
+    let events = store.load(&sid).await.unwrap();
+    assert_eq!(
+        said(&events),
+        vec![(1, "a one".to_string()), (2, "a two".to_string())],
+        "the message after the failure folded onto the failed turn's log"
+    );
+    assert!(
+        EventLog::from_events(sid, events).verify_chain().is_ok(),
+        "the log a failed turn left behind still verifies"
+    );
 }

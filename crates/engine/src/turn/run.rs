@@ -707,10 +707,27 @@ impl Engine {
     /// `dispatch::Dispatcher`; this builds it, so the CLI and the tests keep
     /// the one call they had.
     pub async fn run(self) -> Result<(), EngineError> {
+        self.run_with_policy(crate::dispatch::TurnFailure::Fatal)
+            .await
+    }
+
+    /// The same run, answering a failed turn the way `policy` says (plan
+    /// 2026-09-13 Phase 2, T2.1). `run` is `Fatal`, the CLI's and today's;
+    /// a shard hosting many tenants runs each of its tenants under
+    /// `Isolate`.
+    pub async fn run_with_policy(
+        self,
+        policy: crate::dispatch::TurnFailure,
+    ) -> Result<(), EngineError> {
         let channel = self.parts.channel.clone();
         let slots = self.cfg.worker_slots;
-        crate::dispatch::Dispatcher::new(std::sync::Arc::new(self), channel, slots)
-            .run()
-            .await
+        crate::dispatch::Dispatcher::with_failure_policy(
+            std::sync::Arc::new(self),
+            channel,
+            slots,
+            policy,
+        )
+        .run()
+        .await
     }
 }
