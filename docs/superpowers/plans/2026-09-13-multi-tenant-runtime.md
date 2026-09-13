@@ -356,6 +356,14 @@ has one tenant and wrong the moment it has two: the second tenant's prompts woul
 in the first tenant's file. The sink registry underneath it is already keyed by resolved
 path, so it is ready; only the single-valued tenant id has to go.
 
+**T3.10 The store path defaults per tenant instead of being mandatory.** Added
+2026-09-13 after T1.2 landed. Two overlays that resolve to the same store path are now
+refused naming both, which is H9 and is right. The consequence is that every overlay
+must set its own store path by hand, and forgetting is a startup refusal rather than a
+working default. D4 already says the file is `ns-<tenant>.sqlite` opened by the factory,
+so derive it from the tenant id when the overlay is silent. The uniqueness check stays
+as the guard against someone setting two paths to the same value deliberately.
+
 **CLI identical:** one tenant, one slot, never evicted.
 
 **Exit.** Green; one process serves two tenants with different personas over one port;
@@ -389,8 +397,12 @@ let session = SessionId(format!("{}/web/{}", claims.iss, claims.sub));
 The subject is opaque, never an email address or a phone number. It becomes the fact
 scope key and is written into a durable log the evolution pass later mines.
 
-**T4.3 Keys and lifetime.** Two active signing keys per tenant so rotation is not an
-outage. `exp` enforced. `iat` compared against a per-tenant floor, which is how bulk
+**T4.3 Keys and lifetime.** *Note added 2026-09-13: T1.2 leaves `[serve] token_env`
+overlayable, and it should not be. That token belongs to the listener, and the listener
+is one socket owned by the process, so a tenant must not be able to set it — add it to
+the process-owned list. A tenant's own signing keys are a different field, introduced
+here, and those are per tenant by definition.* Two active signing keys per tenant so
+rotation is not an outage. `exp` enforced. `iat` compared against a per-tenant floor, which is how bulk
 revocation works without a revocation list. Keys come from the tenant overlay (T1.2),
 read from the environment, never from the repo.
 
