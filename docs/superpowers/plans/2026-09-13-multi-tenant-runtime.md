@@ -315,9 +315,51 @@ un-`#[ignore]`d — H1); `an_evicted_tenant_is_rebuilt_on_its_next_message`;
 `a_message_landing_during_tenant_teardown_is_not_lost` (H5);
 `a_tenants_request_cap_does_not_stop_another_tenant`.
 
+**T3.0 `worker_slots` needs a serve default, and it is not 1.** Added 2026-09-13 while
+reviewing. `[engine] worker_slots` defaults to `1`, which is the CLI's serial behaviour
+and correct for one person at a terminal. It is also what `ns-app serve` runs today, and
+it means the *current* serve mode handles one turn at a time across every connected
+client: the second user to speak waits for the first user's model calls to finish. That
+is a live limitation, not a future one, and it is worth a measurement before anyone
+demonstrates the product.
+
+Per tenant it gets worse rather than better, because a company's fifty users would queue
+behind each other inside their own dispatcher. So serve mode needs its own default — a
+small number of tenant slots under a larger shard-wide cap — while the CLI keeps `1`.
+What a slot overlaps is *waiting*, not requests: the throttle and the daily allowance
+are per credential and unaffected. That is exactly why more slots are close to free here
+and why the current default costs latency for nothing.
+
+**T3.7 A dispatcher's `Err` ends its tenant, never the shard.** Added 2026-09-13 after
+reviewing the Phase 2 code as built. Phase 2 classifies `Store` as fatal for the process
+under both policies, on the reasoning that every other tenant writes to a store too.
+Decision D4 makes that reasoning false: each tenant has its own file, so a corrupt page,
+a lock held by something else, or a per-file permission problem belongs to one company
+and not to the nineteen beside it. A genuinely shared condition, a full disk, is the
+exception rather than the rule.
+
+So the shard-level judgement moves up to where it belongs. `Dispatcher::run` returning
+`Err` means *this tenant is finished*; the registry decides what that costs, and only
+the registry can see the pattern that justifies ending the process — the same error
+arriving from every tenant at once. Phase 2's classification is unchanged and still
+correct at its own level; what changes is who reads its verdict.
+
+**T3.8 Quarantine a failing tenant with backoff.** A tenant whose engine fails to build,
+or whose dispatcher ends in error, must not be rebuilt on its next message forever. A
+permanently broken store would otherwise spin: message, build, fail, message, build,
+fail. Hold a failed tenant with exponential backoff and report it, so a broken company
+is visibly broken rather than quietly burning the shard's CPU.
+
+**T3.9 `TRACE_TENANT` becomes per tenant.** T1.5 routes the wire trace through a
+process-level `OnceLock<String>` set once at startup, which is correct while serve mode
+has one tenant and wrong the moment it has two: the second tenant's prompts would land
+in the first tenant's file. The sink registry underneath it is already keyed by resolved
+path, so it is ready; only the single-valued tenant id has to go.
+
 **CLI identical:** one tenant, one slot, never evicted.
 
-**Exit.** Green; one process serves two tenants with different personas over one port.
+**Exit.** Green; one process serves two tenants with different personas over one port;
+no tenant can end the shard on its own.
 
 ---
 

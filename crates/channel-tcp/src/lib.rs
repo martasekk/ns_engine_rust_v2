@@ -14,10 +14,13 @@
 //! - The client's first line: `{"token":"…","session":"…"}`. A wrong or
 //!   missing token, an empty session, or a line that is not that object
 //!   closes the connection with nothing sent back — a caller that failed the
-//!   hello learns nothing about why. A valid hello *claims* the session:
-//!   replies for that session id go to this connection, and a later
-//!   connection claiming the same id takes over — most recent wins, and the
-//!   displaced connection is closed so its client knows.
+//!   hello learns nothing about why. A valid hello *joins* the session:
+//!   replies for that session id go to every connection holding it, and a
+//!   later connection claiming the same id joins the others rather than
+//!   displacing them. One conversation across a user's windows is the
+//!   normal case — a second tab is not an impostor — and displacing would
+//!   leave two tabs knocking each other offline in a loop (multi-tenant
+//!   plan Phase 5, hazard H7).
 //! - Then, from the client: `{"text":"…"}` per message. A line that is not
 //!   that object is ignored, with one line on stderr naming the peer. EOF
 //!   ends the connection's task and releases its slot.
@@ -29,13 +32,14 @@
 //! `crates/pointer/src/agent.rs`; the lessons in `docs/windows-handoff.md`
 //! §1). Each pushes into one inbound queue that `recv` drains — the
 //! dispatcher keeps exactly one `recv` pending, and a full queue holds the
-//! sockets back rather than dropping. `send` routes by session id to the
-//! connection holding that session; a reply for a session with no live
-//! connection, or one that has stopped reading, is logged and dropped — the
-//! engine's log already has it, and that is what the log is for. The
-//! connection cap is machine-wide, not per socket, and the accept loop keeps
-//! an inbound sender of its own, so `recv` reports `Closed` only once the
-//! accept loop itself has ended.
+//! sockets back rather than dropping. `send` routes by session id to every
+//! connection holding that session, each with its own bounded queue; a
+//! reply for a session with no live connection, or for one that has stopped
+//! reading, is logged and dropped — the engine's log already has it, and
+//! that is what the log is for. One peer that stops reading therefore loses
+//! its own replies and nobody else's. The connection cap is machine-wide,
+//! not per socket, and the accept loop keeps an inbound sender of its own,
+//! so `recv` reports `Closed` only once the accept loop itself has ended.
 //!
 //! # Deliberately not here
 //!
@@ -94,11 +98,12 @@ struct Shared {
     max_connections: usize,
     /// Live connections, machine-wide.
     live: AtomicUsize,
-    /// Numbers connections, so one that hangs up releases its session only
-    /// if it still holds it.
+    /// Numbers connections, so one that hangs up removes its own entry and
+    /// leaves the others holding the same session alone.
     next_conn: AtomicU64,
-    /// Which connection holds each session, and the way to write to it.
-    outbound: StdMutex<HashMap<SessionId, Outbound>>,
+    /// Which connections hold each session, and the way to write to each.
+    /// A session with no holder has no entry at all.
+    outbound: StdMutex<HashMap<SessionId, Vec<Outbound>>>,
 }
 
 struct Outbound {
@@ -178,29 +183,38 @@ impl Channel for TcpChannel {
     /// engine's log, and the session's turn must not fail over a peer that
     /// left mid-turn.
     async fn send(&self, session: &SessionId, text: &str) -> Result<(), ChannelError> {
-        let tx = self
+        // Cloned out from under the lock: the lock is a std one, and what
+        // follows is per connection.
+        let holders: Vec<mpsc::Sender<String>> = self
             .shared
             .outbound
             .lock()
             .expect("outbound map")
             .get(session)
-            .map(|o| o.tx.clone());
-        let Some(tx) = tx else {
+            .map(|v| v.iter().map(|o| o.tx.clone()).collect())
+            .unwrap_or_default();
+        if holders.is_empty() {
             eprintln!(
                 "tcp: no connection holds session {}; the reply is in the log only",
                 session.0
             );
             return Ok(());
-        };
-        if let Err(e) = tx.try_send(text.to_string()) {
-            let why = match e {
-                TrySendError::Full(_) => "has stopped reading",
-                TrySendError::Closed(_) => "has gone",
-            };
-            eprintln!(
-                "tcp: the connection holding session {} {why}; the reply is in the log only",
-                session.0
-            );
+        }
+        // One queue per connection, and `try_send` on each: a peer that has
+        // stopped reading loses this reply and delays neither `send` nor
+        // the other windows on its session.
+        for tx in holders {
+            if let Err(e) = tx.try_send(text.to_string()) {
+                let why = match e {
+                    TrySendError::Full(_) => "has stopped reading",
+                    TrySendError::Closed(_) => "has gone",
+                };
+                eprintln!(
+                    "tcp: a connection holding session {} {why}; the reply is in the log only \
+                     for that window",
+                    session.0
+                );
+            }
         }
         Ok(())
     }
@@ -247,9 +261,9 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, inbound: mpsc::
 }
 
 /// One connection: the hello, then lines in until EOF. Lives exactly as
-/// long as its writer does — which ends when the session is taken over by
-/// a newer connection or the socket stops taking replies — so a displaced
-/// client sees EOF rather than silence.
+/// long as its writer does — which ends when its own entry is released or
+/// the socket stops taking replies — and another connection joining the
+/// same session touches neither.
 async fn connection(
     shared: &Shared,
     inbound: mpsc::Sender<Incoming>,
@@ -281,17 +295,19 @@ async fn connection(
     };
 
     let (tx, rx) = mpsc::channel(OUTBOUND_DEPTH);
-    // The displaced entry, if any, is dropped here and not held: its sender
-    // is what keeps the older connection's writer — and so the older
-    // connection — alive.
-    let displaced = shared
-        .outbound
-        .lock()
-        .expect("outbound map")
-        .insert(session.clone(), Outbound { conn, tx })
-        .is_some();
-    if displaced {
-        eprintln!("tcp: {peer} takes over session {}", session.0);
+    // Joining, not taking over: the entries already there keep their
+    // senders, and so their connections.
+    let holders = {
+        let mut map = shared.outbound.lock().expect("outbound map");
+        let holders = map.entry(session.clone()).or_default();
+        holders.push(Outbound { conn, tx });
+        holders.len()
+    };
+    if holders > 1 {
+        eprintln!(
+            "tcp: {peer} joins session {} ({holders} windows)",
+            session.0
+        );
     }
     // Writing is its own task, so a reply never waits behind a read.
     let mut writer = tokio::spawn(write_replies(w, session.clone(), rx));
@@ -300,8 +316,8 @@ async fn connection(
         line.clear();
         let read = tokio::select! {
             read = reader.read_line(&mut line) => read,
-            // Displaced, or the socket refused a reply: this connection is
-            // over, and a half-read line goes with it.
+            // The socket refused a reply, or this connection's entry went:
+            // it is over, and a half-read line goes with it.
             _ = &mut writer => break,
         };
         match read {
@@ -329,15 +345,19 @@ async fn connection(
         }
     }
 
-    // Release the session — unless a newer connection holds it now.
+    // Release this connection's own entry, and the session itself only once
+    // no window is left holding it.
     let mut map = shared.outbound.lock().expect("outbound map");
-    if map.get(&session).is_some_and(|o| o.conn == conn) {
-        map.remove(&session);
+    if let Some(holders) = map.get_mut(&session) {
+        holders.retain(|o| o.conn != conn);
+        if holders.is_empty() {
+            map.remove(&session);
+        }
     }
 }
 
-/// Writes replies as they come until the sender goes (the session was
-/// released or taken over) or the socket refuses one.
+/// Writes replies as they come until the sender goes (this connection's
+/// entry was released) or the socket refuses one.
 async fn write_replies(mut w: OwnedWriteHalf, session: SessionId, mut rx: mpsc::Receiver<String>) {
     while let Some(text) = rx.recv().await {
         let mut line = serde_json::to_string(&Reply {

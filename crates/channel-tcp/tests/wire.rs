@@ -250,27 +250,106 @@ async fn bind_refuses_an_empty_token_and_a_non_loopback_address_unless_allowed()
     assert!(matches!(err, BindError::Io(_)), "{err}");
 }
 
-/// A later connection claiming a session takes it over: replies go to the
-/// newcomer, and the displaced connection is closed so its client knows.
+/// (f) Two windows of one conversation: a second connection claiming a
+/// session joins it rather than displacing it, both stay live, and one
+/// reply reaches both (multi-tenant plan Phase 5, T5.2).
 #[tokio::test]
-async fn a_later_connection_claiming_the_session_takes_it_over() {
+async fn two_connections_on_one_session_both_receive_the_reply() {
     let ch = bound(8).await;
-    let mut old = Client::connect(ch.local_addr()).await;
-    old.hello("t0k", "s").await;
-    old.say("from old").await;
-    assert_eq!(recv(&ch).await.text, "from old");
+    let mut tab = Client::connect(ch.local_addr()).await;
+    tab.hello("t0k", "s").await;
+    tab.say("from the tab").await;
+    // The message proves the hello was processed, so this connection holds
+    // its session by the time the reply goes out.
+    assert_eq!(recv(&ch).await.text, "from the tab");
 
-    let mut new = Client::connect(ch.local_addr()).await;
-    new.hello("t0k", "s").await;
-    new.say("from new").await;
-    assert_eq!(recv(&ch).await.text, "from new");
+    let mut phone = Client::connect(ch.local_addr()).await;
+    phone.hello("t0k", "s").await;
+    phone.say("from the phone").await;
+    assert_eq!(recv(&ch).await.text, "from the phone");
 
     ch.send(&sid("s"), "reply").await.unwrap();
     assert_eq!(
-        new.read().await.as_deref(),
+        tab.read().await.as_deref(),
+        Some(r#"{"session":"s","text":"reply"}"#),
+        "the first connection was not displaced"
+    );
+    assert_eq!(
+        phone.read().await.as_deref(),
         Some(r#"{"session":"s","text":"reply"}"#)
     );
-    assert_eq!(old.read().await, None, "the displaced connection is closed");
+}
+
+/// (g) A departing connection takes only its own entry with it: the other
+/// holder of the same session keeps sending and receiving.
+#[tokio::test]
+async fn closing_one_of_two_connections_leaves_the_other_serving() {
+    let ch = bound(8).await;
+    let mut leaving = Client::connect(ch.local_addr()).await;
+    let mut staying = Client::connect(ch.local_addr()).await;
+    leaving.hello("t0k", "s").await;
+    staying.hello("t0k", "s").await;
+    leaving.say("1").await;
+    staying.say("2").await;
+    recv(&ch).await;
+    recv(&ch).await;
+
+    drop(leaving);
+    // Let the connection task see the EOF and release its own entry.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    staying.say("still here").await;
+    assert_eq!(recv(&ch).await.text, "still here");
+    ch.send(&sid("s"), "reply").await.unwrap();
+    assert_eq!(
+        staying.read().await.as_deref(),
+        Some(r#"{"session":"s","text":"reply"}"#),
+        "the survivor still holds the session"
+    );
+}
+
+/// (h) A peer that stops reading loses its replies to the log; it must hold
+/// up neither the caller of `send` nor the other connection on its session.
+/// The flood is big enough to fill the socket buffers and then the stalled
+/// connection's bounded outbound queue, so that peer is wedged for good;
+/// the other window must still get the next reply.
+#[tokio::test]
+async fn a_stalled_connection_does_not_delay_the_other_holder_of_its_session() {
+    const FLOOD: usize = 200;
+    let ch = bound(8).await;
+    let mut stalled = Client::connect(ch.local_addr()).await;
+    let mut reading = Client::connect(ch.local_addr()).await;
+    stalled.hello("t0k", "s").await;
+    reading.hello("t0k", "s").await;
+    stalled.say("1").await;
+    reading.say("2").await;
+    recv(&ch).await;
+    recv(&ch).await;
+    // `stalled` never calls `read` from here on.
+
+    // Wedge it. The timeout is what a blocking send would trip on; the
+    // bounded queue means this returns in microseconds instead.
+    let bulk = "x".repeat(8 * 1024);
+    timeout(T, async {
+        for _ in 0..FLOOD {
+            ch.send(&sid("s"), &bulk).await.unwrap();
+        }
+    })
+    .await
+    .expect("send never waits on the stalled peer");
+
+    // Let the reading window catch up on whatever of the flood it kept, so
+    // its own queue has room again.
+    while !reading.quiet().await {}
+
+    // The wedged peer is still in the map, still full. The other window
+    // gets this one anyway, and promptly.
+    ch.send(&sid("s"), "after").await.unwrap();
+    assert_eq!(
+        reading.read().await.as_deref(),
+        Some(r#"{"session":"s","text":"after"}"#),
+        "the stalled window did not cost the other one its reply"
+    );
 }
 
 /// A line that is not `{"text":…}` is ignored and the connection stays; a
