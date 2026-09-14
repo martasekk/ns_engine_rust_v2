@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nscore::{Channel, ChannelError, Incoming, SessionId};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Semaphore, SemaphorePermit};
 use tokio::task::{JoinError, JoinSet};
 
 use crate::turn::{Engine, EngineError};
@@ -92,6 +92,49 @@ impl TurnFailure {
     }
 }
 
+/// A ceiling on the turns a whole *process* runs at once, shared by every
+/// dispatcher in it (plan `.claude/plans/continue-polymorphic-pearl.md`
+/// Part B, B1).
+///
+/// One dispatcher per tenant means one `worker_slots` pool per tenant, so N
+/// tenants bound N turns each and the process nothing at all. This is the
+/// missing outer bound: clone it into every dispatcher on the shard and the
+/// turns in flight across all of them cannot exceed it.
+///
+/// # The acquisition order is the safety property
+///
+/// A turn takes its tenant's permit **first** and the shard's **second**,
+/// never the other way round. That order is total, so the wait-for graph has
+/// no cycle: a task may hold a tenant permit while waiting for a shard
+/// permit, but nothing holding a shard permit ever waits for a tenant one.
+/// Reverse it anywhere and two tenants deadlock, each holding what the other
+/// waits for.
+///
+/// The order is the *type's* to enforce, not this paragraph's:
+/// [`ShardSlots::acquire`] takes the tenant permit by reference, so a shard
+/// permit is unobtainable without a tenant permit in hand, and the borrow
+/// keeps that permit held for at least the whole wait.
+#[derive(Clone)]
+pub struct ShardSlots(Arc<Semaphore>);
+
+impl ShardSlots {
+    /// A ceiling of `slots` turns at once, floored at 1 for the reason the
+    /// worker slots are: zero permits would park every turn forever.
+    pub fn new(slots: usize) -> Self {
+        Self(Arc::new(Semaphore::new(slots.max(1))))
+    }
+
+    /// A shard permit, given the tenant permit already held. `held` is never
+    /// read — it is the proof of order documented on the type.
+    async fn acquire<'a>(&'a self, held: &SemaphorePermit<'_>) -> SemaphorePermit<'a> {
+        let _ = held;
+        self.0
+            .acquire()
+            .await
+            .expect("the shard semaphore is never closed")
+    }
+}
+
 /// Reads one channel and runs its sessions, each on its own task.
 pub struct Dispatcher {
     shared: Arc<Shared>,
@@ -113,6 +156,10 @@ struct Shared {
     channel: Arc<dyn Channel>,
     /// One permit per worker slot.
     slots: Semaphore,
+    /// The shard-wide ceiling, when this dispatcher is one of several in one
+    /// process. `None` for every caller that has not asked for one, and that
+    /// is today's behaviour exactly: `slots` is then the only bound.
+    shard: Option<ShardSlots>,
     /// Turns completed since the consolidator last ran: the session tasks
     /// count, the dispatcher resets.
     turns_since_pass: AtomicU32,
@@ -188,6 +235,7 @@ impl Dispatcher {
                 engine,
                 channel,
                 slots: Semaphore::new(n_slots),
+                shard: None,
                 turns_since_pass: AtomicU32::new(0),
                 idle_after,
                 policy,
@@ -198,6 +246,18 @@ impl Dispatcher {
             generations: 0,
             pending: VecDeque::new(),
         }
+    }
+
+    /// Also bounded by a ceiling it shares with the other dispatchers in the
+    /// process ([`ShardSlots`]). Without this the dispatcher keeps only its
+    /// own `slots`, which is what every existing caller gets.
+    pub fn with_shard_slots(mut self, shard: ShardSlots) -> Self {
+        // Unique here by construction: `Shared` is cloned into a session
+        // task only once `run` starts, and `run` takes `self` by value.
+        Arc::get_mut(&mut self.shared)
+            .expect("no session task exists before the dispatcher runs")
+            .shard = Some(shard);
+        self
     }
 
     /// Reads the channel until it closes, then lets every session finish.
@@ -555,6 +615,13 @@ async fn session_turns(
                     .acquire()
                     .await
                     .expect("the slot semaphore is never closed");
+                // Second, and only ever second: the order the whole
+                // deadlock-freedom argument on `ShardSlots` rests on, which
+                // is why this takes the tenant permit it already holds.
+                let shard_permit = match &shared.shard {
+                    Some(shard) => Some(shard.acquire(&permit).await),
+                    None => None,
+                };
                 let text = match engine.run_turn(incoming).await {
                     Ok(text) => text,
                     Err(e) => return Some(Failure::Turn(e)),
@@ -562,6 +629,10 @@ async fn session_turns(
                 // Counted while the slot is still held, so the dispatcher
                 // can never see every slot free and this turn uncounted.
                 shared.turns_since_pass.fetch_add(1, Ordering::SeqCst);
+                // Released in the reverse of the order they were taken, and
+                // both before the reply goes out: a send that blocks holds
+                // up neither this tenant's slots nor the shard's.
+                drop(shard_permit);
                 drop(permit);
                 if let Err(e) = shared.channel.send(session, &text).await {
                     return Some(Failure::Turn(EngineError::Channel(e.to_string())));

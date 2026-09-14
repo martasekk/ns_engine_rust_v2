@@ -1,5 +1,5 @@
 use nscore::*;
-use nsengine::dispatch::TurnFailure;
+use nsengine::dispatch::{Dispatcher, ShardSlots, TurnFailure};
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
@@ -4139,6 +4139,183 @@ async fn one_slot_serializes_across_sessions() {
         "never two turns in flight under one slot"
     );
     assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for sid in ["a", "b"] {
+        let events = store.load(&SessionId(sid.into())).await.unwrap();
+        assert_eq!(
+            events.last().map(|e| e.turn),
+            Some(1),
+            "session {sid} completed its turn"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan continue-polymorphic-pearl Part B, B1: a ceiling several dispatchers
+// share. One dispatcher per tenant gives each tenant its own `worker_slots`
+// pool and the process no bound at all; `ShardSlots` is the outer one.
+
+/// Holds every turn inside the emitter until the gate is opened, counting
+/// the turns in flight and the most there ever were at once. The park is
+/// what makes "the second turn has not started" an observation rather than
+/// a hope: a turn that reached the emitter stays there until released.
+///
+/// No sleep anywhere. The waiter on `open` is registered *before* the turn
+/// announces itself on `arrived`, so the test cannot open the gate into the
+/// gap between the two and lose the wakeup.
+struct GateEmitter {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    high_water: Arc<std::sync::atomic::AtomicUsize>,
+    arrived: Arc<tokio::sync::Notify>,
+    open: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl Emitter for GateEmitter {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut gate = std::pin::pin!(self.open.notified());
+        gate.as_mut().enable();
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.high_water.fetch_max(now, SeqCst);
+        self.arrived.notify_one();
+        gate.await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        Ok(Proposal {
+            rationale: "".into(),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        })
+    }
+}
+
+/// One tenant's dispatcher: its own engine, its own store, its own channel,
+/// its own worker slots — everything B1 will give a tenant except the shard
+/// ceiling, which the caller adds.
+fn tenant_dispatcher(
+    emitter: Box<dyn Emitter>,
+    store: Arc<InMemoryStore>,
+    channel: Arc<dyn Channel>,
+    slots: usize,
+) -> Dispatcher {
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(emitter);
+    b.set_replier(Box::new(ScriptedReplier));
+    b.set_memory(store);
+    b.set_shared_channel(channel.clone());
+    b.set_consolidator(Box::new(NoopConsolidator));
+    let engine = Engine::with_clock(
+        b.build().unwrap(),
+        dispatcher_config(slots),
+        Box::new(|| Timestamp(42)),
+    );
+    Dispatcher::new(Arc::new(engine), channel, slots)
+}
+
+/// Two tenants, two dispatchers, two worker slots each — four turns that
+/// could be in flight at once — under a shard that allows one. Each turn
+/// announces its arrival and parks; the caller observes that it is the
+/// *only* one in flight before letting it go, so a second turn starting
+/// early is caught by that assertion or by the high-water mark.
+async fn one_turn_at_a_time_across_two_dispatchers(shard: ShardSlots) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let in_flight: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let high_water: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let open = Arc::new(tokio::sync::Notify::new());
+
+    let mut runs = tokio::task::JoinSet::new();
+    for (one, two) in [("a", "b"), ("c", "d")] {
+        let channel: Arc<dyn Channel> = Arc::new(SessionsChannel(std::sync::Mutex::new(
+            [(one, "hello from a"), (two, "hello from b")]
+                .into_iter()
+                .collect(),
+        )));
+        let d = tenant_dispatcher(
+            Box::new(GateEmitter {
+                in_flight: in_flight.clone(),
+                high_water: high_water.clone(),
+                arrived: arrived.clone(),
+                open: open.clone(),
+            }),
+            Arc::new(InMemoryStore::new()),
+            channel,
+            2,
+        )
+        .with_shard_slots(shard.clone());
+        runs.spawn(d.run());
+    }
+
+    // Four turns, one at a time, each observed alone before it is let go.
+    let all = async {
+        for turn in 1..=4 {
+            arrived.notified().await;
+            assert_eq!(
+                in_flight.load(SeqCst),
+                1,
+                "turn {turn}: one turn in flight, the other three not started"
+            );
+            open.notify_waiters();
+        }
+        while let Some(joined) = runs.join_next().await {
+            joined.expect("no dispatcher panicked").expect("no error");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), all)
+        .await
+        .expect("every turn ran, one at a time, and both dispatchers finished");
+
+    assert_eq!(
+        high_water.load(SeqCst),
+        1,
+        "the shard cap of 1 was never exceeded across both dispatchers"
+    );
+    assert_eq!(in_flight.load(SeqCst), 0);
+}
+
+#[tokio::test]
+async fn two_dispatchers_sharing_one_shard_cap_never_exceed_it() {
+    one_turn_at_a_time_across_two_dispatchers(ShardSlots::new(1)).await;
+}
+
+/// Zero permits would park every turn forever, so a shard cap of 0 is
+/// floored at 1 exactly as `worker_slots` is. Without the floor this hangs
+/// rather than running its four turns one at a time.
+#[tokio::test]
+async fn a_shard_cap_of_zero_is_floored_at_one() {
+    one_turn_at_a_time_across_two_dispatchers(ShardSlots::new(0)).await;
+}
+
+/// `two_sessions_run_concurrently_under_two_slots` built as a dispatcher
+/// with no shard ceiling: the default is `None`, and `None` is today's
+/// behaviour exactly — two worker slots, two sessions, and session `a`'s
+/// parked turn cannot hold `b`'s back.
+#[tokio::test]
+async fn a_dispatcher_with_no_shard_cap_behaves_exactly_as_before() {
+    let store = Arc::new(InMemoryStore::new());
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let channel: Arc<dyn Channel> = Arc::new(ReleasingChannel {
+        script: SessionsChannel(std::sync::Mutex::new(
+            [("a", "hello from a"), ("b", "hello from b")]
+                .into_iter()
+                .collect(),
+        )),
+        on_sent: "b",
+        release: release_a.clone(),
+    });
+    let d = tenant_dispatcher(
+        Box::new(ParkedEmitter { release_a }),
+        store.clone(),
+        channel,
+        2,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), d.run())
+        .await
+        .expect("session b's turn must complete while session a's is parked")
+        .unwrap();
+
     for sid in ["a", "b"] {
         let events = store.load(&SessionId(sid.into())).await.unwrap();
         assert_eq!(
