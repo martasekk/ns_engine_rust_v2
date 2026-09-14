@@ -222,6 +222,21 @@ pub(crate) async fn check_serve_address(cfg: &ServeSection) -> Result<(), Startu
     Ok(())
 }
 
+/// One tenant, built: the engine and the two things running it takes.
+///
+/// `Engine::run` consumes the engine, and `config`/`parts` are the engine's
+/// own, so an `Arc<Engine>` can be neither run nor asked for its channel or
+/// its slot count. A registry holding one engine per company needs all
+/// three, and the factory is where all three are already in hand, so it
+/// hands them back rather than the engine exporting its internals for two
+/// scalars (plan B2). The caller builds `Dispatcher::new(engine, channel,
+/// worker_slots)`, which is what `Engine::run` built for itself.
+pub(crate) struct BuiltTenant {
+    pub engine: Arc<Engine>,
+    pub channel: Arc<dyn Channel>,
+    pub worker_slots: usize,
+}
+
 /// One tenant's config and one mode in, one running-ready `Engine` out.
 ///
 /// The order of construction is load-bearing and is the order `main` used:
@@ -233,7 +248,7 @@ pub(crate) async fn build_engine(
     tenant: &TenantConfig,
     mode: Mode,
     max_requests: Option<u32>,
-) -> Result<Arc<Engine>, StartupError> {
+) -> Result<BuiltTenant, StartupError> {
     // The tenant's resolved config — the shared `config.toml` with this
     // company's overlay already laid over it (plan T1.2). Everything below
     // reads it exactly as it read the process-wide config before.
@@ -316,23 +331,28 @@ pub(crate) async fn build_engine(
     // reports rather than in the middle of the first turn.
     crate::models::announce(&cfg.models).await;
     let serve_addr = tcp.as_ref().map(|(_, addr)| *addr);
-    if let Some((channel, _)) = tcp {
+    // Kept, not just handed over: the dispatcher the caller builds reads the
+    // same channel the engine was built on, and the engine will not give it
+    // back (plan B2).
+    let channel: Arc<dyn Channel> = match tcp {
         // `serve`: the caller's channel and nothing else — no stdin, and no
         // compose box, which joins a desktop to *one* session.
-        b.set_shared_channel(channel);
-    } else {
-        // stdin, plus the desktop's compose box when there is one to read.
-        // The agent has offered that channel since 2026-09-05 and nothing
-        // collected it; a line typed into the badge went into the outbox and
-        // stopped there.
-        let cli = nschannel_cli::CliChannel::new_stdio().with_session(cli_session.clone());
-        match desktop_messages(cfg).await {
-            Some(client) => b.set_channel(Box::new(
-                nscomponents_std::desktop_channel::WithDesktop::spawn(cli, client),
-            )),
-            None => b.set_channel(Box::new(cli)),
-        };
-    }
+        Some((channel, _)) => channel,
+        None => {
+            // stdin, plus the desktop's compose box when there is one to
+            // read. The agent has offered that channel since 2026-09-05 and
+            // nothing collected it; a line typed into the badge went into
+            // the outbox and stopped there.
+            let cli = nschannel_cli::CliChannel::new_stdio().with_session(cli_session.clone());
+            match desktop_messages(cfg).await {
+                Some(client) => Arc::new(nscomponents_std::desktop_channel::WithDesktop::spawn(
+                    cli, client,
+                )),
+                None => Arc::new(cli),
+            }
+        }
+    };
+    b.set_shared_channel(channel.clone());
     // M6 §5.1: the rolling summary runs on its own role (model, provider,
     // key), so it can be swapped without touching the emitter or replier.
     if cfg.memory.summary_every_turns > 0 {
@@ -492,7 +512,11 @@ pub(crate) async fn build_engine(
         ),
         None => println!("type text, /quit to exit  ·  `ns-app providers` lists the backends"),
     }
-    Ok(engine)
+    Ok(BuiltTenant {
+        engine,
+        channel,
+        worker_slots,
+    })
 }
 
 pub(crate) async fn build_tools(
@@ -929,7 +953,7 @@ mod tests {
             "only the caller holds it yet"
         );
 
-        let engine = build_engine(
+        let built = build_engine(
             &set[0],
             Mode::Serve {
                 channel: channel.clone(),
@@ -940,10 +964,71 @@ mod tests {
         .await
         .expect("the tenant's engine");
 
-        assert_eq!(Arc::strong_count(&engine), 1);
+        assert_eq!(Arc::strong_count(&built.engine), 1);
         assert!(
             Arc::strong_count(&channel) > 1,
             "the engine holds the caller's channel, not one it bound itself"
+        );
+    }
+
+    /// Plan B2. What a dispatcher needs is an `Arc<Engine>`, the channel
+    /// that engine reads and its slot count, and the factory is the one
+    /// place all three are already in hand. Handing them back means the
+    /// caller drives the engine through a handle it keeps, instead of
+    /// taking the engine back out of its `Arc` first - the unwrap that
+    /// panicked the moment a second handle existed, which is exactly what
+    /// the tenant registry will hold.
+    ///
+    /// The clone held across the whole run is the proof.
+    #[tokio::test]
+    async fn the_cli_runs_its_dispatcher_from_an_arc_it_still_holds() {
+        // Closed before the first read, so the dispatcher built here ends
+        // on its own.
+        struct ClosedChannel;
+        #[async_trait::async_trait]
+        impl Channel for ClosedChannel {
+            async fn recv(&self) -> Result<nscore::Incoming, nscore::ChannelError> {
+                Err(nscore::ChannelError::Closed)
+            }
+            async fn send(&self, _s: &SessionId, _t: &str) -> Result<(), nscore::ChannelError> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let addr: SocketAddr = "127.0.0.1:9".parse().expect("a fixture address");
+        let mut set = serve_fixture(root.path(), addr, &["acme"]);
+        // Not the default, so a hard-coded slot count cannot pass for it.
+        set[0].app.engine.worker_slots = 3;
+        let channel: Arc<dyn Channel> = Arc::new(ClosedChannel);
+
+        let built = build_engine(
+            &set[0],
+            Mode::Serve {
+                channel: channel.clone(),
+                addr,
+            },
+            None,
+        )
+        .await
+        .expect("the tenant's engine");
+
+        assert!(
+            Arc::ptr_eq(&built.channel, &channel),
+            "the dispatcher must read the very channel the engine was built on"
+        );
+        assert_eq!(built.worker_slots, 3, "this tenant's own slot count");
+
+        // The handle the caller keeps - a registry keeps one per company.
+        let held = built.engine.clone();
+        nsengine::dispatch::Dispatcher::new(built.engine, built.channel, built.worker_slots)
+            .run()
+            .await
+            .expect("a closed channel ends the run");
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "the run is over and the caller's handle outlived it"
         );
     }
 
@@ -1054,7 +1139,7 @@ mod tests {
             assert_eq!(names.len(), 2, "the time tool plus its own: {names:?}");
             assert_eq!(t.app.persona.text, format!("{}'s persona", t.id));
 
-            let engine = build_engine(
+            let built = build_engine(
                 t,
                 Mode::Cli {
                     session: format!("{}-s1", t.id),
@@ -1065,8 +1150,9 @@ mod tests {
             .expect("the tenant's engine");
             // The engine is built and holds the only handle there is; what is
             // observable from here is that it opened this tenant's store and
-            // no other.
-            assert_eq!(Arc::strong_count(&engine), 1);
+            // no other. The channel now returned alongside is a handle to the
+            // channel, not to the engine, so the count is still one.
+            assert_eq!(Arc::strong_count(&built.engine), 1);
             assert!(store(&t.id).exists(), "{} has its own store", t.id);
         }
         assert!(

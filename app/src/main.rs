@@ -612,16 +612,18 @@ async fn main() {
             session: cli_session,
         }
     };
-    let engine = factory::build_engine(&tenant, mode, max_requests)
+    let built = factory::build_engine(&tenant, mode, max_requests)
         .await
         .unwrap_or_else(|e| e.exit());
-    // `Engine::run` consumes the engine, and the factory hands back the only
-    // handle there is, so this cannot be `None`. The `Arc` is the shape the
-    // tenant registry will hold them in (plan D3); a process that runs one
-    // tenant on stdin takes its engine back out.
-    let engine = Arc::into_inner(engine).expect("the factory returns the only engine handle");
-
-    match engine.run().await {
+    // Exactly the dispatcher `Engine::run` built for itself (`crates/engine`,
+    // `turn/run.rs`): the engine, its channel, its slot count, and the
+    // default `Fatal` failure policy. Built here instead so the engine stays
+    // in the `Arc` the tenant registry will hold it in (plan B2) - taking it
+    // back out would panic the moment a second handle existed.
+    match nsengine::dispatch::Dispatcher::new(built.engine, built.channel, built.worker_slots)
+        .run()
+        .await
+    {
         Ok(()) => {}
         // M12 T6.1: the ceiling this run was given, reached. A stop by
         // arrangement rather than a failure, but non-zero all the same, so a
