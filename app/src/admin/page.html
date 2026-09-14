@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ns-engine — settings</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --panel: #fff; --fg: #1a1a19; --dim: #6b6b66;
+    --line: #e2e2dd; --accent: #2f6f4f; --bad: #a33; --ok: #2f6f4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16171a; --panel: #1c1e22; --fg: #e8e8e6; --dim: #9a9a94;
+            --line: #2c2e33; --accent: #79c0a0; --bad: #e08a8a; --ok: #79c0a0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 20px 24px 0; max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .where { color: var(--dim); font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  nav { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
+  nav button { background: none; border: none; border-bottom: 2px solid transparent;
+               color: var(--dim); font: inherit; padding: 8px 12px; cursor: pointer; }
+  nav button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  main { max-width: 860px; margin: 0 auto; padding: 20px 24px 64px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px 18px; margin: 0 0 16px; }
+  section h2 { font-size: 15px; margin: 0 0 4px; }
+  section .note { color: var(--dim); font-size: 13px; margin: 0 0 14px; }
+  .field { margin: 0 0 14px; }
+  .field label { display: block; font-weight: 600; font-size: 13px; margin: 0 0 4px; }
+  .field .help { color: var(--dim); font-size: 12px; margin: 4px 0 0; }
+  input[type=text], input[type=number], input[type=password], textarea, select {
+    width: 100%; font: inherit; padding: 7px 10px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: inherit; }
+  textarea { min-height: 84px; resize: vertical; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row input[type=checkbox] { width: auto; }
+  button.do { background: var(--accent); color: #fff; border: none; border-radius: 7px;
+              padding: 8px 16px; font: inherit; cursor: pointer; }
+  button.quiet { background: none; border: 1px solid var(--line); color: inherit;
+                 border-radius: 7px; padding: 7px 12px; font: inherit; cursor: pointer; }
+  .bar { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
+         padding: 12px 0; display: flex; gap: 12px; align-items: center; }
+  .msg { font-size: 13px; }
+  .msg.bad { color: var(--bad); }
+  .msg.ok { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { font-size: 12px; color: var(--dim); font-weight: 600; }
+  code, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 99px; border: 1px solid var(--line); }
+  .pill.set { color: var(--ok); border-color: var(--ok); }
+  .pill.missing { color: var(--bad); border-color: var(--bad); }
+  .banner { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+            border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; font-size: 13px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>ns-engine settings</h1>
+  <div class="where" id="root"></div>
+  <nav>
+    <button data-tab="process" aria-selected="true">Process</button>
+    <button data-tab="companies" aria-selected="false">Companies</button>
+    <button data-tab="secrets" aria-selected="false">Credentials</button>
+  </nav>
+</header>
+<main id="main"></main>
+
+<script>
+// The token is in the fragment, which is never sent with a request. It is
+// read once, then taken out of the address bar.
+const TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+try { history.replaceState(null, "", location.pathname); } catch (e) {}
+
+const main = document.getElementById("main");
+let state = null;
+let tab = "process";
+let company = null;
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: { "authorization": "Bearer " + TOKEN, "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const answered = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(answered.error || ("the server answered " + res.status));
+  return answered;
+}
+
+function el(tag, attrs = {}, ...kids) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid !== null && kid !== undefined) node.append(kid.nodeType ? kid : String(kid));
+  }
+  return node;
+}
+
+// One control, drawn for what the field says it is.
+function control(field, value) {
+  const id = "f:" + field.path;
+  let input;
+  if (field.kind === "paragraph") {
+    input = el("textarea", { id });
+    input.value = value ?? "";
+  } else if (field.kind === "list") {
+    input = el("textarea", { id, placeholder: "one per line" });
+    input.value = Array.isArray(value) ? value.join("\n") : (value ?? "");
+  } else if (field.kind === "flag") {
+    input = el("input", { type: "checkbox", id });
+    input.checked = value === true;
+  } else if (field.kind === "choice") {
+    input = el("select", { id }, ...[""].concat(field.choices).map((c) =>
+      el("option", { value: c }, c === "" ? "(default: " + field.default + ")" : c)));
+    input.value = value ?? "";
+  } else if (field.kind === "number") {
+    input = el("input", { type: "number", id, placeholder: field.default });
+    input.value = value ?? "";
+  } else {
+    input = el("input", { type: "text", id, placeholder: field.default });
+    input.value = value ?? "";
+  }
+  input.dataset.path = field.path;
+  input.dataset.kind = field.kind;
+
+  // A field naming a variable says whether that variable has a value, since
+  // naming one nobody exported is the likeliest mistake on this page.
+  let status = null;
+  if (field.kind === "envname" && value) {
+    const known = (state.secrets || []).find((s) => s.name === value);
+    status = el("span", { class: "pill " + (known && known.set ? "set" : "missing") },
+      known && known.set ? "value set" : "no value yet");
+  }
+
+  return el("div", { class: "field" },
+    el("label", { for: id }, field.label, status ? " " : null, status),
+    field.kind === "flag"
+      ? el("div", { class: "row" }, input, el("span", { class: "help" }, field.help))
+      : [input, field.help ? el("p", { class: "help" }, field.help) : null],
+  );
+}
+
+function collect(scope) {
+  const values = {};
+  for (const input of scope.querySelectorAll("[data-path]")) {
+    const kind = input.dataset.kind;
+    if (kind === "flag") values[input.dataset.path] = input.checked;
+    else if (kind === "list") values[input.dataset.path] = input.value;
+    else if (kind === "number") values[input.dataset.path] = input.value.trim();
+    else values[input.dataset.path] = input.value;
+  }
+  return values;
+}
+
+function settingsForm(sections, values, companyId) {
+  const form = el("div", {});
+  for (const section of sections) {
+    form.append(el("section", {},
+      el("h2", {}, section.title),
+      section.note ? el("p", { class: "note" }, section.note) : null,
+      ...section.fields.map((f) => control(f, values[f.path])),
+    ));
+  }
+  const msg = el("span", { class: "msg" });
+  form.append(el("div", { class: "bar" },
+    el("button", { class: "do", onclick: async () => {
+      msg.className = "msg"; msg.textContent = "Saving…";
+      try {
+        const out = await api("/api/settings", { company: companyId, values: collect(form) });
+        msg.className = "msg ok";
+        msg.textContent = "Saved to " + out.saved + " — restart ns-app for it to take effect.";
+        await load();
+      } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+    } }, "Save"),
+    msg,
+  ));
+  return form;
+}
+
+function processTab() {
+  return el("div", {},
+    el("div", { class: "banner" },
+      "These are the process's own settings, shared by every company it hosts. " +
+      "A key is never typed here: a field asks for the name of a variable, and " +
+      "Credentials is where that variable gets its value."),
+    settingsForm(state.process.sections, state.process.values, null));
+}
+
+function companiesTab() {
+  const ids = state.companies;
+  if (!company || !ids.includes(company)) company = ids[0] || null;
+
+  const picker = el("section", {},
+    el("h2", {}, "Companies"),
+    el("p", { class: "note" },
+      "One file each, in tenants/. A company is built on its first message — its own " +
+      "database, persona, keys and budget — and nothing it can set here belongs to the " +
+      "process."),
+    el("div", { class: "row" },
+      ids.length
+        ? el("select", { onchange: (e) => { company = e.target.value; render(); } },
+            ...ids.map((id) => el("option", { value: id, selected: id === company ? "" : null }, id)))
+        : el("span", { class: "help" }, "none yet"),
+      el("input", { type: "text", id: "newid", placeholder: "new company id, e.g. acme" }),
+      el("button", { class: "quiet", onclick: async () => {
+        const id = document.getElementById("newid").value.trim();
+        if (!id) return;
+        try { await api("/api/company", { id }); company = id; await load(); }
+        catch (e) { alert(e.message); }
+      } }, "Add"),
+    ));
+
+  if (!company) return el("div", {}, picker);
+  return el("div", {}, picker,
+    settingsForm(state.company.sections, state.company.values[company] || {}, company));
+}
+
+function secretsTab() {
+  const rows = (state.secrets || []).map((s) => {
+    const input = el("input", { type: "password", placeholder: s.set ? "replace it" : "paste the value" });
+    const msg = el("span", { class: "msg" });
+    const save = async () => {
+      if (!input.value) return;
+      msg.className = "msg"; msg.textContent = "Saving…";
+      try {
+        await api("/api/secret", { name: s.name, value: input.value });
+        input.value = "";
+        await load();
+      } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+    return el("tr", {},
+      el("td", {}, el("div", { class: "mono" }, s.name),
+        el("div", { class: "help" }, s.used_for.join(" · "))),
+      el("td", {},
+        el("span", { class: "pill " + (s.set ? "set" : "missing") },
+          s.set ? (s.source === "environment" ? "exported" : "set") : "missing"),
+        s.source === "environment"
+          ? el("p", { class: "help" }, "exported into this process, so the file is not what is in force")
+          : null),
+      el("td", {}, el("div", { class: "row" }, input,
+        el("button", { class: "quiet", onclick: save }, "Save"),
+        s.source === "file"
+          ? el("button", { class: "quiet", onclick: async () => {
+              try { await api("/api/secret/remove", { name: s.name }); await load(); }
+              catch (e) { alert(e.message); }
+            } }, "Remove")
+          : null), msg),
+    );
+  });
+
+  return el("div", {},
+    el("div", { class: "banner" },
+      "Values for the variables the config names. They are written to " +
+      (state.secretsFile || ".env") + " beside the config, never into config.toml, and " +
+      "never sent back to this page — it is told only whether each one is set. " +
+      "Anything already exported into the process wins over the file."),
+    el("section", {},
+      el("h2", {}, "Credentials and keys"),
+      el("p", { class: "note" },
+        "This is every variable your configuration names. Add a company or name a " +
+        "variable on another tab and it appears here."),
+      rows.length
+        ? el("table", {}, el("thead", {}, el("tr", {},
+            el("th", {}, "Variable"), el("th", {}, "Status"), el("th", {}, "Value"))),
+            el("tbody", {}, ...rows))
+        : el("p", { class: "help" }, "Nothing is named yet.")));
+}
+
+function render() {
+  for (const button of document.querySelectorAll("nav button")) {
+    button.setAttribute("aria-selected", String(button.dataset.tab === tab));
+  }
+  main.replaceChildren(
+    tab === "process" ? processTab() : tab === "companies" ? companiesTab() : secretsTab());
+}
+
+async function load() {
+  state = await api("/api/state");
+  document.getElementById("root").textContent = state.root;
+  render();
+}
+
+for (const button of document.querySelectorAll("nav button")) {
+  button.addEventListener("click", () => { tab = button.dataset.tab; render(); });
+}
+
+load().catch((e) => {
+  main.replaceChildren(el("section", {},
+    el("h2", {}, "Cannot read the settings"),
+    el("p", { class: "msg bad" }, e.message),
+    el("p", { class: "help" },
+      "If this says 401, open the link ns-app printed — it carries the token for this run.")));
+});
+</script>
+</body>
+</html>

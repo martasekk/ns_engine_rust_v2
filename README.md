@@ -96,7 +96,7 @@ refused instead of finding out from the refusal.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 890 tests, no network required
+cargo test  --workspace          # 922 tests, no network required
 
 cp config.example.toml config.toml
 cargo run -p ns-app -- providers # which providers exist, which keys are set
@@ -115,6 +115,24 @@ out `base_url`. `NS_PROVIDER` / `NS_MODEL` override for a single run.
 To drive a desktop, uncomment `[pointer]` in `config.toml`, point `addr` at a
 machine running the agent (started with `allow_remote` for a non-loopback
 bind), and export the token. `NS_POINTER_ADDR` overrides the address.
+
+## Setting it up
+
+```sh
+ns-app admin      # a settings page on loopback, with a one-time token
+```
+
+Provider and models, the listen addresses, the companies this process hosts,
+and the credentials each of them needs. It edits `config.toml` and
+`tenants/*.toml` in place with their comments intact, and refuses any save
+that would not load — so a mistake is a message on screen rather than a
+process that will not start.
+
+Keys are the part worth knowing about. The config never holds one: it names
+an environment variable, and that is what keeps a credential out of a file
+somebody commits. The page keeps that rule — it writes *values* to a
+gitignored `.env` beside the config, and never sends one back to the browser,
+only whether each variable is set.
 
 ## Connecting things to it
 

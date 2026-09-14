@@ -27,7 +27,7 @@ const MAX_HEADERS: usize = 64;
 /// the caller learns that it was refused and not why in any detail, which is
 /// the same discipline `nsidentity::Denied` keeps for credentials.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum HttpError {
+pub enum HttpError {
     #[error("the request line or header block ran past its bound")]
     TooLarge,
     #[error("the body is longer than this endpoint accepts")]
@@ -41,7 +41,7 @@ pub(crate) enum HttpError {
 }
 
 impl HttpError {
-    pub(crate) fn status(&self) -> u16 {
+    pub fn status(&self) -> u16 {
         match self {
             HttpError::TooLarge => 431,
             HttpError::BodyTooLarge => 413,
@@ -53,22 +53,22 @@ impl HttpError {
 }
 
 #[derive(Debug)]
-pub(crate) struct Request {
-    pub(crate) method: String,
+pub struct Request {
+    pub method: String,
     /// The raw target, query string and all.
-    pub(crate) target: String,
-    pub(crate) headers: Vec<(String, String)>,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
     /// The bytes exactly as they arrived. A webhook signature is over these
     /// and not over a re-serialization of what they parsed into: a body that
     /// has been through a JSON round trip will not hash (plan T6.1).
-    pub(crate) body: Vec<u8>,
-    pub(crate) keep_alive: bool,
+    pub body: Vec<u8>,
+    pub keep_alive: bool,
 }
 
 impl Request {
     /// A header by name, matched case-insensitively as HTTP requires. The
     /// first wins; a repeated header is a caller trying its luck.
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -76,7 +76,7 @@ impl Request {
     }
 
     /// The path, without the query string.
-    pub(crate) fn path(&self) -> &str {
+    pub fn path(&self) -> &str {
         match self.target.split_once('?') {
             Some((path, _)) => path,
             None => &self.target,
@@ -86,7 +86,7 @@ impl Request {
     /// One query parameter, percent-decoded. Used by the platform
     /// verification handshakes, which are a `GET` with everything in the
     /// query and nothing in the body.
-    pub(crate) fn query(&self, key: &str) -> Option<String> {
+    pub fn query(&self, key: &str) -> Option<String> {
         let (_, query) = self.target.split_once('?')?;
         query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
@@ -97,7 +97,7 @@ impl Request {
     /// True when the client asked for an upgrade to WebSocket. Both headers
     /// are required by RFC 6455 and both are checked: `Upgrade` names the
     /// protocol, `Connection` says it is an upgrade at all.
-    pub(crate) fn is_websocket_upgrade(&self) -> bool {
+    pub fn is_websocket_upgrade(&self) -> bool {
         let upgrade = self
             .header("upgrade")
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
@@ -112,7 +112,7 @@ impl Request {
 /// Reads one request. `Ok(None)` is a clean end of connection — the peer
 /// went between requests, which on a keep-alive socket is the normal way it
 /// ends and not an error.
-pub(crate) async fn read_request<R: AsyncRead + Unpin>(
+pub async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     max_body: usize,
 ) -> Result<Option<Request>, HttpError> {
@@ -207,15 +207,15 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(
 }
 
 /// What goes back. Built by the routes, written by the connection loop.
-pub(crate) struct Response {
-    pub(crate) status: u16,
-    pub(crate) content_type: &'static str,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
+pub struct Response {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl Response {
-    pub(crate) fn json(status: u16, value: &serde_json::Value) -> Response {
+    pub fn json(status: u16, value: &serde_json::Value) -> Response {
         Response {
             status,
             content_type: "application/json",
@@ -224,7 +224,7 @@ impl Response {
         }
     }
 
-    pub(crate) fn text(status: u16, body: impl Into<String>) -> Response {
+    pub fn text(status: u16, body: impl Into<String>) -> Response {
         Response {
             status,
             content_type: "text/plain; charset=utf-8",
@@ -236,19 +236,19 @@ impl Response {
     /// A refusal the caller learns nothing from. Every route answers a bad
     /// credential, an unknown company and a bad signature with one of these:
     /// which of the three it was belongs in the log, not on the wire.
-    pub(crate) fn refused(status: u16) -> Response {
+    pub fn refused(status: u16) -> Response {
         Response::json(
             status,
             &serde_json::json!({ "error": reason_phrase(status) }),
         )
     }
 
-    pub(crate) fn with_header(mut self, name: &str, value: impl Into<String>) -> Response {
+    pub fn with_header(mut self, name: &str, value: impl Into<String>) -> Response {
         self.headers.push((name.to_string(), value.into()));
         self
     }
 
-    pub(crate) async fn write_to<W: AsyncWrite + Unpin>(
+    pub async fn write_to<W: AsyncWrite + Unpin>(
         &self,
         w: &mut W,
         keep_alive: bool,
@@ -271,7 +271,7 @@ impl Response {
     }
 }
 
-pub(crate) fn reason_phrase(status: u16) -> &'static str {
+pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         202 => "Accepted",

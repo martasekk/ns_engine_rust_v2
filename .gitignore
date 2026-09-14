@@ -7,4 +7,9 @@
 /wire.jsonl
 /scratchpad
 /eval-ledger.json
+/evolution-ledger.json
+/serve.log
 /graphify-out/
+
+# Values for the variables the config names, written by `ns-app admin`.
+/.env

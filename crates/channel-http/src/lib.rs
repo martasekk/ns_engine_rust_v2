@@ -49,7 +49,9 @@
 //! | module        | what it owns                                       |
 //! |---------------|----------------------------------------------------|
 //! | [`server`]    | the socket, the routes, CORS and the bounds        |
-//! | [`http`]      | one bounded request in, one response out           |
+//! | [`http`]      | one bounded request in, one response out. Public,  |
+//! |               | because `ns-app admin` serves its page on the same |
+//! |               | parser rather than writing a second one            |
 //! | [`ws`]        | the upgrade, and frames both ways                  |
 //! | [`chat`]      | a window that holds a session while it is open     |
 //! | [`messages`]  | one message, one reply, nothing held open          |
@@ -61,7 +63,7 @@
 
 mod chat;
 mod hooks;
-mod http;
+pub mod http;
 mod messages;
 pub mod platform;
 mod seen;

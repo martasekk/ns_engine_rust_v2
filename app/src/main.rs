@@ -1,3 +1,4 @@
+mod admin;
 mod budget;
 mod cli;
 mod clients;
@@ -24,6 +25,10 @@ pub(crate) const DEFAULT_TENANT: &str = "local";
 /// that answers and stops, `serve`, or the terminal.
 #[tokio::main]
 async fn main() {
+    // The values for the variables the config names, if `ns-app admin` has
+    // been used to write any. Before anything reads a key, and never over an
+    // exported one: an operator who ran `export` has said what they meant.
+    admin::secrets::load_into_environment(std::path::Path::new("."));
     let cfg_text = std::fs::read_to_string("config.toml").unwrap_or_default();
     let mut cfg = match AppConfig::parse(&cfg_text) {
         Ok(c) => c,
@@ -60,6 +65,24 @@ async fn main() {
         std::process::exit(1);
     }
     let args: Vec<String> = std::env::args().collect();
+
+    // `ns-app admin [host:port]`: the settings page. Before `run_oneshot`
+    // and before the tenant set, because the whole point of it is the
+    // config that does not load yet — a page that refused to open until the
+    // config was already right would be no help at all.
+    if args.get(1).map(String::as_str) == Some("admin") {
+        let listen = args
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:7777".into());
+        let root = std::path::PathBuf::from(".");
+        admin::keep_secrets_out_of_git(&root);
+        if let Err(e) = admin::run(root, &listen).await {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Every subcommand that answers out of a local log or a local config
     // and then stops. The live session below is what is left when none of

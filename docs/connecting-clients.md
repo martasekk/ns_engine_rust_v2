@@ -19,7 +19,42 @@ in does not add an engine, a store, or a second copy of a conversation.
 
 ---
 
-## 0. A company to try it with
+## 0. Setting it up in a page
+
+Everything below can be done in a form instead:
+
+```sh
+ns-app admin          # prints a loopback link carrying a one-time token
+```
+
+Three tabs. **Process** is what the whole shard shares — provider, models,
+the two listen addresses. **Companies** adds one and edits its persona, its
+database and its keys. **Credentials** is every variable your configuration
+names, whether each has a value, and a box to give it one.
+
+Two rules it keeps, and they are the reason it is worth having rather than a
+generic TOML editor:
+
+- **A key never goes into the config.** The config names variables — that is
+  what keeps a credential out of a file somebody commits — so the page writes
+  *values* to a `.env` beside it and leaves the naming where it was. It adds
+  `.env` to `.gitignore` the first time it runs.
+- **A key never comes back out.** The page is told a variable's name, what
+  the config uses it for, and whether it is set. Never the value.
+
+It edits the files in place with their comments intact, and every save has to
+parse as a config before it is written — so a mistake is a refusal on screen
+rather than a process that will not start next time. It binds loopback only,
+with no flag to say otherwise: it edits credentials and has no TLS. Forward a
+port if you need it from elsewhere.
+
+Changes land in the files; a running `ns-app serve` is not reconfigured under
+itself, so restart it to pick them up.
+
+The rest of this section is the same setup done by hand, which is also what
+the page writes.
+
+## 0.1 A company to try it with
 
 A company is a file in `tenants/`, named for the id it is addressed by. This
 is the whole of one:
