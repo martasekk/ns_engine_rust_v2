@@ -173,8 +173,10 @@ async fn route(admin: &Arc<Admin>, request: &Request) -> Response {
     }
     match (request.method.as_str(), request.path()) {
         ("GET", "/api/state") => admin.state(),
+        ("GET", "/api/vault") => admin.vault(),
         ("POST", "/api/settings") => admin.save_settings(&request.body),
         ("POST", "/api/company") => admin.add_company(&request.body),
+        ("POST", "/api/company/rename") => refuse_rename(),
         ("POST", "/api/secret") => admin.save_secret(&request.body),
         ("POST", "/api/secret/remove") => admin.remove_secret(&request.body),
         _ => Response::refused(404),
@@ -207,6 +209,89 @@ struct CompanyRequest {
     id: String,
 }
 
+/// Everything read off disk for one request. Built once per call so the
+/// form and the vault are always describing the same files.
+struct Survey {
+    companies: Vec<String>,
+    summaries: Vec<CompanySummary>,
+    process_values: serde_json::Value,
+    company_values: serde_json::Value,
+    named: Vec<secrets::Reference>,
+}
+
+/// One row of the company list: what an operator needs to see without
+/// opening anything — who it is, what it runs on, how a message reaches it,
+/// and whether it can work at all yet.
+#[derive(serde::Serialize)]
+struct CompanySummary {
+    id: String,
+    /// The model this company's emitter runs.
+    model: String,
+    /// Whether that model is its own choice or the process's. A page that
+    /// showed only the model would make every company look configured.
+    own_model: bool,
+    /// The ways in it is reachable by. Empty means nothing can reach it —
+    /// which is a normal state for a company added a minute ago, and not
+    /// one to leave silent.
+    reach: Vec<String>,
+    /// How many of its variables have no value. The one number that says
+    /// "this company will not work yet".
+    missing: usize,
+    /// Why its overlay does not load, when it does not. A row that showed a
+    /// plausible model for a company the loader refuses would be the page
+    /// disagreeing with startup, which is the one thing it is here to
+    /// prevent.
+    problem: Option<String>,
+}
+
+/// The model this config's emitter resolves to, or the reason it does not.
+/// The reason is the one startup would print, so an operator reading the row
+/// is reading the error they would otherwise have met at the next restart.
+fn emitter_model(llm: &crate::config::LlmConfig) -> Result<String, String> {
+    llm.roles()?
+        .into_iter()
+        .find(|target| target.role == crate::config::Role::Emitter)
+        .map(|target| target.model)
+        .ok_or_else(|| "no emitter role resolves".to_string())
+}
+
+/// The ways a message can arrive for this company. Both are properties of
+/// what it holds, never of a route it was given: there is one socket and one
+/// endpoint for the whole process, and a company is told apart by the
+/// credential or by the account id inside a signed payload.
+fn reachable_by(overlay: &AppConfig) -> Vec<String> {
+    let mut ways = Vec::new();
+    if !overlay.auth.signing_key_envs.is_empty() {
+        ways.push("a token it signs".to_string());
+    }
+    if overlay
+        .whatsapp
+        .as_ref()
+        .is_some_and(|w| !w.phone_number_id.trim().is_empty())
+    {
+        ways.push("WhatsApp".to_string());
+    }
+    ways
+}
+
+/// This company's variables that have no value yet.
+fn missing_values(
+    id: &str,
+    named: &[secrets::Reference],
+    entries: &[secrets::SecretStatus],
+) -> usize {
+    let mut theirs: Vec<&str> = Vec::new();
+    for reference in named.iter().filter(|r| r.company.as_deref() == Some(id)) {
+        if !theirs.contains(&reference.name.as_str()) {
+            theirs.push(&reference.name);
+        }
+    }
+    theirs
+        .iter()
+        .filter(|name| !entries.iter().any(|e| e.name == **name && e.set))
+        .count()
+}
+
 #[derive(serde::Deserialize)]
 struct SecretRequest {
     name: String,
@@ -229,48 +314,126 @@ impl Admin {
     /// schemas, the current value of each, the companies, and which
     /// variables are set.
     fn state(&self) -> Response {
-        let base = match self.load_base() {
-            Ok(base) => base,
+        let survey = match self.survey() {
+            Ok(survey) => survey,
             Err(e) => return Response::json(200, &serde_json::json!({ "error": e })),
         };
-        let companies = self.company_ids();
-        let mut company_configs = Vec::new();
-        let mut company_values = serde_json::Map::new();
-        for id in &companies {
-            let doc = match document::read(&self.company_path(id)) {
-                Ok(doc) => doc,
-                Err(e) => {
-                    return Response::json(200, &serde_json::json!({ "error": e.to_string() }))
-                }
-            };
-            company_values.insert(id.clone(), values_of(&doc, schema::COMPANY));
-            if let Ok(cfg) = AppConfig::parse(&doc.to_string()) {
-                company_configs.push((id.clone(), cfg));
-            }
-        }
-        let doc = match document::read(&self.config_path()) {
-            Ok(doc) => doc,
-            Err(e) => return Response::json(200, &serde_json::json!({ "error": e.to_string() })),
-        };
-        let named = schema::variables_named(&base, &company_configs);
         Response::json(
             200,
             &serde_json::json!({
                 "root": self.root.display().to_string(),
-                "process": { "sections": schema::PROCESS, "values": values_of(&doc, schema::PROCESS) },
-                "company": { "sections": schema::COMPANY, "values": company_values },
-                "companies": companies,
-                "secrets": secrets::status(&self.root, &named),
+                "process": { "sections": schema::PROCESS, "values": survey.process_values },
+                "company": { "sections": schema::COMPANY, "values": survey.company_values },
+                "companies": survey.companies,
+                "summaries": survey.summaries,
+                "secrets": secrets::status(&self.root, &survey.named),
                 "secretsFile": secrets::SECRETS_FILE,
             }),
         )
     }
 
-    /// The base config as startup reads it, so the page reports what is in
-    /// force rather than what the file says in isolation.
-    fn load_base(&self) -> Result<AppConfig, String> {
-        let text = std::fs::read_to_string(self.config_path()).unwrap_or_default();
-        AppConfig::parse(&text).map_err(|e| e.to_string())
+    /// The vault: every variable the configuration names, and every one the
+    /// file holds that nothing names yet. Values are not part of it — the
+    /// route exists to say what is set and who reaches for it.
+    fn vault(&self) -> Response {
+        let survey = match self.survey() {
+            Ok(survey) => survey,
+            Err(e) => return Response::json(200, &serde_json::json!({ "error": e })),
+        };
+        Response::json(
+            200,
+            &serde_json::json!({
+                "entries": secrets::vault(&self.root, &survey.named),
+                "secretsFile": secrets::SECRETS_FILE,
+            }),
+        )
+    }
+
+    /// The base config, every company's overlay, and every variable the
+    /// whole set names — what both `/api/state` and `/api/vault` are built
+    /// from, read once so the two can never disagree.
+    fn survey(&self) -> Result<Survey, String> {
+        // The base config as startup reads it, so the page reports what is
+        // in force rather than what the file says in isolation.
+        let base_text = std::fs::read_to_string(self.config_path()).unwrap_or_default();
+        let base = AppConfig::parse(&base_text).map_err(|e| e.to_string())?;
+        let tenants = self.root.join(crate::tenant::TENANT_DIR);
+        let companies = self.company_ids();
+        let mut configs = Vec::new();
+        let mut company_values = serde_json::Map::new();
+        for id in &companies {
+            let doc = document::read(&self.company_path(id)).map_err(|e| e.to_string())?;
+            company_values.insert(id.clone(), values_of(&doc, schema::COMPANY));
+            if let Ok(cfg) = AppConfig::parse(&doc.to_string()) {
+                configs.push((id.clone(), cfg));
+            }
+        }
+        let doc = document::read(&self.config_path()).map_err(|e| e.to_string())?;
+        // Deliberately the overlays *alone*: a merged config inherits the
+        // base's key variable, which would make every company reference the
+        // house key and make it look shared the moment there were two.
+        let named = schema::variables_named(&base, &configs);
+        let entries = secrets::status(&self.root, &named);
+        let base_model = emitter_model(&base.llm).ok();
+        // Every company gets a row, including one whose overlay does not
+        // parse. That company is exactly the one somebody needs to open and
+        // fix, and a list built only from the overlays that loaded would
+        // leave it with no row to click.
+        let summaries = companies
+            .iter()
+            .map(|id| {
+                if !configs.iter().any(|(known, _)| known == id) {
+                    return CompanySummary {
+                        id: id.clone(),
+                        model: "—".to_string(),
+                        own_model: false,
+                        reach: Vec::new(),
+                        missing: 0,
+                        problem: Some(format!(
+                            "{}.toml is not a configuration this can read — open it and \
+                             fix the line it names at startup",
+                            id
+                        )),
+                    };
+                }
+                // The model and the ways in are properties of the merged
+                // config, because that is the one the company's engine is
+                // built from. Running the loader's own merge is what keeps
+                // this row and startup from ever disagreeing.
+                let merged = crate::tenant::load_one(&base_text, &tenants, id);
+                let (model, problem) = match &merged {
+                    Ok(tenant) => match emitter_model(&tenant.app.llm) {
+                        Ok(model) => (model, None),
+                        Err(why) => ("—".to_string(), Some(why)),
+                    },
+                    Err(e) => ("—".to_string(), Some(e.to_string())),
+                };
+                CompanySummary {
+                    id: id.clone(),
+                    // Its own model means the merged config runs something
+                    // other than what the process runs — which is true
+                    // whether it named the model or named a provider that
+                    // carried one. Reading the overlay for a `model` key
+                    // would call a company inherited while it ran a model
+                    // the process has never heard of.
+                    own_model: problem.is_none() && Some(&model) != base_model.as_ref(),
+                    model,
+                    reach: match &merged {
+                        Ok(tenant) => reachable_by(&tenant.app),
+                        Err(_) => Vec::new(),
+                    },
+                    missing: missing_values(id, &named, &entries),
+                    problem,
+                }
+            })
+            .collect();
+        Ok(Survey {
+            process_values: values_of(&doc, schema::PROCESS),
+            company_values: serde_json::Value::Object(company_values),
+            companies,
+            summaries,
+            named,
+        })
     }
 
     fn company_ids(&self) -> Vec<String> {
@@ -393,6 +556,36 @@ impl Admin {
         let Ok(request) = serde_json::from_slice::<SecretRequest>(body) else {
             return Response::refused(400);
         };
+        // Removing a key one company names breaks that company, and the
+        // operator doing it is looking at its row. Removing one that *two*
+        // companies name breaks a company that is not on the screen, so it
+        // is refused and both are named: the fix is to give one of them its
+        // own entry first.
+        //
+        // A survey that cannot be built is a refusal, not a licence: if one
+        // tenant file is unreadable this cannot tell whether the key is
+        // shared, and guessing "it is not" is the guess that breaks a
+        // company.
+        let survey = match self.survey() {
+            Ok(survey) => survey,
+            Err(e) => {
+                return bad_request(format!(
+                    "cannot tell who uses {} while the configuration does not read ({e}), \
+                     so it is left alone",
+                    request.name
+                ))
+            }
+        };
+        let sharing = secrets::owners_referencing(&survey.named, &request.name);
+        if sharing.len() > 1 {
+            return bad_request(format!(
+                "{} is the key {} {} use — removing it would stop the one you are not \
+                 looking at. Give one of them its own variable first.",
+                request.name,
+                sharing.join(" and "),
+                if sharing.len() == 2 { "both" } else { "all" }
+            ));
+        }
         match secrets::remove(&self.root, &request.name) {
             Ok(()) => Response::json(200, &serde_json::json!({ "removed": request.name })),
             Err(e) => bad_request(e),
@@ -402,6 +595,25 @@ impl Admin {
 
 fn bad_request(detail: String) -> Response {
     Response::json(400, &serde_json::json!({ "error": detail }))
+}
+
+/// H3. A company's id is the first segment of every session id it has ever
+/// had and the name of its store file, so a rename would leave its history
+/// addressed by a name nothing answers to. The route exists only to say
+/// that in words: the page does not offer the control, and a caller that
+/// went looking for it gets the reason rather than a bare 404.
+///
+/// Copying is not offered either — it would be the same id problem with an
+/// extra database, and the two companies would share every variable the
+/// copy inherited without either page saying so.
+fn refuse_rename() -> Response {
+    bad_request(
+        "a company cannot be renamed: its id is the first segment of every session id it \
+         has ever had and the name of its store file, and neither of those follows. Add \
+         the new company and move the conversations deliberately, or keep the id and \
+         change what it is called on its persona."
+            .to_string(),
+    )
 }
 
 fn env_suffix(id: &str) -> String {
@@ -547,8 +759,10 @@ mod tests {
         );
         for (method, path) in [
             ("GET", "/api/state"),
+            ("GET", "/api/vault"),
             ("POST", "/api/settings"),
             ("POST", "/api/secret"),
+            ("POST", "/api/secret/remove"),
             ("POST", "/api/company"),
         ] {
             let refused = route(&admin, &request(method, path, None, "{}")).await;
@@ -722,7 +936,342 @@ mod tests {
         // It is reported as set, which is the whole of what the page needs.
         assert!(body.contains("NS_TEST_ADMIN_STATE_KEY"), "{body}");
         assert!(body.contains("\"set\":true"), "{body}");
+
+        // T1.3 / H2: the vault is a second way to ask the same question,
+        // and the rule has to hold on it too or the feature undid the test.
+        let vault = route(&admin, &request("GET", "/api/vault", Some("the-token"), "")).await;
+        let body = String::from_utf8_lossy(&vault.body);
+        assert!(
+            !body.contains("sk-do-not-echo-me"),
+            "a secret reached the page through the vault: {body}"
+        );
+        assert!(body.contains("NS_TEST_ADMIN_STATE_KEY"), "{body}");
         std::env::remove_var("NS_TEST_ADMIN_STATE_KEY");
+    }
+
+    /// Two overlays, one `[llm] api_key_env`.
+    fn two_companies_on_one_key(root: &Path) {
+        std::fs::write(
+            root.join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\napi_key_env = \"NS_TEST_ADMIN_HOUSE\"\n",
+        )
+        .expect("the config");
+        std::fs::create_dir_all(root.join("tenants")).expect("tenants");
+        for id in ["acme", "beta"] {
+            std::fs::write(
+                root.join("tenants").join(format!("{id}.toml")),
+                format!(
+                    "[store]\npath = \"ns-{id}.sqlite\"\n\
+                     [llm]\nprovider = \"groq\"\napi_key_env = \"NS_TEST_ADMIN_BOTH\"\n"
+                ),
+            )
+            .expect("the overlay");
+        }
+    }
+
+    /// T1.4 / H1. Two companies naming one key share the provider's quota
+    /// and, by the throttle's key of (base URL, key hash), one throttle.
+    /// The row names both, so it is never something to discover later.
+    #[tokio::test]
+    async fn a_key_two_companies_reference_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        two_companies_on_one_key(dir.path());
+        let admin = admin(dir.path());
+
+        let vault = route(&admin, &request("GET", "/api/vault", Some("the-token"), "")).await;
+        assert_eq!(vault.status, 200);
+        let answered: serde_json::Value =
+            serde_json::from_slice(&vault.body).expect("the vault is json");
+        let entries = answered["entries"].as_array().expect("entries");
+
+        let both = entries
+            .iter()
+            .find(|e| e["name"] == "NS_TEST_ADMIN_BOTH")
+            .expect("the shared entry");
+        assert_eq!(both["shared"], true, "{both}");
+        assert_eq!(both["companies"], serde_json::json!(["acme", "beta"]));
+
+        // The process's own key is named by nobody's overlay, so it is not
+        // shared however many companies the deployment has.
+        let house = entries
+            .iter()
+            .find(|e| e["name"] == "NS_TEST_ADMIN_HOUSE")
+            .expect("the process key");
+        assert_eq!(house["shared"], false, "{house}");
+    }
+
+    /// T1.2. Removing a key one company names is its own business; removing
+    /// one two companies name breaks the company that is not on the screen.
+    #[tokio::test]
+    async fn removing_a_key_two_companies_reference_is_refused_naming_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        two_companies_on_one_key(dir.path());
+        let admin = admin(dir.path());
+        secrets::set(dir.path(), "NS_TEST_ADMIN_BOTH", "shared-value").expect("sets");
+        secrets::set(dir.path(), "NS_TEST_ADMIN_HOUSE", "house-value").expect("sets");
+
+        let refused = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/secret/remove",
+                Some("the-token"),
+                r#"{"name":"NS_TEST_ADMIN_BOTH"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+        let said = String::from_utf8_lossy(&refused.body);
+        assert!(said.contains("acme") && said.contains("beta"), "{said}");
+        let text = std::fs::read_to_string(dir.path().join(secrets::SECRETS_FILE)).expect("reads");
+        assert!(text.contains("NS_TEST_ADMIN_BOTH"), "still there: {text}");
+
+        // The one only the process names is removable as it always was.
+        let removed = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/secret/remove",
+                Some("the-token"),
+                r#"{"name":"NS_TEST_ADMIN_HOUSE"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(removed.status, 200);
+        std::env::remove_var("NS_TEST_ADMIN_BOTH");
+        std::env::remove_var("NS_TEST_ADMIN_HOUSE");
+    }
+
+    /// T2.2. The config layer always allowed a company its own model; only
+    /// the page did not offer it. This is that gap closed, through the
+    /// route that would refuse a path the schema does not own.
+    #[tokio::test]
+    async fn a_company_can_be_given_its_own_model_and_its_own_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\nemitter = { model = \"house/model\" }\n",
+        )
+        .expect("the config");
+        let admin = admin(dir.path());
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company",
+                Some("the-token"),
+                r#"{"id":"acme"}"#,
+            ),
+        )
+        .await;
+
+        let saved = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/settings",
+                Some("the-token"),
+                r#"{"company":"acme","values":{"llm.provider":"groq",
+                    "llm.api_key_env":"NS_LLM_API_KEY_ACME",
+                    "llm.emitter.model":"theirs/model"}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            saved.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&saved.body)
+        );
+
+        let text = std::fs::read_to_string(dir.path().join("tenants").join("acme.toml"))
+            .expect("the overlay");
+        assert!(text.contains("theirs/model"), "{text}");
+        assert!(text.contains("NS_LLM_API_KEY_ACME"), "{text}");
+
+        // And the list says it is theirs rather than the house's.
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        let acme = &answered["summaries"][0];
+        assert_eq!(acme["id"], "acme");
+        assert_eq!(acme["model"], "theirs/model");
+        assert_eq!(acme["own_model"], true);
+        // Its signing key and its provider key, neither of them set yet.
+        assert_eq!(acme["missing"], 2, "{acme}");
+        assert_eq!(acme["reach"], serde_json::json!(["a token it signs"]));
+    }
+
+    /// A company that asks for nothing of its own runs the process's model,
+    /// and the row says so rather than making it look chosen.
+    #[tokio::test]
+    async fn a_company_without_its_own_model_shows_the_process_one_as_inherited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\nemitter = { model = \"house/model\" }\n",
+        )
+        .expect("the config");
+        let admin = admin(dir.path());
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company",
+                Some("the-token"),
+                r#"{"id":"acme"}"#,
+            ),
+        )
+        .await;
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        let acme = &answered["summaries"][0];
+        assert_eq!(acme["model"], "house/model");
+        assert_eq!(acme["own_model"], false, "{acme}");
+    }
+
+    /// An overlay the loader refuses is reported as refused, rather than
+    /// shown with a plausible model it will never run. The page and startup
+    /// disagreeing is the failure this whole module exists to avoid.
+    #[tokio::test]
+    async fn a_company_whose_overlay_the_loader_refuses_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\nemitter = { model = \"house/model\" }\n",
+        )
+        .expect("the config");
+        std::fs::create_dir_all(dir.path().join("tenants")).expect("tenants");
+        // `http` is process-owned: a company that could move the endpoint
+        // could take another company's callers.
+        std::fs::write(
+            dir.path().join("tenants").join("acme.toml"),
+            "[http]\nlisten = \"0.0.0.0:9\"\n",
+        )
+        .expect("the overlay");
+        let admin = admin(dir.path());
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        let acme = &answered["summaries"][0];
+        assert!(acme["problem"].is_string(), "{acme}");
+        assert!(
+            acme["problem"].as_str().expect("text").contains("http"),
+            "{acme}"
+        );
+        assert_eq!(acme["reach"], serde_json::json!([]));
+    }
+
+    /// A company whose overlay is not a configuration at all still gets a
+    /// row. It is the one somebody has to open and fix, and a list built
+    /// only from the overlays that loaded would leave it with nothing to
+    /// click and no hint that it exists.
+    #[tokio::test]
+    async fn a_company_whose_overlay_does_not_parse_still_has_a_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\n",
+        )
+        .expect("the config");
+        std::fs::create_dir_all(dir.path().join("tenants")).expect("tenants");
+        // Valid TOML, and not a configuration.
+        std::fs::write(
+            dir.path().join("tenants").join("beta.toml"),
+            "[llm]\nprovider = 5\n",
+        )
+        .expect("the overlay");
+        let admin = admin(dir.path());
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        let rows = answered["summaries"].as_array().expect("summaries");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the broken company still has a row: {rows:?}"
+        );
+        assert_eq!(rows[0]["id"], "beta");
+        assert!(rows[0]["problem"].is_string(), "{}", rows[0]);
+    }
+
+    /// A company that names a provider and no model runs that provider's
+    /// default, which is not the process's model. Calling it inherited
+    /// would print a caption naming a model the process does not run.
+    #[tokio::test]
+    async fn a_company_that_names_only_a_provider_is_not_called_inherited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"openrouter\"\n",
+        )
+        .expect("the config");
+        std::fs::create_dir_all(dir.path().join("tenants")).expect("tenants");
+        std::fs::write(
+            dir.path().join("tenants").join("acme.toml"),
+            "[llm]\nprovider = \"mistral\"\n",
+        )
+        .expect("the overlay");
+        let admin = admin(dir.path());
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        let acme = &answered["summaries"][0];
+        assert_eq!(acme["model"], "mistral-small-latest");
+        assert_eq!(acme["own_model"], true, "{acme}");
+    }
+
+    /// T2.4 / H3. The id is the first segment of every session id the
+    /// company has and the name of its store file. Neither follows a
+    /// rename, so there is no rename — and a caller that looks for one is
+    /// told why rather than given a 404 to guess at.
+    #[tokio::test]
+    async fn a_company_cannot_be_renamed_and_the_refusal_says_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+        let refused = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company/rename",
+                Some("the-token"),
+                r#"{"id":"acme","to":"acme-gmbh"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+        let said = String::from_utf8_lossy(&refused.body);
+        assert!(said.contains("session id"), "{said}");
+        assert!(said.contains("store file"), "{said}");
+        // Not a setting either, so it cannot arrive through a save.
+        assert!(schema::field_of(schema::COMPANY, "id").is_none());
+    }
+
+    /// A key minted before the company that will use it is still in the
+    /// vault, and still absent from the form's own list.
+    #[tokio::test]
+    async fn a_key_nothing_references_is_in_the_vault_and_not_in_the_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"ollama\"\n",
+        )
+        .expect("the config");
+        let admin = admin(dir.path());
+        secrets::set(dir.path(), "NS_TEST_ADMIN_EARLY", "minted-early").expect("sets");
+
+        let vault = route(&admin, &request("GET", "/api/vault", Some("the-token"), "")).await;
+        let body = String::from_utf8_lossy(&vault.body);
+        assert!(body.contains("NS_TEST_ADMIN_EARLY"), "{body}");
+        assert!(!body.contains("minted-early"), "a value reached the page");
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let state = String::from_utf8_lossy(&state.body);
+        assert!(
+            !state.contains("NS_TEST_ADMIN_EARLY"),
+            "the form drew a variable nothing names: {state}"
+        );
+        std::env::remove_var("NS_TEST_ADMIN_EARLY");
     }
 
     #[test]

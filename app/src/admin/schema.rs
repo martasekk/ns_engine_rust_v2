@@ -10,6 +10,7 @@
 //! A field is a dotted path into the document ([`super::document`]), so
 //! adding one is a line here and nothing else.
 
+use super::secrets::Reference;
 use crate::config::AppConfig;
 
 /// Which control the page draws, and what the value must parse as.
@@ -93,7 +94,7 @@ pub(crate) const PROCESS: &[Section] = &[
     Section {
         title: "Model",
         note: "Which provider and models this deployment drives. The key itself is never \
-               here — the config names a variable, and Credentials is where that variable \
+               here — the config names a variable, and the Vault is where that variable \
                gets its value.",
         fields: &[
             field(
@@ -275,6 +276,47 @@ pub(crate) const PROCESS: &[Section] = &[
 /// sets one.
 pub(crate) const COMPANY: &[Section] = &[
     Section {
+        title: "Their model",
+        note: "Left empty, this company runs on the process's provider, key and model. \
+               Filling any of it in gives them their own — including their own quota, if \
+               the key is theirs alone. The models catalogue stays the process's.",
+        fields: &[
+            field(
+                "llm.provider",
+                "Provider",
+                Kind::Text,
+                "A preset name, as on the Process tab. Naming one here points this \
+                 company's calls somewhere else entirely, key included.",
+                "the process's",
+            ),
+            field(
+                "llm.base_url",
+                "Endpoint",
+                Kind::Text,
+                "Spelled out, when the provider is not one of the presets.",
+                "the process's",
+            ),
+            field(
+                "llm.api_key_env",
+                "API key variable",
+                Kind::EnvName,
+                "The name of the variable holding this company's provider key — not the \
+                 key. A variable another company also names is a shared quota and a \
+                 shared throttle, and the Vault tab says which.",
+                "the process's",
+            ),
+            field(
+                "llm.emitter.model",
+                "Model",
+                Kind::Text,
+                "The model that chooses this company's actions and writes its replies. \
+                 One model does both, so this is the choice that decides how good their \
+                 agent is.",
+                "the process's",
+            ),
+        ],
+    },
+    Section {
         title: "Who they are",
         note: "Anything left empty falls back to the process settings.",
         fields: &[
@@ -384,11 +426,16 @@ pub(crate) fn field_of(sections: &[Section], path: &str) -> Option<&'static Fiel
 pub(crate) fn variables_named(
     base: &AppConfig,
     companies: &[(String, AppConfig)],
-) -> Vec<(String, String)> {
-    let mut named: Vec<(String, String)> = Vec::new();
-    let mut note = |name: Option<&str>, what: &str| {
+) -> Vec<Reference> {
+    let mut named: Vec<Reference> = Vec::new();
+    let mut note = |name: Option<&str>, what: &str, path: &str, company: Option<&str>| {
         if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
-            named.push((name.to_string(), what.to_string()));
+            named.push(Reference {
+                name: name.to_string(),
+                used_for: what.to_string(),
+                company: company.map(str::to_string),
+                path: path.to_string(),
+            });
         }
     };
 
@@ -402,45 +449,190 @@ pub(crate) fn variables_named(
                     note(
                         Some(&target.api_key_env),
                         &format!("the {}'s provider key", target.role.as_str()),
+                        key_path(&base.llm, target.role),
+                        None,
                     );
                 }
             }
         }
         // A config too broken to resolve roles still names a key.
-        Err(_) => note(base.llm.api_key_env.as_deref(), "the provider key"),
+        Err(_) => note(
+            base.llm.api_key_env.as_deref(),
+            "the provider key",
+            "llm.api_key_env",
+            None,
+        ),
     }
     if base.serve.auth == crate::config::AuthMode::Shared {
-        note(Some(&base.serve.token_env), "the shared socket token");
+        note(
+            Some(&base.serve.token_env),
+            "the shared socket token",
+            "serve.token_env",
+            None,
+        );
     }
     note(
         Some(&base.http.whatsapp_verify_token_env),
         "the WhatsApp verification token",
+        "http.whatsapp_verify_token_env",
+        None,
     );
     if let Some(pointer) = &base.pointer {
-        note(Some(&pointer.token_env), "the pointer agent's token");
+        note(
+            Some(&pointer.token_env),
+            "the pointer agent's token",
+            "pointer.token_env",
+            None,
+        );
     }
 
     for (id, company) in companies {
         for (index, env) in company.auth.signing_key_envs.iter().enumerate() {
             let which = if index == 0 { "current" } else { "previous" };
-            note(Some(env), &format!("{id}'s {which} signing key"));
+            note(
+                Some(env),
+                &format!("{id}'s {which} signing key"),
+                "auth.signing_key_envs",
+                Some(id),
+            );
         }
         if let Some(whatsapp) = &company.whatsapp {
             note(
                 Some(&whatsapp.access_token_env),
                 &format!("{id}'s WhatsApp access token"),
+                "whatsapp.access_token_env",
+                Some(id),
             );
             note(
                 Some(&whatsapp.app_secret_env),
                 &format!("{id}'s WhatsApp app secret"),
+                "whatsapp.app_secret_env",
+                Some(id),
             );
             note(
                 Some(&whatsapp.session_salt_env),
                 &format!("{id}'s WhatsApp session salt"),
+                "whatsapp.session_salt_env",
+                Some(id),
             );
+        }
+        for (name, used_for, path) in company_provider_keys(id, &company.llm) {
+            note(Some(&name), &used_for, &path, Some(id));
         }
     }
     named
+}
+
+/// Which key a company's own `[llm]` reaches for, and nothing more.
+///
+/// Only what the overlay actually says. A company with no `[llm]` of its own
+/// runs on the process's provider and the process's key, and reporting that
+/// as *its* key would hang a phantom reference on every company's row — and
+/// make a key look shared the moment a second company existed.
+fn company_provider_keys(
+    id: &str,
+    llm: &crate::config::LlmConfig,
+) -> Vec<(String, String, String)> {
+    if !picks_a_provider(llm) {
+        return Vec::new();
+    }
+    let mut keys: Vec<(String, String, String)> = Vec::new();
+    let mut note = |name: String, path: &str| {
+        if !name.trim().is_empty() && !keys.iter().any(|(known, _, _)| known == &name) {
+            keys.push((name, format!("{id}'s provider key"), path.to_string()));
+        }
+    };
+    match llm.roles() {
+        Ok(targets) => {
+            for target in targets {
+                if !target.local {
+                    note(target.api_key_env.clone(), key_path(llm, target.role));
+                }
+            }
+        }
+        // Named a provider but no model the resolver can place. The
+        // provider still decides the key, and that is the half of it worth
+        // showing — the other half is the company's missing model, which the
+        // company list reports on its own.
+        Err(_) => {
+            if let Some(env) = llm.api_key_env.clone() {
+                note(env, "llm.api_key_env");
+            } else if let Some(preset) = chosen_preset(llm).filter(|p| !p.local) {
+                note(preset.api_key_env.to_string(), "llm.provider");
+            }
+        }
+    }
+    keys
+}
+
+/// Whether this `[llm]` says anything at all about which provider — and so
+/// which key variable — its calls use.
+///
+/// There are four ways to say it and they are easy to count as three. A
+/// `provider:model` prefix reads least like a provider choice and is the one
+/// that gets missed: miss it and the company's real key appears in no row,
+/// can never be seen as shared, and counts as nothing missing on a company
+/// that cannot make a single request.
+fn picks_a_provider(llm: &crate::config::LlmConfig) -> bool {
+    llm.provider.is_some()
+        || llm.base_url.is_some()
+        || llm.api_key_env.is_some()
+        || llm.emitter.api_key_env.is_some()
+        || llm.summarizer.api_key_env.is_some()
+        || has_prefix(&llm.emitter.model)
+        || has_prefix(&llm.summarizer.model)
+}
+
+fn has_prefix(model: &Option<String>) -> bool {
+    model
+        .as_deref()
+        .is_some_and(|spec| nsllm::provider::split_model(spec).0.is_some())
+}
+
+fn chosen_preset(llm: &crate::config::LlmConfig) -> Option<&'static nsllm::provider::Provider> {
+    llm.provider
+        .as_deref()
+        .and_then(nsllm::provider::find)
+        .or_else(|| {
+            llm.emitter
+                .model
+                .as_deref()
+                .and_then(|spec| nsllm::provider::split_model(spec).0)
+        })
+}
+
+/// The control that decided the key a role resolved to, so the page can
+/// point at the thing to change rather than at a field nobody set.
+///
+/// The order is the resolver's own (`LlmConfig::role`): the role's override,
+/// then the preset a `provider:model` prefix names, then the shared `[llm]`
+/// key, then the preset. Getting it wrong would send an operator to a field
+/// whose value is not the one in force.
+fn key_path(llm: &crate::config::LlmConfig, role: crate::config::Role) -> &'static str {
+    use crate::config::Role;
+    let (section_env, model) = match role {
+        Role::Emitter => (&llm.emitter.api_key_env, &llm.emitter.model),
+        Role::Summarizer => (&llm.summarizer.api_key_env, &llm.summarizer.model),
+    };
+    if section_env.is_some() {
+        return match role {
+            Role::Emitter => "llm.emitter.api_key_env",
+            Role::Summarizer => "llm.summarizer.api_key_env",
+        };
+    }
+    if has_prefix(model) {
+        return match role {
+            Role::Emitter => "llm.emitter.model",
+            Role::Summarizer => "llm.summarizer.model",
+        };
+    }
+    if llm.api_key_env.is_some() {
+        return "llm.api_key_env";
+    }
+    if llm.provider.is_some() || llm.base_url.is_some() {
+        return "llm.provider";
+    }
+    "llm.api_key_env"
 }
 
 #[cfg(test)]
@@ -498,7 +690,7 @@ mod tests {
         )
         .expect("parses");
         let named = variables_named(&base, &[("acme".to_string(), acme)]);
-        let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = named.iter().map(|r| r.name.as_str()).collect();
 
         assert!(names.contains(&"MY_KEY"), "{names:?}");
         assert!(names.contains(&"MY_SOCKET_TOKEN"), "{names:?}");
@@ -506,14 +698,104 @@ mod tests {
         // The rotation is described rather than just listed twice.
         let current = named
             .iter()
-            .find(|(n, _)| n == "ACME_NOW")
+            .find(|r| r.name == "ACME_NOW")
             .expect("current");
-        assert!(current.1.contains("current"), "{:?}", current.1);
+        assert!(current.used_for.contains("current"), "{current:?}");
         let previous = named
             .iter()
-            .find(|(n, _)| n == "ACME_BEFORE")
+            .find(|r| r.name == "ACME_BEFORE")
             .expect("previous");
-        assert!(previous.1.contains("previous"), "{:?}", previous.1);
+        assert!(previous.used_for.contains("previous"), "{previous:?}");
+    }
+
+    /// T1.1. Every entry says where it is named, and whose it is — the two
+    /// things that turn a list of variables into something an operator can
+    /// act on without opening a file.
+    #[test]
+    fn every_reference_carries_its_path_and_its_owner() {
+        let base = AppConfig::parse("[llm]\nprovider = \"openrouter\"\napi_key_env = \"MY_KEY\"\n")
+            .expect("parses");
+        let acme = AppConfig::parse("[auth]\nsigning_key_envs = [\"ACME_NOW\"]\n").expect("parses");
+        let named = variables_named(&base, &[("acme".to_string(), acme)]);
+
+        let process = named.iter().find(|r| r.name == "MY_KEY").expect("the key");
+        assert_eq!(process.path, "llm.api_key_env");
+        assert_eq!(process.company, None, "the process's own");
+
+        let theirs = named.iter().find(|r| r.name == "ACME_NOW").expect("theirs");
+        assert_eq!(theirs.path, "auth.signing_key_envs");
+        assert_eq!(theirs.company.as_deref(), Some("acme"));
+    }
+
+    /// A company with no `[llm]` of its own is not a company referencing
+    /// the process's key: it would make that key look shared as soon as a
+    /// second company existed, and sharing is the one thing this page must
+    /// not cry wolf about.
+    #[test]
+    fn a_company_without_its_own_provider_references_no_key() {
+        let base =
+            AppConfig::parse("[llm]\nprovider = \"openrouter\"\napi_key_env = \"SHARED_KEY\"\n")
+                .expect("parses");
+        let plain = AppConfig::parse("[store]\npath = \"ns-acme.sqlite\"\n").expect("parses");
+        let named = variables_named(&base, &[("acme".to_string(), plain)]);
+        assert!(
+            !named.iter().any(|r| r.company.is_some()),
+            "a company claimed a key it never named: {named:?}"
+        );
+    }
+
+    /// A `provider:model` prefix picks a provider, and a provider brings a
+    /// key variable with it. Missing it would leave the company's real key
+    /// in no row at all — unlistable, never shared, and counted as nothing
+    /// missing on a company that cannot make a single request.
+    #[test]
+    fn a_company_that_picks_its_provider_in_the_model_prefix_still_names_a_key() {
+        let base = AppConfig::parse("[llm]\napi_key_env = \"HOUSE_KEY\"\n").expect("parses");
+        let acme = AppConfig::parse("[llm.emitter]\nmodel = \"mistral:mistral-small-latest\"\n")
+            .expect("parses");
+        let named = variables_named(&base, &[("acme".to_string(), acme)]);
+        let theirs = named
+            .iter()
+            .find(|r| r.company.as_deref() == Some("acme"))
+            .expect("acme names a key through the prefix");
+        assert_eq!(theirs.name, "MISTRAL_API_KEY");
+        // And the row points at the control that actually chose it.
+        assert_eq!(theirs.path, "llm.emitter.model");
+    }
+
+    /// The prefix beats `[llm] api_key_env` in the resolver, so it has to
+    /// beat it here too — otherwise the page names a variable whose value
+    /// is not the one the call is made with.
+    #[test]
+    fn a_prefix_outranks_the_shared_key_the_way_the_resolver_does() {
+        let base = AppConfig::parse(
+            "[llm]\napi_key_env = \"HOUSE_KEY\"\n[llm.emitter]\nmodel = \"mistral:m\"\n",
+        )
+        .expect("parses");
+        let named = variables_named(&base, &[]);
+        let emitter = named
+            .iter()
+            .find(|r| r.used_for.contains("emitter"))
+            .expect("the emitter's key");
+        assert_eq!(emitter.name, "MISTRAL_API_KEY");
+        assert_eq!(emitter.path, "llm.emitter.model");
+    }
+
+    /// T2.2's half of the vault: a company that names its own key is a
+    /// reference like any other, and the row can say whose it is.
+    #[test]
+    fn a_company_with_its_own_key_is_a_reference_of_its_own() {
+        let base = AppConfig::parse("[llm]\napi_key_env = \"SHARED_KEY\"\n").expect("parses");
+        let acme =
+            AppConfig::parse("[llm]\nprovider = \"groq\"\napi_key_env = \"ACME_PROVIDER_KEY\"\n")
+                .expect("parses");
+        let named = variables_named(&base, &[("acme".to_string(), acme)]);
+        let theirs = named
+            .iter()
+            .find(|r| r.name == "ACME_PROVIDER_KEY")
+            .expect("the company's own key");
+        assert_eq!(theirs.company.as_deref(), Some("acme"));
+        assert_eq!(theirs.path, "llm.api_key_env");
     }
 
     /// A local server needs no key, so naming one on the page would be a
@@ -522,7 +804,7 @@ mod tests {
     fn a_local_provider_names_no_key() {
         let base = AppConfig::parse("[llm]\nprovider = \"ollama\"\n").expect("parses");
         let named = variables_named(&base, &[]);
-        let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = named.iter().map(|r| r.name.as_str()).collect();
         assert!(
             !names.iter().any(|n| n.contains("API_KEY")),
             "a local provider asked for a key: {names:?}"

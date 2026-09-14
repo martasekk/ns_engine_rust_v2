@@ -55,6 +55,11 @@
   .pill { font-size: 11px; padding: 2px 7px; border-radius: 99px; border: 1px solid var(--line); }
   .pill.set { color: var(--ok); border-color: var(--ok); }
   .pill.missing { color: var(--bad); border-color: var(--bad); }
+  .help.sharing { color: var(--fg); border-left: 2px solid var(--bad); padding-left: 8px;
+                  margin: 6px 0 0; }
+  table.pick tbody tr { cursor: pointer; }
+  table.pick tbody tr.chosen { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .chosen-name { font-size: 15px; margin: 22px 0 10px; color: var(--dim); }
   .banner { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
             border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; font-size: 13px; color: var(--dim); }
 </style>
@@ -66,7 +71,7 @@
   <nav>
     <button data-tab="process" aria-selected="true">Process</button>
     <button data-tab="companies" aria-selected="false">Companies</button>
-    <button data-tab="secrets" aria-selected="false">Credentials</button>
+    <button data-tab="secrets" aria-selected="false">Vault</button>
   </nav>
 </header>
 <main id="main"></main>
@@ -96,6 +101,7 @@ async function api(path, body) {
 function el(tag, attrs = {}, ...kids) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined) continue;
     if (k === "class") node.className = v;
     else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
     else if (v !== null && v !== undefined) node.setAttribute(k, v);
@@ -106,11 +112,61 @@ function el(tag, attrs = {}, ...kids) {
   return node;
 }
 
+// What the vault knows about one variable. The vault is the fuller list —
+// it holds keys nothing references yet — and the form's own list is the
+// fallback for the moment before it has loaded.
+function vaultEntry(name) {
+  return (state.vault || []).find((s) => s.name === name)
+      || (state.secrets || []).find((s) => s.name === name)
+      || null;
+}
+
+// The name a new key gets, minted from what it is for and whose it is:
+// NS_LLM_API_KEY_ACME. Derived rather than typed, because a name invented
+// on the spot is the one that gets misspelled on the second company.
+function mintName(field, companyId) {
+  const purpose = field.path.replace(/_envs?$/, "").replace(/[^A-Za-z0-9]+/g, "_").toUpperCase();
+  return "NS_" + purpose + (companyId ? "_" + companyId.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase() : "");
+}
+
+// A key field is a pick from the vault, not a name typed from memory. The
+// list is every entry the vault holds — including ones nothing references
+// yet — plus one option that mints a new name and asks for the value once.
+function envNamePicker(field, value, companyId) {
+  const NEW = "+new";
+  const names = (state.vault || []).map((s) => s.name);
+  if (value && !names.includes(value)) names.unshift(value);
+
+  const select = el("select", { id: "f:" + field.path },
+    el("option", { value: "" }, "(default: " + field.default + ")"),
+    ...names.map((n) => el("option", { value: n }, n)),
+    el("option", { value: NEW }, "new key…"));
+  select.value = value ?? "";
+
+  let previous = select.value;
+  select.addEventListener("change", async () => {
+    if (select.value !== NEW) { previous = select.value; return; }
+    const name = window.prompt("Name for the new key", mintName(field, companyId));
+    if (!name) { select.value = previous; return; }
+    const secret = window.prompt("Its value. It is written to the vault now; Save puts the name in the config.");
+    if (secret === null) { select.value = previous; return; }
+    try {
+      await api("/api/secret", { name: name.trim(), value: secret });
+      select.append(el("option", { value: name.trim() }, name.trim()));
+      select.value = name.trim();
+      previous = select.value;
+    } catch (e) { alert(e.message); select.value = previous; }
+  });
+  return select;
+}
+
 // One control, drawn for what the field says it is.
-function control(field, value) {
+function control(field, value, companyId) {
   const id = "f:" + field.path;
   let input;
-  if (field.kind === "paragraph") {
+  if (field.kind === "envname") {
+    input = envNamePicker(field, value, companyId);
+  } else if (field.kind === "paragraph") {
     input = el("textarea", { id });
     input.value = value ?? "";
   } else if (field.kind === "list") {
@@ -137,7 +193,7 @@ function control(field, value) {
   // naming one nobody exported is the likeliest mistake on this page.
   let status = null;
   if (field.kind === "envname" && value) {
-    const known = (state.secrets || []).find((s) => s.name === value);
+    const known = vaultEntry(value);
     status = el("span", { class: "pill " + (known && known.set ? "set" : "missing") },
       known && known.set ? "value set" : "no value yet");
   }
@@ -168,7 +224,7 @@ function settingsForm(sections, values, companyId) {
     form.append(el("section", {},
       el("h2", {}, section.title),
       section.note ? el("p", { class: "note" }, section.note) : null,
-      ...section.fields.map((f) => control(f, values[f.path])),
+      ...section.fields.map((f) => control(f, values[f.path], companyId)),
     ));
   }
   const msg = el("span", { class: "msg" });
@@ -192,7 +248,7 @@ function processTab() {
     el("div", { class: "banner" },
       "These are the process's own settings, shared by every company it hosts. " +
       "A key is never typed here: a field asks for the name of a variable, and " +
-      "Credentials is where that variable gets its value."),
+      "the Vault is where that variable gets its value."),
     settingsForm(state.process.sections, state.process.values, null));
 }
 
@@ -200,17 +256,38 @@ function companiesTab() {
   const ids = state.companies;
   if (!company || !ids.includes(company)) company = ids[0] || null;
 
+  const rows = (state.summaries || []).map((s) => el("tr", {
+      class: s.id === company ? "chosen" : null,
+      onclick: () => { company = s.id; render(); },
+    },
+    el("td", {}, el("div", { class: "mono" }, s.id),
+      s.problem ? el("div", { class: "msg bad" }, s.problem) : null),
+    el("td", {}, el("div", {}, s.model),
+      s.own_model ? null : el("div", { class: "help" }, "the process's")),
+    el("td", {}, s.reach.length
+      ? s.reach.join(", ")
+      : el("span", { class: "pill missing" }, "nothing reaches it yet")),
+    el("td", {}, s.missing
+      ? el("span", { class: "pill missing" },
+          s.missing + (s.missing === 1 ? " key has no value" : " keys have no value"))
+      : el("span", { class: "pill set" }, "ready")),
+  ));
+
   const picker = el("section", {},
     el("h2", {}, "Companies"),
     el("p", { class: "note" },
       "One file each, in tenants/. A company is built on its first message — its own " +
       "database, persona, keys and budget — and nothing it can set here belongs to the " +
-      "process."),
-    el("div", { class: "row" },
-      ids.length
-        ? el("select", { onchange: (e) => { company = e.target.value; render(); } },
-            ...ids.map((id) => el("option", { value: id, selected: id === company ? "" : null }, id)))
-        : el("span", { class: "help" }, "none yet"),
+      "process. They all arrive on the one socket and the one endpoint: a company is " +
+      "told apart by the credential it signs with, or by the account id inside a signed " +
+      "delivery, never by an address of its own."),
+    rows.length
+      ? el("table", { class: "pick" }, el("thead", {}, el("tr", {},
+          el("th", {}, "Company"), el("th", {}, "Model"),
+          el("th", {}, "Reachable by"), el("th", {}, "Keys"))),
+          el("tbody", {}, ...rows))
+      : el("p", { class: "help" }, "None yet."),
+    el("div", { class: "row", style: "margin-top:14px" },
       el("input", { type: "text", id: "newid", placeholder: "new company id, e.g. acme" }),
       el("button", { class: "quiet", onclick: async () => {
         const id = document.getElementById("newid").value.trim();
@@ -218,15 +295,38 @@ function companiesTab() {
         try { await api("/api/company", { id }); company = id; await load(); }
         catch (e) { alert(e.message); }
       } }, "Add"),
-    ));
+    ),
+    el("p", { class: "help" },
+      "An id cannot be changed afterwards: it is the first segment of every session id " +
+      "the company has and the name of its store file, and neither of those would " +
+      "follow. Choose it as you would a directory name."));
 
   if (!company) return el("div", {}, picker);
   return el("div", {}, picker,
+    el("h2", { class: "chosen-name mono" }, company),
     settingsForm(state.company.sections, state.company.values[company] || {}, company));
 }
 
-function secretsTab() {
-  const rows = (state.secrets || []).map((s) => {
+// Where a variable is named, in a sentence. The company first, because on
+// this page the question is nearly always "whose is this?".
+function whereNamed(use) {
+  return (use.company ? use.company + " · " : "the process · ") + use.path;
+}
+
+// What sharing one key actually costs, in words rather than a pill. The
+// throttle is keyed on (base URL, key hash), so two companies on one key
+// are one queue: the busy one paces the quiet one.
+function sharingNote(entry) {
+  const owners = (entry.process ? ["the process itself"] : []).concat(entry.companies);
+  return el("p", { class: "help sharing" },
+    owners.join(" and ") + " all use this key. They share the provider's quota and " +
+    "one throttle, so the busier one paces the others. Give one its own variable if " +
+    "that is not what you want.");
+}
+
+function vaultTab() {
+  const entries = state.vault || [];
+  const rows = entries.map((s) => {
     const input = el("input", { type: "password", placeholder: s.set ? "replace it" : "paste the value" });
     const msg = el("span", { class: "msg" });
     const save = async () => {
@@ -241,7 +341,13 @@ function secretsTab() {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
     return el("tr", {},
       el("td", {}, el("div", { class: "mono" }, s.name),
-        el("div", { class: "help" }, s.used_for.join(" · "))),
+        el("div", { class: "help" }, s.used_for.join(" · ")),
+        s.shared ? sharingNote(s) : null),
+      el("td", {},
+        (s.referenced_by || []).length
+          ? el("div", {}, ...s.referenced_by.map((u) =>
+              el("div", { class: "help mono" }, whereNamed(u))))
+          : el("span", { class: "pill" }, "not used yet")),
       el("td", {},
         el("span", { class: "pill " + (s.set ? "set" : "missing") },
           s.set ? (s.source === "environment" ? "exported" : "set") : "missing"),
@@ -259,6 +365,10 @@ function secretsTab() {
     );
   });
 
+  const mint = el("input", { type: "text", placeholder: "NS_SOMETHING_ACME" });
+  const mintValue = el("input", { type: "password", placeholder: "the value" });
+  const mintMsg = el("span", { class: "msg" });
+
   return el("div", {},
     el("div", { class: "banner" },
       "Values for the variables the config names. They are written to " +
@@ -266,15 +376,30 @@ function secretsTab() {
       "never sent back to this page — it is told only whether each one is set. " +
       "Anything already exported into the process wins over the file."),
     el("section", {},
-      el("h2", {}, "Credentials and keys"),
+      el("h2", {}, "The vault"),
       el("p", { class: "note" },
-        "This is every variable your configuration names. Add a company or name a " +
-        "variable on another tab and it appears here."),
+        "Every variable your configuration names, and every one the file holds that " +
+        "nothing names yet. A key minted here can be picked on a company's key field."),
       rows.length
         ? el("table", {}, el("thead", {}, el("tr", {},
-            el("th", {}, "Variable"), el("th", {}, "Status"), el("th", {}, "Value"))),
+            el("th", {}, "Variable"), el("th", {}, "Used by"),
+            el("th", {}, "Status"), el("th", {}, "Value"))),
             el("tbody", {}, ...rows))
-        : el("p", { class: "help" }, "Nothing is named yet.")));
+        : el("p", { class: "help" }, "Nothing is named yet."),
+      el("div", { class: "row", style: "margin-top:14px" }, mint, mintValue,
+        el("button", { class: "quiet", onclick: async () => {
+          if (!mint.value.trim() || !mintValue.value) return;
+          mintMsg.className = "msg"; mintMsg.textContent = "Saving…";
+          try {
+            await api("/api/secret", { name: mint.value.trim(), value: mintValue.value });
+            mint.value = ""; mintValue.value = "";
+            await load();
+          } catch (e) { mintMsg.className = "msg bad"; mintMsg.textContent = e.message; }
+        } }, "Add a key")),
+      el("p", { class: "help" },
+        "Adding one before the company that will use it is fine — it is listed as not " +
+        "used yet until something names it."),
+      mintMsg));
 }
 
 function render() {
@@ -282,11 +407,14 @@ function render() {
     button.setAttribute("aria-selected", String(button.dataset.tab === tab));
   }
   main.replaceChildren(
-    tab === "process" ? processTab() : tab === "companies" ? companiesTab() : secretsTab());
+    tab === "process" ? processTab() : tab === "companies" ? companiesTab() : vaultTab());
 }
 
 async function load() {
   state = await api("/api/state");
+  // The vault is its own route because it knows about entries the form does
+  // not — a key minted before anything names it.
+  state.vault = (await api("/api/vault")).entries || [];
   document.getElementById("root").textContent = state.root;
   render();
 }
