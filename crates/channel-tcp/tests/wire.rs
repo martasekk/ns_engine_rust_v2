@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use nschannel_tcp::{BindError, TcpChannel, HELLO_MAX};
-use nscore::{Channel, Incoming, SessionId};
+use nschannel_tcp::{BindError, TcpChannel, TenantChannel, HELLO_MAX, INBOUND_DEPTH};
+use nscore::{Channel, ChannelError, Incoming, SessionId};
 use nsidentity::{hmac_sha256, Hello, Hs256Verifier, IdentityResolver, TenantAuth};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -148,6 +148,199 @@ async fn nothing_received(ch: &TcpChannel) -> bool {
 
 fn sid(s: &str) -> SessionId {
     SessionId(s.into())
+}
+
+const ACME: &[u8] = b"acme-signing-key";
+const BETA: &[u8] = b"beta-signing-key";
+
+/// A listener two companies present tokens to.
+async fn bound_two() -> Arc<TcpChannel> {
+    TcpChannel::bind(
+        "127.0.0.1:0",
+        verifier(&[("acme", ACME), ("beta", BETA)]),
+        8,
+        false,
+    )
+    .await
+    .expect("bind loopback")
+}
+
+/// The registry's side of a cold company: wait to be told it has messages
+/// nobody is draining, then take its channel.
+async fn wait_for_tenant(ch: &TcpChannel, want: &str) -> Arc<TenantChannel> {
+    loop {
+        let woken = timeout(T, ch.next_active_tenant())
+            .await
+            .expect("a wake in time")
+            .expect("the wake stream outlives the listener");
+        if woken == want {
+            return ch
+                .tenant_channel(&woken)
+                .expect("a woken company has its receiver parked");
+        }
+    }
+}
+
+async fn tenant_recv(ch: &TenantChannel) -> Incoming {
+    timeout(T, ch.recv())
+        .await
+        .expect("recv in time")
+        .expect("recv")
+}
+
+/// (B3) A company that floods and is drained by nobody blocks its own
+/// connections and nothing else: the other company round trips while the
+/// flooding connection is still stuck mid-write.
+#[tokio::test]
+async fn one_tenants_flood_does_not_delay_another() {
+    // Enough to fill acme's queue and then the socket buffers behind it,
+    // so the flooding client is certainly still writing at the end.
+    const FLOOD: usize = INBOUND_DEPTH * 8;
+    let ch = bound_two().await;
+
+    let mut flooding = Client::connect(ch.local_addr()).await;
+    flooding.hello(&token(ACME, "acme", "u1"), "").await;
+    let flood = tokio::spawn(async move {
+        let bulk = "x".repeat(8 * 1024);
+        for _ in 0..FLOOD {
+            flooding.say(&bulk).await;
+        }
+        flooding
+    });
+
+    let mut beta_client = Client::connect(ch.local_addr()).await;
+    beta_client.hello(&token(BETA, "beta", "u1"), "").await;
+    beta_client.say("from beta").await;
+
+    let beta = wait_for_tenant(&ch, "beta").await;
+    let incoming = tenant_recv(&beta).await;
+    assert_eq!(incoming.session, sid("beta/web/u1"));
+    assert_eq!(incoming.text, "from beta");
+    beta.send(&sid("beta/web/u1"), "for beta").await.unwrap();
+    assert_eq!(
+        beta_client.read().await.as_deref(),
+        Some(r#"{"session":"beta/web/u1","text":"for beta"}"#),
+        "beta round trips while acme is wedged"
+    );
+
+    assert!(
+        !flood.is_finished(),
+        "acme is still blocked on its own queue, so that is what beta overtook"
+    );
+    // And nothing of acme's was dropped to let beta past: its queue is
+    // full of it, and drains when somebody finally takes it.
+    let acme = ch.tenant_channel("acme").expect("acme's queue exists");
+    for _ in 0..INBOUND_DEPTH {
+        assert_eq!(tenant_recv(&acme).await.session, sid("acme/web/u1"));
+    }
+    flood.abort();
+}
+
+/// (B3, risk 1) A connection stuck on a company's full queue is not what
+/// the shutdown waits for: dropping the listener closes it, even though
+/// the engine holding that queue is draining nothing.
+#[tokio::test]
+async fn listener_shutdown_unblocks_a_connection_stalled_on_a_full_tenant_queue() {
+    let ch = bound_jwt(ACME).await;
+    let mut c = Client::connect(ch.local_addr()).await;
+    c.hello(&token(ACME, "acme", "u1"), "").await;
+    c.say("first").await;
+
+    // The engine's side: it takes the queue, reads one message and then
+    // stops, so everything after this piles up and stays there.
+    let acme = wait_for_tenant(&ch, "acme").await;
+    assert_eq!(tenant_recv(&acme).await.text, "first");
+
+    // Enough to fill the queue and then the socket buffers behind it. The
+    // client stopping mid-write is the proof that its connection is where
+    // the test says it is: waiting to hand a message to a full queue, and
+    // not waiting on the socket for the next one.
+    let bulk = "x".repeat(8 * 1024);
+    let wedged = timeout(QUIET, async {
+        for _ in 0..INBOUND_DEPTH * 64 {
+            c.say(&bulk).await;
+        }
+    })
+    .await
+    .is_err();
+    assert!(wedged, "the connection is stalled on acme's full queue");
+
+    drop(ch);
+    assert_eq!(
+        c.read().await,
+        None,
+        "the stalled connection was closed by the shutdown"
+    );
+    // And its queue closes once what it holds is gone, rather than staying
+    // open on a connection that is never coming back.
+    let closed = loop {
+        match timeout(T, acme.recv()).await.expect("recv in time") {
+            Ok(_) => continue,
+            Err(e) => break e,
+        }
+    };
+    assert!(matches!(closed, ChannelError::Closed), "{closed}");
+}
+
+/// (B3) A company with no queue yet gets one on its first message, and the
+/// wake that says so is one wake however much it then says.
+#[tokio::test]
+async fn a_cold_tenants_first_message_wakes_the_listener_once() {
+    let ch = bound_jwt(ACME).await;
+    let mut c = Client::connect(ch.local_addr()).await;
+    c.hello(&token(ACME, "acme", "u1"), "").await;
+    for i in 0..3 {
+        c.say(&format!("m{i}")).await;
+    }
+
+    let woken = timeout(T, ch.next_active_tenant())
+        .await
+        .expect("a wake in time")
+        .expect("the wake stream outlives the listener");
+    assert_eq!(woken, "acme");
+    assert!(
+        timeout(QUIET, ch.next_active_tenant()).await.is_err(),
+        "three messages, one wake"
+    );
+
+    // The wake was not instead of the messages: all three are in the queue
+    // it announced.
+    let acme = ch.tenant_channel("acme").expect("its receiver is parked");
+    for i in 0..3 {
+        assert_eq!(tenant_recv(&acme).await.text, format!("m{i}"));
+    }
+}
+
+/// (B3) Dropping the listener is the shutdown, and it is not a loss: each
+/// company's channel hands over what its queue already held and only then
+/// reports closed, which is what the single inbound queue did.
+#[tokio::test]
+async fn dropping_the_listener_closes_every_tenant_channel_after_it_drains() {
+    let ch = bound_two().await;
+    let mut a = Client::connect(ch.local_addr()).await;
+    a.hello(&token(ACME, "acme", "u1"), "").await;
+    a.say("from acme").await;
+    let mut b = Client::connect(ch.local_addr()).await;
+    b.hello(&token(BETA, "beta", "u1"), "").await;
+    b.say("from beta").await;
+
+    let acme = wait_for_tenant(&ch, "acme").await;
+    let beta = wait_for_tenant(&ch, "beta").await;
+    drop(ch);
+
+    for (name, tenant) in [("acme", &acme), ("beta", &beta)] {
+        let incoming = tenant_recv(tenant).await;
+        assert_eq!(
+            incoming.text,
+            format!("from {name}"),
+            "what was queued before the shutdown still arrives"
+        );
+        let err = timeout(T, tenant.recv())
+            .await
+            .expect("closed in time")
+            .expect_err("closed once it has drained");
+        assert!(matches!(err, ChannelError::Closed), "{err}");
+    }
 }
 
 /// (a) Two clients on sessions `a` and `b`: both messages reach `recv` with
