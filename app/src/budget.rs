@@ -1620,7 +1620,7 @@ mod tests {
     }
 
     fn named(profile: SchemaProfile, names: &[&str]) -> Vec<nscore::ActionSpec> {
-        let all = crate::budget_specs(profile);
+        let all = crate::cli::budget_specs(profile);
         names
             .iter()
             .map(|n| {
@@ -1708,8 +1708,8 @@ mod tests {
     #[test]
     fn the_slim_profile_cuts_the_desktop_array_by_at_least_thirty_five_percent_and_keeps_every_action_name(
     ) {
-        let full = crate::budget_specs(SchemaProfile::Full);
-        let slim = crate::budget_specs(SchemaProfile::Slim);
+        let full = crate::cli::budget_specs(SchemaProfile::Full);
+        let slim = crate::cli::budget_specs(SchemaProfile::Slim);
         let (ft, st) = (array_tokens(&full), array_tokens(&slim));
         // The plan's 1,350 is unreachable and the envelope test says why:
         // eighteen tools cost ~1,100 tokens before a single word, and
@@ -1847,7 +1847,7 @@ mod tests {
             }
         }
         for p in [SchemaProfile::Full, SchemaProfile::Slim] {
-            let specs = crate::budget_specs(p);
+            let specs = crate::cli::budget_specs(p);
             println!(
                 "{:12} {:4}  {:5} chars  {:4} tokens",
                 "desktop set",

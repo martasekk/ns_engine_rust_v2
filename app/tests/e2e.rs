@@ -182,10 +182,28 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SqliteStore::open(&dir.path().join("serve.sqlite")).unwrap());
-    let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t0k".into(), 8, false)
+    let listener = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t0k".into(), 8, false)
         .await
         .unwrap();
-    let addr = channel.local_addr();
+    let addr = listener.local_addr();
+
+    // The client speaks first, as one does to a cold company: its hello and
+    // its line create the company's queue, and the wake is what says so.
+    // The engine is then built on that company's own channel, which is how
+    // `serve` builds one (`registry.rs`).
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (r, mut w) = stream.into_split();
+    w.write_all(b"{\"token\":\"t0k\",\"session\":\"s1\"}\n{\"text\":\"hi\"}\n")
+        .await
+        .unwrap();
+    let tenant = listener
+        .next_active_tenant()
+        .await
+        .expect("a woken company");
+    let channel = listener
+        .tenant_channel(&tenant)
+        .expect("a woken company has its receiver parked");
+
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
     b.set_replier(Box::new(ScriptedReplier));
@@ -204,11 +222,6 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
     );
     let run = tokio::spawn(e.run());
 
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let (r, mut w) = stream.into_split();
-    w.write_all(b"{\"token\":\"t0k\",\"session\":\"s1\"}\n{\"text\":\"hi\"}\n")
-        .await
-        .unwrap();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
     tokio::time::timeout(
@@ -233,6 +246,8 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
     assert_eq!(events.last().map(|e| e.turn), Some(1));
     assert!(!run.is_finished(), "the server outlives its client");
     run.abort();
+    // The listener is the caller's for the whole run, as it is in `serve`.
+    drop(listener);
 }
 
 /// Multi-tenant plan B9, the end to end for Part B: one port, two companies,

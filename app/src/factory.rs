@@ -956,6 +956,28 @@ mod tests {
         crate::tenant::load_set(&base, root, "local").expect("the fixture tenants")
     }
 
+    /// One company's side of a listener the caller has bound: what a
+    /// registry hands each engine, and what `Mode::Serve` takes. The queue
+    /// only exists once somebody has spoken for that company, so the
+    /// fixture speaks - a hello and one line, exactly as a client would.
+    async fn tenant_channel_of(listener: &nschannel_tcp::TcpChannel) -> Arc<dyn Channel> {
+        use tokio::io::AsyncWriteExt;
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr())
+            .await
+            .expect("connect to the caller's listener");
+        client
+            .write_all(b"{\"token\":\"t\",\"session\":\"s\"}\n{\"text\":\"hi\"}\n")
+            .await
+            .expect("the hello and one line");
+        let tenant = listener
+            .next_active_tenant()
+            .await
+            .expect("the wake stream outlives the listener");
+        listener
+            .tenant_channel(&tenant)
+            .expect("a woken company has its receiver parked")
+    }
+
     /// Plan A6. `auth = "jwt"` and nothing to verify against is a process
     /// that could only ever refuse every client, so it is refused at
     /// startup instead — with the tenant and the variable named, in both
@@ -1095,10 +1117,11 @@ mod tests {
     #[tokio::test]
     async fn build_engine_takes_its_serve_channel_from_the_caller() {
         let root = tempfile::tempdir().expect("tempdir");
-        let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
+        let listener = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
             .await
             .expect("the caller's listener");
-        let addr = channel.local_addr();
+        let addr = listener.local_addr();
+        let channel = tenant_channel_of(&listener).await;
         let set = serve_fixture(root.path(), addr, &["acme"]);
         assert_eq!(
             Arc::strong_count(&channel),
@@ -1195,10 +1218,11 @@ mod tests {
     #[tokio::test]
     async fn build_engine_no_longer_binds_a_socket() {
         let root = tempfile::tempdir().expect("tempdir");
-        let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
+        let listener = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
             .await
             .expect("the caller's listener");
-        let addr = channel.local_addr();
+        let addr = listener.local_addr();
+        let channel = tenant_channel_of(&listener).await;
         let set = serve_fixture(root.path(), addr, &["acme", "beta"]);
         assert_eq!(set.len(), 2);
 

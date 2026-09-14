@@ -81,6 +81,10 @@ impl Client {
     }
 }
 
+/// The company every shared-token connection speaks for: one process, one
+/// token, one tenant.
+const LOCAL: &str = "local";
+
 async fn bound(max_connections: usize) -> Arc<TcpChannel> {
     TcpChannel::bind_shared("127.0.0.1:0", "t0k".into(), max_connections, false)
         .await
@@ -134,16 +138,18 @@ async fn bound_jwt(key: &[u8]) -> Arc<TcpChannel> {
         .expect("bind loopback")
 }
 
-async fn recv(ch: &TcpChannel) -> Incoming {
-    timeout(T, ch.recv())
-        .await
-        .expect("recv in time")
-        .expect("recv")
+/// True when nothing reaches this company's engine within `QUIET`: its
+/// queue exists and is empty. A different claim from
+/// [`no_tenant_woken`]'s, which is that no queue exists at all.
+async fn nothing_received(ch: &TenantChannel) -> bool {
+    timeout(QUIET, ch.recv()).await.is_err()
 }
 
-/// True when nothing reaches `recv` within `QUIET`.
-async fn nothing_received(ch: &TcpChannel) -> bool {
-    timeout(QUIET, ch.recv()).await.is_err()
+/// True when no company is announced within `QUIET`. The first message to
+/// reach a company creates its queue and wakes once, so a silent wake
+/// stream is nothing having been queued for anybody.
+async fn no_tenant_woken(ch: &TcpChannel) -> bool {
+    !matches!(timeout(QUIET, ch.next_active_tenant()).await, Ok(Some(_)))
 }
 
 fn sid(s: &str) -> SessionId {
@@ -356,15 +362,16 @@ async fn two_sessions_each_receive_only_their_own_replies() {
     a.say("from a").await;
     b.say("from b").await;
 
-    let mut got = [recv(&ch).await, recv(&ch).await];
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    let mut got = [tenant_recv(&local).await, tenant_recv(&local).await];
     got.sort_by(|x, y| x.session.0.cmp(&y.session.0));
     assert_eq!(got[0].session, sid("a"));
     assert_eq!(got[0].text, "from a");
     assert_eq!(got[1].session, sid("b"));
     assert_eq!(got[1].text, "from b");
 
-    ch.send(&sid("b"), "rb").await.unwrap();
-    ch.send(&sid("a"), "ra").await.unwrap();
+    local.send(&sid("b"), "rb").await.unwrap();
+    local.send(&sid("a"), "ra").await.unwrap();
     assert_eq!(
         a.read().await.as_deref(),
         Some(r#"{"session":"a","text":"ra"}"#)
@@ -386,17 +393,17 @@ async fn a_wrong_token_is_closed_before_any_message() {
     c.hello("nope", "a").await;
     c.say("must never arrive").await;
     assert_eq!(c.read().await, None, "closed, nothing sent");
-    assert!(nothing_received(&ch).await);
+    assert!(no_tenant_woken(&ch).await);
 
     let mut c = Client::connect(ch.local_addr()).await;
     c.line("this is not a hello").await;
     assert_eq!(c.read().await, None, "a malformed hello is closed too");
-    assert!(nothing_received(&ch).await);
+    assert!(no_tenant_woken(&ch).await);
 
     let mut c = Client::connect(ch.local_addr()).await;
     c.hello("t0k", "").await;
     assert_eq!(c.read().await, None, "an empty session id is refused");
-    assert!(nothing_received(&ch).await);
+    assert!(no_tenant_woken(&ch).await);
 }
 
 /// (c) With `max_connections = 2` the third connection is closed at once,
@@ -413,8 +420,9 @@ async fn the_connection_past_the_cap_is_closed_and_the_others_keep_working() {
     one.say("1").await;
     two.say("2").await;
     // Both are live: their messages came through.
-    recv(&ch).await;
-    recv(&ch).await;
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    tenant_recv(&local).await;
+    tenant_recv(&local).await;
 
     let mut three = Client::connect(addr).await;
     assert_eq!(
@@ -424,8 +432,8 @@ async fn the_connection_past_the_cap_is_closed_and_the_others_keep_working() {
     );
 
     one.say("still here").await;
-    assert_eq!(recv(&ch).await.text, "still here");
-    ch.send(&sid("two"), "yes").await.unwrap();
+    assert_eq!(tenant_recv(&local).await.text, "still here");
+    local.send(&sid("two"), "yes").await.unwrap();
     assert_eq!(
         two.read().await.as_deref(),
         Some(r#"{"session":"two","text":"yes"}"#)
@@ -439,7 +447,7 @@ async fn the_connection_past_the_cap_is_closed_and_the_others_keep_working() {
         let mut four = Client::connect(addr).await;
         four.hello("t0k", "four").await;
         four.say("4").await;
-        if let Ok(Ok(incoming)) = timeout(QUIET, ch.recv()).await {
+        if let Ok(Ok(incoming)) = timeout(QUIET, local.recv()).await {
             assert_eq!(incoming.session, sid("four"));
             admitted = true;
             break;
@@ -456,12 +464,13 @@ async fn a_reply_to_a_departed_session_is_dropped_without_panic() {
     let mut c = Client::connect(ch.local_addr()).await;
     c.hello("t0k", "gone").await;
     c.say("hi").await;
-    assert_eq!(recv(&ch).await.session, sid("gone"));
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    assert_eq!(tenant_recv(&local).await.session, sid("gone"));
     drop(c);
     // Let the connection task see the EOF and release the session.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    ch.send(&sid("gone"), "too late").await.unwrap();
-    ch.send(&sid("never"), "nobody").await.unwrap();
+    local.send(&sid("gone"), "too late").await.unwrap();
+    local.send(&sid("never"), "nobody").await.unwrap();
 }
 
 /// (e) `bind` refuses an empty token and a non-loopback address unless
@@ -516,14 +525,15 @@ async fn two_connections_on_one_session_both_receive_the_reply() {
     tab.say("from the tab").await;
     // The message proves the hello was processed, so this connection holds
     // its session by the time the reply goes out.
-    assert_eq!(recv(&ch).await.text, "from the tab");
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    assert_eq!(tenant_recv(&local).await.text, "from the tab");
 
     let mut phone = Client::connect(ch.local_addr()).await;
     phone.hello("t0k", "s").await;
     phone.say("from the phone").await;
-    assert_eq!(recv(&ch).await.text, "from the phone");
+    assert_eq!(tenant_recv(&local).await.text, "from the phone");
 
-    ch.send(&sid("s"), "reply").await.unwrap();
+    local.send(&sid("s"), "reply").await.unwrap();
     assert_eq!(
         tab.read().await.as_deref(),
         Some(r#"{"session":"s","text":"reply"}"#),
@@ -546,16 +556,17 @@ async fn closing_one_of_two_connections_leaves_the_other_serving() {
     staying.hello("t0k", "s").await;
     leaving.say("1").await;
     staying.say("2").await;
-    recv(&ch).await;
-    recv(&ch).await;
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    tenant_recv(&local).await;
+    tenant_recv(&local).await;
 
     drop(leaving);
     // Let the connection task see the EOF and release its own entry.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     staying.say("still here").await;
-    assert_eq!(recv(&ch).await.text, "still here");
-    ch.send(&sid("s"), "reply").await.unwrap();
+    assert_eq!(tenant_recv(&local).await.text, "still here");
+    local.send(&sid("s"), "reply").await.unwrap();
     assert_eq!(
         staying.read().await.as_deref(),
         Some(r#"{"session":"s","text":"reply"}"#),
@@ -578,8 +589,9 @@ async fn a_stalled_connection_does_not_delay_the_other_holder_of_its_session() {
     reading.hello("t0k", "s").await;
     stalled.say("1").await;
     reading.say("2").await;
-    recv(&ch).await;
-    recv(&ch).await;
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    tenant_recv(&local).await;
+    tenant_recv(&local).await;
     // `stalled` never calls `read` from here on.
 
     // Wedge it. The timeout is what a blocking send would trip on; the
@@ -587,7 +599,7 @@ async fn a_stalled_connection_does_not_delay_the_other_holder_of_its_session() {
     let bulk = "x".repeat(8 * 1024);
     timeout(T, async {
         for _ in 0..FLOOD {
-            ch.send(&sid("s"), &bulk).await.unwrap();
+            local.send(&sid("s"), &bulk).await.unwrap();
         }
     })
     .await
@@ -599,7 +611,7 @@ async fn a_stalled_connection_does_not_delay_the_other_holder_of_its_session() {
 
     // The wedged peer is still in the map, still full. The other window
     // gets this one anyway, and promptly.
-    ch.send(&sid("s"), "after").await.unwrap();
+    local.send(&sid("s"), "after").await.unwrap();
     assert_eq!(
         reading.read().await.as_deref(),
         Some(r#"{"session":"s","text":"after"}"#),
@@ -618,13 +630,14 @@ async fn a_malformed_line_is_ignored_and_the_connection_stays() {
     c.line("").await;
     c.line("plain words").await;
     c.say("after").await;
-    assert_eq!(recv(&ch).await.text, "after");
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    assert_eq!(tenant_recv(&local).await.text, "after");
     assert!(
-        nothing_received(&ch).await,
+        nothing_received(&local).await,
         "only the well-formed line came through"
     );
 
-    ch.send(&sid("m"), "two\nlines").await.unwrap();
+    local.send(&sid("m"), "two\nlines").await.unwrap();
     assert_eq!(
         c.read().await.as_deref(),
         Some(r#"{"session":"m","text":"two\nlines"}"#)
@@ -642,7 +655,8 @@ async fn a_client_cannot_choose_its_session_id() {
     c.hello(&token(KEY, "acme", "u1"), "acme/web/victim").await;
     c.say("hello").await;
 
-    let incoming = recv(&ch).await;
+    let acme = wait_for_tenant(&ch, "acme").await;
+    let incoming = tenant_recv(&acme).await;
     assert_eq!(
         incoming.session,
         sid("acme/web/u1"),
@@ -651,9 +665,9 @@ async fn a_client_cannot_choose_its_session_id() {
 
     // And the session it claimed is not one it holds: a reply meant for the
     // victim does not reach the impostor.
-    ch.send(&sid("acme/web/victim"), "private").await.unwrap();
+    acme.send(&sid("acme/web/victim"), "private").await.unwrap();
     assert!(c.quiet().await, "no reply for the claimed session arrived");
-    ch.send(&sid("acme/web/u1"), "yours").await.unwrap();
+    acme.send(&sid("acme/web/u1"), "yours").await.unwrap();
     assert_eq!(
         c.read().await.as_deref(),
         Some(r#"{"session":"acme/web/u1","text":"yours"}"#)
@@ -673,18 +687,19 @@ async fn a_jwt_hello_derives_its_session_and_ignores_the_clients_session_field()
         .line(&serde_json::json!({"token": token(KEY, "acme", "u1")}).to_string())
         .await;
     without.say("no session field").await;
-    assert_eq!(recv(&ch).await.session, sid("acme/web/u1"));
+    let acme = wait_for_tenant(&ch, "acme").await;
+    assert_eq!(tenant_recv(&acme).await.session, sid("acme/web/u1"));
 
     // A second subject of the same tenant is a different session, derived
     // the same way.
     let mut other = Client::connect(ch.local_addr()).await;
     other.hello(&token(KEY, "acme", "u2"), "acme/web/u1").await;
     other.say("from u2").await;
-    let incoming = recv(&ch).await;
+    let incoming = tenant_recv(&acme).await;
     assert_eq!(incoming.session, sid("acme/web/u2"));
     assert_eq!(incoming.text, "from u2");
 
-    ch.send(&sid("acme/web/u1"), "for u1").await.unwrap();
+    acme.send(&sid("acme/web/u1"), "for u1").await.unwrap();
     assert_eq!(
         without.read().await.as_deref(),
         Some(r#"{"session":"acme/web/u1","text":"for u1"}"#)
@@ -715,20 +730,28 @@ async fn a_token_for_one_tenant_cannot_reach_another() {
         .await;
     forged.say("must never arrive").await;
     assert_eq!(forged.read().await, None, "closed, nothing sent");
-    assert!(nothing_received(&ch).await);
+    assert!(no_tenant_woken(&ch).await);
 
     // The same subject name under each tenant is two distinct sessions.
     let mut a = Client::connect(ch.local_addr()).await;
     a.hello(&token(ACME, "acme", "u1"), "").await;
     a.say("from acme").await;
-    assert_eq!(recv(&ch).await.session, sid("acme/web/u1"));
+    let acme_tenant = wait_for_tenant(&ch, "acme").await;
+    assert_eq!(tenant_recv(&acme_tenant).await.session, sid("acme/web/u1"));
 
     let mut b = Client::connect(ch.local_addr()).await;
     b.hello(&token(OTHER, "other", "u1"), "").await;
     b.say("from other").await;
-    assert_eq!(recv(&ch).await.session, sid("other/web/u1"));
+    let other_tenant = wait_for_tenant(&ch, "other").await;
+    assert_eq!(
+        tenant_recv(&other_tenant).await.session,
+        sid("other/web/u1")
+    );
 
-    ch.send(&sid("acme/web/u1"), "for acme").await.unwrap();
+    acme_tenant
+        .send(&sid("acme/web/u1"), "for acme")
+        .await
+        .unwrap();
     assert_eq!(
         a.read().await.as_deref(),
         Some(r#"{"session":"acme/web/u1","text":"for acme"}"#)
@@ -764,8 +787,13 @@ async fn a_silent_connection_is_dropped_at_the_hello_deadline() {
         let mut c = Client::connect(ch.local_addr()).await;
         c.hello("t0k", "s").await;
         c.say("here").await;
-        if let Ok(Ok(incoming)) = timeout(QUIET, ch.recv()).await {
-            assert_eq!(incoming.session, sid("s"));
+        // The company is cold until somebody gets in, so the wake is what
+        // says one did; the message it announced is then in its queue.
+        if let Ok(Some(tenant)) = timeout(QUIET, ch.next_active_tenant()).await {
+            let local = ch
+                .tenant_channel(&tenant)
+                .expect("a woken company has its receiver parked");
+            assert_eq!(tenant_recv(&local).await.session, sid("s"));
             spoke = Some(c);
             break;
         }
@@ -786,7 +814,7 @@ async fn an_oversized_hello_is_refused_without_buffering_it() {
     huge.hello("t0k", &session).await;
     huge.say("must never arrive").await;
     assert_eq!(huge.read().await, None, "closed, nothing sent");
-    assert!(nothing_received(&ch).await);
+    assert!(no_tenant_woken(&ch).await);
 
     // A hello that fits is untouched by the bound. The envelope around the
     // session id is well under a hundred bytes.
@@ -794,7 +822,8 @@ async fn an_oversized_hello_is_refused_without_buffering_it() {
     let session = "y".repeat(HELLO_MAX as usize - 100);
     fits.hello("t0k", &session).await;
     fits.say("arrives").await;
-    let incoming = recv(&ch).await;
+    let local = wait_for_tenant(&ch, LOCAL).await;
+    let incoming = tenant_recv(&local).await;
     assert_eq!(incoming.session, sid(&session));
     assert_eq!(incoming.text, "arrives");
 }

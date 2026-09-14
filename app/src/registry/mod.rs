@@ -24,34 +24,41 @@
 //! test about who builds what and when. Production passes a closure over
 //! `factory::build_engine`, whose output already implements [`RunTenant`]
 //! (`main::tenant_builder`, plan B9).
+//!
+//! This file is the map. `TenantRegistry` itself lives here - the build
+//! lock, the eviction ordering and the wake loop - and each of the concerns
+//! it is assembled from lives in a sibling named after it:
+//!
+//! | module      | what it owns                                        |
+//! |-------------|-----------------------------------------------------|
+//! | [`wiring`]  | the three edges to the world, each behind a trait    |
+//! | [`stats`]   | what a company cost, counted on its own channel      |
+//! | [`limits`]  | the knobs, and the backoff arithmetic                |
+//! | [`failure`] | what a failure costs, and how long it is waited out  |
 
-use crate::factory::{BuiltTenant, StartupError};
-use async_trait::async_trait;
-use nscore::{Channel, ChannelError, Incoming, SessionId};
-use nsengine::dispatch::{Dispatcher, ShardSlots, TurnFailure};
-use nsengine::turn::EngineError;
+mod failure;
+mod limits;
+mod stats;
+mod wiring;
+
+// The names this module was a single file under, kept exactly as they were:
+// `registry::TenantRegistry`, `registry::RegistryLimits` and
+// `registry::BuildTenant` are what `main` builds a shard out of, and a split
+// is not a reason to rewrite its imports.
+pub(crate) use limits::RegistryLimits;
+pub(crate) use wiring::{BuildTenant, RunTenant, TenantSource};
+
+use failure::{Quarantine, RegistryError, ShardFatal};
+use limits::backoff_for;
+use nscore::Channel;
+use nsengine::dispatch::ShardSlots;
+use stats::{Activity, CountedChannel, TenantStats};
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-
-/// A future that has been boxed to cross a trait boundary. No `futures`
-/// dependency for one alias.
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// How a company is built, given its id and the channel its engine drains.
-///
-/// The channel comes from the registry rather than from the closure because
-/// the registry is what must drop it at the right moment; a builder that
-/// fetched its own would leave the eviction ordering to whoever wrote the
-/// closure.
-pub(crate) type BuildTenant<R> = Arc<
-    dyn Fn(String, Arc<dyn Channel>) -> BoxFuture<'static, Result<R, StartupError>> + Send + Sync,
->;
 
 /// A `Mutex` that a panic cannot take out of service.
 ///
@@ -62,159 +69,6 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The listener side, as the registry needs it.
-///
-/// Two methods, both of them `TcpChannel`'s. A trait rather than the
-/// concrete type so a test can drive the wake stream by hand instead of
-/// binding a socket and opening connections to provoke one.
-pub(crate) trait TenantSource: Send + Sync + 'static {
-    /// This company's inbound queue, or `None` when it has none or somebody
-    /// already drains it.
-    fn tenant_channel(&self, tenant: &str) -> Option<Arc<dyn Channel>>;
-    /// The next company with messages and no engine draining them. `None`
-    /// when the listener is gone, which is the shard's shutdown.
-    ///
-    /// Cancel-safe: the registry polls this inside a `select!` and drops the
-    /// future when a sweep or a shard failure wins the race.
-    fn next_active_tenant(&self) -> BoxFuture<'_, Option<String>>;
-}
-
-impl TenantSource for nschannel_tcp::TcpChannel {
-    fn tenant_channel(&self, tenant: &str) -> Option<Arc<dyn Channel>> {
-        let channel = nschannel_tcp::TcpChannel::tenant_channel(self, tenant)?;
-        Some(channel as Arc<dyn Channel>)
-    }
-
-    fn next_active_tenant(&self) -> BoxFuture<'_, Option<String>> {
-        Box::pin(nschannel_tcp::TcpChannel::next_active_tenant(self))
-    }
-}
-
-/// What a built company does when it is let go: it runs until it stops.
-///
-/// `BuiltTenant` is the production implementor and its `run` is exactly the
-/// dispatcher `main` builds today, with serve's isolating failure policy and
-/// the process-wide shard ceiling added.
-pub(crate) trait RunTenant: Send + 'static {
-    fn run(self, shard: ShardSlots) -> BoxFuture<'static, Result<(), EngineError>>;
-}
-
-impl RunTenant for BuiltTenant {
-    fn run(self, shard: ShardSlots) -> BoxFuture<'static, Result<(), EngineError>> {
-        // A shard: one session's failure ends that session, and a failure
-        // wide enough to end this company's dispatcher is caught by the
-        // registry rather than by the process.
-        Box::pin(
-            Dispatcher::with_failure_policy(
-                self.engine,
-                self.channel,
-                self.worker_slots,
-                TurnFailure::Isolate,
-            )
-            .with_shard_slots(shard)
-            .run(),
-        )
-    }
-}
-
-/// What one company cost and is costing, countable from where the registry
-/// stands (plan B8).
-///
-/// The registry sees a company's traffic because it owns the channel its
-/// engine drains, so `turns` and `in_flight` are counted by wrapping it.
-/// `requests` is the engine's own number, reported when a metered run ends
-/// on its ceiling. Nothing here is sampled or estimated.
-#[derive(Debug, Default)]
-pub(crate) struct TenantStats {
-    turns: AtomicU64,
-    failures: AtomicU64,
-    replies: AtomicU64,
-    builds: AtomicU64,
-    requests: AtomicU64,
-}
-
-impl TenantStats {
-    /// Messages this company's engine has taken off its queue.
-    pub(crate) fn turns(&self) -> u64 {
-        self.turns.load(Ordering::SeqCst)
-    }
-    /// Replies it has sent back.
-    pub(crate) fn replies(&self) -> u64 {
-        self.replies.load(Ordering::SeqCst)
-    }
-    /// Turns taken and not yet answered. A difference rather than a gauge,
-    /// so a turn that fails without replying stays counted until the
-    /// company is rebuilt - which is the honest reading of "in flight".
-    pub(crate) fn in_flight(&self) -> u64 {
-        self.turns().saturating_sub(self.replies())
-    }
-    /// Builds that failed, plus runs that ended with an error.
-    pub(crate) fn failures(&self) -> u64 {
-        self.failures.load(Ordering::SeqCst)
-    }
-    /// Engines built for this company since the process started.
-    pub(crate) fn builds(&self) -> u64 {
-        self.builds.load(Ordering::SeqCst)
-    }
-    /// Provider requests attributed to this company, as the engine counted
-    /// them (`EngineError::RequestCap`'s `spent`).
-    pub(crate) fn requests(&self) -> u64 {
-        self.requests.load(Ordering::SeqCst)
-    }
-
-    fn record_spend(&self, requests: u32) {
-        self.requests
-            .fetch_add(u64::from(requests), Ordering::SeqCst);
-    }
-}
-
-/// The channel handed to one company's engine, counting what crosses it.
-///
-/// The engine is not asked to report anything: a turn is a message taken
-/// off this company's queue, and the count is taken where the registry
-/// already stands between the listener and the engine.
-struct CountedChannel {
-    inner: Arc<dyn Channel>,
-    stats: Arc<TenantStats>,
-    activity: Arc<Activity>,
-}
-
-#[async_trait]
-impl Channel for CountedChannel {
-    async fn recv(&self) -> Result<Incoming, ChannelError> {
-        let got = self.inner.recv().await;
-        if got.is_ok() {
-            self.stats.turns.fetch_add(1, Ordering::SeqCst);
-            self.activity.touch();
-        }
-        got
-    }
-
-    async fn send(&self, session: &SessionId, text: &str) -> Result<(), ChannelError> {
-        let sent = self.inner.send(session, text).await;
-        if sent.is_ok() {
-            self.stats.replies.fetch_add(1, Ordering::SeqCst);
-            self.activity.touch();
-        }
-        sent
-    }
-}
-
-/// When this company last said or heard anything.
-struct Activity(Mutex<Instant>);
-
-impl Activity {
-    fn new() -> Self {
-        Self(Mutex::new(Instant::now()))
-    }
-    fn touch(&self) {
-        *locked(&self.0) = Instant::now();
-    }
-    fn idle_for(&self) -> Duration {
-        locked(&self.0).elapsed()
-    }
-}
-
 /// One company with an engine up.
 struct Live {
     /// `Option` because eviction takes it out and drops it *before* the
@@ -223,100 +77,6 @@ struct Live {
     task: Option<JoinHandle<()>>,
     activity: Arc<Activity>,
 }
-
-/// A company that failed and is not being retried yet.
-struct Quarantine {
-    attempts: u32,
-    until: Instant,
-}
-
-/// The knobs, in one struct so `new` does not take seven scalars.
-#[derive(Debug, Clone)]
-pub(crate) struct RegistryLimits {
-    /// How long a company may be silent before its engine is torn down.
-    ///
-    /// Its own knob, and far longer than the session idle timeout on
-    /// purpose: a session going quiet costs a summary, a company going
-    /// quiet costs a rebuild - providers re-dialled, a store re-opened,
-    /// `learned.toml` re-read. Minutes, not seconds.
-    pub idle_evict_after: Duration,
-    /// How often the serve loop looks for idle companies.
-    pub sweep_every: Duration,
-    /// First backoff after a failure; doubles per consecutive failure.
-    pub backoff_base: Duration,
-    /// The ceiling that doubling stops at.
-    pub backoff_max: Duration,
-    /// How many *distinct* companies must report a store error inside
-    /// `store_window` before the shard is considered gone (B5).
-    pub store_fatal_tenants: usize,
-    pub store_window: Duration,
-}
-
-impl Default for RegistryLimits {
-    fn default() -> Self {
-        Self {
-            idle_evict_after: Duration::from_secs(15 * 60),
-            sweep_every: Duration::from_secs(30),
-            backoff_base: Duration::from_secs(5),
-            backoff_max: Duration::from_secs(5 * 60),
-            store_fatal_tenants: 3,
-            store_window: Duration::from_secs(60),
-        }
-    }
-}
-
-/// What one company's failure costs.
-#[derive(Debug)]
-pub(crate) enum ShardVerdict {
-    /// This company and nobody else.
-    TenantOnly,
-    /// Every company here. The shard stops.
-    ShardFatal(ShardFatal),
-}
-
-/// Why the whole shard stopped, in the words it is reported in.
-#[derive(Debug)]
-pub(crate) struct ShardFatal {
-    pub reason: String,
-    /// The companies whose failures added up to it.
-    pub tenants: Vec<String>,
-}
-
-impl std::fmt::Display for ShardFatal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.reason, self.tenants.join(", "))
-    }
-}
-
-impl std::error::Error for ShardFatal {}
-
-/// Why a resolve did not leave an engine running.
-#[derive(Debug)]
-pub(crate) enum RegistryError {
-    /// The company failed recently and its backoff has not elapsed. Not an
-    /// error of this message: a refusal to rebuild a broken company once
-    /// per message.
-    Quarantined { tenant: String, retry_in: Duration },
-    /// The build itself was refused.
-    Build { tenant: String, detail: String },
-}
-
-impl std::fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RegistryError::Quarantined { tenant, retry_in } => write!(
-                f,
-                "tenant {tenant} is quarantined after a failure; not retried for another {}s",
-                retry_in.as_secs()
-            ),
-            RegistryError::Build { tenant, detail } => {
-                write!(f, "tenant {tenant} failed to start: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RegistryError {}
 
 /// One process, many companies.
 pub(crate) struct TenantRegistry<R: RunTenant> {
@@ -367,7 +127,7 @@ impl<R: RunTenant> TenantRegistry<R> {
     /// Idempotent and safe to call from anywhere: a company that is already
     /// live, or whose queue somebody else has taken, is `Ok(())` with
     /// nothing built.
-    pub(crate) async fn resolve(self: &Arc<Self>, tenant: &str) -> Result<(), RegistryError> {
+    async fn resolve(self: &Arc<Self>, tenant: &str) -> Result<(), RegistryError> {
         if let Some(retry_in) = self.quarantined_for(tenant) {
             return Err(RegistryError::Quarantined {
                 tenant: tenant.to_string(),
@@ -481,49 +241,9 @@ impl<R: RunTenant> TenantRegistry<R> {
         }
     }
 
-    /// What one company's failure costs the shard (plan B5).
-    ///
-    /// A pure decision over the error and the failures already seen: no
-    /// store, no engine, no channel. Exhaustive over `EngineError` with no
-    /// wildcard arm, for the reason `TurnFailure::verdict` has none - a
-    /// fourth variant must not inherit a policy by accident.
-    pub(crate) fn on_tenant_error(&self, tenant: &str, e: &EngineError) -> ShardVerdict {
-        match e {
-            // One company's database file. Every company here has its own,
-            // so one failing says nothing about the others - until several
-            // of them fail inside the window, which is the disk.
-            EngineError::Store(_) => {
-                let now = Instant::now();
-                let mut seen = locked(&self.store_errors);
-                seen.retain(|(_, at)| now.duration_since(*at) < self.limits.store_window);
-                if !seen.iter().any(|(id, _)| id == tenant) {
-                    seen.push((tenant.to_string(), now));
-                }
-                if seen.len() >= self.limits.store_fatal_tenants {
-                    let tenants: Vec<String> = seen.iter().map(|(id, _)| id.clone()).collect();
-                    ShardVerdict::ShardFatal(ShardFatal {
-                        reason: format!(
-                            "store failures from {} tenants within {}s",
-                            tenants.len(),
-                            self.limits.store_window.as_secs()
-                        ),
-                        tenants,
-                    })
-                } else {
-                    ShardVerdict::TenantOnly
-                }
-            }
-            // A metered run reaching its ceiling. Not a fault, and one
-            // company's arrangement.
-            EngineError::RequestCap { .. } => ShardVerdict::TenantOnly,
-            // One company's connection went away.
-            EngineError::Channel(_) => ShardVerdict::TenantOnly,
-        }
-    }
-
     /// Tear this company's engine down: stop the run, drop the channel,
     /// then unregister.
-    pub(crate) async fn evict(&self, tenant: &str) {
+    async fn evict(&self, tenant: &str) {
         let task = locked(&self.live)
             .get_mut(tenant)
             .and_then(|live| live.task.take());
@@ -535,7 +255,7 @@ impl<R: RunTenant> TenantRegistry<R> {
     }
 
     /// Every company that has been quiet longer than the eviction knob.
-    pub(crate) async fn sweep_idle(&self) {
+    async fn sweep_idle(&self) {
         let stale: Vec<String> = locked(&self.live)
             .iter()
             .filter(|(_, live)| live.activity.idle_for() >= self.limits.idle_evict_after)
@@ -549,7 +269,7 @@ impl<R: RunTenant> TenantRegistry<R> {
 
     /// This company's counters, created on first mention so a company that
     /// has only ever failed still has a row.
-    pub(crate) fn stats_for(&self, tenant: &str) -> Arc<TenantStats> {
+    fn stats_for(&self, tenant: &str) -> Arc<TenantStats> {
         locked(&self.stats)
             .entry(tenant.to_string())
             .or_default()
@@ -586,43 +306,8 @@ impl<R: RunTenant> TenantRegistry<R> {
     }
 
     /// Whether this company is live right now.
-    pub(crate) fn is_live(&self, tenant: &str) -> bool {
+    fn is_live(&self, tenant: &str) -> bool {
         locked(&self.live).contains_key(tenant)
-    }
-
-    /// How long until this company may be rebuilt, or `None` if it may now.
-    pub(crate) fn quarantined_for(&self, tenant: &str) -> Option<Duration> {
-        let held = locked(&self.quarantine);
-        let q = held.get(tenant)?;
-        q.until.checked_duration_since(Instant::now())
-    }
-
-    /// What a run that ended leaves behind.
-    fn finish(&self, tenant: &str, outcome: Result<(), EngineError>) {
-        if let Err(e) = outcome {
-            let stats = self.stats_for(tenant);
-            stats.failures.fetch_add(1, Ordering::SeqCst);
-            // The engine's own request count, attributed to the company
-            // that spent it.
-            if let EngineError::RequestCap { spent, .. } = &e {
-                stats.record_spend(*spent);
-            }
-            match self.on_tenant_error(tenant, &e) {
-                ShardVerdict::TenantOnly => {
-                    let retry_in = self.quarantine(tenant);
-                    eprintln!(
-                        "tenant {tenant} stopped: {e}; not retried for {}s",
-                        retry_in.as_secs()
-                    );
-                }
-                ShardVerdict::ShardFatal(fatal) => {
-                    eprintln!("shard stopping: {fatal}");
-                    *locked(&self.fatal) = Some(fatal);
-                    self.fatal_notify.notify_one();
-                }
-            }
-        }
-        self.unregister(tenant);
     }
 
     /// The ordering rule, in one place.
@@ -642,23 +327,6 @@ impl<R: RunTenant> TenantRegistry<R> {
         locked(&self.live).remove(tenant);
     }
 
-    /// Quarantine this company and say for how long.
-    fn quarantine(&self, tenant: &str) -> Duration {
-        let mut held = locked(&self.quarantine);
-        let entry = held.entry(tenant.to_string()).or_insert(Quarantine {
-            attempts: 0,
-            until: Instant::now(),
-        });
-        entry.attempts = entry.attempts.saturating_add(1);
-        let wait = backoff_for(
-            entry.attempts,
-            self.limits.backoff_base,
-            self.limits.backoff_max,
-        );
-        entry.until = Instant::now() + wait;
-        wait
-    }
-
     /// This company's build lock, created on demand.
     fn build_gate(&self, tenant: &str) -> Arc<tokio::sync::Mutex<()>> {
         locked(&self.building)
@@ -676,19 +344,19 @@ impl<R: RunTenant> TenantRegistry<R> {
     }
 }
 
-/// Doubling backoff, capped. The first failure waits `base`, the second
-/// twice that, and so on until `max`.
-fn backoff_for(attempts: u32, base: Duration, max: Duration) -> Duration {
-    let shift = attempts.saturating_sub(1).min(16);
-    base.saturating_mul(1u32 << shift).min(max)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::failure::ShardVerdict;
+    use super::wiring::BoxFuture;
     use super::*;
+    use crate::factory::StartupError;
+    use async_trait::async_trait;
+    use nscore::{ChannelError, Incoming, SessionId};
+    use nsengine::turn::EngineError;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicBool;
     use std::sync::Weak;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     /// A listener the test drives by hand.
@@ -1316,17 +984,5 @@ mod tests {
         assert!(report.contains("tenant acme: turns=1"), "{report}");
         assert!(report.contains("requests=42"), "{report}");
         assert!(report.contains("tenant beta: turns=1"), "{report}");
-    }
-
-    /// In flight is what has been taken and not yet answered: a company
-    /// mid-turn shows one, not zero.
-    #[tokio::test]
-    async fn a_turn_in_progress_counts_as_in_flight() {
-        let stats = Arc::new(TenantStats::default());
-        stats.turns.fetch_add(2, Ordering::SeqCst);
-        stats.replies.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(stats.in_flight(), 1);
-        stats.replies.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(stats.in_flight(), 0);
     }
 }
