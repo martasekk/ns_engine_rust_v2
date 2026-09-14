@@ -613,6 +613,7 @@ dependencies = [
  "ns-core",
  "ns-engine",
  "ns-evolution",
+ "ns-identity",
  "ns-llm",
  "ns-memory-sqlite",
  "ns-pointer",

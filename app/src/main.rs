@@ -124,6 +124,38 @@ pub(crate) const DEFAULT_TENANT: &str = "local";
 /// meant.
 static TRACE_TENANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The one tenant this process runs, out of the set the working directory
+/// resolved to, or the message to print and stop on.
+///
+/// Two refusals, and neither is a fallback. More than one tenant is the
+/// registry's job and it has not landed. *None* is a `tenants/` directory
+/// holding no overlay at all — a `README.md` in there, or the overlays moved
+/// aside for a moment — and running it under the base config would put a
+/// company's traffic on the shared persona and the shared store, which is
+/// exactly what a missing overlay is already refused for
+/// (`TenantError::Missing`). An operator who wants the base config deletes
+/// the directory; one who left it empty by accident is told so.
+fn one_tenant(mut set: Vec<tenant::TenantConfig>) -> Result<tenant::TenantConfig, String> {
+    if set.is_empty() {
+        return Err(format!(
+            "{}/ holds no overlay — a tenant is its overlay, so an empty directory is refused \
+             rather than run on the base config. Remove the directory to serve config.toml \
+             alone.",
+            tenant::TENANT_DIR
+        ));
+    }
+    if set.len() > 1 {
+        let ids: Vec<&str> = set.iter().map(|t| t.id.as_str()).collect();
+        return Err(format!(
+            "{} tenants are configured ({}) — one process serves one tenant until the \
+             tenant registry lands (multi-tenant plan phase 3).",
+            set.len(),
+            ids.join(", ")
+        ));
+    }
+    Ok(set.remove(0))
+}
+
 /// `serve`: name the tenant whose trace file this process writes, and refuse
 /// an NS_TRACE that cannot hold one file per tenant. Called at startup so a
 /// bad setting is a refusal rather than a surprise on the first request.
@@ -511,35 +543,29 @@ async fn main() {
     // refuses rather than exits, so the shard that will host many of these
     // survives one bad config; here, where the process is this tenant's,
     // `exit` prints and stops exactly as the inlined version did.
-    if serve {
-        // Serving is the multi-tenant shape even at one tenant, so the wire
-        // trace is per tenant from here on (plan H10). Until Phase 3 gives
-        // the process a tenant set, that tenant is the plan's `local`.
-        if let Err(e) = set_trace_tenant(DEFAULT_TENANT) {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    }
     // The tenant set this working directory serves (plan T1.2). With no
     // `tenants/` directory that is one tenant called `local` built from
     // `config.toml` alone, which is this process exactly as it was; the
     // overlays are refused by name here rather than at the first turn.
-    let mut set = tenant::load_set(&cfg_text, std::path::Path::new("."), DEFAULT_TENANT)
+    let set = tenant::load_set(&cfg_text, std::path::Path::new("."), DEFAULT_TENANT)
         .unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
         });
-    if set.len() > 1 {
-        let ids: Vec<&str> = set.iter().map(|t| t.id.as_str()).collect();
-        eprintln!(
-            "{} tenants are configured ({}) — one process serves one tenant until the \
-             tenant registry lands (multi-tenant plan phase 3).",
-            set.len(),
-            ids.join(", ")
-        );
+    let mut tenant = one_tenant(set).unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
+    });
+    if serve {
+        // Serving is the multi-tenant shape even at one tenant, so the wire
+        // trace is per tenant from here on (plan H10) — named for the tenant
+        // that was actually resolved, so a single `tenants/acme.toml` writes
+        // `acme.jsonl` and not the default id's file.
+        if let Err(e) = set_trace_tenant(&tenant.id) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     }
-    let mut tenant = set.remove(0);
     // The same swap the base config gets: NS_PROVIDER=ollama ns-app.
     tenant
         .app
@@ -553,17 +579,25 @@ async fn main() {
     // the pointer has been dialled, and with the same words as before.
     let mode = if serve {
         let serve_cfg = &tenant.app.serve;
-        let Some(token) = serve_cfg.token() else {
-            factory::StartupError::MissingServeToken {
-                env: serve_cfg.token_env.clone(),
-            }
-            .exit()
+        // Shared auth off loopback is refused here rather than at the bind
+        // (plan A6): the port is still free, and the message names the
+        // config key instead of the socket.
+        if let Err(e) = factory::check_serve_address(serve_cfg).await {
+            e.exit()
+        }
+        // Which resolver the listener decides identity with is the whole of
+        // `[serve] auth`. A missing token or an unnamed signing key is
+        // refused before the socket, with the tenant named.
+        let auth = match factory::serve_resolver(&tenant) {
+            Ok(auth) => auth,
+            Err(e) => e.exit(),
         };
-        match nschannel_tcp::TcpChannel::bind_shared(
+        match nschannel_tcp::TcpChannel::bind_with(
             &serve_cfg.listen,
-            token,
+            auth,
             serve_cfg.max_connections,
             serve_cfg.allow_remote,
+            std::time::Duration::from_millis(serve_cfg.hello_timeout_ms),
         )
         .await
         {
@@ -662,6 +696,86 @@ fn render_dump(events: &[nscore::Event]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a tenant set under a scratch root and hand back the root.
+    fn tenant_root(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(tenant::TENANT_DIR)).expect("tenants dir");
+        for (id, text) in files {
+            std::fs::write(
+                dir.path()
+                    .join(tenant::TENANT_DIR)
+                    .join(format!("{id}.toml")),
+                text,
+            )
+            .expect("overlay");
+        }
+        dir
+    }
+
+    /// R1. A `tenants/` directory holding no overlay — a `README.md` in
+    /// there, or the files moved aside for a moment — used to take the
+    /// vector's first element and abort the process on an index panic. It is
+    /// a refusal now, with the directory named, because running it on the
+    /// base config would put a company on the shared persona and the shared
+    /// store.
+    #[test]
+    fn an_empty_tenants_directory_does_not_panic() {
+        let root = tenant_root(&[]);
+        let set = tenant::load_set("", root.path(), DEFAULT_TENANT).expect("an empty set loads");
+        assert!(set.is_empty(), "the directory holds no overlay");
+        let err = match one_tenant(set) {
+            Err(e) => e,
+            Ok(t) => panic!("an empty tenants/ must be refused, not run as {:?}", t.id),
+        };
+        assert!(err.contains(tenant::TENANT_DIR), "{err}");
+
+        // And the two cases either side of it are unchanged: one tenant is
+        // that tenant, more than one is still the registry's refusal.
+        let root = tenant_root(&[("acme", "")]);
+        let set = tenant::load_set("", root.path(), DEFAULT_TENANT).expect("one overlay");
+        assert_eq!(one_tenant(set).expect("one tenant").id, "acme");
+
+        // Each names its own store, learned file and ledger, because a set
+        // that shares any of the three is refused before it gets here.
+        let root = tenant_root(&[
+            (
+                "acme",
+                "[store]\npath = \"ns-acme.sqlite\"\n\
+                 [evolution]\nlearned_path = \"l-acme.toml\"\nledger_path = \"g-acme.json\"\n",
+            ),
+            (
+                "beta",
+                "[store]\npath = \"ns-beta.sqlite\"\n\
+                 [evolution]\nlearned_path = \"l-beta.toml\"\nledger_path = \"g-beta.json\"\n",
+            ),
+        ]);
+        let set = tenant::load_set("", root.path(), DEFAULT_TENANT).expect("two overlays");
+        let err = match one_tenant(set) {
+            Err(e) => e,
+            Ok(_) => panic!("two tenants must be refused"),
+        };
+        assert!(err.contains("acme") && err.contains("beta"), "{err}");
+    }
+
+    /// R2. The trace file is named for the tenant that was resolved, not for
+    /// the id the process would have used had there been no overlay: a
+    /// single `tenants/acme.toml` writes `acme.jsonl`. Labelling it before
+    /// the set was loaded put acme's prompts in `local.jsonl`.
+    #[test]
+    fn a_tenants_trace_is_named_for_the_tenant_not_the_default() {
+        let root = tenant_root(&[("acme", "")]);
+        let set = tenant::load_set("", root.path(), DEFAULT_TENANT).expect("one overlay");
+        let tenant = one_tenant(set).expect("one tenant");
+        assert_ne!(tenant.id, DEFAULT_TENANT, "the overlay names it");
+
+        let dir = root.path().join("trace");
+        let named = trace_path(&dir.to_string_lossy(), Some(&tenant.id)).expect("a trace path");
+        assert!(named.ends_with("acme.jsonl"), "{named}");
+        let defaulted =
+            trace_path(&dir.to_string_lossy(), Some(DEFAULT_TENANT)).expect("a trace path");
+        assert_ne!(named, defaulted, "the default id is a different file");
+    }
 
     #[test]
     fn render_dump_is_one_json_line_per_event() {

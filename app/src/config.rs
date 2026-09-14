@@ -35,6 +35,11 @@ pub struct AppConfig {
     /// var holds its token.
     #[serde(default)]
     pub serve: ServeSection,
+    /// [auth] — this company's signing material for `auth = "jwt"` (plan
+    /// A6). Deliberately *not* process-owned: the listener is the process's,
+    /// but the keys that say who a caller is are the company's.
+    #[serde(default)]
+    pub auth: AuthSection,
 }
 
 /// [models] — the local CPU model service, for the evaluation lane only
@@ -406,6 +411,67 @@ pub struct ServeSection {
     /// TLS, so on the network it would be the whole conversation in clear.
     #[serde(default)]
     pub allow_remote: bool,
+    /// How a client proves who it is (plan A6). `shared` is today's single
+    /// token in `token_env` and is the default, so a config written before
+    /// this key existed behaves exactly as it did.
+    #[serde(default)]
+    pub auth: AuthMode,
+    /// How long a connection has to send its hello before it is dropped. A
+    /// socket that opens and then says nothing costs a task and a slot.
+    #[serde(default = "default_hello_timeout_ms")]
+    pub hello_timeout_ms: u64,
+}
+
+/// How `serve` decides who a client is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// One token for everyone, from `[serve] token_env`. It proves the
+    /// caller read an env var and nothing else, so it is loopback only.
+    #[default]
+    Shared,
+    /// A signed HS256 token per person, verified against `[auth]`.
+    Jwt,
+}
+
+/// [auth] — the signing material `auth = "jwt"` verifies against. Per tenant
+/// and overlayable: each company signs with its own key.
+///
+/// The keys themselves are never in the file, for the reason no other
+/// credential here is: `signing_key_envs` names the variables they are read
+/// from. Two names mean a rotation is in progress — the first is what tokens
+/// are signed with now, the second the key it replaced, still accepted until
+/// everything minted under it has expired.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct AuthSection {
+    /// One or two env var names, current first. Empty under `auth = "jwt"`
+    /// is a named startup refusal rather than a process that accepts nothing.
+    #[serde(default)]
+    pub signing_key_envs: Vec<String>,
+    /// Tokens issued before this Unix second are refused however well
+    /// signed: this company's way of revoking everything minted up to a
+    /// breach. 0 means no floor.
+    #[serde(default)]
+    pub iat_floor: u64,
+}
+
+impl AuthSection {
+    /// The keys, in the order they are tried. A variable that is named and
+    /// unset is the operator's mistake rather than an invitation to run on
+    /// one fewer key, so it comes back as its own name for the refusal to
+    /// print.
+    pub fn signing_keys(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut keys = Vec::new();
+        for name in &self.signing_key_envs {
+            let value = std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| name.clone())?;
+            keys.push(value.into_bytes());
+        }
+        Ok(keys)
+    }
 }
 
 fn default_serve_listen() -> String {
@@ -420,6 +486,10 @@ fn default_serve_max_connections() -> usize {
     8
 }
 
+fn default_hello_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for ServeSection {
     fn default() -> Self {
         Self {
@@ -427,6 +497,8 @@ impl Default for ServeSection {
             token_env: default_serve_token_env(),
             max_connections: default_serve_max_connections(),
             allow_remote: false,
+            auth: AuthMode::Shared,
+            hello_timeout_ms: default_hello_timeout_ms(),
         }
     }
 }
@@ -1168,9 +1240,9 @@ impl LlmConfig {
         let where_ = role.as_str();
         let sampling = match &s.sampling {
             None => None,
-            Some(v) => {
-                Some(nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
-            }
+            Some(v) => Some(
+                nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?,
+            ),
         };
         let reasoning = match &s.reasoning {
             None => None,
@@ -1572,7 +1644,10 @@ mod tests {
         let on = AppConfig::parse("[memory]\narchive_foreign_notes = true\n").unwrap();
         assert!(on.memory.archive_foreign_notes);
         // The rest of [memory] is untouched by the knob.
-        assert_eq!(on.memory.window_turns, MemorySection::default().window_turns);
+        assert_eq!(
+            on.memory.window_turns,
+            MemorySection::default().window_turns
+        );
     }
 
     /// M10 T1.3. The knob defaults to today's behaviour, the way every knob
@@ -1625,7 +1700,10 @@ mod tests {
             .llm
             .capability()
             .unwrap_err();
-        assert!(err.contains("huge") && err.contains("small, strong"), "{err}");
+        assert!(
+            err.contains("huge") && err.contains("small, strong"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1671,9 +1749,7 @@ mod tests {
         assert_eq!(set.recall.coarse_k, 20);
         assert_eq!(set.recall.rerank_budget_ms, 1500);
         assert_eq!(set.memory.exemplars_max, 2);
-        let pc = set
-            .evolution
-            .pass_config(true, &set.memory, &set.models);
+        let pc = set.evolution.pass_config(true, &set.memory, &set.models);
         assert_eq!(pc.embed_backfill_batch, 8);
     }
 
@@ -1931,7 +2007,10 @@ mod tests {
         let cfg = AppConfig::parse("[llm.replier]\nreasoning = \"maximum\"\n").unwrap();
         let err = cfg.llm.shaping(Role::Replier).unwrap_err();
         assert!(err.starts_with("[llm.replier]"), "{err}");
-        assert!(err.contains("maximum") && err.contains("\"medium\""), "{err}");
+        assert!(
+            err.contains("maximum") && err.contains("\"medium\""),
+            "{err}"
+        );
 
         let cfg = AppConfig::parse("[llm.summarizer]\nsampling = \"off\"\n").unwrap();
         let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
@@ -1951,7 +2030,11 @@ mod tests {
         let target = cfg.llm.role(Role::Emitter).unwrap();
         let (shape, note) = cfg
             .llm
-            .shape(Role::Emitter, &target.model, nsllm::emitter::default_shape())
+            .shape(
+                Role::Emitter,
+                &target.model,
+                nsllm::emitter::default_shape(),
+            )
             .unwrap();
         assert!(shape.temperature.is_none());
         let line = note.expect("the coercion is announced");
@@ -2217,6 +2300,42 @@ mod tests {
         );
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
+    }
+
+    /// Plan A6, the CLI invariant: a config written before `auth` existed
+    /// means shared auth with today's token, and a config with no `[auth]`
+    /// section at all names no keys. `jwt` is only ever reached by asking
+    /// for it.
+    #[test]
+    fn auth_defaults_to_shared_so_todays_config_is_unchanged() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Shared);
+        assert_eq!(cfg.serve.hello_timeout_ms, 5_000);
+        assert_eq!(cfg.auth, AuthSection::default());
+        assert!(cfg.auth.signing_key_envs.is_empty());
+        assert_eq!(cfg.auth.iat_floor, 0);
+        // The whole `[serve]` table is still the default one: two new keys
+        // did not move any other.
+        assert_eq!(cfg.serve, ServeSection::default());
+
+        // A config that sets `[serve] listen` alone — the shape every
+        // deployment before A6 has — still gets shared auth.
+        let cfg = AppConfig::parse("[serve]\nlisten = \"127.0.0.1:7400\"\n").unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Shared);
+
+        // Asked for, both parse, and `[auth]` is read beside them.
+        let cfg = AppConfig::parse(
+            "[serve]\nauth = \"jwt\"\nhello_timeout_ms = 250\n\
+             [auth]\nsigning_key_envs = [\"NOW\", \"BEFORE\"]\niat_floor = 1700000000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Jwt);
+        assert_eq!(cfg.serve.hello_timeout_ms, 250);
+        assert_eq!(cfg.auth.signing_key_envs, ["NOW", "BEFORE"]);
+        assert_eq!(cfg.auth.iat_floor, 1_700_000_000);
+
+        // A mode nobody implements is refused rather than defaulted.
+        assert!(AppConfig::parse("[serve]\nauth = \"none\"\n").is_err());
     }
 
     /// `[serve]` defaults to loopback 7375, `NS_SERVE_TOKEN`, eight

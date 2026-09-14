@@ -8,12 +8,14 @@
 //! config, the factory returns a `StartupError`, because a shard hosting
 //! nineteen good tenants must not die of the twentieth's typo.
 
-use crate::config::{AppConfig, Role, RoleTarget};
+use crate::config::{AppConfig, AuthMode, Role, RoleTarget, ServeSection};
 use crate::env_override;
 use crate::tenant::TenantConfig;
 use nscore::{Channel, HarnessBuilder, SessionId, Tool};
 use nsengine::store::NoopConsolidator;
 use nsengine::turn::{Engine, EngineConfig};
+use nsidentity::{Hello, Hs256Verifier, IdentityResolver, SharedTokenResolver, TenantAuth};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -67,6 +69,20 @@ pub(crate) enum StartupError {
     MissingServeToken {
         env: String,
     },
+    /// Plan A6: `auth = "jwt"` with nothing to verify against — either
+    /// `[auth] signing_key_envs` names no variable, or one it names is not
+    /// exported. Refused by name rather than started with an empty key
+    /// table, which would refuse every client instead.
+    MissingSigningKeys {
+        tenant: String,
+        env: String,
+    },
+    /// Plan A6: the shared token proves the caller read an env var and
+    /// nothing else, so it is loopback only. The channel refuses this at
+    /// bind; saying it here names the config key rather than a socket.
+    SharedAuthOffLoopback {
+        listen: String,
+    },
     /// The listener would not bind.
     Serve(String),
     /// Assembly is a gate: a missing slot, a duplicated one, two tools
@@ -108,6 +124,17 @@ impl std::fmt::Display for StartupError {
                 "{env} is not set — `ns-app serve` needs a token; every client presents it in \
                  its first line."
             ),
+            Self::MissingSigningKeys { tenant, env } => write!(
+                f,
+                "tenant {tenant:?}: {env} is not set — [serve] auth = \"jwt\" verifies every \
+                 token against the keys [auth] signing_key_envs names."
+            ),
+            Self::SharedAuthOffLoopback { listen } => write!(
+                f,
+                "refusing to serve on {listen:?} with [serve] auth = \"shared\": one token for \
+                 everyone proves nothing, so it is loopback only — set auth = \"jwt\" to serve \
+                 an address other machines can reach."
+            ),
             Self::Serve(e) => write!(f, "serve: {e}"),
             Self::Harness(e) => write!(f, "ns-harness: cannot assemble the harness: {e}"),
         }
@@ -115,6 +142,85 @@ impl std::fmt::Display for StartupError {
 }
 
 impl std::error::Error for StartupError {}
+
+/// The resolver the listener will decide identity with, built from one
+/// tenant's `[serve] auth` and `[auth]` (plan A6).
+///
+/// Shared is today: one token from `token_env`, every client it, and a
+/// session id the client chooses. JWT is a key table — current key first,
+/// the one it replaced second — and a session id derived from the claims.
+/// Either way this is the whole difference between the two modes; the
+/// listener itself has one code path.
+pub(crate) fn serve_resolver(
+    tenant: &TenantConfig,
+) -> Result<Arc<dyn IdentityResolver<Hello>>, StartupError> {
+    let cfg = &tenant.app;
+    match cfg.serve.auth {
+        AuthMode::Shared => {
+            let Some(token) = cfg.serve.token() else {
+                return Err(StartupError::MissingServeToken {
+                    env: cfg.serve.token_env.clone(),
+                });
+            };
+            // `SHARED_TENANT` in the channel is the CLI's `local`, which is
+            // this tenant's id in exactly the case shared auth is for.
+            Ok(Arc::new(SharedTokenResolver::new(token, tenant.id.clone())))
+        }
+        AuthMode::Jwt => {
+            // Named and unset is the operator's mistake; named nothing at
+            // all is a process that could only ever refuse. Both are the one
+            // refusal, because both leave nothing to verify against.
+            if cfg.auth.signing_key_envs.is_empty() {
+                return Err(StartupError::MissingSigningKeys {
+                    tenant: tenant.id.clone(),
+                    env: "[auth] signing_key_envs".to_string(),
+                });
+            }
+            let keys = cfg
+                .auth
+                .signing_keys()
+                .map_err(|env| StartupError::MissingSigningKeys {
+                    tenant: tenant.id.clone(),
+                    env,
+                })?;
+            let mut keys = keys.into_iter();
+            let auth = TenantAuth {
+                current: keys.next().expect("signing_key_envs is not empty"),
+                previous: keys.next(),
+                iat_floor: cfg.auth.iat_floor,
+            };
+            let table = HashMap::from([(tenant.id.clone(), auth)]);
+            Ok(Arc::new(Hs256Verifier::new(table)))
+        }
+    }
+}
+
+/// Plan A6: shared auth on an address other machines can reach, refused
+/// before the port is taken.
+///
+/// The channel refuses the same thing at bind
+/// (`BindError::SharedAuthOffLoopback`); doing it here means the operator is
+/// told which config key to change rather than which socket failed, and the
+/// port is still free when they are told. `allow_remote` does not buy it:
+/// that knob means "I meant this address", not "one token is enough".
+pub(crate) async fn check_serve_address(cfg: &ServeSection) -> Result<(), StartupError> {
+    if cfg.auth != AuthMode::Shared {
+        return Ok(());
+    }
+    // A name that will not resolve is the listener's own error to report,
+    // with the words it has always used.
+    let Ok(addrs) = tokio::net::lookup_host(&cfg.listen).await else {
+        return Ok(());
+    };
+    for addr in addrs {
+        if !addr.ip().is_loopback() {
+            return Err(StartupError::SharedAuthOffLoopback {
+                listen: cfg.listen.clone(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// One tenant's config and one mode in, one running-ready `Engine` out.
 ///
@@ -711,17 +817,99 @@ mod tests {
             root.join("learned.toml").display().to_string()
         );
         for id in ids {
+            // A store, a learned file and a ledger of this tenant's own:
+            // guard G1 refuses a set that shares any of the three, and the
+            // base names one of each.
             std::fs::write(
                 root.join(crate::tenant::TENANT_DIR)
                     .join(format!("{id}.toml")),
                 format!(
-                    "[store]\npath = {:?}\n",
-                    root.join(format!("ns-{id}.sqlite")).display().to_string()
+                    "[store]\npath = {:?}\n\
+                     [evolution]\nlearned_path = {:?}\nledger_path = {:?}\n",
+                    root.join(format!("ns-{id}.sqlite")).display().to_string(),
+                    root.join(format!("learned-{id}.toml"))
+                        .display()
+                        .to_string(),
+                    root.join(format!("ledger-{id}.json")).display().to_string()
                 ),
             )
             .expect("overlay");
         }
         crate::tenant::load_set(&base, root, "local").expect("the fixture tenants")
+    }
+
+    /// Plan A6. `auth = "jwt"` and nothing to verify against is a process
+    /// that could only ever refuse every client, so it is refused at
+    /// startup instead — with the tenant and the variable named, in both
+    /// shapes the mistake takes: no variable named at all, and one named
+    /// that is not exported.
+    #[test]
+    fn jwt_auth_with_no_signing_keys_is_refused_by_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let addr: SocketAddr = "127.0.0.1:7375".parse().expect("a literal address");
+
+        // Named nothing.
+        let mut set = serve_fixture(root.path(), addr, &["acme"]);
+        set[0].app.serve.auth = crate::config::AuthMode::Jwt;
+        let err = match serve_resolver(&set[0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("jwt with no signing keys must be refused"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("signing_key_envs"), "{err}");
+
+        // Named a variable nobody exported. A variable no other test
+        // touches, so this cannot race one.
+        std::env::remove_var("NS_TEST_A6_SIGNING_KEY");
+        set[0].app.auth.signing_key_envs = vec!["NS_TEST_A6_SIGNING_KEY".into()];
+        let err = match serve_resolver(&set[0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a key env that is not set must be refused"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("NS_TEST_A6_SIGNING_KEY"), "{err}");
+
+        // Exported, and the resolver builds.
+        std::env::set_var("NS_TEST_A6_SIGNING_KEY", "a signing key");
+        serve_resolver(&set[0]).expect("the tenant's verifier");
+        std::env::remove_var("NS_TEST_A6_SIGNING_KEY");
+    }
+
+    /// Plan A6. One token for everyone proves the caller read an env var and
+    /// nothing else, so it may not be the only thing between the network and
+    /// a conversation. The channel refuses it at bind; refusing it here
+    /// leaves the port free and names the config key.
+    #[tokio::test]
+    async fn a_non_loopback_bind_under_shared_auth_is_refused_at_startup() {
+        let mut cfg = ServeSection {
+            listen: "0.0.0.0:9000".into(),
+            ..ServeSection::default()
+        };
+        let err = match check_serve_address(&cfg).await {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("shared auth off loopback must be refused"),
+        };
+        assert!(err.contains("0.0.0.0:9000"), "{err}");
+        assert!(err.contains("shared"), "{err}");
+
+        // `allow_remote` says "I meant this address", not "one token is
+        // enough", so it does not buy the refusal off.
+        cfg.allow_remote = true;
+        assert!(
+            check_serve_address(&cfg).await.is_err(),
+            "allow_remote does not make a shared token sufficient"
+        );
+
+        // Loopback, which is every deployment today, is untouched; and jwt
+        // is what an address other machines can reach is for.
+        cfg.allow_remote = false;
+        cfg.listen = "127.0.0.1:7375".into();
+        check_serve_address(&cfg).await.expect("loopback is fine");
+        cfg.listen = "0.0.0.0:9000".into();
+        cfg.auth = AuthMode::Jwt;
+        check_serve_address(&cfg)
+            .await
+            .expect("jwt proves who the caller is");
     }
 
     /// The listener is the caller's (plan A1). The factory installs the
@@ -826,12 +1014,21 @@ mod tests {
             let overlay = format!(
                 "[persona]\ntext = {persona:?}\n\
                  [store]\npath = {:?}\n\
+                 [evolution]\nlearned_path = {:?}\nledger_path = {:?}\n\
                  [[http_component]]\nname = {tool:?}\n\
                  description = \"one company's own tool\"\n\
                  url = \"https://example.invalid/{tool}\"\n\
                  side_effect = \"Pure\"\n\
                  args_schema = {{ type = \"object\" }}\n",
-                store(id).display().to_string()
+                store(id).display().to_string(),
+                root.path()
+                    .join(format!("learned-{id}.toml"))
+                    .display()
+                    .to_string(),
+                root.path()
+                    .join(format!("ledger-{id}.json"))
+                    .display()
+                    .to_string()
             );
             std::fs::write(
                 root.path()

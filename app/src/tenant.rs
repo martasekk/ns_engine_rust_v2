@@ -27,10 +27,23 @@ pub(crate) const TENANT_DIR: &str = "tenants";
 
 /// The keys the process owns and an overlay may therefore not set, as dotted
 /// paths into the config. `[models]` is the local model service this box runs;
-/// `[serve] listen` is the shard's own socket. The wire trace has no config
+/// everything under `[serve]` named here belongs to the one socket the
+/// process listens on — its address, the token it accepts, how it decides
+/// who a caller is, and how long a silent client has. A company that could
+/// set any of them could take the shard's other tenants off the air, or
+/// downgrade the whole listener to a shared token it knows (plan A6).
+///
+/// `[auth]` is deliberately absent: the keys that say who a caller is are
+/// the company's, and each signs with its own. The wire trace has no config
 /// key at all — it is `NS_TRACE`, read by the process — so there is nothing
 /// here to refuse for it.
-const PROCESS_OWNED: [&str; 2] = ["models", "serve.listen"];
+const PROCESS_OWNED: [&str; 5] = [
+    "models",
+    "serve.listen",
+    "serve.token_env",
+    "serve.auth",
+    "serve.hello_timeout_ms",
+];
 
 /// One tenant, resolved: the id it is addressed by and the config a factory
 /// builds its engine from.
@@ -40,16 +53,39 @@ pub(crate) struct TenantConfig {
 }
 
 impl TenantConfig {
-    /// The store file this tenant's data lives in, lexically normalised so
-    /// `./ns.sqlite` and `ns.sqlite` are recognised as the one file. Lexical
-    /// and not `canonicalize`, because the file does not exist yet at load.
-    /// `Components` drops every `.` but a leading one, so that one goes here.
-    fn store_path(&self) -> PathBuf {
-        Path::new(&self.app.store.path)
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .collect()
+    /// The files this tenant must not share with another one, each as
+    /// `(the key that names it, what sharing it would mean, its value)`.
+    ///
+    /// The store is the company's conversations; the learned rules are what
+    /// its traffic taught the engine to say; the ledger is the record of
+    /// that learning. Two companies on one of them is one company's traffic
+    /// shaping another's replies, and nothing downstream would ever notice.
+    fn private_paths(&self) -> [(&'static str, &'static str, &str); 3] {
+        [
+            ("store path", "database", self.app.store.path.as_str()),
+            (
+                "evolution.learned_path",
+                "set of learned rules",
+                self.app.evolution.learned_path.as_str(),
+            ),
+            (
+                "evolution.ledger_path",
+                "evolution ledger",
+                self.app.evolution.ledger_path.as_str(),
+            ),
+        ]
     }
+}
+
+/// A configured path, lexically normalised so `./ns.sqlite` and `ns.sqlite`
+/// are recognised as the one file. Lexical and not `canonicalize`, because
+/// the file does not exist yet at load. `Components` drops every `.` but a
+/// leading one, so that one goes here.
+fn normalise(path: &str) -> PathBuf {
+    Path::new(path)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
 }
 
 /// A tenant set that refused itself, with the tenant and the file named.
@@ -75,10 +111,20 @@ pub(crate) enum TenantError {
         path: String,
         key: String,
     },
-    /// Plan H9: two overlays resolve to one store file. Both are named,
-    /// because the copy-pasted one is not knowable from here and the
-    /// operator has to see the pair to find it.
-    StoreClash { a: String, b: String, path: String },
+    /// Plan H9, widened by guard G1: two overlays resolve to one of the
+    /// files a tenant must have to itself — its store, its learned rules or
+    /// its ledger. Both tenants are named, because the copy-pasted one is
+    /// not knowable from here and the operator has to see the pair to find
+    /// it.
+    PathClash {
+        a: String,
+        b: String,
+        /// The key that names the file, so the operator knows which line.
+        key: &'static str,
+        /// What the two would be sharing, in words.
+        what: &'static str,
+        path: String,
+    },
 }
 
 impl std::fmt::Display for TenantError {
@@ -101,10 +147,16 @@ impl std::fmt::Display for TenantError {
                 "tenant {tenant:?}: {path}: {key} is owned by the process and cannot be \
                  set per tenant."
             ),
-            Self::StoreClash { a, b, path } => write!(
+            Self::PathClash {
+                a,
+                b,
+                key,
+                what,
+                path,
+            } => write!(
                 f,
-                "tenants {a:?} and {b:?} both resolve to the store path {path:?} — \
-                 two companies would share one database."
+                "tenants {a:?} and {b:?} both resolve to the {key} {path:?} — \
+                 two companies would share one {what}."
             ),
         }
     }
@@ -155,7 +207,7 @@ pub(crate) fn load_set(
     for id in &ids {
         set.push(load_one(base_text, &dir, id)?);
     }
-    check_store_paths(&set)?;
+    check_private_paths(&set)?;
     Ok(set)
 }
 
@@ -244,20 +296,29 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// Plan H9. Two tenants on one store file is two companies in one database,
-/// and nothing downstream would ever notice.
-fn check_store_paths(set: &[TenantConfig]) -> Result<(), TenantError> {
-    let mut seen: std::collections::HashMap<PathBuf, &str> = std::collections::HashMap::new();
-    for t in set {
-        let path = t.store_path();
-        if let Some(first) = seen.get(&path) {
-            return Err(TenantError::StoreClash {
-                a: first.to_string(),
-                b: t.id.clone(),
-                path: t.app.store.path.clone(),
-            });
+/// Plan H9, widened by guard G1. Two tenants on one store file is two
+/// companies in one database; two on one `learned.toml` or one ledger is one
+/// company's traffic shaping the other's replies. Neither is anything
+/// downstream would ever notice, so all three are one check here.
+///
+/// Each kind gets its own table: a tenant naming its ledger after another
+/// tenant's store would be strange, but it is not the sharing this guards
+/// against and inventing a refusal for it would be a rule nobody asked for.
+fn check_private_paths(set: &[TenantConfig]) -> Result<(), TenantError> {
+    for slot in 0..3 {
+        let mut seen: std::collections::HashMap<PathBuf, &str> = std::collections::HashMap::new();
+        for t in set {
+            let (key, what, raw) = t.private_paths()[slot];
+            if let Some(first) = seen.insert(normalise(raw), &t.id) {
+                return Err(TenantError::PathClash {
+                    a: first.to_string(),
+                    b: t.id.clone(),
+                    key,
+                    what,
+                    path: raw.to_string(),
+                });
+            }
         }
-        seen.insert(path, &t.id);
     }
     Ok(())
 }
@@ -401,6 +462,58 @@ mod tests {
         assert!(err.contains("acme") && err.contains("beta"), "{err}");
     }
 
+    /// Guard G1. The learned rules are what one company's traffic taught the
+    /// engine to say; two companies on one file is one company shaping the
+    /// other's replies, and it is the same copy-paste that produces a shared
+    /// store.
+    #[test]
+    fn two_tenants_sharing_a_learned_path_are_refused_naming_both() {
+        let root = tenants(&[
+            (
+                "acme",
+                "[store]\npath = \"ns-acme.sqlite\"\n\
+                 [evolution]\nlearned_path = \"learned-acme.toml\"\nledger_path = \"l-acme.json\"\n",
+            ),
+            (
+                "beta",
+                "[store]\npath = \"ns-beta.sqlite\"\n\
+                 [evolution]\nlearned_path = \"./learned-acme.toml\"\nledger_path = \"l-beta.json\"\n",
+            ),
+        ]);
+        let err = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("two tenants on one learned.toml must be refused"),
+        };
+        assert!(err.contains("acme") && err.contains("beta"), "{err}");
+        assert!(err.contains("learned-acme.toml"), "{err}");
+        assert!(err.contains("learned_path"), "{err}");
+    }
+
+    /// Guard G1, the ledger: the record of what was learned and what it cost.
+    /// Shared, one company's regressions are charged to the other's budget.
+    #[test]
+    fn two_tenants_sharing_a_ledger_path_are_refused_naming_both() {
+        let root = tenants(&[
+            (
+                "acme",
+                "[store]\npath = \"ns-acme.sqlite\"\n\
+                 [evolution]\nlearned_path = \"learned-acme.toml\"\nledger_path = \"ledger.json\"\n",
+            ),
+            (
+                "beta",
+                "[store]\npath = \"ns-beta.sqlite\"\n\
+                 [evolution]\nlearned_path = \"learned-beta.toml\"\nledger_path = \"./ledger.json\"\n",
+            ),
+        ]);
+        let err = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("two tenants on one ledger must be refused"),
+        };
+        assert!(err.contains("acme") && err.contains("beta"), "{err}");
+        assert!(err.contains("ledger.json"), "{err}");
+        assert!(err.contains("ledger_path"), "{err}");
+    }
+
     /// What the process owns, an overlay may not move: a tenant that could
     /// name the listen address could take the shard's other tenants off the
     /// air, and `[models]` is this box's service, not this company's.
@@ -409,6 +522,12 @@ mod tests {
         for (key, text) in [
             ("serve.listen", "[serve]\nlisten = \"0.0.0.0:9999\"\n"),
             ("models", "[models]\nenabled = true\n"),
+            ("serve.token_env", "[serve]\ntoken_env = \"ACME_TOKEN\"\n"),
+            ("serve.auth", "[serve]\nauth = \"shared\"\n"),
+            (
+                "serve.hello_timeout_ms",
+                "[serve]\nhello_timeout_ms = 60000\n",
+            ),
         ] {
             let root = tenants(&[("acme", text)]);
             let err = match load_set(BASE, root.path(), "local") {
@@ -418,5 +537,30 @@ mod tests {
             assert!(err.contains("acme"), "{err}");
             assert!(err.contains(key), "{err}");
         }
+    }
+
+    /// Plan A6, the one worth naming on its own. `serve.token_env` is the
+    /// variable the *listener* reads: an overlay that could point it
+    /// somewhere else would choose the token every other company's clients
+    /// must present. `[auth]` is the other side of the same line — the keys
+    /// that say who a caller is are the company's, and are overlayable.
+    #[test]
+    fn an_overlay_naming_serve_token_env_is_refused() {
+        let root = tenants(&[("acme", "[serve]\ntoken_env = \"ACME_TOKEN\"\n")]);
+        let err = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a tenant may not name the listener's token"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("serve.token_env"), "{err}");
+
+        let root = tenants(&[(
+            "acme",
+            "[store]\npath = \"ns-acme.sqlite\"\n\
+             [auth]\nsigning_key_envs = [\"ACME_SIGNING_KEY\"]\niat_floor = 1700000000\n",
+        )]);
+        let set = load_set(BASE, root.path(), "local").expect("[auth] is the company's");
+        assert_eq!(set[0].app.auth.signing_key_envs, ["ACME_SIGNING_KEY"]);
+        assert_eq!(set[0].app.auth.iat_floor, 1_700_000_000);
     }
 }
