@@ -70,6 +70,10 @@ pub enum Denied {
     Expired { exp: u64, now: u64 },
     #[error("issued at {iat}, before tenant floor {floor} (unix seconds)")]
     IssuedBeforeFloor { iat: u64, floor: u64 },
+    #[error("issued at {iat}, ahead of now {now} by more than {skew}s (unix seconds)")]
+    IssuedInTheFuture { iat: u64, now: u64, skew: u64 },
+    #[error("claims a life of {lifetime}s, more than the {max}s a token may hold")]
+    LifetimeTooLong { lifetime: u64, max: u64 },
     #[error("presented token does not match the shared token of tenant {tenant:?}")]
     WrongSharedToken { tenant: String },
 }
@@ -129,6 +133,15 @@ pub fn valid_claim(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
+
+/// How far ahead of our own clock a token's `iat` may sit. Minting and
+/// presenting are seconds apart in practice, and two machines' clocks differ
+/// by less than this or they have a worse problem than authentication.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 60;
+
+/// The longest life a token may claim, `exp - iat`. A credential that outlives
+/// the working day it was minted for is a credential nobody is tracking.
+pub const MAX_LIFETIME_SECS: u64 = 24 * 60 * 60;
 
 /// One tenant's signing material.
 pub struct TenantAuth {
@@ -239,6 +252,27 @@ impl TokenVerifier for Hs256Verifier {
             return Err(Denied::Expired {
                 exp: claims.exp,
                 now,
+            });
+        }
+        // A token dated in the future is what makes `iat_floor` mean
+        // anything. Without this, someone who held the key for a minute mints
+        // a batch dated a century out, and every one of them survives the
+        // rotation that was supposed to end them: the floor only refuses
+        // tokens issued *before* it, and these claim to be issued after.
+        if claims.iat > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            return Err(Denied::IssuedInTheFuture {
+                iat: claims.iat,
+                now,
+                skew: MAX_CLOCK_SKEW_SECS,
+            });
+        }
+        // And a ceiling on the life a token may claim, so that a stolen one is
+        // a bounded problem even before anybody notices it was stolen.
+        let lifetime = claims.exp.saturating_sub(claims.iat);
+        if lifetime > MAX_LIFETIME_SECS {
+            return Err(Denied::LifetimeTooLong {
+                lifetime,
+                max: MAX_LIFETIME_SECS,
             });
         }
         if claims.iat < auth.iat_floor {
@@ -540,6 +574,77 @@ mod tests {
         assert!(
             matches!(err, Denied::Expired { exp, now } if exp == NOW_SECS - 1 && now == NOW_SECS),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_dated_in_the_future_is_refused() {
+        let v = verifier(acme(None, 0));
+        let ahead = NOW_SECS + MAX_CLOCK_SKEW_SECS + 1;
+        let token = mint(
+            KEY,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+            &claims_json("acme", "u1", ahead, ahead + 600),
+        );
+        let err = v.verify(&token).unwrap_err();
+        assert!(
+            matches!(err, Denied::IssuedInTheFuture { iat, .. } if iat == ahead),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_inside_the_skew_allowance_is_accepted() {
+        // Two machines' clocks disagree by a little; that is not an attack.
+        let v = verifier(acme(None, 0));
+        let ahead = NOW_SECS + MAX_CLOCK_SKEW_SECS;
+        let token = mint(
+            KEY,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+            &claims_json("acme", "u1", ahead, ahead + 600),
+        );
+        assert_eq!(v.verify(&token).unwrap().sub, "u1");
+    }
+
+    #[test]
+    fn a_token_claiming_more_than_a_days_life_is_refused() {
+        let v = verifier(acme(None, 0));
+        let iat = NOW_SECS - 10;
+        let token = mint(
+            KEY,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+            &claims_json("acme", "u1", iat, iat + MAX_LIFETIME_SECS + 1),
+        );
+        let err = v.verify(&token).unwrap_err();
+        assert!(
+            matches!(err, Denied::LifetimeTooLong { max, .. } if max == MAX_LIFETIME_SECS),
+            "{err:?}"
+        );
+    }
+
+    /// The attack the two bounds above exist to stop, end to end.
+    ///
+    /// Someone holds the signing key for a moment and mints a token dated a
+    /// century out. The tenant notices, rotates the key, and sets the floor to
+    /// the moment of the breach. The old key is still accepted — that is what
+    /// rotation means — so the signature still matches, the token is not
+    /// expired, and the floor cannot touch it because the floor only refuses
+    /// tokens issued *earlier*. Without an upper bound on `iat`, revoking is
+    /// impossible short of dropping the previous key and cutting off every
+    /// honest client mid-rotation.
+    #[test]
+    fn a_future_dated_token_cannot_step_over_the_revocation_floor() {
+        let rotated = verifier(acme(Some(KEY.to_vec()), NOW_SECS));
+        let far = NOW_SECS + 60 * 60 * 24 * 365 * 80;
+        let minted_during_the_breach = mint(
+            KEY,
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+            &claims_json("acme", "u1", far, far + 600),
+        );
+        let err = rotated.verify(&minted_during_the_breach).unwrap_err();
+        assert!(
+            matches!(err, Denied::IssuedInTheFuture { .. }),
+            "a future-dated token survived the rotation that was meant to end it: {err:?}"
         );
     }
 
