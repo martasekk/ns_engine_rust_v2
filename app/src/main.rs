@@ -4,6 +4,7 @@ mod eval;
 mod factory;
 mod grade;
 mod models;
+mod registry;
 mod tenant;
 
 use config::{AppConfig, Role, RoleTarget};
@@ -118,12 +119,6 @@ fn throttle_for(target: &RoleTarget, key: &str) -> Arc<nsllm::client::Throttle> 
 /// the company called `local` (multi-tenant plan §2).
 pub(crate) const DEFAULT_TENANT: &str = "local";
 
-/// The tenant whose wire trace this process writes, set once by `serve`
-/// before the first client is built. `None` is the CLI and every one-shot
-/// subcommand: one tenant on one box, which is what NS_TRACE has always
-/// meant.
-static TRACE_TENANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
 /// The one tenant this process runs, out of the set the working directory
 /// resolved to, or the message to print and stop on.
 ///
@@ -156,14 +151,18 @@ fn one_tenant(mut set: Vec<tenant::TenantConfig>) -> Result<tenant::TenantConfig
     Ok(set.remove(0))
 }
 
-/// `serve`: name the tenant whose trace file this process writes, and refuse
-/// an NS_TRACE that cannot hold one file per tenant. Called at startup so a
-/// bad setting is a refusal rather than a surprise on the first request.
-pub(crate) fn set_trace_tenant(tenant: &str) -> Result<(), String> {
+/// `serve`: refuse an NS_TRACE that cannot hold one file per tenant. Called
+/// at startup so a bad setting is a refusal rather than a surprise on the
+/// first request.
+///
+/// It names no tenant of its own any more (plan B7): which company a record
+/// belongs to travels with the client that writes it, so a process serving
+/// two companies cannot put the second one's prompts in the first one's
+/// file. All that is left here is the check.
+pub(crate) fn check_trace_dir(tenant: &str) -> Result<(), String> {
     if let Some(raw) = env_override("NS_TRACE") {
         trace_path(&raw, Some(tenant))?;
     }
-    let _ = TRACE_TENANT.set(tenant.to_string());
     Ok(())
 }
 
@@ -188,14 +187,22 @@ fn trace_path(raw: &str, tenant: Option<&str>) -> Result<String, String> {
     Ok(dir.join(format!("{tenant}.jsonl")).to_string_lossy().into())
 }
 
-/// The wire log, opened once per path when NS_TRACE names one. A path that
-/// cannot be opened is fatal: a trace the user asked for and did not get
-/// would let them debug against a file that is silently never written.
-fn trace_sink() -> Option<Arc<nsllm::trace::Trace>> {
+/// The wire log for one tenant, opened once per path when NS_TRACE names
+/// one. A path that cannot be opened is fatal: a trace the user asked for
+/// and did not get would let them debug against a file that is silently
+/// never written.
+fn trace_sink(tenant: Option<&str>) -> Option<Arc<nsllm::trace::Trace>> {
+    trace_sink_from(env_override("NS_TRACE"), tenant)
+}
+
+/// The same, with NS_TRACE's value handed in: the registry is keyed by the
+/// resolved path, so two tenants under one directory are two sinks and the
+/// same tenant asked twice is one (plan B7).
+fn trace_sink_from(raw: Option<String>, tenant: Option<&str>) -> Option<Arc<nsllm::trace::Trace>> {
     type Sinks = std::sync::Mutex<std::collections::HashMap<String, Arc<nsllm::trace::Trace>>>;
     static SINKS: std::sync::OnceLock<Sinks> = std::sync::OnceLock::new();
-    let raw = env_override("NS_TRACE")?;
-    let path = trace_path(&raw, TRACE_TENANT.get().map(String::as_str)).unwrap_or_else(|e| {
+    let raw = raw?;
+    let path = trace_path(&raw, tenant).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
@@ -222,6 +229,9 @@ pub(crate) fn client_for(
     target: &RoleTarget,
     transport: Arc<nsllm::transport::ReqwestTransport>,
     key: &str,
+    // Whose trace file this client's requests land in. `None` is the
+    // terminal: NS_TRACE is the file it names (plan B7).
+    tenant: Option<&str>,
 ) -> nsllm::client::OpenRouterClient {
     let c = nsllm::client::OpenRouterClient::new(transport, key.to_string())
         .with_throttle(throttle_for(target, key));
@@ -229,7 +239,7 @@ pub(crate) fn client_for(
         Some(url) => c.with_base_url(url.clone()),
         None => c,
     };
-    match trace_sink() {
+    match trace_sink(tenant) {
         Some(trace) => c.with_trace(trace, target.role.as_str()),
         None => c,
     }
@@ -502,7 +512,9 @@ async fn main() {
             .await
             .unwrap_or_else(|e| e.exit());
         let emitter = factory::role(&cfg, Role::Emitter).unwrap_or_else(|e| e.exit());
-        let pass = factory::build_pass(&cfg, rules, &tools, &emitter, dry_run, spend);
+        // `ns-app evolve` is the idle pass run by hand, in the terminal: one
+        // tenant on one box, so NS_TRACE is the file it names (plan B7).
+        let pass = factory::build_pass(&cfg, rules, &tools, &emitter, dry_run, spend, None);
         // M8 T3.1: `evolve` is the idle pass run by hand, and the embeddings
         // backfill is one of its steps — so this store needs the encoder the
         // running harness's does, or `ns-app evolve` would be the one place
@@ -560,8 +572,9 @@ async fn main() {
         // Serving is the multi-tenant shape even at one tenant, so the wire
         // trace is per tenant from here on (plan H10) — named for the tenant
         // that was actually resolved, so a single `tenants/acme.toml` writes
-        // `acme.jsonl` and not the default id's file.
-        if let Err(e) = set_trace_tenant(&tenant.id) {
+        // `acme.jsonl` and not the default id's file. Refused here, at
+        // startup, rather than on the first request.
+        if let Err(e) = check_trace_dir(&tenant.id) {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -572,6 +585,21 @@ async fn main() {
         .llm
         .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
     let tenant = tenant;
+    // Plan B6: the ceiling on turns running at once across every tenant this
+    // process hosts — the shard's, not a company's, which is why no overlay
+    // may set it (`tenant::PROCESS_OWNED`). `None` in the terminal, which
+    // runs one turn at a time and has no shard to bound. Read before the
+    // bind, so a typo is refused while the port is still free.
+    let shard_slots = if serve {
+        let cap = tenant
+            .app
+            .engine
+            .shard_worker_slots()
+            .unwrap_or_else(|e| factory::StartupError::Config(e).exit());
+        Some(nsengine::dispatch::ShardSlots::new(cap))
+    } else {
+        None
+    };
     // One socket serves the whole process, so the bind is the caller's and
     // not the factory's (plan A1): a shard building one engine per company
     // would otherwise reach for the same address once per tenant. A missing
@@ -620,10 +648,12 @@ async fn main() {
     // default `Fatal` failure policy. Built here instead so the engine stays
     // in the `Arc` the tenant registry will hold it in (plan B2) - taking it
     // back out would panic the moment a second handle existed.
-    match nsengine::dispatch::Dispatcher::new(built.engine, built.channel, built.worker_slots)
-        .run()
-        .await
-    {
+    let mut dispatcher =
+        nsengine::dispatch::Dispatcher::new(built.engine, built.channel, built.worker_slots);
+    if let Some(shard) = shard_slots {
+        dispatcher = dispatcher.with_shard_slots(shard);
+    }
+    match dispatcher.run().await {
         Ok(()) => {}
         // M12 T6.1: the ceiling this run was given, reached. A stop by
         // arrangement rather than a failure, but non-zero all the same, so a
@@ -977,5 +1007,29 @@ mod tests {
             .to_string_lossy()
             .to_string();
         assert_eq!(trace_path(&fresh, None).unwrap(), fresh);
+    }
+
+    /// Plan B7. The tenant is an argument, not a process-wide global set
+    /// once: with a global, the second company in the process traced into
+    /// the first one's file and nothing said so.
+    #[test]
+    fn two_tenants_traces_land_in_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().to_string_lossy().to_string();
+        let acme = trace_sink_from(Some(raw.clone()), Some("acme")).expect("a sink");
+        let globex = trace_sink_from(Some(raw.clone()), Some("globex")).expect("a sink");
+        assert!(
+            !Arc::ptr_eq(&acme, &globex),
+            "one company's prompts must not append to another's file"
+        );
+        assert!(dir.path().join("acme.jsonl").exists());
+        assert!(dir.path().join("globex.jsonl").exists());
+        // The same company asked twice is the one open file, as before.
+        let again = trace_sink_from(Some(raw), Some("acme")).expect("a sink");
+        assert!(Arc::ptr_eq(&acme, &again), "one sink per resolved path");
+        // No tenant is the terminal: NS_TRACE is the file, untouched.
+        let file = dir.path().join("wire.jsonl").to_string_lossy().to_string();
+        let cli = trace_sink_from(Some(file.clone()), None).expect("a sink");
+        assert_eq!(cli.path().to_string_lossy(), file);
     }
 }
