@@ -263,6 +263,10 @@ pub(crate) async fn build_engine(
         Mode::Serve { channel, addr } => (Some((channel, addr)), String::new()),
     };
     let serve = tcp.is_some();
+    // Plan B7: which company's file this engine's clients trace into. The
+    // terminal is `None` — one tenant on one box, where NS_TRACE names the
+    // file itself and always has.
+    let trace_tenant: Option<&str> = serve.then_some(tenant.id.as_str());
 
     // Each role resolves on its own, so the emitter can sit on a local
     // model while the replier stays in the cloud (or the other way round).
@@ -282,7 +286,10 @@ pub(crate) async fn build_engine(
         .remember_residual()
         .map_err(StartupError::Config)?;
     let budget_mode = cfg.memory.budget_mode().map_err(StartupError::Config)?;
-    let worker_slots = cfg.engine.worker_slots().map_err(StartupError::Config)?;
+    // Which knob this is depends on the mode: the terminal is one person
+    // typing and stays serial, serving overlaps the waiting of several
+    // conversations (plan B6).
+    let worker_slots = cfg.engine.slots_for(serve).map_err(StartupError::Config)?;
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules(cfg)?;
@@ -296,8 +303,13 @@ pub(crate) async fn build_engine(
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(
         nsllm::emitter::CloudEmitter::new(
-            crate::client_for(&emitter_target, transport.clone(), &emitter_key)
-                .with_usage_sink(usage.clone(), "emitter"),
+            crate::client_for(
+                &emitter_target,
+                transport.clone(),
+                &emitter_key,
+                trace_tenant,
+            )
+            .with_usage_sink(usage.clone(), "emitter"),
             emitter_target.model.clone(),
         )
         .with_shape(shape(
@@ -314,8 +326,13 @@ pub(crate) async fn build_engine(
     ));
     b.set_replier(Box::new(
         nsllm::replier::CloudReplier::new(
-            crate::client_for(&replier_target, transport.clone(), &replier_key)
-                .with_usage_sink(usage.clone(), "replier"),
+            crate::client_for(
+                &replier_target,
+                transport.clone(),
+                &replier_key,
+                trace_tenant,
+            )
+            .with_usage_sink(usage.clone(), "replier"),
             replier_target.model.clone(),
         )
         .with_shape(shape(
@@ -359,7 +376,7 @@ pub(crate) async fn build_engine(
         let target = role(cfg, Role::Summarizer)?;
         match target.key() {
             Some(role_key) => {
-                let c = crate::client_for(&target, transport.clone(), &role_key)
+                let c = crate::client_for(&target, transport.clone(), &role_key, trace_tenant)
                     .with_usage_sink(usage.clone(), "summarizer");
                 b.set_summarizer(Box::new(
                     nsllm::summarizer::CloudSummarizer::new(c, target.model.clone())
@@ -391,6 +408,7 @@ pub(crate) async fn build_engine(
             &emitter_target,
             false,
             true,
+            trace_tenant,
         )));
     } else {
         if let (Some(cap), true) = (max_requests, cfg.evolution.enabled) {
@@ -691,6 +709,9 @@ pub(crate) fn build_pass(
     emitter: &RoleTarget,
     dry_run: bool,
     spend: bool,
+    // Plan B7: the company whose trace file the pass's own paid lanes append
+    // to. `None` is the terminal and `ns-app evolve`, which are one tenant.
+    trace_tenant: Option<&str>,
 ) -> nsevolution::pass::EvolutionPass {
     let specs: Vec<nscore::ActionSpec> = tools.iter().map(|t| t.spec().clone()).collect();
     let mut pass_cfg = cfg.evolution.pass_config(dry_run, &cfg.memory, &cfg.models);
@@ -764,7 +785,7 @@ pub(crate) fn build_pass(
             let mut pass = pass;
             if let Some(judge) = nsevolution::client_eval::ClientEvaluator::for_model(
                 cfg.models.judge_model.as_deref(),
-                crate::client_for(emitter, transport.clone(), &key)
+                crate::client_for(emitter, transport.clone(), &key, trace_tenant)
                     .with_usage_sink(judge_sink.clone(), "judge"),
                 |c| nsevolution::client_eval::JudgeConfig {
                     // Sonnet 5's shape, and harmless on anything else: no
@@ -795,9 +816,17 @@ pub(crate) fn build_pass(
             let factory_key = key.clone();
             let factory_model = model.clone();
             let factory_sink = probe_sink.clone();
+            // The factory outlives this call, so the tenant it traces under
+            // is owned rather than borrowed from the config.
+            let factory_trace = trace_tenant.map(str::to_string);
             let emitter_factory: nsevolution::notes::EmitterFactory = Arc::new(move || {
-                let c = crate::client_for(&factory_target, factory_transport.clone(), &factory_key)
-                    .with_usage_sink(factory_sink.clone(), "probe");
+                let c = crate::client_for(
+                    &factory_target,
+                    factory_transport.clone(),
+                    &factory_key,
+                    factory_trace.as_deref(),
+                )
+                .with_usage_sink(factory_sink.clone(), "probe");
                 Box::new(nsllm::emitter::CloudEmitter::new(c, factory_model.clone()))
                     as Box<dyn nscore::Emitter>
             });
@@ -807,7 +836,7 @@ pub(crate) fn build_pass(
                 persona: cfg.persona.text.clone(),
             };
             let proposer = nsevolution::notes::ClientNoteProposer {
-                client: crate::client_for(emitter, transport, &key)
+                client: crate::client_for(emitter, transport, &key, trace_tenant)
                     .with_usage_sink(proposer_sink.clone(), "notes-proposer"),
                 model,
             };
@@ -998,8 +1027,11 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let addr: SocketAddr = "127.0.0.1:9".parse().expect("a fixture address");
         let mut set = serve_fixture(root.path(), addr, &["acme"]);
-        // Not the default, so a hard-coded slot count cannot pass for it.
+        // Not either default, so a hard-coded slot count cannot pass for it.
+        // Both knobs, because which one a build reads is its mode's (B6) and
+        // what is asserted below is that the tenant's own number comes back.
         set[0].app.engine.worker_slots = 3;
+        set[0].app.engine.serve_worker_slots = 3;
         let channel: Arc<dyn Channel> = Arc::new(ClosedChannel);
 
         let built = build_engine(

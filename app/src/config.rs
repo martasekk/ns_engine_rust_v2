@@ -1305,6 +1305,25 @@ pub struct EngineSection {
     /// stay global. Read through `worker_slots()`, which refuses 0.
     #[serde(default = "default_worker_slots")]
     pub worker_slots: usize,
+    /// The same, for `ns-app serve`, and the reason it is a second key: the
+    /// terminal is one person typing, so `worker_slots = 1` is right there
+    /// and inherited here it is a latency bug — the second client to speak
+    /// waits out the first client's model calls, which are seconds.
+    ///
+    /// What a slot overlaps is *waiting*, not requests: pacing hangs off the
+    /// credential (one throttle per endpoint and key) and the daily
+    /// allowance stays global, so the extra slots buy latency and cost
+    /// nothing. Read through `slots_for(true)`, which refuses 0.
+    #[serde(default = "default_serve_worker_slots")]
+    pub serve_worker_slots: usize,
+    /// The ceiling on turns running at once across *every* tenant in the
+    /// process, handed to `ShardSlots`. Twenty companies at four slots each
+    /// is eighty concurrent turns on one box, which is a memory and file
+    /// handle number rather than a latency one — so the shard keeps its own
+    /// bound below the sum. Process-owned (`tenant::PROCESS_OWNED`): a
+    /// company sets how many turns *it* runs at once, never the shard's.
+    #[serde(default = "default_shard_worker_slots")]
+    pub shard_worker_slots: usize,
 }
 
 fn default_confirm_irreversible() -> bool {
@@ -1315,6 +1334,14 @@ fn default_worker_slots() -> usize {
     1
 }
 
+fn default_serve_worker_slots() -> usize {
+    4
+}
+
+fn default_shard_worker_slots() -> usize {
+    16
+}
+
 impl Default for EngineSection {
     fn default() -> Self {
         Self {
@@ -1322,6 +1349,8 @@ impl Default for EngineSection {
             max_emit_retries: 3,
             confirm_irreversible: default_confirm_irreversible(),
             worker_slots: default_worker_slots(),
+            serve_worker_slots: default_serve_worker_slots(),
+            shard_worker_slots: default_shard_worker_slots(),
         }
     }
 }
@@ -1332,6 +1361,30 @@ impl EngineSection {
     pub fn worker_slots(&self) -> Result<usize, String> {
         match self.worker_slots {
             0 => Err("[engine] worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
+        }
+    }
+
+    /// How many turns one tenant runs at once, for the mode being built:
+    /// `serve_worker_slots` when serving, `worker_slots` in the terminal
+    /// (plan B6). Which key the error names is which key was read.
+    pub fn slots_for(&self, serve: bool) -> Result<usize, String> {
+        if !serve {
+            return self.worker_slots();
+        }
+        match self.serve_worker_slots {
+            0 => Err("[engine] serve_worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
+        }
+    }
+
+    /// The process's ceiling across every tenant. `ShardSlots` floors a 0 at
+    /// 1 rather than parking every turn forever; refusing it here means an
+    /// operator who typed one is told, instead of running one turn at a time
+    /// across the whole shard and wondering why.
+    pub fn shard_worker_slots(&self) -> Result<usize, String> {
+        match self.shard_worker_slots {
+            0 => Err("[engine] shard_worker_slots must be at least 1, got 0".into()),
             n => Ok(n),
         }
     }
@@ -2262,6 +2315,52 @@ mod tests {
         )
         .unwrap();
         let err = cfg.engine.worker_slots().unwrap_err();
+        assert!(err.contains("[engine] worker_slots"), "{err}");
+    }
+
+    /// `[engine]` with its two required keys and one more line.
+    fn engine_toml(line: &str) -> String {
+        format!("[engine]\nmax_iterations = 5\nmax_emit_retries = 3\n{line}\n")
+    }
+
+    /// Plan B6. What a slot overlaps is waiting, not requests, so serving
+    /// does not inherit the terminal's one slot: the second client to speak
+    /// would otherwise queue behind the first one's model calls.
+    #[test]
+    fn serve_mode_defaults_to_more_than_one_worker_slot() {
+        let cfg = AppConfig::parse("").unwrap();
+        let slots = cfg.engine.slots_for(true).unwrap();
+        assert!(
+            slots > 1,
+            "serve must overlap turns by default, got {slots}"
+        );
+        assert_eq!(slots, 4);
+        // And the ceiling every tenant in the process shares.
+        assert_eq!(cfg.engine.shard_worker_slots().unwrap(), 16);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(true).unwrap(), 9);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 0")).unwrap();
+        let err = cfg.engine.slots_for(true).unwrap_err();
+        assert!(err.contains("[engine] serve_worker_slots"), "{err}");
+        let cfg = AppConfig::parse(&engine_toml("shard_worker_slots = 0")).unwrap();
+        let err = cfg.engine.shard_worker_slots().unwrap_err();
+        assert!(err.contains("[engine] shard_worker_slots"), "{err}");
+    }
+
+    /// Plan B6, the other half: the terminal is unchanged. One slot, even
+    /// when the serve knob names a larger number.
+    #[test]
+    fn cli_mode_still_defaults_to_one_worker_slot() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 1);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 1);
+        // `worker_slots` is still what the terminal reads when it is set.
+        let cfg =
+            AppConfig::parse(&engine_toml("worker_slots = 3\nserve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 3);
+        let cfg = AppConfig::parse(&engine_toml("worker_slots = 0")).unwrap();
+        let err = cfg.engine.slots_for(false).unwrap_err();
         assert!(err.contains("[engine] worker_slots"), "{err}");
     }
 

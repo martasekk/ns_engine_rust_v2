@@ -33,16 +33,21 @@ pub(crate) const TENANT_DIR: &str = "tenants";
 /// set any of them could take the shard's other tenants off the air, or
 /// downgrade the whole listener to a shared token it knows (plan A6).
 ///
+/// `[engine] shard_worker_slots` is the ceiling on turns running at once
+/// across every tenant (plan B6): a company sets how many turns *it* runs at
+/// once, but raising the shard's would spend the others' concurrency.
+///
 /// `[auth]` is deliberately absent: the keys that say who a caller is are
 /// the company's, and each signs with its own. The wire trace has no config
 /// key at all — it is `NS_TRACE`, read by the process — so there is nothing
 /// here to refuse for it.
-const PROCESS_OWNED: [&str; 5] = [
+const PROCESS_OWNED: [&str; 6] = [
     "models",
     "serve.listen",
     "serve.token_env",
     "serve.auth",
     "serve.hello_timeout_ms",
+    "engine.shard_worker_slots",
 ];
 
 /// One tenant, resolved: the id it is addressed by and the config a factory
@@ -562,5 +567,33 @@ mod tests {
         let set = load_set(BASE, root.path(), "local").expect("[auth] is the company's");
         assert_eq!(set[0].app.auth.signing_key_envs, ["ACME_SIGNING_KEY"]);
         assert_eq!(set[0].app.auth.iat_floor, 1_700_000_000);
+    }
+
+    /// Plan B6. A company sets how many turns *it* runs at once; the ceiling
+    /// for the whole shard is the process's, and an overlay that could raise
+    /// it would spend every other company's concurrency.
+    #[test]
+    fn an_overlay_naming_the_shard_cap_is_refused() {
+        let root = tenants(&[(
+            "acme",
+            "[engine]\nmax_iterations = 5\nmax_emit_retries = 3\nshard_worker_slots = 512\n",
+        )]);
+        let err = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a tenant may not set the shard's ceiling"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("engine.shard_worker_slots"), "{err}");
+
+        // Its own slots, both knobs, stay the company's to set.
+        let root = tenants(&[(
+            "acme",
+            "[store]\npath = \"ns-acme.sqlite\"\n\
+             [engine]\nmax_iterations = 5\nmax_emit_retries = 3\n\
+             worker_slots = 2\nserve_worker_slots = 7\n",
+        )]);
+        let set = load_set(BASE, root.path(), "local").expect("its own slots are overlayable");
+        assert_eq!(set[0].app.engine.slots_for(false).unwrap(), 2);
+        assert_eq!(set[0].app.engine.slots_for(true).unwrap(), 7);
     }
 }
