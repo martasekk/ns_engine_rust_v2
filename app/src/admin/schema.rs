@@ -30,6 +30,13 @@ pub(crate) enum Kind {
     /// beside whether that variable is set, because naming a variable
     /// nobody exported is the likeliest mistake on this page.
     EnvName,
+    /// The name of one persona in the shared library. A choice, but over a
+    /// set that is on disk rather than in this file, so it cannot be a
+    /// [`Kind::Choice`] with its fixed list.
+    PersonaRef,
+    /// Names of modules in the shared library. Several, and they add to
+    /// whatever the company defines inline rather than replacing it.
+    ModuleRefs,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -313,6 +320,30 @@ pub(crate) const COMPANY: &[Section] = &[
                  One model does both, so this is the choice that decides how good their \
                  agent is.",
                 "the process's",
+            ),
+        ],
+    },
+    Section {
+        title: "From the library",
+        note: "Shared things, named rather than copied — so a correction to one persona \
+               reaches every company using it. Editing one of these on the Library tab \
+               changes it for all of them, and that tab says which.",
+        fields: &[
+            field(
+                "library.persona",
+                "Shared persona",
+                Kind::PersonaRef,
+                "One of personas/. A company that writes its own persona below gets that \
+                 instead, and the reference sits unused.",
+                "none",
+            ),
+            field(
+                "library.modules",
+                "Shared modules",
+                Kind::ModuleRefs,
+                "Each is a file of tools in modules/. They add to whatever this company \
+                 defines for itself — this company also has X, rather than only X.",
+                "none",
             ),
         ],
     },

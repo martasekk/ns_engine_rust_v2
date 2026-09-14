@@ -10,9 +10,28 @@ pub struct AppConfig {
     pub store: StoreSection,
     #[serde(default, rename = "http_component")]
     pub http_components: Vec<nscomponents_std::http_tool::HttpToolConfig>,
+    /// [library] — the shared persona and modules this company uses, each
+    /// named rather than copied. Resolved against `personas/` and
+    /// `modules/` beside `tenants/` when the tenant set is loaded.
+    #[serde(default)]
+    pub library: LibrarySection,
     /// [templates] table: id = "text with {placeholders}".
     #[serde(default)]
     pub templates: std::collections::HashMap<String, String>,
+    /// [groups] table: name = ["module", …] — which of this company's
+    /// modules a group of its people may reach.
+    ///
+    /// **Stored and not enforced.** Nothing reads this to filter anything
+    /// yet; the multi-tenant plan's Phase 8 owns the enforcement, where a
+    /// group reaches a session through the token's `grants` claim. The hard
+    /// part is named there and is not solved here: tools are registered once
+    /// at assembly, so a per-session subset needs a filter the turn loop
+    /// does not have. A second mechanism invented here would be one more way
+    /// to say who may reach a tool than anybody can hold in their head.
+    ///
+    /// Ordered, so the page lists them the same way on every box.
+    #[serde(default)]
+    pub groups: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub evolution: EvolutionSection,
     #[serde(default)]
@@ -1471,6 +1490,31 @@ impl EngineSection {
 pub struct PersonaSection {
     #[serde(default)]
     pub text: String,
+}
+
+/// [library] — what this company uses out of the shared library, by name.
+///
+/// Files, referenced rather than copied. Copying the text into each overlay
+/// would let two companies meant to share a persona drift apart silently,
+/// which is the thing "shared" exists to prevent; a database would give up
+/// the property that makes the tenant overlays reviewable, which is that
+/// they are files you can read and diff.
+///
+/// The names are spelled here rather than at the top level because
+/// `[persona]` is already a table: `persona = "support-brief"` beside
+/// `[persona] text = "…"` is a config that cannot be parsed at all.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LibrarySection {
+    /// `personas/<name>.md`. Ignored, and reported as overridden, when this
+    /// company writes its own `[persona] text`.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// `modules/<name>.toml`, each a file of `[[http_component]]` entries.
+    /// These *add* to whatever the company defines inline: "this company
+    /// also has X" is the normal case, and "this company has none of the
+    /// shared ones" is not.
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

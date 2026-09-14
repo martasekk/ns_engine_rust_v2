@@ -36,6 +36,10 @@
     width: 100%; font: inherit; padding: 7px 10px; border-radius: 7px;
     border: 1px solid var(--line); background: var(--bg); color: inherit; }
   textarea { min-height: 84px; resize: vertical; }
+  textarea.tall { min-height: 180px; font-family: ui-monospace, Menlo, Consolas, monospace;
+                  font-size: 13px; }
+  label.check { font-weight: 400; margin: 0 0 4px; }
+  label.check input { width: auto; }
   .row { display: flex; gap: 10px; align-items: center; }
   .row input[type=checkbox] { width: auto; }
   button.do { background: var(--accent); color: #fff; border: none; border-radius: 7px;
@@ -71,6 +75,7 @@
   <nav>
     <button data-tab="process" aria-selected="true">Process</button>
     <button data-tab="companies" aria-selected="false">Companies</button>
+    <button data-tab="library" aria-selected="false">Library</button>
     <button data-tab="secrets" aria-selected="false">Vault</button>
   </nav>
 </header>
@@ -95,6 +100,11 @@ async function api(path, body) {
   });
   const answered = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(answered.error || ("the server answered " + res.status));
+  // Some reads answer 200 with an error in the body — a config that will
+  // not parse, say. Treated as an error here rather than rendered as an
+  // empty page, which would look like "there is nothing configured" and
+  // invite somebody to save over what is actually there.
+  if (answered.error) throw new Error(answered.error);
   return answered;
 }
 
@@ -166,6 +176,28 @@ function control(field, value, companyId) {
   let input;
   if (field.kind === "envname") {
     input = envNamePicker(field, value, companyId);
+  } else if (field.kind === "personaref") {
+    const names = libraryOf("persona").map((e) => e.name);
+    if (value && !names.includes(value)) names.unshift(value);
+    input = el("select", { id },
+      el("option", { value: "" }, "(default: " + field.default + ")"),
+      ...names.map((n) => el("option", { value: n }, n)));
+    input.value = value ?? "";
+  } else if (field.kind === "modulerefs") {
+    // Checkboxes rather than a list of names typed from memory: a module
+    // that is not in the library is refused at the next start, and this is
+    // where that mistake is cheapest to not make.
+    const chosen = Array.isArray(value) ? value : [];
+    const known = libraryOf("module").map((e) => e.name);
+    for (const name of chosen) if (!known.includes(name)) known.push(name);
+    input = el("div", { id },
+      ...(known.length
+        ? known.map((n) => {
+            const box = el("input", { type: "checkbox", value: n });
+            box.checked = chosen.includes(n);
+            return el("label", { class: "row check" }, box, el("span", {}, n));
+          })
+        : [el("span", { class: "help" }, "the library has no modules yet")]));
   } else if (field.kind === "paragraph") {
     input = el("textarea", { id });
     input.value = value ?? "";
@@ -210,7 +242,12 @@ function collect(scope) {
   const values = {};
   for (const input of scope.querySelectorAll("[data-path]")) {
     const kind = input.dataset.kind;
-    if (kind === "flag") values[input.dataset.path] = input.checked;
+    if (kind === "modulerefs") {
+      values[input.dataset.path] =
+        [...input.querySelectorAll("input[type=checkbox]")].filter((b) => b.checked)
+          .map((b) => b.value);
+    }
+    else if (kind === "flag") values[input.dataset.path] = input.checked;
     else if (kind === "list") values[input.dataset.path] = input.value;
     else if (kind === "number") values[input.dataset.path] = input.value.trim();
     else values[input.dataset.path] = input.value;
@@ -304,7 +341,8 @@ function companiesTab() {
   if (!company) return el("div", {}, picker);
   return el("div", {}, picker,
     el("h2", { class: "chosen-name mono" }, company),
-    settingsForm(state.company.sections, state.company.values[company] || {}, company));
+    settingsForm(state.company.sections, state.company.values[company] || {}, company),
+    groupsSection(company));
 }
 
 // Where a variable is named, in a sentence. The company first, because on
@@ -402,12 +440,162 @@ function vaultTab() {
       mintMsg));
 }
 
+// H6. Groups can be expressed and cannot yet do anything, and the page does
+// not pretend otherwise — every one of these controls carries the notice,
+// because a reader who saw only the form would reasonably assume the thing
+// it describes is in force.
+const GROUPS_ARE_INERT =
+  "Nothing enforces this yet. Groups are stored and shown so the shape can be " +
+  "agreed on; the enforcement belongs to the multi-tenant plan's Phase 8, where a " +
+  "group reaches a session through the token's grants claim. Until then, every " +
+  "person at this company reaches every tool it has.";
+
+function groupsSection(companyId) {
+  const groups = (state.groups || {})[companyId] || {};
+  const modules = libraryOf("module").map((e) => e.name);
+  const name = el("input", { type: "text", placeholder: "new group, e.g. agents" });
+
+  const save = async (groupName, chosen, remove) => {
+    try {
+      await api("/api/group",
+        { company: companyId, name: groupName, modules: chosen, remove: !!remove });
+      await load();
+    } catch (e) { alert(e.message); }
+  };
+
+  const rows = Object.entries(groups).map(([groupName, chosen]) => {
+    // Whatever the group already names is offered even when the library no
+    // longer lists it — a module renamed or a library that failed to load
+    // would otherwise turn "Save group" into a silent wipe of names the
+    // operator never saw.
+    const offered = modules.slice();
+    for (const m of chosen) if (!offered.includes(m)) offered.push(m);
+    const boxes = offered.map((m) => {
+      const box = el("input", { type: "checkbox", value: m });
+      box.checked = chosen.includes(m);
+      return el("label", { class: "row check" }, box, el("span", {}, m),
+        modules.includes(m) ? null
+          : el("span", { class: "pill missing" }, "not in the library"));
+    });
+    return el("div", { class: "field" },
+      el("label", {}, groupName),
+      boxes.length ? boxes : el("span", { class: "help" }, "no modules in the library yet"),
+      el("div", { class: "row", style: "margin-top:6px" },
+        el("button", { class: "quiet", onclick: (e) => {
+          const picked = [...e.target.closest(".field").querySelectorAll("input:checked")]
+            .map((b) => b.value);
+          save(groupName, picked, false);
+        } }, "Save group"),
+        el("button", { class: "quiet", onclick: () => save(groupName, [], true) }, "Remove")));
+  });
+
+  return el("section", {},
+    el("h2", {}, "Groups ", el("span", { class: "pill missing" }, "not enforced yet")),
+    el("p", { class: "note" },
+      "A group is a name and a set of this company's modules — who among its people " +
+      "may reach what."),
+    el("p", { class: "help sharing" }, GROUPS_ARE_INERT),
+    rows.length ? rows : el("p", { class: "help" }, "None yet."),
+    el("div", { class: "row", style: "margin-top:14px" }, name,
+      el("button", { class: "quiet", onclick: () => {
+        if (!name.value.trim()) return;
+        save(name.value.trim(), [], false);
+      } }, "Add group")));
+}
+
+function libraryOf(kind) {
+  return (state.library || []).filter((e) => e.kind === kind);
+}
+
+// One shared thing, with its readers above the editor rather than below it.
+// H4: an edit here reaches every company naming it, and the page has to say
+// which ones before the save, not after.
+function libraryEntry(entry) {
+  const area = el("textarea", { class: "tall" });
+  area.value = entry.text;
+  const msg = el("span", { class: "msg" });
+
+  const save = async () => {
+    if (entry.used_by.length > 1) {
+      const ok = window.confirm(
+        "This " + entry.kind + " is used by " + entry.used_by.join(", ") +
+        ".\n\nSaving changes it for all of them. Continue?");
+      if (!ok) return;
+    }
+    msg.className = "msg"; msg.textContent = "Saving…";
+    try {
+      await api("/api/library", { kind: entry.kind, name: entry.name, text: area.value });
+      await load();
+    } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
+  };
+
+  return el("section", {},
+    el("h2", {}, el("span", { class: "mono" }, entry.name),
+      entry.kind === "module" && entry.components !== null
+        ? el("span", { class: "pill" }, entry.components + " tool" +
+            (entry.components === 1 ? "" : "s"))
+        : null),
+    entry.used_by.length
+      ? el("p", { class: "note" + (entry.used_by.length > 1 ? " help sharing" : "") },
+          "Used by " + entry.used_by.join(", ") +
+          (entry.used_by.length > 1
+            ? " — an edit here changes it for all of them."
+            : "."))
+      : el("p", { class: "note" }, "No company uses this yet."),
+    entry.overridden_by.length
+      ? el("p", { class: "help sharing" },
+          entry.overridden_by.join(", ") + " name it but write their own persona, so " +
+          "this text does not reach them.")
+      : null,
+    entry.problem ? el("p", { class: "msg bad" }, entry.problem) : null,
+    area,
+    el("div", { class: "row", style: "margin-top:10px" },
+      el("button", { class: "do", onclick: save }, "Save"), msg));
+}
+
+function libraryTab() {
+  const name = el("input", { type: "text", placeholder: "new name, e.g. support-brief" });
+  const kind = el("select", {},
+    el("option", { value: "persona" }, "persona"),
+    el("option", { value: "module" }, "module"));
+
+  return el("div", {},
+    el("div", { class: "banner" },
+      "Shared things, referenced by name and never copied: personas/ is prose, " +
+      "modules/ is files of tools. A company names what it uses on its own tab, and a " +
+      "name that is not here is refused at startup rather than skipped — so a company " +
+      "never quietly runs without the persona it asked for."),
+    ...(state.library || []).map(libraryEntry),
+    el("section", {},
+      el("h2", {}, "Add something"),
+      el("p", { class: "note" },
+        "A persona is prose. A module is the same [[http_component]] entries you would " +
+        "otherwise paste into a config, and is checked before it is written."),
+      el("div", { class: "row" }, kind, name,
+        el("button", { class: "quiet", onclick: async () => {
+          if (!name.value.trim()) return;
+          const starter = kind.value === "module"
+            ? "[[http_component]]\nname = \"\"\ndescription = \"\"\nurl = \"\"\n" +
+              "side_effect = \"Pure\"\nargs_schema = { type = \"object\" }\n"
+            : "";
+          try {
+            await api("/api/library",
+              { kind: kind.value, name: name.value.trim(), text: starter, fresh: true });
+            name.value = "";
+            await load();
+          } catch (e) { alert(e.message); }
+        } }, "Create"))));
+}
+
 function render() {
   for (const button of document.querySelectorAll("nav button")) {
     button.setAttribute("aria-selected", String(button.dataset.tab === tab));
   }
   main.replaceChildren(
-    tab === "process" ? processTab() : tab === "companies" ? companiesTab() : vaultTab());
+    tab === "process" ? processTab()
+      : tab === "companies" ? companiesTab()
+      : tab === "library" ? libraryTab()
+      : vaultTab());
 }
 
 async function load() {
@@ -415,6 +603,7 @@ async function load() {
   // The vault is its own route because it knows about entries the form does
   // not — a key minted before anything names it.
   state.vault = (await api("/api/vault")).entries || [];
+  state.library = (await api("/api/library")).entries || [];
   document.getElementById("root").textContent = state.root;
   render();
 }

@@ -42,6 +42,7 @@
 //! | this file    | the socket, the routes, and who may call them       |
 
 mod document;
+mod library;
 mod schema;
 pub(crate) mod secrets;
 
@@ -174,6 +175,9 @@ async fn route(admin: &Arc<Admin>, request: &Request) -> Response {
     match (request.method.as_str(), request.path()) {
         ("GET", "/api/state") => admin.state(),
         ("GET", "/api/vault") => admin.vault(),
+        ("GET", "/api/library") => admin.library(),
+        ("POST", "/api/library") => admin.save_library(&request.body),
+        ("POST", "/api/group") => admin.save_group(&request.body),
         ("POST", "/api/settings") => admin.save_settings(&request.body),
         ("POST", "/api/company") => admin.add_company(&request.body),
         ("POST", "/api/company/rename") => refuse_rename(),
@@ -209,10 +213,40 @@ struct CompanyRequest {
     id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct GroupRequest {
+    company: String,
+    name: String,
+    #[serde(default)]
+    modules: Vec<String>,
+    /// Take it out rather than write it.
+    #[serde(default)]
+    remove: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct LibraryRequest {
+    /// "persona" or "module".
+    kind: String,
+    name: String,
+    #[serde(default)]
+    text: String,
+    /// This is a new thing, not an edit. A name already taken is refused
+    /// rather than blanked.
+    #[serde(default)]
+    fresh: bool,
+}
+
 /// Everything read off disk for one request. Built once per call so the
 /// form and the vault are always describing the same files.
 struct Survey {
     companies: Vec<String>,
+    /// The process's own config, which is a reader of the library too.
+    base: AppConfig,
+    /// Each company's overlay as parsed on its own — what says which
+    /// library things it *names*, which the merged config has already
+    /// resolved away.
+    configs: Vec<(String, AppConfig)>,
     summaries: Vec<CompanySummary>,
     process_values: serde_json::Value,
     company_values: serde_json::Value,
@@ -326,6 +360,11 @@ impl Admin {
                 "company": { "sections": schema::COMPANY, "values": survey.company_values },
                 "companies": survey.companies,
                 "summaries": survey.summaries,
+                // Per company, name → the modules that group may reach.
+                // Nothing enforces it yet; the page says so.
+                "groups": survey.configs.iter()
+                    .map(|(id, c)| (id.clone(), serde_json::json!(c.groups)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
                 "secrets": secrets::status(&self.root, &survey.named),
                 "secretsFile": secrets::SECRETS_FILE,
             }),
@@ -349,6 +388,95 @@ impl Admin {
         )
     }
 
+    /// The shared library: every persona and module, each carrying the
+    /// companies that name it. The readers travel with the thing because
+    /// the page has to name them before an edit, not after.
+    fn library(&self) -> Response {
+        let survey = match self.survey() {
+            Ok(survey) => survey,
+            Err(e) => return Response::json(200, &serde_json::json!({ "error": e })),
+        };
+        Response::json(
+            200,
+            &serde_json::json!({
+                "entries": library::list(&self.root, &survey.base, &survey.configs),
+            }),
+        )
+    }
+
+    fn save_library(&self, body: &[u8]) -> Response {
+        let Ok(request) = serde_json::from_slice::<LibraryRequest>(body) else {
+            return Response::refused(400);
+        };
+        let Some(kind) = library::Kind::parse(&request.kind) else {
+            return bad_request(format!(
+                "{:?} is not something this library holds — a persona or a module",
+                request.kind
+            ));
+        };
+        match library::write(
+            &self.root,
+            kind,
+            request.name.trim(),
+            &request.text,
+            request.fresh,
+        ) {
+            Ok(()) => Response::json(
+                200,
+                &serde_json::json!({ "saved": request.name, "kind": request.kind }),
+            ),
+            Err(e) => bad_request(e),
+        }
+    }
+
+    /// One group, written or removed.
+    ///
+    /// Groups do not go through [`schema`]'s allowlist because their names
+    /// are the operator's, and a fixed list of dotted paths cannot hold a
+    /// name nobody has chosen yet. The property the allowlist exists for is
+    /// kept another way: this writes under `groups.` and nowhere else, and
+    /// the name is checked against the same charset a library name is, so a
+    /// caller cannot walk out of the table with a dotted name.
+    fn save_group(&self, body: &[u8]) -> Response {
+        let Ok(request) = serde_json::from_slice::<GroupRequest>(body) else {
+            return Response::refused(400);
+        };
+        let id = request.company.trim();
+        if !self.company_ids().iter().any(|known| known == id) {
+            return bad_request(format!("no company {id:?} is configured"));
+        }
+        let name = request.name.trim();
+        if !library::valid_name(name) {
+            return bad_request(format!(
+                "{name:?} is not usable as a group name: letters, digits, dashes and \
+                 underscores — a dot would make it a table of its own"
+            ));
+        }
+        let path = self.company_path(id);
+        let mut doc = match document::read(&path) {
+            Ok(doc) => doc,
+            Err(e) => return bad_request(e.to_string()),
+        };
+        let setting = if request.remove {
+            Setting::Unset
+        } else {
+            // A group with no modules is a real thing to say — these people
+            // reach nothing — so it is written as an empty list rather than
+            // collapsing into a removal the way a cleared field does.
+            Setting::List(request.modules.clone())
+        };
+        if let Err(e) = document::set(&mut doc, &format!("groups.{name}"), setting) {
+            return bad_request(e.to_string());
+        }
+        if let Err(e) = document::loads_as_config(&doc) {
+            return bad_request(e.to_string());
+        }
+        if let Err(e) = document::write(&path, &doc) {
+            return bad_request(e.to_string());
+        }
+        Response::json(200, &serde_json::json!({ "saved": name }))
+    }
+
     /// The base config, every company's overlay, and every variable the
     /// whole set names — what both `/api/state` and `/api/vault` are built
     /// from, read once so the two can never disagree.
@@ -357,7 +485,6 @@ impl Admin {
         // in force rather than what the file says in isolation.
         let base_text = std::fs::read_to_string(self.config_path()).unwrap_or_default();
         let base = AppConfig::parse(&base_text).map_err(|e| e.to_string())?;
-        let tenants = self.root.join(crate::tenant::TENANT_DIR);
         let companies = self.company_ids();
         let mut configs = Vec::new();
         let mut company_values = serde_json::Map::new();
@@ -400,7 +527,7 @@ impl Admin {
                 // config, because that is the one the company's engine is
                 // built from. Running the loader's own merge is what keeps
                 // this row and startup from ever disagreeing.
-                let merged = crate::tenant::load_one(&base_text, &tenants, id);
+                let merged = crate::tenant::load_one(&base_text, &self.root, id);
                 let (model, problem) = match &merged {
                     Ok(tenant) => match emitter_model(&tenant.app.llm) {
                         Ok(model) => (model, None),
@@ -431,6 +558,8 @@ impl Admin {
             process_values: values_of(&doc, schema::PROCESS),
             company_values: serde_json::Value::Object(company_values),
             companies,
+            base,
+            configs,
             summaries,
             named,
         })
@@ -478,6 +607,13 @@ impl Admin {
                 Ok(setting) => setting,
                 Err(e) => return bad_request(e),
             };
+            // A library field's *value* is a file name, which makes it the
+            // one place on this page where an accepted key can still carry
+            // a path. The loader refuses it too — this is so the operator
+            // hears about it now rather than at the next start.
+            if let Err(e) = library_names_are_usable(field, &setting) {
+                return bad_request(e);
+            }
             if let Err(e) = document::set(&mut doc, field_path, setting) {
                 return bad_request(e.to_string());
             }
@@ -593,6 +729,26 @@ impl Admin {
     }
 }
 
+/// A `[library]` field carries a name that becomes a file name, so its
+/// value is checked the way the loader checks it. Every other field's value
+/// is only ever a value.
+fn library_names_are_usable(field: &schema::Field, setting: &Setting) -> Result<(), String> {
+    let names: Vec<&String> = match (field.kind, setting) {
+        (schema::Kind::PersonaRef, Setting::Text(name)) => vec![name],
+        (schema::Kind::ModuleRefs, Setting::List(names)) => names.iter().collect(),
+        _ => return Ok(()),
+    };
+    for name in names {
+        if !library::valid_name(name) {
+            return Err(format!(
+                "{name:?} is not usable as a library name: letters, digits, dashes and \
+                 underscores, because it names a file under personas/ or modules/"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn bad_request(detail: String) -> Response {
     Response::json(400, &serde_json::json!({ "error": detail }))
 }
@@ -665,7 +821,7 @@ fn to_setting(field: &schema::Field, value: &serde_json::Value) -> Result<Settin
             serde_json::Value::String(s) => s == "true",
             _ => return Err(format!("{} is on or off", field.label)),
         }),
-        Kind::List => {
+        Kind::List | Kind::ModuleRefs => {
             let items: Vec<String> = match value {
                 serde_json::Value::Array(items) => items
                     .iter()
@@ -695,7 +851,7 @@ fn to_setting(field: &schema::Field, value: &serde_json::Value) -> Result<Settin
             }
             Setting::Text(chosen)
         }
-        Kind::Text | Kind::Paragraph | Kind::EnvName => {
+        Kind::Text | Kind::Paragraph | Kind::EnvName | Kind::PersonaRef => {
             Setting::Text(value.as_str().unwrap_or_default().to_string())
         }
     })
@@ -760,6 +916,8 @@ mod tests {
         for (method, path) in [
             ("GET", "/api/state"),
             ("GET", "/api/vault"),
+            ("GET", "/api/library"),
+            ("POST", "/api/library"),
             ("POST", "/api/settings"),
             ("POST", "/api/secret"),
             ("POST", "/api/secret/remove"),
@@ -1160,6 +1318,241 @@ mod tests {
             "{acme}"
         );
         assert_eq!(acme["reach"], serde_json::json!([]));
+    }
+
+    /// T4.1. A group is a name and a set of modules, written into the
+    /// company's own overlay and read back from it.
+    #[tokio::test]
+    async fn a_group_is_stored_on_the_company_and_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"ollama\"\n",
+        )
+        .expect("the config");
+        let admin = admin(dir.path());
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company",
+                Some("the-token"),
+                r#"{"id":"acme"}"#,
+            ),
+        )
+        .await;
+
+        let saved = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/group",
+                Some("the-token"),
+                r#"{"company":"acme","name":"agents","modules":["orders","stock"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            saved.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&saved.body)
+        );
+
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        assert_eq!(
+            answered["groups"]["acme"]["agents"],
+            serde_json::json!(["orders", "stock"])
+        );
+
+        // A group that reaches nothing is a real thing to say, so an empty
+        // set is written rather than collapsing into a removal.
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/group",
+                Some("the-token"),
+                r#"{"company":"acme","name":"agents","modules":[]}"#,
+            ),
+        )
+        .await;
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        assert_eq!(answered["groups"]["acme"]["agents"], serde_json::json!([]));
+
+        // And removing takes it out.
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/group",
+                Some("the-token"),
+                r#"{"company":"acme","name":"agents","remove":true}"#,
+            ),
+        )
+        .await;
+        let state = route(&admin, &request("GET", "/api/state", Some("the-token"), "")).await;
+        let answered: serde_json::Value = serde_json::from_slice(&state.body).expect("json");
+        assert_eq!(answered["groups"]["acme"], serde_json::json!({}));
+    }
+
+    /// The groups route is the one place that writes outside the schema's
+    /// allowlist, so it keeps the property the allowlist exists for by
+    /// hand: under `groups.` and nowhere else.
+    #[tokio::test]
+    async fn a_group_name_cannot_walk_out_of_its_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company",
+                Some("the-token"),
+                r#"{"id":"acme"}"#,
+            ),
+        )
+        .await;
+        for bad in ["serve.listen", "../x", "has space", ""] {
+            let body = serde_json::json!({ "company": "acme", "name": bad, "modules": [] });
+            let refused = route(
+                &admin,
+                &request("POST", "/api/group", Some("the-token"), &body.to_string()),
+            )
+            .await;
+            assert_eq!(refused.status, 400, "{bad:?} was accepted");
+        }
+        // And a company that does not exist is not a file to create.
+        let body = r#"{"company":"nobody","name":"agents","modules":[]}"#;
+        let refused = route(
+            &admin,
+            &request("POST", "/api/group", Some("the-token"), body),
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+    }
+
+    /// H6, the half a test can hold: the page says in as many words that
+    /// nothing is enforced, and names the plan that owns the enforcement.
+    #[test]
+    fn the_page_says_groups_are_not_enforced_and_which_plan_owns_it() {
+        assert!(PAGE.contains("Nothing enforces this yet"), "the notice");
+        assert!(PAGE.contains("Phase 8"), "the plan that owns enforcement");
+        assert!(PAGE.contains("grants"), "the seam it will arrive through");
+    }
+
+    /// T3.4 / H4, through the routes: a persona two companies name comes
+    /// back carrying both, so the page can say so before the save.
+    #[tokio::test]
+    async fn a_shared_persona_reports_every_company_it_reaches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"ollama\"\n",
+        )
+        .expect("the config");
+        std::fs::create_dir_all(dir.path().join("tenants")).expect("tenants");
+        for (id, extra) in [("acme", ""), ("beta", "[persona]\ntext = \"ours\"\n")] {
+            std::fs::write(
+                dir.path().join("tenants").join(format!("{id}.toml")),
+                format!("[library]\npersona = \"support-brief\"\n{extra}"),
+            )
+            .expect("the overlay");
+        }
+        let admin = admin(dir.path());
+
+        let created = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/library",
+                Some("the-token"),
+                r#"{"kind":"persona","name":"support-brief","text":"Be brief."}"#,
+            ),
+        )
+        .await;
+        assert_eq!(created.status, 200);
+
+        let listed = route(
+            &admin,
+            &request("GET", "/api/library", Some("the-token"), ""),
+        )
+        .await;
+        let answered: serde_json::Value = serde_json::from_slice(&listed.body).expect("json");
+        let entry = &answered["entries"][0];
+        assert_eq!(entry["name"], "support-brief");
+        assert_eq!(entry["used_by"], serde_json::json!(["acme", "beta"]));
+        // beta writes its own, so the shared text never reaches it.
+        assert_eq!(entry["overridden_by"], serde_json::json!(["beta"]));
+    }
+
+    /// The one field on this page whose accepted key can still carry a
+    /// path. The loader refuses it too; this is so the operator hears about
+    /// it at the save rather than at the next start.
+    #[tokio::test]
+    async fn a_library_reference_that_would_leave_the_directory_is_refused_at_the_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+        route(
+            &admin,
+            &request(
+                "POST",
+                "/api/company",
+                Some("the-token"),
+                r#"{"id":"acme"}"#,
+            ),
+        )
+        .await;
+
+        for body in [
+            r#"{"company":"acme","values":{"library.persona":"../../../secrets"}}"#,
+            r#"{"company":"acme","values":{"library.modules":["ok","../escape"]}}"#,
+        ] {
+            let refused = route(
+                &admin,
+                &request("POST", "/api/settings", Some("the-token"), body),
+            )
+            .await;
+            assert_eq!(refused.status, 400, "{body}");
+        }
+        let text = std::fs::read_to_string(dir.path().join("tenants").join("acme.toml"))
+            .expect("the overlay");
+        assert!(!text.contains(".."), "nothing was written: {text}");
+    }
+
+    /// A module is checked at the save, where the operator is still looking
+    /// at it, rather than at the next start.
+    #[tokio::test]
+    async fn a_module_that_does_not_parse_is_refused_at_the_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+        let refused = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/library",
+                Some("the-token"),
+                r#"{"kind":"module","name":"orders","text":"not [[[ toml"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+        assert!(!dir.path().join("modules").exists(), "nothing was written");
+
+        // And a name that would leave the directory is refused too.
+        let escape = route(
+            &admin,
+            &request(
+                "POST",
+                "/api/library",
+                Some("the-token"),
+                r#"{"kind":"persona","name":"../../escape","text":"x"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(escape.status, 400);
     }
 
     /// A company whose overlay is not a configuration at all still gets a

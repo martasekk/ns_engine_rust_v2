@@ -25,6 +25,47 @@ use std::path::{Path, PathBuf};
 /// config alone.
 pub(crate) const TENANT_DIR: &str = "tenants";
 
+/// The shared library, beside `tenants/`. A persona is prose; a module is a
+/// file of `[[http_component]]` entries — literally the TOML you would
+/// otherwise paste into each company's overlay.
+///
+/// Files, and not a database, for the reason the overlays are files: a file
+/// is reviewable and diffable, and the answer that made the tenant set
+/// legible should not be given up the first time something else needs
+/// storing.
+pub(crate) const PERSONA_DIR: &str = "personas";
+pub(crate) const MODULE_DIR: &str = "modules";
+
+/// One module file: the same shape `[[http_component]]` has in the config,
+/// so a module is moved into the library by cutting the entries out of a
+/// config and pasting them into a file.
+///
+/// `deny_unknown_fields` because the failure it prevents is silent: a file
+/// spelling the table `[[http_components]]`, or holding something else
+/// entirely, would otherwise parse as a module with nothing in it, and the
+/// company that named it would simply not have the tools it was sold.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleFile {
+    #[serde(default, rename = "http_component")]
+    http_components: Vec<nscomponents_std::http_tool::HttpToolConfig>,
+}
+
+/// A name in the library, which is also a file name.
+///
+/// The charset is the whole of the check, and it is the only thing standing
+/// between `[library] persona = "…"` and an arbitrary file: the name is
+/// joined onto `personas/` and read, so a value carrying `..` or a separator
+/// would put a file from anywhere on the box into every prompt this company
+/// sends. Letters, digits, dashes and underscores leave no way to say it.
+pub(crate) fn valid_library_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// The keys the process owns and an overlay may therefore not set, as dotted
 /// paths into the config. `[models]` is the local model service this box runs;
 /// everything under `[serve]` named here belongs to the one socket the
@@ -117,6 +158,44 @@ pub(crate) enum TenantError {
         path: String,
         key: String,
     },
+    /// H5. The overlay names a persona or a module the library does not
+    /// hold. Refused here rather than started without it: a company whose
+    /// persona silently failed to load would answer in the base's voice,
+    /// and a company missing a module would say it cannot do the thing it
+    /// was bought for — both of which look like the model having a bad day
+    /// rather than a file being absent.
+    MissingFromLibrary {
+        tenant: String,
+        /// "persona" or "module", for the message.
+        kind: &'static str,
+        name: String,
+        /// The file it should have been.
+        path: String,
+    },
+    /// A module file is there and is not a set of components.
+    MalformedModule {
+        tenant: String,
+        name: String,
+        path: String,
+        detail: String,
+    },
+    /// A library name that is not usable as a file name. Refused before it
+    /// is joined onto a directory, because the join is what would turn
+    /// `../../secrets` into a file read.
+    BadLibraryName {
+        tenant: String,
+        kind: &'static str,
+        name: String,
+    },
+    /// Two modules this company named define the same tool. Dropping one
+    /// silently would leave an operator who had just added a module looking
+    /// at a tool that still calls the old endpoint.
+    ModuleToolClash {
+        tenant: String,
+        tool: String,
+        a: String,
+        b: String,
+    },
     /// Plan H9, widened by guard G1: two overlays resolve to one of the
     /// files a tenant must have to itself — its store, its learned rules or
     /// its ledger. Both tenants are named, because the copy-pasted one is
@@ -153,6 +232,32 @@ impl std::fmt::Display for TenantError {
                 "tenant {tenant:?}: {path}: {key} is owned by the process and cannot be \
                  set per tenant."
             ),
+            Self::MissingFromLibrary {
+                tenant,
+                kind,
+                name,
+                path,
+            } => write!(
+                f,
+                "tenant {tenant:?}: {kind} {name:?} is not in the library — it should be \
+                 {path}. A named {kind} that is not there is refused rather than skipped."
+            ),
+            Self::MalformedModule {
+                tenant,
+                name,
+                path,
+                detail,
+            } => write!(f, "tenant {tenant:?}: module {name:?}: {path}: {detail}"),
+            Self::BadLibraryName { tenant, kind, name } => write!(
+                f,
+                "tenant {tenant:?}: {name:?} is not usable as a {kind} name — letters, \
+                 digits, dashes and underscores, because it names a file."
+            ),
+            Self::ModuleToolClash { tenant, tool, a, b } => write!(
+                f,
+                "tenant {tenant:?}: modules {a:?} and {b:?} both define the tool {tool:?} — \
+                 one would silently win, so neither is loaded."
+            ),
             Self::PathClash {
                 a,
                 b,
@@ -183,9 +288,16 @@ pub(crate) fn load_set(
 ) -> Result<Vec<TenantConfig>, TenantError> {
     let dir = root.join(TENANT_DIR);
     if !dir.is_dir() {
+        // The library is resolved here too. A single-tenant deployment that
+        // names a shared persona is a deployment that means it, and skipping
+        // the reference because there happened to be no `tenants/` would be
+        // the silent failure H5 exists to stop — just without a company id
+        // to blame it on.
+        let mut app = AppConfig::parse(base_text).map_err(TenantError::Base)?;
+        resolve_library(&mut app, base_text, base_text, root, default_id)?;
         return Ok(vec![TenantConfig {
             id: default_id.to_string(),
-            app: AppConfig::parse(base_text).map_err(TenantError::Base)?,
+            app,
         }]);
     }
     let mut ids = Vec::new();
@@ -211,25 +323,174 @@ pub(crate) fn load_set(
     ids.sort();
     let mut set = Vec::new();
     for id in &ids {
-        set.push(load_one(base_text, &dir, id)?);
+        set.push(load_one(base_text, root, id)?);
     }
     check_private_paths(&set)?;
     Ok(set)
 }
 
 /// One tenant: the base config with `<dir>/<id>.toml` laid over it.
-pub(crate) fn load_one(base_text: &str, dir: &Path, id: &str) -> Result<TenantConfig, TenantError> {
-    let path = dir.join(format!("{id}.toml"));
+pub(crate) fn load_one(
+    base_text: &str,
+    root: &Path,
+    id: &str,
+) -> Result<TenantConfig, TenantError> {
+    let path = root.join(TENANT_DIR).join(format!("{id}.toml"));
     let shown = path.display().to_string();
     let overlay_text = std::fs::read_to_string(&path).map_err(|_| TenantError::Missing {
         tenant: id.to_string(),
         path: shown.clone(),
     })?;
-    let app = overlay(base_text, &overlay_text, id, &shown)?;
+    let mut app = overlay(base_text, &overlay_text, id, &shown)?;
+    resolve_library(&mut app, base_text, &overlay_text, root, id)?;
     Ok(TenantConfig {
         id: id.to_string(),
         app,
     })
+}
+
+/// Turns the names in `[library]` into the things they name.
+///
+/// **The persona.** An inline value beats a reference, at the level that
+/// asked for the reference: a company that wrote its own `[persona] text`
+/// gets it, and a base that wrote both gets its own too. The test is never
+/// the *merged* text, because the merged text is usually the base's and
+/// treating that as an override would mean a library persona could never
+/// reach anybody at all.
+///
+/// **The modules.** A union, not a replacement. The components a company
+/// writes inline stay, and each named module adds its own; a module naming a
+/// tool the company already defines is left out rather than registered
+/// twice, because assembly refuses two tools claiming one name and the
+/// message would be about the harness rather than about the module.
+fn resolve_library(
+    app: &mut AppConfig,
+    base_text: &str,
+    overlay_text: &str,
+    root: &Path,
+    id: &str,
+) -> Result<(), TenantError> {
+    if let Some(name) = app.library.persona.clone() {
+        if !valid_library_name(&name) {
+            return Err(TenantError::BadLibraryName {
+                tenant: id.to_string(),
+                kind: "persona",
+                name,
+            });
+        }
+        let path = root.join(PERSONA_DIR).join(format!("{name}.md"));
+        let prose =
+            std::fs::read_to_string(&path).map_err(|_| TenantError::MissingFromLibrary {
+                tenant: id.to_string(),
+                kind: "persona",
+                name: name.clone(),
+                path: path.display().to_string(),
+            })?;
+        // Whichever level asked for the persona is the level whose own
+        // `[persona] text` gets to override it.
+        let asked = if names_a_library_persona(overlay_text) {
+            overlay_text
+        } else {
+            base_text
+        };
+        if !writes_its_own_persona(asked) {
+            app.persona.text = prose.trim().to_string();
+        }
+    }
+    // Which module brought each tool, so a collision between two of them
+    // can name both. Tools the company wrote inline are not in here: losing
+    // to those is the documented rule, not a mistake.
+    let mut brought_by: Vec<(String, String)> = Vec::new();
+    for name in app.library.modules.clone() {
+        if !valid_library_name(&name) {
+            return Err(TenantError::BadLibraryName {
+                tenant: id.to_string(),
+                kind: "module",
+                name,
+            });
+        }
+        let path = root.join(MODULE_DIR).join(format!("{name}.toml"));
+        let text = std::fs::read_to_string(&path).map_err(|_| TenantError::MissingFromLibrary {
+            tenant: id.to_string(),
+            kind: "module",
+            name: name.clone(),
+            path: path.display().to_string(),
+        })?;
+        let module: ModuleFile =
+            toml::from_str(&text).map_err(|e| TenantError::MalformedModule {
+                tenant: id.to_string(),
+                name: name.clone(),
+                path: path.display().to_string(),
+                detail: e.to_string(),
+            })?;
+        if module.http_components.is_empty() {
+            return Err(TenantError::MalformedModule {
+                tenant: id.to_string(),
+                name: name.clone(),
+                path: path.display().to_string(),
+                detail: "there are no [[http_component]] entries in it, so naming it \
+                         registers nothing"
+                    .to_string(),
+            });
+        }
+        for component in module.http_components {
+            if let Some((_, first)) = brought_by.iter().find(|(tool, _)| tool == &component.name) {
+                return Err(TenantError::ModuleToolClash {
+                    tenant: id.to_string(),
+                    tool: component.name.clone(),
+                    a: first.clone(),
+                    b: name.clone(),
+                });
+            }
+            brought_by.push((component.name.clone(), name.clone()));
+            // A tool the company defines for itself stays its own: the
+            // module adds what is missing rather than replacing what is
+            // there, and assembly would refuse the pair anyway.
+            if !app.http_components.iter().any(|c| c.name == component.name) {
+                app.http_components.push(component);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether this text is a module file, and how many components it holds.
+///
+/// The settings page writes library files, and a module that does not parse
+/// would be refused at the next start rather than at the save — which is the
+/// failure mode the whole "every save must load" rule exists to prevent.
+pub(crate) fn check_module(text: &str) -> Result<usize, String> {
+    let module: ModuleFile = toml::from_str(text).map_err(|e| e.to_string())?;
+    if module.http_components.is_empty() {
+        return Err(
+            "there are no [[http_component]] entries in it, so naming it would register \
+             nothing"
+                .to_string(),
+        );
+    }
+    Ok(module.http_components.len())
+}
+
+/// Whether this overlay writes a persona of its own, as opposed to
+/// inheriting the base's. Read off the overlay's own text for the reason in
+/// [`resolve_library`].
+fn writes_its_own_persona(text: &str) -> bool {
+    reads(text, "persona", "text")
+        .and_then(|v| v.as_str().map(|t| !t.trim().is_empty()))
+        .unwrap_or(false)
+}
+
+/// Whether this level is the one that named a library persona.
+fn names_a_library_persona(text: &str) -> bool {
+    reads(text, "library", "persona").is_some()
+}
+
+fn reads(text: &str, table: &str, key: &str) -> Option<toml::Value> {
+    toml::from_str::<toml::Value>(text)
+        .ok()?
+        .get(table)?
+        .get(key)
+        .cloned()
 }
 
 /// The merge itself.
@@ -355,6 +616,293 @@ mod tests {
         dir
     }
 
+    /// Put a file in the shared library beside `tenants/`.
+    fn library(root: &Path, kind: &str, name: &str, text: &str) {
+        let dir = root.join(kind);
+        std::fs::create_dir_all(&dir).expect("library dir");
+        let extension = if kind == PERSONA_DIR { "md" } else { "toml" };
+        std::fs::write(dir.join(format!("{name}.{extension}")), text).expect("library file");
+    }
+
+    fn a_component(tool: &str, description: &str) -> String {
+        format!(
+            "[[http_component]]\nname = \"{tool}\"\n\
+             description = \"{description}\"\n\
+             url = \"https://example.test/{tool}\"\n\
+             side_effect = \"Pure\"\n\
+             args_schema = {{ type = \"object\" }}\n"
+        )
+    }
+
+    fn a_module(tool: &str) -> String {
+        a_component(tool, "from the library")
+    }
+
+    /// T3.2 and D5. Two companies name one persona and get the same words;
+    /// the one that wrote its own gets its own, and the reference is simply
+    /// not used.
+    #[test]
+    fn a_company_can_use_a_shared_persona_and_override_it() {
+        let root = tenants(&[
+            (
+                "acme",
+                "[store]\npath = \"ns-acme.sqlite\"\n\
+                 [evolution]\nlearned_path = \"acme-learned.toml\"\n\
+                 ledger_path = \"acme-ledger.jsonl\"\n\
+                 [library]\npersona = \"support-brief\"\n",
+            ),
+            (
+                "beta",
+                "[store]\npath = \"ns-beta.sqlite\"\n\
+                 [evolution]\nlearned_path = \"beta-learned.toml\"\n\
+                 ledger_path = \"beta-ledger.jsonl\"\n\
+                 [library]\npersona = \"support-brief\"\n\
+                 [persona]\ntext = \"beta says it its own way\"\n",
+            ),
+        ]);
+        library(
+            root.path(),
+            PERSONA_DIR,
+            "support-brief",
+            "Answer in two sentences.\n",
+        );
+        let set = load_set(BASE, root.path(), "local").expect("the set loads");
+
+        let acme = set.iter().find(|t| t.id == "acme").expect("acme");
+        assert_eq!(acme.app.persona.text, "Answer in two sentences.");
+        let beta = set.iter().find(|t| t.id == "beta").expect("beta");
+        assert_eq!(
+            beta.app.persona.text, "beta says it its own way",
+            "an inline persona beats the reference"
+        );
+    }
+
+    /// D5. Modules add; they do not replace. A company keeps the components
+    /// it wrote and gains the ones it named.
+    #[test]
+    fn modules_from_the_library_and_the_overlay_are_one_set() {
+        let root = tenants(&[(
+            "acme",
+            &format!(
+                "[library]\nmodules = [\"orders\", \"stock\"]\n{}",
+                a_component("its_own", "written into the overlay")
+            ),
+        )]);
+        library(root.path(), MODULE_DIR, "orders", &a_module("place_order"));
+        library(root.path(), MODULE_DIR, "stock", &a_module("check_stock"));
+        let set = load_set(BASE, root.path(), "local").expect("the set loads");
+
+        let mut names: Vec<&str> = set[0]
+            .app
+            .http_components
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["check_stock", "its_own", "place_order"]);
+    }
+
+    /// A module that names a tool the company already defines does not
+    /// register it twice — assembly refuses two tools on one name, and the
+    /// message would be about the harness rather than about the module.
+    #[test]
+    fn a_module_does_not_shadow_a_tool_the_company_already_has() {
+        let root = tenants(&[(
+            "acme",
+            &format!(
+                "[library]\nmodules = [\"orders\"]\n{}",
+                a_component("place_order", "the company's own")
+            ),
+        )]);
+        library(root.path(), MODULE_DIR, "orders", &a_module("place_order"));
+        let set = load_set(BASE, root.path(), "local").expect("the set loads");
+
+        assert_eq!(set[0].app.http_components.len(), 1);
+        assert_eq!(
+            set[0].app.http_components[0].description,
+            "the company's own"
+        );
+    }
+
+    /// H5. A named persona that is not there is refused at load, with the
+    /// file it should have been — not started in the base's voice.
+    #[test]
+    fn a_missing_persona_is_refused_naming_the_file() {
+        let root = tenants(&[("acme", "[library]\npersona = \"not-written-yet\"\n")]);
+        let said = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a persona that is not there must be refused"),
+        };
+        assert!(said.contains("acme"), "{said}");
+        assert!(said.contains("not-written-yet"), "{said}");
+        assert!(said.contains("not-written-yet.md"), "{said}");
+        assert!(said.contains("personas"), "{said}");
+    }
+
+    /// The same for a module, and for one that is there and is not a set of
+    /// components.
+    #[test]
+    fn a_missing_or_broken_module_is_refused_naming_the_file() {
+        let root = tenants(&[("acme", "[library]\nmodules = [\"orders\"]\n")]);
+        let absent = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a module that is not there must be refused"),
+        };
+        assert!(absent.contains("orders.toml"), "{absent}");
+
+        library(root.path(), MODULE_DIR, "orders", "this is not toml [[[");
+        let said = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a module that does not parse must be refused"),
+        };
+        assert!(said.contains("orders"), "{said}");
+        assert!(said.contains("acme"), "{said}");
+    }
+
+    /// The `[library]` value is a file name, which makes it the one field
+    /// where an accepted key can still carry a path. A name that walked out
+    /// of `personas/` would put a file from anywhere on the box into every
+    /// prompt the company sends — and hand it back to whoever chats with it.
+    #[test]
+    fn a_library_name_that_would_leave_the_directory_is_refused_at_load() {
+        let secret = tempfile::tempdir().expect("tempdir");
+        std::fs::write(secret.path().join("private.md"), "the private notes").expect("file");
+
+        for name in ["../../private", "..\\..\\private", "a/b", "a:b", ""] {
+            let root = tenants(&[(
+                "acme",
+                &format!("[library]\npersona = {}\n", toml_string(name)),
+            )]);
+            let said = match load_set(BASE, root.path(), "local") {
+                Err(e) => e.to_string(),
+                Ok(set) => panic!(
+                    "{name:?} was accepted; persona became {:?}",
+                    set[0].app.persona.text
+                ),
+            };
+            assert!(said.contains("not usable"), "{name:?}: {said}");
+        }
+    }
+
+    fn toml_string(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\"))
+    }
+
+    /// Two modules defining one tool: one would silently win, and the
+    /// operator who just added the second would see a tool still calling
+    /// the first one's endpoint.
+    #[test]
+    fn two_modules_defining_one_tool_are_refused_naming_both() {
+        let root = tenants(&[("acme", "[library]\nmodules = [\"orders\", \"orders_v2\"]\n")]);
+        library(root.path(), MODULE_DIR, "orders", &a_module("place_order"));
+        library(
+            root.path(),
+            MODULE_DIR,
+            "orders_v2",
+            &a_module("place_order"),
+        );
+
+        let said = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("two modules on one tool name must be refused"),
+        };
+        assert!(said.contains("orders"), "{said}");
+        assert!(said.contains("orders_v2"), "{said}");
+        assert!(said.contains("place_order"), "{said}");
+    }
+
+    /// A module that parses and registers nothing is the silent version of
+    /// a missing module: the company simply does not have the tools it was
+    /// sold, and nothing says so.
+    #[test]
+    fn a_module_that_registers_nothing_is_refused() {
+        let root = tenants(&[("acme", "[library]\nmodules = [\"orders\"]\n")]);
+        // The plural is a real typo and would otherwise parse as nothing.
+        library(
+            root.path(),
+            MODULE_DIR,
+            "orders",
+            "[[http_components]]\nname = \"place_order\"\n",
+        );
+        let said = match load_set(BASE, root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a module registering nothing must be refused"),
+        };
+        assert!(said.contains("orders"), "{said}");
+    }
+
+    /// The CLI and every one-shot subcommand take the no-`tenants/` path.
+    /// A deployment that names a shared persona there means it, and the
+    /// reference is resolved and refused exactly as it would be for a
+    /// company — skipping it because there was no tenant directory would be
+    /// the silent failure with nobody to blame it on.
+    #[test]
+    fn a_deployment_with_no_tenants_directory_still_gets_its_library() {
+        let root = tempfile::tempdir().expect("tempdir");
+        library(root.path(), PERSONA_DIR, "house", "The house voice.\n");
+        let set = load_set("[library]\npersona = \"house\"\n", root.path(), "local")
+            .expect("the set loads");
+        assert_eq!(set[0].app.persona.text, "The house voice.");
+
+        let said = match load_set("[library]\npersona = \"absent\"\n", root.path(), "local") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a persona that is not there must be refused"),
+        };
+        assert!(said.contains("absent.md"), "{said}");
+    }
+
+    /// The override rule applies at the level that asked for the
+    /// reference. A base that names a persona *and* writes its own text
+    /// gets its own; a company that inherits that reference and writes
+    /// nothing gets the library's.
+    #[test]
+    fn an_inline_persona_beats_the_reference_at_the_level_that_made_it() {
+        let root = tenants(&[("acme", "[store]\npath = \"ns-acme.sqlite\"\n")]);
+        library(root.path(), PERSONA_DIR, "house", "The library voice.\n");
+
+        let both = "[library]\npersona = \"house\"\n[persona]\ntext = \"the base's own\"\n";
+        let set = load_set(both, root.path(), "local").expect("loads");
+        assert_eq!(
+            set[0].app.persona.text, "the base's own",
+            "the base wrote both, so its own text stands"
+        );
+
+        let reference_only = "[library]\npersona = \"house\"\n";
+        let set = load_set(reference_only, root.path(), "local").expect("loads");
+        assert_eq!(set[0].app.persona.text, "The library voice.");
+    }
+
+    /// T4.3. Groups are expressed and inert. The loader carries them and
+    /// nothing downstream narrows anything by them — a company with a group
+    /// naming one module still has every tool it had, because the
+    /// enforcement seam is a filter over the registered tool set inside the
+    /// turn loop, and it does not exist yet.
+    #[test]
+    fn groups_are_stored_and_change_nothing_about_the_tools() {
+        let root = tenants(&[(
+            "acme",
+            &format!(
+                "[library]\nmodules = [\"orders\"]\n\
+                 [groups]\nagents = [\"orders\"]\nreadonly = []\n{}",
+                a_component("its_own", "written into the overlay")
+            ),
+        )]);
+        library(root.path(), MODULE_DIR, "orders", &a_module("place_order"));
+        let set = load_set(BASE, root.path(), "local").expect("the set loads");
+
+        assert_eq!(set[0].app.groups["agents"], vec!["orders"]);
+        assert!(set[0].app.groups["readonly"].is_empty());
+        // Both tools are still registered: the group narrowed nothing.
+        let mut names: Vec<&str> = set[0]
+            .app
+            .http_components
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["its_own", "place_order"]);
+    }
+
     /// The CLI invariant: no `tenants/` directory is one tenant called
     /// `local`, the base config alone, every default today's.
     #[test]
@@ -408,7 +956,7 @@ mod tests {
     #[test]
     fn a_missing_tenant_overlay_is_refused_by_name() {
         let root = tenants(&[]);
-        let err = match load_one(BASE, &root.path().join(TENANT_DIR), "acme") {
+        let err = match load_one(BASE, root.path(), "acme") {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a missing overlay must be refused"),
         };

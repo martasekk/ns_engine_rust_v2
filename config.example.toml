@@ -158,6 +158,34 @@ text = "You are a helpful, concise assistant."
 [store]
 path = "ns.sqlite"
 
+# The shared library, for a deployment hosting more than one company.
+# `personas/<name>.md` is prose; `modules/<name>.toml` is a file of
+# [[http_component]] entries — the same TOML you would otherwise paste into
+# every overlay. Both directories sit beside `tenants/`.
+#
+# A company names what it uses instead of holding a copy, so a correction to
+# one persona reaches everybody using it rather than the one file somebody
+# remembered to edit. A name that is not in the library is refused at
+# startup, naming the file it should have been: a company that silently ran
+# without the persona it asked for would just look like a bad model.
+#
+# A company that writes its own [persona] text gets that, and the reference
+# is left unused. Modules *add* to whatever the company defines for itself.
+# [library]
+# persona = "support-brief"
+# modules = ["orders", "stock"]
+
+# Which of this company's modules a group of its people may reach.
+#
+# STORED AND NOT ENFORCED. Nothing reads this yet. The multi-tenant plan's
+# Phase 8 owns the enforcement, where a group reaches a session through the
+# token's `grants` claim; the hard part is that tools are registered once at
+# assembly, so a per-session subset needs a filter the turn loop does not
+# have. Until then every person at a company reaches every tool it has.
+# [groups]
+# agents = ["orders", "stock"]
+# readonly = ["stock"]
+
 # Evolution pass (self-improvement, spec 2026-09-02). Both drivers:
 #   batch:  ns-app evolve [--dry-run]      (cron-friendly; audit via git diff learned.toml)
 #   idle:   after idle_after_secs of silence while running (0 = off)
