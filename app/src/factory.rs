@@ -83,6 +83,21 @@ pub(crate) enum StartupError {
     SharedAuthOffLoopback {
         listen: String,
     },
+    /// Plan B9: one shared token cannot tell two companies apart, so a set
+    /// of more than one tenant under `auth = "shared"` could only ever route
+    /// every client to whichever company the token was said to stand for.
+    /// Refused at startup rather than served as one company wearing
+    /// everybody's name.
+    SharedAuthManyTenants {
+        tenants: Vec<String>,
+    },
+    /// Plan B9: a message naming a company this shard does not host. The
+    /// identity layer refuses an unknown tenant before a queue can exist, so
+    /// this is the second answer to the same question: a name with no config
+    /// behind it is refused, never built from the base config.
+    UnknownTenant {
+        tenant: String,
+    },
     /// The listener would not bind.
     Serve(String),
     /// Assembly is a gate: a missing slot, a duplicated one, two tools
@@ -135,6 +150,20 @@ impl std::fmt::Display for StartupError {
                  everyone proves nothing, so it is loopback only — set auth = \"jwt\" to serve \
                  an address other machines can reach."
             ),
+            Self::SharedAuthManyTenants { tenants } => write!(
+                f,
+                "{} tenants are configured ({}) with [serve] auth = \"shared\": one token for \
+                 everyone cannot tell them apart, so every client would arrive as the same \
+                 company - set auth = \"jwt\" to serve more than one.",
+                tenants.len(),
+                tenants.join(", ")
+            ),
+            Self::UnknownTenant { tenant } => write!(
+                f,
+                "tenant {tenant:?} is not configured in {}/: a message for a company this shard \
+                 does not host is refused, not built from the base config.",
+                crate::tenant::TENANT_DIR
+            ),
             Self::Serve(e) => write!(f, "serve: {e}"),
             Self::Harness(e) => write!(f, "ns-harness: cannot assemble the harness: {e}"),
         }
@@ -167,29 +196,65 @@ pub(crate) fn serve_resolver(
             Ok(Arc::new(SharedTokenResolver::new(token, tenant.id.clone())))
         }
         AuthMode::Jwt => {
-            // Named and unset is the operator's mistake; named nothing at
-            // all is a process that could only ever refuse. Both are the one
-            // refusal, because both leave nothing to verify against.
-            if cfg.auth.signing_key_envs.is_empty() {
-                return Err(StartupError::MissingSigningKeys {
-                    tenant: tenant.id.clone(),
-                    env: "[auth] signing_key_envs".to_string(),
-                });
+            let table = HashMap::from([(tenant.id.clone(), tenant_auth(tenant)?)]);
+            Ok(Arc::new(Hs256Verifier::new(table)))
+        }
+    }
+}
+
+/// One company's signing material, or the refusal that names what is
+/// missing. Split out of [`serve_resolver`] so the shard's table (many
+/// companies, one verifier) is built from the same reading of `[auth]` as a
+/// single company's.
+fn tenant_auth(tenant: &TenantConfig) -> Result<TenantAuth, StartupError> {
+    let cfg = &tenant.app;
+    if cfg.auth.signing_key_envs.is_empty() {
+        return Err(StartupError::MissingSigningKeys {
+            tenant: tenant.id.clone(),
+            env: "[auth] signing_key_envs".to_string(),
+        });
+    }
+    let keys = cfg
+        .auth
+        .signing_keys()
+        .map_err(|env| StartupError::MissingSigningKeys {
+            tenant: tenant.id.clone(),
+            env,
+        })?;
+    let mut keys = keys.into_iter();
+    Ok(TenantAuth {
+        current: keys.next().expect("signing_key_envs is not empty"),
+        previous: keys.next(),
+        iat_floor: cfg.auth.iat_floor,
+    })
+}
+
+/// The resolver for a whole shard: one listener, every company in the set
+/// (plan B9).
+///
+/// `[serve]` is process-owned (`tenant::PROCESS_OWNED`), so the mode is read
+/// off any member and is the same for all of them; `[auth]` is deliberately
+/// per company, so the key table has a row each and a token minted by one
+/// company reaches only its own engine. Shared auth is the exception and it
+/// is a refusal: one token names one company, so it can serve a set of one
+/// and nothing larger.
+pub(crate) fn shard_resolver(
+    set: &[TenantConfig],
+) -> Result<Arc<dyn IdentityResolver<Hello>>, StartupError> {
+    let Some(first) = set.first() else {
+        // `main` refuses an empty set before it reaches this.
+        return Err(StartupError::Config("no tenant to serve".into()));
+    };
+    match first.app.serve.auth {
+        AuthMode::Shared if set.len() > 1 => Err(StartupError::SharedAuthManyTenants {
+            tenants: set.iter().map(|t| t.id.clone()).collect(),
+        }),
+        AuthMode::Shared => serve_resolver(first),
+        AuthMode::Jwt => {
+            let mut table = HashMap::new();
+            for tenant in set {
+                table.insert(tenant.id.clone(), tenant_auth(tenant)?);
             }
-            let keys = cfg
-                .auth
-                .signing_keys()
-                .map_err(|env| StartupError::MissingSigningKeys {
-                    tenant: tenant.id.clone(),
-                    env,
-                })?;
-            let mut keys = keys.into_iter();
-            let auth = TenantAuth {
-                current: keys.next().expect("signing_key_envs is not empty"),
-                previous: keys.next(),
-                iat_floor: cfg.auth.iat_floor,
-            };
-            let table = HashMap::from([(tenant.id.clone(), auth)]);
             Ok(Arc::new(Hs256Verifier::new(table)))
         }
     }
@@ -926,6 +991,65 @@ mod tests {
         std::env::set_var("NS_TEST_A6_SIGNING_KEY", "a signing key");
         serve_resolver(&set[0]).expect("the tenant's verifier");
         std::env::remove_var("NS_TEST_A6_SIGNING_KEY");
+    }
+
+    /// Plan B9. One listener decides identity for every company on it, so
+    /// the key table has a row per company and each row is read from that
+    /// company's own `[auth]`. A set whose second member names a key nobody
+    /// exported is refused by that member's name, which is what proves the
+    /// table is built from the whole set rather than from its first entry.
+    #[test]
+    fn the_shard_resolver_reads_every_tenants_keys() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let addr: SocketAddr = "127.0.0.1:7379".parse().expect("a literal address");
+        let mut set = serve_fixture(root.path(), addr, &["acme", "globex"]);
+        for tenant in &mut set {
+            tenant.app.serve.auth = crate::config::AuthMode::Jwt;
+            tenant.app.auth.signing_key_envs =
+                vec![format!("NS_TEST_B9_KEY_{}", tenant.id.to_uppercase())];
+        }
+        std::env::set_var("NS_TEST_B9_KEY_ACME", "acme's signing key");
+        std::env::remove_var("NS_TEST_B9_KEY_GLOBEX");
+
+        let err = match shard_resolver(&set) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a company with no key to verify against must be refused"),
+        };
+        assert!(err.contains("globex"), "{err}");
+        assert!(err.contains("NS_TEST_B9_KEY_GLOBEX"), "{err}");
+
+        std::env::set_var("NS_TEST_B9_KEY_GLOBEX", "globex's signing key");
+        shard_resolver(&set).expect("the shard's verifier");
+        std::env::remove_var("NS_TEST_B9_KEY_ACME");
+        std::env::remove_var("NS_TEST_B9_KEY_GLOBEX");
+    }
+
+    /// Plan B9. The shared token is one secret that names one company, so a
+    /// shard of several under it would answer every client as whichever
+    /// company the token was said to stand for. Refused at startup, with
+    /// the companies named, rather than served as one wearing all their
+    /// names. One company under shared auth is unchanged.
+    #[test]
+    fn shared_auth_cannot_serve_more_than_one_tenant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let addr: SocketAddr = "127.0.0.1:7380".parse().expect("a literal address");
+        let set = serve_fixture(root.path(), addr, &["acme", "globex"]);
+        let err = match shard_resolver(&set) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("one token cannot tell two companies apart"),
+        };
+        assert!(err.contains("acme") && err.contains("globex"), "{err}");
+
+        // And one company under the same auth still builds its resolver,
+        // which is `ns-app serve` on a laptop exactly as it was. Its own
+        // root, since a fixture's overlays stay in the directory.
+        let alone = tempfile::tempdir().expect("tempdir");
+        let mut set = serve_fixture(alone.path(), addr, &["acme"]);
+        // A variable no other test touches, so this cannot race one.
+        std::env::set_var("NS_TEST_B9_SHARED_TOKEN", "t0k");
+        set[0].app.serve.token_env = "NS_TEST_B9_SHARED_TOKEN".into();
+        shard_resolver(&set).expect("one company under shared auth");
+        std::env::remove_var("NS_TEST_B9_SHARED_TOKEN");
     }
 
     /// Plan A6. One token for everyone proves the caller read an env var and

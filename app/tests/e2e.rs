@@ -234,3 +234,153 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
     assert!(!run.is_finished(), "the server outlives its client");
     run.abort();
 }
+
+/// Multi-tenant plan B9, the end to end for Part B: one port, two companies,
+/// two personas, two stores.
+///
+/// Each client presents its own company's token, the listener hands each
+/// company its own inbound queue, and a dispatcher per company drains it -
+/// the shape `main` now runs through the tenant registry. What is proven
+/// here is the isolation the shard exists for: each client gets the reply
+/// only its own company's engine could have produced, and each company's
+/// store holds its own turn and nothing of the other's.
+///
+/// The personas are scripted rather than configured, because what a company
+/// says is all a client can observe of it: acme echoes "acme speaking",
+/// globex echoes "globex speaking", and neither string may reach the other's
+/// client or the other's database.
+#[tokio::test]
+async fn one_process_serves_two_tenants_with_different_personas_over_one_port() {
+    use nsidentity::{Denied, Hello, Identity, IdentityResolver, Trust};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A token per company, which is all identity has to do here: Part A
+    /// proves the JWT path, and this test is about what happens once a
+    /// connection is known to speak for a company.
+    struct PerTenantToken;
+    #[async_trait::async_trait]
+    impl IdentityResolver<Hello> for PerTenantToken {
+        async fn resolve(&self, hello: Hello) -> Result<Identity, Denied> {
+            let tenant = match hello.token.as_str() {
+                "acme-token" => "acme",
+                "globex-token" => "globex",
+                _ => {
+                    return Err(Denied::UnknownTenant {
+                        tenant: hello.token,
+                    })
+                }
+            };
+            Ok(Identity {
+                tenant: tenant.to_string(),
+                session: nsidentity::session_id(tenant, "u1"),
+                trust: Trust::Verified,
+            })
+        }
+        fn describe(&self) -> &str {
+            "per-tenant token (test)"
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = nschannel_tcp::TcpChannel::bind_with(
+        "127.0.0.1:0",
+        Arc::new(PerTenantToken),
+        8,
+        false,
+        nschannel_tcp::HELLO_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let addr = listener.local_addr();
+
+    // Both clients speak before either engine exists, which is the shard's
+    // cold start: the listener queues each company's message and names the
+    // company, and only then is an engine built for it.
+    let mut clients = Vec::new();
+    for token in ["acme-token", "globex-token"] {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(
+            format!("{{\"token\":\"{token}\"}}\n{{\"text\":\"who are you\"}}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        clients.push((BufReader::new(r), w));
+    }
+
+    // The wake loop, as the registry runs it: a company that has spoken and
+    // has nobody draining it gets an engine of its own.
+    let mut stores = std::collections::HashMap::new();
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let tenant = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listener.next_active_tenant(),
+        )
+        .await
+        .expect("a company speaks")
+        .expect("the listener is up");
+        let channel = listener.tenant_channel(&tenant).expect("its own queue");
+        let store =
+            Arc::new(SqliteStore::open(&dir.path().join(format!("{tenant}.sqlite"))).unwrap());
+        let mut b = HarnessBuilder::new();
+        b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
+            rationale: "the company answers".into(),
+            action: "echo".into(),
+            args: serde_json::json!({ "text": format!("{tenant} speaking") }),
+        }])));
+        b.set_replier(Box::new(ScriptedReplier));
+        b.set_memory(store.clone());
+        b.set_shared_channel(channel.clone());
+        b.set_consolidator(Box::new(NoopConsolidator));
+        b.add_tool(Arc::new(EchoTool::new()));
+        let engine = Arc::new(Engine::with_clock(
+            b.build().unwrap(),
+            EngineConfig {
+                // As `serve` configures it: each session its own fact scope.
+                scope_for: Arc::new(|sid| sid.0.clone()),
+                max_echo_ratio: 1.1,
+                ..EngineConfig::default()
+            },
+            Box::new(|| Timestamp(42)),
+        ));
+        stores.insert(tenant.clone(), store);
+        runs.push(tokio::spawn(
+            nsengine::dispatch::Dispatcher::new(engine, channel, 1).run(),
+        ));
+    }
+
+    for ((mut reader, w), tenant) in clients.into_iter().zip(["acme", "globex"]) {
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("a reply in time")
+        .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(reply["session"], format!("{tenant}/web/u1"));
+        let text = reply["text"].as_str().unwrap();
+        let other = if tenant == "acme" { "globex" } else { "acme" };
+        assert!(text.contains(tenant), "{tenant} got: {text}");
+        assert!(!text.contains(other), "{tenant} saw {other}: {text}");
+        drop(reader);
+        drop(w);
+    }
+
+    for (tenant, store) in &stores {
+        let events = store
+            .load(&SessionId(format!("{tenant}/web/u1")))
+            .await
+            .unwrap();
+        assert_eq!(events.last().map(|e| e.turn), Some(1));
+        let other = if tenant == "acme" { "globex" } else { "acme" };
+        let dumped = serde_json::to_string(&events).unwrap();
+        assert!(!dumped.contains(other), "{tenant}'s store holds {other}");
+    }
+    for run in runs {
+        assert!(!run.is_finished(), "a company's engine outlives its client");
+        run.abort();
+    }
+}

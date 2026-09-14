@@ -22,11 +22,8 @@
 //! double: the real factory is `pub(crate)` and building a real engine
 //! dials providers and opens sqlite files, neither of which belongs in a
 //! test about who builds what and when. Production passes a closure over
-//! `factory::build_engine`, whose output already implements [`RunTenant`].
-//!
-//! Until B9 wires `main` to it, nothing in the binary calls any of this;
-//! the module-level allow below goes when that lands.
-#![allow(dead_code)]
+//! `factory::build_engine`, whose output already implements [`RunTenant`]
+//! (`main::tenant_builder`, plan B9).
 
 use crate::factory::{BuiltTenant, StartupError};
 use async_trait::async_trait;
@@ -567,7 +564,7 @@ impl<R: RunTenant> TenantRegistry<R> {
         let mut out = String::new();
         for id in ids {
             let s = self.stats_for(&id);
-            let state = if locked(&self.live).contains_key(&id) {
+            let state = if self.is_live(&id) {
                 "live"
             } else if self.quarantined_for(&id).is_some() {
                 "quarantined"

@@ -122,8 +122,9 @@ pub(crate) const DEFAULT_TENANT: &str = "local";
 /// The one tenant this process runs, out of the set the working directory
 /// resolved to, or the message to print and stop on.
 ///
-/// Two refusals, and neither is a fallback. More than one tenant is the
-/// registry's job and it has not landed. *None* is a `tenants/` directory
+/// Two refusals, and neither is a fallback. More than one tenant is a shard,
+/// which is `ns-app serve` and the tenant registry; the terminal is one
+/// person at one company. *None* is a `tenants/` directory
 /// holding no overlay at all — a `README.md` in there, or the overlays moved
 /// aside for a moment — and running it under the base config would put a
 /// company's traffic on the shared persona and the shared store, which is
@@ -142,13 +143,145 @@ fn one_tenant(mut set: Vec<tenant::TenantConfig>) -> Result<tenant::TenantConfig
     if set.len() > 1 {
         let ids: Vec<&str> = set.iter().map(|t| t.id.as_str()).collect();
         return Err(format!(
-            "{} tenants are configured ({}) — one process serves one tenant until the \
-             tenant registry lands (multi-tenant plan phase 3).",
+            "{} tenants are configured ({}) - the terminal is one person at one company, so it \
+             serves one tenant; `ns-app serve` is what hosts a set.",
             set.len(),
             ids.join(", ")
         ));
     }
     Ok(set.remove(0))
+}
+
+/// `ns-app serve`: one listener, and an engine per company built on that
+/// company's first message (plan B9).
+///
+/// The shape is the registry's, not a dispatcher's: nothing is built at
+/// startup, because a shard of twenty companies would otherwise dial twenty
+/// sets of providers and open twenty databases for the two that will speak
+/// today. What startup does own is everything a mistake should be loud
+/// about while the port is still free - the trace directory, the shard
+/// ceiling, the listen address, the key table - and the socket itself, which
+/// is one for the process however many companies arrive on it.
+async fn serve_shard(mut set: Vec<tenant::TenantConfig>, max_requests: Option<u32>) {
+    if set.is_empty() {
+        // The same refusal the terminal gives, for the same reason: a
+        // company is its overlay, and an empty directory is not one.
+        match one_tenant(set) {
+            Err(e) => eprintln!("{e}"),
+            Ok(_) => unreachable!("an empty set holds no tenant"),
+        }
+        std::process::exit(1);
+    }
+    for tenant in &mut set {
+        // Serving is the multi-tenant shape even at one tenant, so the wire
+        // trace is per tenant (plan H10): NS_TRACE names a directory and
+        // each company writes its own file in it. Refused here, at startup,
+        // rather than on the first request.
+        if let Err(e) = check_trace_dir(&tenant.id) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        // The same swap the base config gets: NS_PROVIDER=ollama ns-app.
+        tenant
+            .app
+            .llm
+            .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
+    }
+    // `[serve]` and the shard ceiling are process-owned
+    // (`tenant::PROCESS_OWNED`), so any member's copy is the process's.
+    let process = &set[0];
+    // Plan B6: the ceiling on turns running at once across every tenant this
+    // process hosts - the shard's, not a company's. Read before the bind, so
+    // a typo is refused while the port is still free.
+    let shard = nsengine::dispatch::ShardSlots::new(
+        process
+            .app
+            .engine
+            .shard_worker_slots()
+            .unwrap_or_else(|e| factory::StartupError::Config(e).exit()),
+    );
+    let serve_cfg = &process.app.serve;
+    // Shared auth off loopback is refused here rather than at the bind
+    // (plan A6): the port is still free, and the message names the config
+    // key instead of the socket.
+    if let Err(e) = factory::check_serve_address(serve_cfg).await {
+        e.exit()
+    }
+    // Which resolver the listener decides identity with is the whole of
+    // `[serve] auth`, now over the whole set: a token minted by one company
+    // reaches that company's engine and no other. A missing token, an
+    // unnamed signing key, or one shared token asked to stand for several
+    // companies is refused before the socket.
+    let auth = match factory::shard_resolver(&set) {
+        Ok(auth) => auth,
+        Err(e) => e.exit(),
+    };
+    // One socket serves the whole process, so the bind is the caller's and
+    // not the factory's (plan A1): a shard building one engine per company
+    // would otherwise reach for the same address once per tenant.
+    let listener = match nschannel_tcp::TcpChannel::bind_with(
+        &serve_cfg.listen,
+        auth,
+        serve_cfg.max_connections,
+        serve_cfg.allow_remote,
+        std::time::Duration::from_millis(serve_cfg.hello_timeout_ms),
+    )
+    .await
+    {
+        Ok(listener) => listener,
+        Err(e) => factory::StartupError::Serve(e.to_string()).exit(),
+    };
+    let addr = listener.local_addr();
+    let registry = Arc::new(registry::TenantRegistry::new(
+        tenant_builder(set, addr, max_requests),
+        listener,
+        shard,
+        registry::RegistryLimits::default(),
+    ));
+    // The wake loop replaces the single dispatcher: a company that speaks
+    // and has nobody draining its queue gets an engine, and a company's own
+    // failure stops that company alone. `Err` is the one thing no company
+    // can decide for itself (plan B5), and it ends the process the way a
+    // dead engine always has - the reason on stderr, a non-zero status.
+    let outcome = registry.clone().serve().await;
+    // What each company cost while this shard was up (plan B8), printed
+    // where it can still be read: after the wake loop, whichever way it
+    // ended. Nothing else in the process counts per company.
+    let report = registry.report();
+    if !report.is_empty() {
+        eprint!("{report}");
+    }
+    if let Err(fatal) = outcome {
+        eprintln!("engine stopped: {fatal}");
+        std::process::exit(1);
+    }
+}
+
+/// How the registry builds one company: its overlay out of the set that was
+/// loaded, on the channel the registry hands it (plan B9).
+///
+/// A name the set does not hold is refused rather than built. The identity
+/// layer already refuses an unknown company before it can have a queue, so
+/// this is the same answer given twice on purpose: the alternative to a
+/// refusal here is not an error, it is a company quietly assembled from the
+/// base config, on the shared persona and the shared store.
+fn tenant_builder(
+    set: Vec<tenant::TenantConfig>,
+    addr: std::net::SocketAddr,
+    max_requests: Option<u32>,
+) -> registry::BuildTenant<factory::BuiltTenant> {
+    let by_id: Arc<std::collections::HashMap<String, tenant::TenantConfig>> =
+        Arc::new(set.into_iter().map(|t| (t.id.clone(), t)).collect());
+    Arc::new(move |id, channel| {
+        let by_id = by_id.clone();
+        Box::pin(async move {
+            let Some(tenant) = by_id.get(&id) else {
+                return Err(factory::StartupError::UnknownTenant { tenant: id });
+            };
+            factory::build_engine(tenant, factory::Mode::Serve { channel, addr }, max_requests)
+                .await
+        })
+    })
 }
 
 /// `serve`: refuse an NS_TRACE that cannot hold one file per tenant. Called
@@ -564,81 +697,25 @@ async fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         });
+    // `serve` is the whole set: one socket, and an engine per company built
+    // on its first message (plan B9). The terminal below is unchanged - one
+    // tenant, one dispatcher, and more than one of them still refused.
+    if serve {
+        serve_shard(set, max_requests).await;
+        return;
+    }
     let mut tenant = one_tenant(set).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
-    if serve {
-        // Serving is the multi-tenant shape even at one tenant, so the wire
-        // trace is per tenant from here on (plan H10) — named for the tenant
-        // that was actually resolved, so a single `tenants/acme.toml` writes
-        // `acme.jsonl` and not the default id's file. Refused here, at
-        // startup, rather than on the first request.
-        if let Err(e) = check_trace_dir(&tenant.id) {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    }
     // The same swap the base config gets: NS_PROVIDER=ollama ns-app.
     tenant
         .app
         .llm
         .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
     let tenant = tenant;
-    // Plan B6: the ceiling on turns running at once across every tenant this
-    // process hosts — the shard's, not a company's, which is why no overlay
-    // may set it (`tenant::PROCESS_OWNED`). `None` in the terminal, which
-    // runs one turn at a time and has no shard to bound. Read before the
-    // bind, so a typo is refused while the port is still free.
-    let shard_slots = if serve {
-        let cap = tenant
-            .app
-            .engine
-            .shard_worker_slots()
-            .unwrap_or_else(|e| factory::StartupError::Config(e).exit());
-        Some(nsengine::dispatch::ShardSlots::new(cap))
-    } else {
-        None
-    };
-    // One socket serves the whole process, so the bind is the caller's and
-    // not the factory's (plan A1): a shard building one engine per company
-    // would otherwise reach for the same address once per tenant. A missing
-    // token or an address that will not bind is still refused here, before
-    // the pointer has been dialled, and with the same words as before.
-    let mode = if serve {
-        let serve_cfg = &tenant.app.serve;
-        // Shared auth off loopback is refused here rather than at the bind
-        // (plan A6): the port is still free, and the message names the
-        // config key instead of the socket.
-        if let Err(e) = factory::check_serve_address(serve_cfg).await {
-            e.exit()
-        }
-        // Which resolver the listener decides identity with is the whole of
-        // `[serve] auth`. A missing token or an unnamed signing key is
-        // refused before the socket, with the tenant named.
-        let auth = match factory::serve_resolver(&tenant) {
-            Ok(auth) => auth,
-            Err(e) => e.exit(),
-        };
-        match nschannel_tcp::TcpChannel::bind_with(
-            &serve_cfg.listen,
-            auth,
-            serve_cfg.max_connections,
-            serve_cfg.allow_remote,
-            std::time::Duration::from_millis(serve_cfg.hello_timeout_ms),
-        )
-        .await
-        {
-            Ok(channel) => factory::Mode::Serve {
-                addr: channel.local_addr(),
-                channel,
-            },
-            Err(e) => factory::StartupError::Serve(e.to_string()).exit(),
-        }
-    } else {
-        factory::Mode::Cli {
-            session: cli_session,
-        }
+    let mode = factory::Mode::Cli {
+        session: cli_session,
     };
     let built = factory::build_engine(&tenant, mode, max_requests)
         .await
@@ -648,11 +725,8 @@ async fn main() {
     // default `Fatal` failure policy. Built here instead so the engine stays
     // in the `Arc` the tenant registry will hold it in (plan B2) - taking it
     // back out would panic the moment a second handle existed.
-    let mut dispatcher =
+    let dispatcher =
         nsengine::dispatch::Dispatcher::new(built.engine, built.channel, built.worker_slots);
-    if let Some(shard) = shard_slots {
-        dispatcher = dispatcher.with_shard_slots(shard);
-    }
     match dispatcher.run().await {
         Ok(()) => {}
         // M12 T6.1: the ceiling this run was given, reached. A stop by
@@ -788,6 +862,41 @@ mod tests {
             Ok(_) => panic!("two tenants must be refused"),
         };
         assert!(err.contains("acme") && err.contains("beta"), "{err}");
+    }
+
+    /// Plan B9. The shard builds a company out of the set that was loaded,
+    /// and a name that set does not hold is refused. The danger it guards
+    /// is not an error going unreported: it is a company quietly assembled
+    /// from the base config - shared persona, shared store - because the
+    /// builder took whatever it could find rather than what was asked for.
+    #[tokio::test]
+    async fn a_message_for_an_unknown_tenant_is_refused_not_built() {
+        struct NullChannel;
+        #[async_trait::async_trait]
+        impl nscore::Channel for NullChannel {
+            async fn recv(&self) -> Result<nscore::Incoming, nscore::ChannelError> {
+                Err(nscore::ChannelError::Closed)
+            }
+            async fn send(
+                &self,
+                _s: &nscore::SessionId,
+                _t: &str,
+            ) -> Result<(), nscore::ChannelError> {
+                Ok(())
+            }
+        }
+
+        let root = tenant_root(&[("acme", "[store]\npath = \"ns-acme.sqlite\"\n")]);
+        let set = tenant::load_set("", root.path(), DEFAULT_TENANT).expect("one overlay");
+        assert_eq!(set.len(), 1, "one company is configured");
+        let build = tenant_builder(set, "127.0.0.1:0".parse().expect("a literal address"), None);
+        let channel: Arc<dyn nscore::Channel> = Arc::new(NullChannel);
+        let err = match build("globex".to_string(), channel).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a company nobody configured must not be built"),
+        };
+        assert!(err.contains("globex"), "{err}");
+        assert!(err.contains(tenant::TENANT_DIR), "{err}");
     }
 
     /// R2. The trace file is named for the tenant that was resolved, not for
