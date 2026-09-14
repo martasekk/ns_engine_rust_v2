@@ -397,6 +397,73 @@ fn render_dump(events: &[nscore::Event]) -> String {
         .join("\n")
 }
 
+/// `ns-app token <tenant> [--subject ID] [--minutes N]` → the token, on
+/// stdout, and nothing else on it.
+///
+/// In production a company's own back end mints these, at the moment it
+/// knows which of *its* users is on the page, and this subcommand does not
+/// exist in that path. What it is for is the step before that exists: a test
+/// company, a staging environment, a demo, someone holding the chat window
+/// open to see whether any of this works.
+///
+/// Nothing but the token is printed, so `TOKEN=$(ns-app token acme)` is the
+/// whole of using it. Everything else goes to stderr.
+pub(crate) fn mint_token(
+    set: &[crate::tenant::TenantConfig],
+    args: &[String],
+) -> Result<String, String> {
+    let usage = "usage: ns-app token <tenant> [--subject ID] [--minutes N]";
+    let Some(id) = args.first() else {
+        return Err(usage.to_string());
+    };
+    let (mut subject, mut minutes) = ("u1".to_string(), 60u64);
+    let mut rest = args[1..].iter();
+    while let Some(flag) = rest.next() {
+        let Some(value) = rest.next() else {
+            return Err(format!("{flag} needs a value — {usage}"));
+        };
+        match flag.as_str() {
+            "--subject" => subject = value.clone(),
+            "--minutes" => {
+                minutes = value
+                    .parse()
+                    .map_err(|_| format!("--minutes takes a number, not {value:?}"))?
+            }
+            _ => return Err(usage.to_string()),
+        }
+    }
+    let tenant = set.iter().find(|t| &t.id == id).ok_or_else(|| {
+        // The configured ids, because the likeliest mistake here is a typo
+        // or a company whose overlay was never written.
+        let known: Vec<&str> = set.iter().map(|t| t.id.as_str()).collect();
+        format!(
+            "no tenant {id:?} is configured — this working directory serves: {}",
+            known.join(", ")
+        )
+    })?;
+    if tenant.app.serve.auth != crate::config::AuthMode::Jwt {
+        // Minting against a server that will not verify tokens is a token
+        // that cannot be used, and the refusal it would meet says only that
+        // something was denied.
+        return Err(format!(
+            "tenant {id:?} runs [serve] auth = \"shared\", which verifies no token — set \
+             auth = \"jwt\" and give [auth] signing_key_envs a variable to mint against"
+        ));
+    }
+    // The *current* key, which is the one tokens are signed with; a second
+    // name in `signing_key_envs` is the key being rotated out, still
+    // accepted but no longer minted with.
+    let auth = factory::tenant_auth(tenant).map_err(|e| e.to_string())?;
+    nsidentity::mint_hs256(
+        &auth.current,
+        &tenant.id,
+        &subject,
+        nsidentity::now_secs(),
+        minutes.saturating_mul(60),
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,6 +19,62 @@ in does not add an engine, a store, or a second copy of a conversation.
 
 ---
 
+## 0. A company to try it with
+
+A company is a file in `tenants/`, named for the id it is addressed by. This
+is the whole of one:
+
+```toml
+# tenants/acme.toml
+[persona]
+text = "You are Acme's support assistant. Be brief and concrete."
+
+[store]
+path = "ns-acme.sqlite"          # its own database; isolation is the filesystem's
+
+[auth]
+signing_key_envs = ["NS_SIGNING_KEY_ACME"]   # named, never held in the file
+```
+
+and beside it, in `config.toml`, the two ways in the process opens:
+
+```toml
+[serve]
+listen = "127.0.0.1:7375"
+auth = "jwt"                     # the chat window presents a token and nothing else
+
+[http]
+listen = "127.0.0.1:8787"
+origins = ["*"]                  # a page opened from a file has no origin
+```
+
+Then:
+
+```sh
+export NS_SIGNING_KEY_ACME="something long and random"
+ns-app serve
+TOKEN=$(ns-app token acme --subject martin)
+```
+
+Nothing is built until someone speaks: the first message for `acme` is what
+opens its database and builds its engine. Its sessions are `acme/web/martin`
+and the like — the company is the first segment, so two companies cannot
+collide, and a token for one cannot name a session of the other.
+
+To see it: serve the example page and open it against the endpoint.
+
+```sh
+cd crates/channel-http/examples && python -m http.server 8080
+# then: http://127.0.0.1:8080/web-chat.html?ws=127.0.0.1:8787
+```
+
+Paste the token, and talk. (Opening the page straight off disk works too —
+it falls back to `127.0.0.1:8787` — but serving it is closer to how it will
+really be used, and avoids each browser's rules about what a `file://` page
+may do.)
+
+---
+
 ## 1. The wire, once
 
 The socket and the WebSocket speak the same three objects, so one client
@@ -81,6 +137,21 @@ an opaque per-user subject (never an email address or a phone number), with
 `iat` and `exp` set. The browser never holds the signing key. Close codes:
 `4001` the hello was not accepted, `1009` a frame or message past its bound,
 `1001` the shard is shutting down.
+
+Before that back end exists — a test company, a staging box, someone wanting
+to see whether any of this works — `ns-app` will mint one:
+
+```sh
+ns-app token acme --subject martin --minutes 120
+```
+
+It reads that company's *current* signing key from the variable its
+`[auth] signing_key_envs` names, and prints the token and nothing else, so
+`TOKEN=$(ns-app token acme)` is the whole of using it. It refuses a company
+running `auth = "shared"`, which verifies no token, and refuses a subject the
+session id cannot be made of. It is not part of the production path: there,
+the company mints its own, in its own service, at the moment it knows which
+of *its* users is on the page.
 
 **Cross-origin.** `[http] origins` lists the browser origins allowed to open
 a window or call the JSON route; `["*"]` is the right answer for a widget

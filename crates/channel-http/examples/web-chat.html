@@ -57,8 +57,21 @@
   </form>
 
 <script>
-// Where the shard is. Same origin by default; `wss:` when the page is https.
-const ENDPOINT = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/chat";
+// Where the shard is.
+//
+// Served beside it, that is this origin. Opened straight off disk — which is
+// how you try it first — there is no origin at all, so it falls back to the
+// default listen address. `?ws=host:port` overrides either.
+//
+// A page opened from a file sends `Origin: null`, so the shard must be
+// running with `[http] origins = ["*"]` to accept it. A page served beside
+// the shard needs nothing.
+const ENDPOINT = (() => {
+  const asked = new URLSearchParams(location.search).get("ws");
+  if (asked) return asked.startsWith("ws") ? asked : "ws://" + asked + "/chat";
+  if (!location.host) return "ws://127.0.0.1:8787/chat";
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/chat";
+})();
 
 const log = document.getElementById("log");
 const state = document.getElementById("state");
@@ -119,10 +132,33 @@ function connect() {
   socket.onerror = () => {};
 }
 
+// A token in `#token=…` connects on load, which is how you try this without
+// pasting anything. The *fragment*, deliberately: a fragment is never sent
+// with a request, so it does not reach an access log or a referrer header
+// the way `?token=` would. It is still a credential in a URL, which is a
+// convenience for a local trial and not how a real widget gets one — that is
+// a fetch from your own back end, at the moment it knows who is on the page.
+const fragment = new URLSearchParams(location.hash.slice(1)).get("token");
+if (fragment) {
+  document.getElementById("token").value = fragment;
+  // Out of the address bar once it has been read, so a screenshot or a
+  // shoulder does not carry it. In a try, because a page opened from a file
+  // is not allowed to rewrite its own URL in every browser — and losing the
+  // tidy-up must not cost the rest of this script.
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch (e) {
+    /* the token stays in the address bar; it is a local trial */
+  }
+}
+
 document.getElementById("connect").onclick = () => {
   token = document.getElementById("token").value.trim();
   if (!token) return;
   if (socket) socket.close();
+  // Said once, because "nothing happens" and "it is talking to the wrong
+  // port" look identical from here.
+  say("Connecting to " + ENDPOINT, "note");
   connect();
 };
 
@@ -134,6 +170,9 @@ composer.onsubmit = (event) => {
   say(what, "mine");
   text.value = "";
 };
+
+// Arrived with a token: open the window already talking.
+if (fragment) document.getElementById("connect").click();
 </script>
 </body>
 </html>

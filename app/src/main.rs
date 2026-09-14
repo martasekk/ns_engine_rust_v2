@@ -74,6 +74,37 @@ async fn main() {
     // at the points that differ: the channel, the fact scope, the banner.
     let serve = args.get(1).map(String::as_str) == Some("serve");
 
+    // The tenant set this working directory serves (plan T1.2). With no
+    // `tenants/` directory that is one tenant called `local` built from
+    // `config.toml` alone, which is this process exactly as it was; the
+    // overlays are refused by name here rather than at the first turn.
+    //
+    // Read before the flags because `token` is a subcommand of the *set*
+    // rather than of a session, and flag parsing would otherwise refuse its
+    // arguments before the set had been looked at.
+    let set = tenant::load_set(&cfg_text, std::path::Path::new("."), DEFAULT_TENANT)
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
+
+    // `ns-app token <tenant>`: a credential for one of this working
+    // directory's companies, printed and nothing else. Here rather than in
+    // `run_oneshot` because it is the first subcommand that needs the tenant
+    // set — a company's signing key is its own, and the set is what holds it.
+    if args.get(1).map(String::as_str) == Some("token") {
+        match cli::mint_token(&set, &args[2..]) {
+            // Alone on stdout, so `TOKEN=$(ns-app token acme)` is the whole
+            // of using it.
+            Ok(token) => println!("{token}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     // M12 T6.1: the metered-session flags. `serve` takes its session ids
     // from its clients, so only the ceiling means anything there.
     let flags_from = if serve { 2 } else { 1 };
@@ -89,19 +120,6 @@ async fn main() {
         }
     };
 
-    // The whole assembly, one tenant's worth (multi-tenant plan T1.1). It
-    // refuses rather than exits, so the shard that will host many of these
-    // survives one bad config; here, where the process is this tenant's,
-    // `exit` prints and stops exactly as the inlined version did.
-    // The tenant set this working directory serves (plan T1.2). With no
-    // `tenants/` directory that is one tenant called `local` built from
-    // `config.toml` alone, which is this process exactly as it was; the
-    // overlays are refused by name here rather than at the first turn.
-    let set = tenant::load_set(&cfg_text, std::path::Path::new("."), DEFAULT_TENANT)
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
     // `serve` is the whole set: one socket, and an engine per company built
     // on its first message (plan B9). The terminal below is unchanged - one
     // tenant, one dispatcher, and more than one of them still refused.

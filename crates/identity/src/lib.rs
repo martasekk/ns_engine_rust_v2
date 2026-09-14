@@ -18,10 +18,12 @@
 //! | [`hmac`]       | HMAC-SHA256 and constant-time equality             |
 //! | [`base64url`]  | decoding one segment of a compact JWS              |
 //! | [`jwt`]        | is this token genuine, and inside its bounds       |
+//! | [`issue`]      | making one, which is a company's own back end's job |
 //! | [`resolvers`]  | what identity a genuine credential stands for      |
 
 mod base64url;
 mod hmac;
+mod issue;
 mod jwt;
 mod resolvers;
 mod vocabulary;
@@ -33,6 +35,7 @@ mod minting;
 // to rewrite the imports of the app, the TCP channel or their tests: every
 // name below is still `nsidentity::X`.
 pub use hmac::hmac_sha256;
+pub use issue::{mint_hs256, now_secs, CannotMint};
 pub use jwt::{Hs256Verifier, TenantAuth, MAX_CLOCK_SKEW_SECS, MAX_LIFETIME_SECS};
 pub use resolvers::SharedTokenResolver;
 pub use vocabulary::{

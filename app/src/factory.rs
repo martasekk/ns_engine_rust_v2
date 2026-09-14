@@ -206,7 +206,7 @@ pub(crate) fn serve_resolver(
 /// missing. Split out of [`serve_resolver`] so the shard's table (many
 /// companies, one verifier) is built from the same reading of `[auth]` as a
 /// single company's.
-fn tenant_auth(tenant: &TenantConfig) -> Result<TenantAuth, StartupError> {
+pub(crate) fn tenant_auth(tenant: &TenantConfig) -> Result<TenantAuth, StartupError> {
     let cfg = &tenant.app;
     if cfg.auth.signing_key_envs.is_empty() {
         return Err(StartupError::MissingSigningKeys {
