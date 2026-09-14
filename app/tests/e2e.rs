@@ -182,7 +182,7 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SqliteStore::open(&dir.path().join("serve.sqlite")).unwrap());
-    let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t0k".into(), 8, false)
+    let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t0k".into(), 8, false)
         .await
         .unwrap();
     let addr = channel.local_addr();

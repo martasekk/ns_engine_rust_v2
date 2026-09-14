@@ -11,10 +11,17 @@
 //!
 //! One JSON object per line, both ways, UTF-8, `\n`-terminated.
 //!
-//! - The client's first line: `{"token":"…","session":"…"}`. A wrong or
-//!   missing token, an empty session, or a line that is not that object
-//!   closes the connection with nothing sent back — a caller that failed the
-//!   hello learns nothing about why. A valid hello *joins* the session:
+//! - The client's first line: `{"token":"…","session":"…"}`. What that line
+//!   proves, and what session it stands for, is the resolver's to say
+//!   (`nsidentity::IdentityResolver`): a refusal of any kind closes the
+//!   connection with nothing sent back — a caller that failed the hello
+//!   learns nothing about why, while the log names which refusal it was.
+//!   Under the shared token the client still names its own session, and
+//!   under a verified resolver the session is derived from the credential
+//!   and the field is ignored, so no client can name itself into somebody
+//!   else's conversation. A hello that does not arrive within the deadline,
+//!   or that runs past [`HELLO_MAX`], is closed too. A valid hello *joins*
+//!   the session:
 //!   replies for that session id go to every connection holding it, and a
 //!   later connection claiming the same id joins the others rather than
 //!   displacing them. One conversation across a user's windows is the
@@ -43,19 +50,22 @@
 //!
 //! # Deliberately not here
 //!
-//! No authentication beyond the one shared token, no TLS, and loopback by
-//! default: a non-loopback bind is refused unless `allow_remote` says it was
-//! meant. Multi-user auth is a v1 non-goal (findings §6, last bullet) —
-//! identity is the connection.
+//! No TLS, and loopback by default: a non-loopback bind is refused unless
+//! `allow_remote` says it was meant, and a resolver that proves nothing is
+//! refused off loopback whatever `allow_remote` says. Who a connection is
+//! belongs to `ns-identity`; this crate knows only that something turned a
+//! hello into a session id.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nscore::{Channel, ChannelError, Incoming, SessionId};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use nsidentity::{Hello, IdentityResolver, SharedTokenResolver};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
@@ -69,17 +79,29 @@ const INBOUND_DEPTH: usize = 64;
 /// has stopped reading; further replies are logged and dropped, as for a
 /// peer that has gone.
 const OUTBOUND_DEPTH: usize = 64;
+/// How long a connection has to send its hello before it is closed. Without
+/// it a silent peer would hold one of `max_connections` for ever.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most a hello may be. Applied with `take`, so a longer one is refused
+/// without ever being buffered.
+pub const HELLO_MAX: u64 = 8 * 1024;
+/// The company a shared-token connection speaks for. One process, one
+/// token, one tenant: the shared token cannot tell two companies apart.
+const SHARED_TENANT: &str = "local";
 
-/// Why `bind` refused to start. Each of the first two is a mistake that
-/// would otherwise fail silently and permanently: a server with no token
-/// answers anyone who finds the port, and one bound to `0.0.0.0` by accident
-/// is the whole conversation on the network.
+/// Why `bind` refused to start. Each is a mistake that would otherwise fail
+/// silently and permanently: a server with no token answers anyone who finds
+/// the port, one bound to `0.0.0.0` by accident is the whole conversation on
+/// the network, and one that proves nothing about its callers must not be
+/// reachable from off the machine at all.
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
     #[error("refusing to start with an empty token: there is no unauthenticated mode")]
     EmptyToken,
     #[error("refusing to serve on {0}: not a loopback address — set allow_remote to mean it")]
     NotLoopback(SocketAddr),
+    #[error("refusing to serve on {addr} with {auth}: it proves nothing, so it is loopback only")]
+    SharedAuthOffLoopback { addr: SocketAddr, auth: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -94,7 +116,10 @@ pub struct TcpChannel {
 
 /// What the accept loop and the connection tasks share with the channel.
 struct Shared {
-    token: String,
+    /// Turns a hello into an identity, or refuses it. The only thing here
+    /// that knows what a credential is.
+    resolver: Arc<dyn IdentityResolver<Hello>>,
+    hello_timeout: Duration,
     max_connections: usize,
     /// Live connections, machine-wide.
     live: AtomicUsize,
@@ -112,12 +137,6 @@ struct Outbound {
 }
 
 #[derive(serde::Deserialize)]
-struct Hello {
-    token: String,
-    session: String,
-}
-
-#[derive(serde::Deserialize)]
 struct Text {
     text: String,
 }
@@ -130,25 +149,44 @@ struct Reply<'a> {
 
 impl TcpChannel {
     /// Binds `listen` before returning, so a bad address fails at startup
-    /// and not in the accept loop, then spawns the accept loop. Refuses an
-    /// empty token, and a non-loopback address unless `allow_remote`.
+    /// and not in the accept loop, then spawns the accept loop. `auth` says
+    /// who each hello is; a non-loopback address is refused unless
+    /// `allow_remote`, and a resolver that proves nothing is refused off
+    /// loopback whatever `allow_remote` says.
     pub async fn bind(
         listen: &str,
-        token: String,
+        auth: Arc<dyn IdentityResolver<Hello>>,
         max_connections: usize,
         allow_remote: bool,
     ) -> Result<Arc<TcpChannel>, BindError> {
-        if token.is_empty() {
-            return Err(BindError::EmptyToken);
+        Self::bind_with(listen, auth, max_connections, allow_remote, HELLO_TIMEOUT).await
+    }
+
+    /// [`bind`](Self::bind) with the hello deadline named rather than
+    /// [`HELLO_TIMEOUT`].
+    pub async fn bind_with(
+        listen: &str,
+        auth: Arc<dyn IdentityResolver<Hello>>,
+        max_connections: usize,
+        allow_remote: bool,
+        hello_timeout: Duration,
+    ) -> Result<Arc<TcpChannel>, BindError> {
+        // Before the port is taken: a name resolving to anything off loopback
+        // is a mistake worth reporting with the port still free. A `:0` bind
+        // is named here by the port that was asked for, which is 0, and the
+        // address is what makes the message useful either way.
+        for addr in resolve(listen).await? {
+            check_address(addr, auth.as_ref(), allow_remote)?;
         }
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        if !local_addr.ip().is_loopback() && !allow_remote {
-            return Err(BindError::NotLoopback(local_addr));
-        }
+        // Belt and braces: what was resolved and what was bound are two
+        // lookups, and the one that matters is the one holding the socket.
+        check_address(local_addr, auth.as_ref(), allow_remote)?;
         let (tx, rx) = mpsc::channel(INBOUND_DEPTH);
         let shared = Arc::new(Shared {
-            token,
+            resolver: auth,
+            hello_timeout,
             max_connections,
             live: AtomicUsize::new(0),
             next_conn: AtomicU64::new(0),
@@ -162,10 +200,52 @@ impl TcpChannel {
         }))
     }
 
+    /// [`bind`](Self::bind) under the one shared token: every client that
+    /// knows it names its own session, which proves nothing, so this is
+    /// loopback-only development and the existing tests.
+    pub async fn bind_shared(
+        listen: &str,
+        token: String,
+        max_connections: usize,
+        allow_remote: bool,
+    ) -> Result<Arc<TcpChannel>, BindError> {
+        if token.is_empty() {
+            return Err(BindError::EmptyToken);
+        }
+        let auth = Arc::new(SharedTokenResolver::new(token, SHARED_TENANT));
+        Self::bind(listen, auth, max_connections, allow_remote).await
+    }
+
     /// Where the listener actually is — the port, when `listen` said `:0`.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+}
+
+/// Every address `listen` stands for. A name with two records is two chances
+/// to be on the network by accident, so all of them are checked.
+async fn resolve(listen: &str) -> Result<Vec<SocketAddr>, BindError> {
+    Ok(tokio::net::lookup_host(listen).await?.collect())
+}
+
+fn check_address(
+    addr: SocketAddr,
+    auth: &dyn IdentityResolver<Hello>,
+    allow_remote: bool,
+) -> Result<(), BindError> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    if !allow_remote {
+        return Err(BindError::NotLoopback(addr));
+    }
+    if auth.loopback_only() {
+        return Err(BindError::SharedAuthOffLoopback {
+            addr,
+            auth: auth.describe().to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -274,22 +354,46 @@ async fn connection(
     let (r, w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
-    // The hello. Anything short of a valid one closes the connection with
-    // nothing sent: a caller that failed it learns nothing about why.
-    match reader.read_line(&mut line).await {
+    // The hello, under a deadline and a length bound: a peer that says
+    // nothing must not hold a connection slot, and one that says too much
+    // must not be buffered while it does it. Anything short of a valid hello
+    // closes the connection with nothing sent — a caller that failed it
+    // learns nothing about why, and the log says which refusal it was.
+    let mut bounded = (&mut reader).take(HELLO_MAX);
+    let read = match tokio::time::timeout(shared.hello_timeout, bounded.read_line(&mut line)).await
+    {
+        Ok(read) => read,
+        Err(_) => {
+            eprintln!(
+                "tcp: {peer}: refused (no hello within {:?})",
+                shared.hello_timeout
+            );
+            return;
+        }
+    };
+    let overlong = bounded.limit() == 0 && !line.ends_with('\n');
+    drop(bounded);
+    match read {
         Ok(0) | Err(_) => return,
         Ok(_) => {}
     }
-    let session = match serde_json::from_str::<Hello>(line.trim()) {
-        Ok(h) if constant_time_eq(&h.token, &shared.token) && !h.session.is_empty() => {
-            SessionId(h.session)
-        }
-        Ok(_) => {
-            eprintln!("tcp: {peer}: refused (wrong token or empty session)");
-            return;
-        }
+    if overlong {
+        eprintln!("tcp: {peer}: refused (a hello longer than {HELLO_MAX} bytes)");
+        return;
+    }
+    let hello = match serde_json::from_str::<Hello>(line.trim()) {
+        Ok(h) => h,
         Err(_) => {
             eprintln!("tcp: {peer}: refused (malformed hello)");
+            return;
+        }
+    };
+    // The session is the resolver's to say, never the client's to claim: only
+    // the shared-token resolver honours what the hello asked for.
+    let session = match shared.resolver.resolve(hello).await {
+        Ok(identity) => identity.session,
+        Err(denied) => {
+            eprintln!("tcp: {peer}: refused ({denied})");
             return;
         }
     };
@@ -370,15 +474,4 @@ async fn write_replies(mut w: OwnedWriteHalf, session: SessionId, mut rx: mpsc::
             break;
         }
     }
-}
-
-/// Compares every byte regardless of where they first differ (as the
-/// pointer agent does for its token).
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut diff = (a.len() ^ b.len()) as u8;
-    for i in 0..a.len().max(b.len()) {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
-    }
-    diff == 0
 }

@@ -8,8 +8,13 @@ name = "nschannel_tcp"
 
 [dependencies]
 ns-core = { path = "../core" }
+ns-identity = { path = "../identity" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# The wire tests mint their own tokens and supply their own resolver.
+base64 = { workspace = true }

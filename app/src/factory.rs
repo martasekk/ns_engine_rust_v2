@@ -730,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn build_engine_takes_its_serve_channel_from_the_caller() {
         let root = tempfile::tempdir().expect("tempdir");
-        let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t".into(), 4, false)
+        let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
             .await
             .expect("the caller's listener");
         let addr = channel.local_addr();
@@ -766,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn build_engine_no_longer_binds_a_socket() {
         let root = tempfile::tempdir().expect("tempdir");
-        let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t".into(), 4, false)
+        let channel = nschannel_tcp::TcpChannel::bind_shared("127.0.0.1:0", "t".into(), 4, false)
             .await
             .expect("the caller's listener");
         let addr = channel.local_addr();

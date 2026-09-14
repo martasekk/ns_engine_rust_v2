@@ -292,9 +292,19 @@ impl IdentityResolver<Hello> for SharedTokenResolver {
                 tenant: self.tenant.clone(),
             });
         }
+        // The client is the only thing that can name a session under this
+        // resolver, so a hello that names none is refused rather than given a
+        // made-up id: substituting one would silently join every anonymous
+        // client to a single conversation.
+        let session = arrival
+            .session
+            .filter(|s| !s.is_empty())
+            .ok_or(Denied::Malformed(
+                "the shared token needs a session id in the hello",
+            ))?;
         Ok(Identity {
             tenant: self.tenant.clone(),
-            session: SessionId(arrival.session.unwrap_or_else(|| "default".to_string())),
+            session: SessionId(session),
             trust: Trust::Anonymous,
         })
     }
@@ -711,9 +721,25 @@ mod tests {
 
         let err = block_on(r.resolve(Hello {
             token: "wrong".into(),
-            session: None,
+            session: Some("a".into()),
         }))
         .unwrap_err();
         assert!(matches!(err, Denied::WrongSharedToken { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_shared_resolver_refuses_a_missing_session() {
+        // Nothing but the client can name a session here, so there is no id to
+        // substitute: a hello without one is refused, exactly as the TCP
+        // channel has always refused an empty one.
+        let r = SharedTokenResolver::new("dev-token", "local");
+        for session in [None, Some(String::new())] {
+            let err = block_on(r.resolve(Hello {
+                token: "dev-token".into(),
+                session,
+            }))
+            .unwrap_err();
+            assert!(matches!(err, Denied::Malformed(_)), "{err:?}");
+        }
     }
 }

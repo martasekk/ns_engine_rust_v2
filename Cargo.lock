@@ -638,7 +638,9 @@ name = "ns-channel-tcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "ns-core",
+ "ns-identity",
  "serde",
  "serde_json",
  "thiserror",

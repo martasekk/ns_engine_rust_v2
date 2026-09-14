@@ -559,7 +559,7 @@ async fn main() {
             }
             .exit()
         };
-        match nschannel_tcp::TcpChannel::bind(
+        match nschannel_tcp::TcpChannel::bind_shared(
             &serve_cfg.listen,
             token,
             serve_cfg.max_connections,
