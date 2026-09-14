@@ -88,6 +88,11 @@ embedded on customer sites whose domains this shard has never been told
 about. The credential is what keeps a caller out — the origin list is what
 stops a page elsewhere from quietly spending a visitor's token.
 
+**Keepalive.** The server pings an open window every 25 seconds, inside the
+sixty most proxies reap an idle connection after, so a quiet conversation is
+not dropped between turns. A client that wants to notice a dead server sooner
+can ping as well; this channel answers pongs.
+
 ## 4. One message, one reply
 
 For a script, a cron job, or a back end putting its own UI in front of the

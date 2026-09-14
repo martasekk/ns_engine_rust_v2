@@ -9,8 +9,8 @@
 //! point — one client, two transports, one wire.
 //!
 //! Two tasks, as on the socket: this one reads, and a writer owns the write
-//! half. Everything that goes out — a reply, a pong, the close frame —
-//! goes through the writer, so no two frames can interleave.
+//! half. Everything that goes out — a reply, a pong, a keepalive ping, the
+//! close frame — goes through the writer, so no two frames can interleave.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,9 +25,16 @@ use crate::http::{Request, Response};
 use crate::server::Serve;
 use crate::ws::{self, close, Message};
 
+/// How often an open window is pinged. Comfortably inside the sixty seconds
+/// most proxies reap an idle connection after.
+const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// What the writing task sends, whoever asked for it.
 enum Out {
     Reply(String),
+    /// A keepalive this task sends itself.
+    Ping,
+    /// The answer to a peer's ping, carrying its payload back.
     Pong(Vec<u8>),
     Close(u16),
 }
@@ -194,6 +201,15 @@ async fn write_out(
     mut replies: mpsc::Receiver<String>,
     mut control: mpsc::Receiver<Out>,
 ) {
+    // A chat window is idle between turns, and an idle connection is what a
+    // reverse proxy or a NAT reaps — usually at sixty seconds, without
+    // telling either end. The ping keeps it in use and, because a write to a
+    // socket nobody is on the other end of fails, is also how this task
+    // learns a peer has gone without waiting for a reply to send.
+    let mut heartbeat = tokio::time::interval(PING_EVERY);
+    // The first tick is immediate; a window does not need pinging the moment
+    // it connects.
+    heartbeat.tick().await;
     loop {
         let out = tokio::select! {
             reply = replies.recv() => match reply {
@@ -201,6 +217,7 @@ async fn write_out(
                 // The sink was released: this window is over.
                 None => return,
             },
+            _ = heartbeat.tick() => Out::Ping,
             control = control.recv() => match control {
                 Some(out) => out,
                 None => return,
@@ -215,6 +232,7 @@ async fn write_out(
                 .expect("two strings serialize");
                 ws::write_text(&mut w, &line).await
             }
+            Out::Ping => ws::write_frame(&mut w, 0x9, b"").await,
             Out::Pong(payload) => ws::write_frame(&mut w, 0xa, &payload).await,
             Out::Close(code) => {
                 let _ = ws::write_close(&mut w, code).await;
