@@ -1,0 +1,49 @@
+# The `ns-app serve` half of a config: who may connect, and how. Nothing here
+# is read by the CLI. Append the parts you want to `config.toml`; the full
+# guide, with a worked client of each kind, is docs/connecting-clients.md.
+
+# The socket: one JSON object per line, what a desktop app or a script holds
+# open. `auth = "shared"` is one token for everyone, which proves nothing and
+# is therefore refused off loopback; `auth = "jwt"` verifies a token per
+# person against the keys `[auth] signing_key_envs` names, per company.
+[serve]
+listen = "127.0.0.1:7375"
+auth = "jwt"
+token_env = "NS_SERVE_TOKEN"
+max_connections = 8
+
+# The HTTP endpoint, which is everything that is not a raw socket: a browser's
+# chat window over `GET /chat`, one message and one reply over
+# `POST /v1/messages`, and every platform's webhook under `POST /hooks/...`.
+# An empty or absent `listen` means it is never opened, so a config written
+# before this section existed serves exactly what it served before. No TLS
+# here: terminate it in front, and a non-loopback bind is refused unless
+# `allow_remote` says it was meant.
+[http]
+listen = "127.0.0.1:8787"
+allow_remote = false
+max_connections = 256
+hello_timeout_ms = 5000              # a caller that connects and says nothing
+reply_timeout_ms = 120000            # how long POST /v1/messages waits for a turn
+max_body_bytes = 262144              # a webhook batch is the large case
+origins = ["https://shop.example"]   # browsers allowed to open a window; ["*"] for a widget on customer sites
+seen_path = "ns-webhooks-seen.tsv"   # platform message ids already answered, so a retry is not a second turn
+whatsapp_verify_token_env = "NS_WA_VERIFY_TOKEN"
+
+# Per company, and therefore in `tenants/<id>.toml` rather than here: this
+# company's signing keys. Two names mean a rotation is in progress.
+[auth]
+signing_key_envs = ["NS_SIGNING_KEY_ACME"]
+iat_floor = 0
+
+# One company's WhatsApp business account — also `tenants/<id>.toml`. The
+# endpoint above is the process's; the account is the company's. A delivery is
+# routed to a company by the business number inside its own signed payload,
+# and a customer's phone number never becomes a session id: the subject is
+# HMAC(this company's salt, customer id).
+[whatsapp]
+phone_number_id = "123456789012345"
+access_token_env = "NS_WA_TOKEN_ACME"
+app_secret_env = "NS_WA_SECRET_ACME"
+session_salt_env = "NS_WA_SALT_ACME"
+graph_version = "v21.0"

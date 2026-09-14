@@ -41,7 +41,8 @@ pub(crate) const TENANT_DIR: &str = "tenants";
 /// the company's, and each signs with its own. The wire trace has no config
 /// key at all — it is `NS_TRACE`, read by the process — so there is nothing
 /// here to refuse for it.
-const PROCESS_OWNED: [&str; 6] = [
+const PROCESS_OWNED: [&str; 7] = [
+    "http",
     "models",
     "serve.listen",
     "serve.token_env",

@@ -40,6 +40,110 @@ pub struct AppConfig {
     /// but the keys that say who a caller is are the company's.
     #[serde(default)]
     pub auth: AuthSection,
+    /// [http] — the second way in: a browser's chat window, a request from a
+    /// script, and every platform webhook. Absent, or with no `listen`,
+    /// means the process serves the socket alone and exactly as before.
+    #[serde(default)]
+    pub http: HttpSection,
+    /// [whatsapp] — this company's WhatsApp business account, if it has one.
+    /// Per tenant and overlayable, because the account, the token and the
+    /// salt are the company's; the endpoint they all arrive on is the
+    /// process's and lives in `[http]`.
+    #[serde(default)]
+    pub whatsapp: Option<WhatsAppSection>,
+}
+
+/// [http] — `ns-app serve`'s HTTP endpoint (`nschannel_http`): the way in
+/// for anything that is not a raw socket.
+///
+/// Process-owned in its entirety, for the reason `[serve] listen` is: one
+/// port belongs to the process however many companies arrive on it, and a
+/// company that could move it could take another company's callers.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct HttpSection {
+    /// `host:port`, or empty for "do not open it at all" — which is the
+    /// default, so a config written before this key existed serves exactly
+    /// what it served before.
+    #[serde(default)]
+    pub listen: String,
+    /// Whether a non-loopback `listen` is meant. Off, a bind to one is
+    /// refused at startup: there is no TLS here, and terminating it belongs
+    /// in front of this process.
+    #[serde(default)]
+    pub allow_remote: bool,
+    #[serde(default = "default_http_max_connections")]
+    pub max_connections: usize,
+    /// How long a caller has to send its first line, or its hello once
+    /// upgraded.
+    #[serde(default = "default_hello_timeout_ms")]
+    pub hello_timeout_ms: u64,
+    /// How long `POST /v1/messages` holds a request open waiting for the
+    /// turn's reply before it answers 504.
+    #[serde(default = "default_reply_timeout_ms")]
+    pub reply_timeout_ms: u64,
+    /// The most a request body may be; a webhook batch is the large case.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Which browser origins may call the JSON route and open a chat
+    /// window. Empty means none, which is right for a page served beside
+    /// this process; `["*"]` means any, which is what a widget embedded on
+    /// customer sites needs.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Where the ids of already-answered platform messages are kept, so a
+    /// retry after a restart is still a retry. Empty means in memory only,
+    /// which is a deliberate choice to answer some redeliveries twice.
+    #[serde(default = "default_seen_path")]
+    pub seen_path: String,
+    /// The env var holding the token a platform echoes during its one-off
+    /// verification handshake. One per process, because the endpoint is.
+    #[serde(default)]
+    pub whatsapp_verify_token_env: String,
+}
+
+impl Default for HttpSection {
+    fn default() -> Self {
+        Self {
+            listen: String::new(),
+            allow_remote: false,
+            max_connections: default_http_max_connections(),
+            hello_timeout_ms: default_hello_timeout_ms(),
+            reply_timeout_ms: default_reply_timeout_ms(),
+            max_body_bytes: default_max_body_bytes(),
+            origins: Vec::new(),
+            seen_path: default_seen_path(),
+            whatsapp_verify_token_env: String::new(),
+        }
+    }
+}
+
+impl HttpSection {
+    /// Whether this process opens the endpoint at all.
+    pub fn enabled(&self) -> bool {
+        !self.listen.trim().is_empty()
+    }
+}
+
+/// [whatsapp] — one company's WhatsApp business account.
+///
+/// Every secret is named rather than held, exactly as the provider keys and
+/// the serve token are: a repository is not where an access token lives.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct WhatsAppSection {
+    /// Meta's id for the business number. What a delivery is routed to this
+    /// company by, and the only thing in the payload that says so.
+    pub phone_number_id: String,
+    /// The env var holding the token replies are sent with.
+    pub access_token_env: String,
+    /// The env var holding the app secret deliveries are signed with.
+    pub app_secret_env: String,
+    /// The env var holding the salt customer ids are hashed under, so a
+    /// phone number never becomes a session id. Per company, so the same
+    /// person at two companies is two unrelated subjects.
+    pub session_salt_env: String,
+    /// The Graph API version replies go to.
+    #[serde(default = "default_graph_version")]
+    pub graph_version: String,
 }
 
 /// [models] — the local CPU model service, for the evaluation lane only
@@ -488,6 +592,27 @@ fn default_serve_max_connections() -> usize {
 
 fn default_hello_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_http_max_connections() -> usize {
+    256
+}
+
+/// Two minutes: longer than a turn, shorter than any client's patience.
+fn default_reply_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_max_body_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_seen_path() -> String {
+    "ns-webhooks-seen.tsv".into()
+}
+
+pub(crate) fn default_graph_version() -> String {
+    nschannel_http::whatsapp::DEFAULT_GRAPH_VERSION.into()
 }
 
 impl Default for ServeSection {

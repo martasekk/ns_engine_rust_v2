@@ -18,6 +18,10 @@ crates/memory-sqlite  the event log and an FTS5 index over it
 crates/provenance     where a fact came from
 crates/evolution      the self-improvement pass: mine → propose → gate → apply
 crates/channel-cli    a REPL channel, generic over reader/writer
+crates/channel-hub    one queue per company, one set of windows per session
+crates/channel-tcp    the socket: one JSON object per line
+crates/channel-http   web chat windows, one-shot requests, platform webhooks
+crates/identity       who a caller is, per channel, before anything downstream
 crates/components-std time, HTTP and pointer tools
 crates/pointer        remote pointer, keyboard, clipboard and UI reading
 app                   ns-app: wires a config file into a running harness
@@ -92,7 +96,7 @@ refused instead of finding out from the refusal.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 334 tests, no network required
+cargo test  --workspace          # 890 tests, no network required
 
 cp config.example.toml config.toml
 cargo run -p ns-app -- providers # which providers exist, which keys are set
@@ -112,6 +116,29 @@ To drive a desktop, uncomment `[pointer]` in `config.toml`, point `addr` at a
 machine running the agent (started with `allow_remote` for a non-loopback
 bind), and export the token. `NS_POINTER_ADDR` overrides the address.
 
+## Connecting things to it
+
+`ns-app serve` hosts many companies in one process, and each can be reached
+four ways at once — a raw socket, a browser's WebSocket, a one-shot HTTP
+request, and a platform's signed webhook:
+
+| way in | who it is for | reply arrives |
+|---|---|---|
+| TCP, one JSON object per line | desktop apps, scripts | on the same socket |
+| `GET /chat`, upgraded | a custom web chat window | on the same socket |
+| `POST /v1/messages` | `curl`, a cron job, another back end | in the response |
+| `POST /hooks/<platform>` | WhatsApp, and platforms shaped like it | as a call to the platform's API |
+
+They are four envelopes, not four conversations. A customer with a tab open,
+that customer's desktop app and that customer on WhatsApp share one session,
+one engine and one log; the engine has no field with which to ask which is
+which. The socket and the WebSocket speak the same three JSON objects, so one
+client library serves both.
+
+`docs/connecting-clients.md` is the guide, with a worked client of each kind in
+`crates/channel-http/examples/` — a complete chat page, a desktop client, and
+the `[serve]`/`[http]`/`[whatsapp]` config they need.
+
 ## Docs
 
 | | |
@@ -120,6 +147,7 @@ bind), and export the token. `NS_POINTER_ADDR` overrides the address.
 | `docs/pointer-work-split.md` | which half implements what, and why |
 | `docs/windows-handoff.md` | notes to and from the Windows agent maintainer |
 | `docs/providers.md` | swapping the model, per role or per run |
+| `docs/connecting-clients.md` | every way in: sockets, web chat windows, webhooks |
 | `docs/superpowers/` | specs and plans |
 | `docs/research/` | the literature the design leans on |
 

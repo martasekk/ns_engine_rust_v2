@@ -608,6 +608,8 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "ns-channel-cli",
+ "ns-channel-http",
+ "ns-channel-hub",
  "ns-channel-tcp",
  "ns-components-std",
  "ns-core",
@@ -635,11 +637,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-channel-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hmac",
+ "ns-channel-hub",
+ "ns-channel-tcp",
+ "ns-core",
+ "ns-identity",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ns-channel-hub"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ns-core",
+ "tokio",
+]
+
+[[package]]
 name = "ns-channel-tcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "ns-channel-hub",
  "ns-core",
  "ns-identity",
  "serde",
@@ -1114,6 +1147,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

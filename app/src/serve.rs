@@ -108,12 +108,34 @@ pub(crate) async fn serve_shard(mut set: Vec<tenant::TenantConfig>, max_requests
         Ok(auth) => auth,
         Err(e) => e.exit(),
     };
+    // Every way in meets at one hub: a company's queue is filled by its
+    // sockets, its browser windows and its platform webhooks alike, and the
+    // registry watches the hub rather than one listener per transport. It is
+    // also the shutdown now — the last way in closed, not the first.
+    let hub = nschannel_hub::Hub::new();
+    // The platforms this shard answers webhooks for, read while the ports
+    // are still free: a company whose WhatsApp secrets are missing is a
+    // named refusal here rather than one that fails every delivery Meta
+    // sends it.
+    let platforms = match factory::shard_platforms(&set, &process.app.http) {
+        Ok(platforms) => platforms,
+        Err(e) => e.exit(),
+    };
+    if !platforms.is_empty() && !process.app.http.enabled() {
+        factory::StartupError::Config(
+            "a [whatsapp] account is configured but [http] listen is empty: a platform has \
+             nowhere to deliver to"
+                .into(),
+        )
+        .exit()
+    }
     // One socket serves the whole process, so the bind is the caller's and
     // not the factory's (plan A1): a shard building one engine per company
     // would otherwise reach for the same address once per tenant.
-    let listener = match nschannel_tcp::TcpChannel::bind_with(
+    let listener = match nschannel_tcp::TcpChannel::bind_on(
+        hub.clone(),
         &serve_cfg.listen,
-        auth,
+        auth.clone(),
         serve_cfg.max_connections,
         serve_cfg.allow_remote,
         std::time::Duration::from_millis(serve_cfg.hello_timeout_ms),
@@ -124,9 +146,26 @@ pub(crate) async fn serve_shard(mut set: Vec<tenant::TenantConfig>, max_requests
         Err(e) => factory::StartupError::Serve(e.to_string()).exit(),
     };
     let addr = listener.local_addr();
+    // The second way in, and only if it was asked for: a config written
+    // before `[http]` existed opens the socket alone, exactly as it did.
+    let http = if process.app.http.enabled() {
+        let cfg = http_config(&process.app.http);
+        match nschannel_http::HttpChannel::bind_on(hub.clone(), cfg, auth, platforms).await {
+            Ok(http) => {
+                eprintln!(
+                    "http: chat windows, requests and platform webhooks on {}",
+                    http.local_addr()
+                );
+                Some(http)
+            }
+            Err(e) => factory::StartupError::Serve(e.to_string()).exit(),
+        }
+    } else {
+        None
+    };
     let registry = Arc::new(registry::TenantRegistry::new(
         tenant_builder(set, addr, max_requests),
-        listener,
+        hub,
         shard,
         registry::RegistryLimits::default(),
     ));
@@ -136,6 +175,10 @@ pub(crate) async fn serve_shard(mut set: Vec<tenant::TenantConfig>, max_requests
     // can decide for itself (plan B5), and it ends the process the way a
     // dead engine always has - the reason on stderr, a non-zero status.
     let outcome = registry.clone().serve().await;
+    // Held until the wake loop is over: each is a way in, and dropping the
+    // last of them is what shuts the hub down.
+    drop(listener);
+    drop(http);
     // What each company cost while this shard was up (plan B8), printed
     // where it can still be read: after the wake loop, whichever way it
     // ended. Nothing else in the process counts per company.
@@ -146,6 +189,27 @@ pub(crate) async fn serve_shard(mut set: Vec<tenant::TenantConfig>, max_requests
     if let Err(fatal) = outcome {
         eprintln!("engine stopped: {fatal}");
         std::process::exit(1);
+    }
+}
+
+/// `[http]` as the channel crate wants it. A translation and nothing more,
+/// except for one decision: `origins = ["*"]` is `Any`, because a widget a
+/// customer embeds on their own site arrives from a domain this shard has
+/// never been told about, and listing them all would be a deployment per
+/// customer.
+fn http_config(cfg: &crate::config::HttpSection) -> nschannel_http::HttpConfig {
+    nschannel_http::HttpConfig {
+        listen: cfg.listen.clone(),
+        allow_remote: cfg.allow_remote,
+        max_connections: cfg.max_connections,
+        hello_timeout: std::time::Duration::from_millis(cfg.hello_timeout_ms),
+        reply_timeout: std::time::Duration::from_millis(cfg.reply_timeout_ms),
+        max_body: cfg.max_body_bytes,
+        origins: if cfg.origins.iter().any(|o| o == "*") {
+            nschannel_http::Origins::Any
+        } else {
+            nschannel_http::Origins::These(cfg.origins.clone())
+        },
     }
 }
 

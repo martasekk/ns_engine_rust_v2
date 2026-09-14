@@ -503,6 +503,60 @@ changed, and it shapes anything proactive.
 **Exit.** Green; one shard serves a web tenant and a WhatsApp tenant at once, and the
 engine cannot tell them apart.
 
+### Phase 6, as built (2026-09-14)
+
+Built, with three additions the phase text did not anticipate. Each is recorded
+because each changed the shape rather than the schedule.
+
+**A1. The hub came first, and it is the whole reason this phase was small.**
+Phase 3 put the queues, the session-to-window map and the shutdown inside
+`ns-channel-tcp`, where they were reachable only through a socket. A second way
+in could not have used any of it. They are now `ns-channel-hub`: one queue per
+company, one set of *sinks* per session, and a shutdown counted by open
+ingresses rather than by one listener being dropped. `ns-channel-tcp` keeps the
+socket, the hello and the line format and nothing else; its nineteen wire tests
+passed unchanged across the move, which is what says the extraction was one.
+
+The generalisation that mattered was smaller than expected: a *sink* is a
+bounded queue of reply text, so a browser's WebSocket, a desktop app's socket
+and the task that posts a reply back to Meta are the same thing to the hub.
+T6.5's "outbound has no connection" therefore needed no special case — the
+webhook endpoint attaches a sink like anything else and drains it into API
+calls.
+
+**A2. The web widget is not reachable over the TCP channel, and Phase 4 could
+not have told us.** A browser cannot open a TCP socket. T4.2 specified the web
+widget's resolver against the TCP hello, which is right, but the transport it
+would arrive on did not exist: `ns-channel-http` is it. `GET /chat` upgrades to
+a WebSocket and speaks the *same three objects* as the socket, so one client
+library serves both; `POST /v1/messages` is the shape for a caller that holds
+nothing open. Neither is a new identity story — both take the same
+`IdentityResolver<Hello>`, which is what D6's seam was for.
+
+**A3. A signature proves one account, not any account.** T6.4 says the tenant
+comes from the business phone number id inside the verified payload, which is
+correct and insufficient. A shard holding two companies' app secrets must check
+that the account the payload names is the one whose secret matched — otherwise
+any company on the shard can sign a delivery claiming another company's number
+and speak as it. `a_payload_signed_by_another_tenants_secret_is_refused` pins
+it. This is the multi-tenant version of a single-tenant assumption, and it is
+exactly the class of thing §1 D3 warns about.
+
+**What landed against the phase's own tests.** T6.1 (verify over raw bytes
+before parsing), T6.2 (`SeenIds`, a persistent per-shard set, because a retry
+outlives a restart), T6.3 (sorted by platform timestamp), T6.4 (tenant from the
+verified payload; subject is `HMAC(company salt, customer id)`, so a phone
+number reaches neither the session id nor the fact scope), T6.5 (replies
+through an injected transport, three attempts then logged), T6.6 (the send
+window is documented at the adapter and holds by construction, since every
+reply answers a message that just arrived; anything proactive needs the
+template API and is refused the shortcut).
+
+**Not built, deliberately.** A second platform. The `Platform` trait is the
+seam — `accept`, `reply`, and an optional `verification` — and WhatsApp is the
+worked example. Adding Slack or Telegram touches no other crate, which is the
+property worth having before there is a second one.
+
 ---
 
 ## Phase 7 — scale-out and operations, gated

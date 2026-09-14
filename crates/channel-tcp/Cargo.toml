@@ -8,6 +8,7 @@ name = "nschannel_tcp"
 
 [dependencies]
 ns-core = { path = "../core" }
+ns-channel-hub = { path = "../channel-hub" }
 ns-identity = { path = "../identity" }
 async-trait = { workspace = true }
 serde = { workspace = true }

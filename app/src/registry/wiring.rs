@@ -44,14 +44,17 @@ pub(crate) trait TenantSource: Send + Sync + 'static {
     fn next_active_tenant(&self) -> BoxFuture<'_, Option<String>>;
 }
 
-impl TenantSource for nschannel_tcp::TcpChannel {
+/// The hub, which is where every way in meets: the socket, the browser's
+/// WebSocket and each platform's webhook all fill the same company queues,
+/// so the registry watches one thing and not one per listener.
+impl TenantSource for nschannel_hub::Hub {
     fn tenant_channel(&self, tenant: &str) -> Option<Arc<dyn Channel>> {
-        let channel = nschannel_tcp::TcpChannel::tenant_channel(self, tenant)?;
+        let channel = nschannel_hub::Hub::tenant_channel(self, tenant)?;
         Some(channel as Arc<dyn Channel>)
     }
 
     fn next_active_tenant(&self) -> BoxFuture<'_, Option<String>> {
-        Box::pin(nschannel_tcp::TcpChannel::next_active_tenant(self))
+        Box::pin(nschannel_hub::Hub::next_active_tenant(self))
     }
 }
 

@@ -5,6 +5,8 @@ members = [
     "crates/identity",
     "crates/engine",
     "crates/channel-cli",
+    "crates/channel-hub",
+    "crates/channel-http",
     "crates/channel-tcp",
     "crates/memory-sqlite",
     "crates/llm",

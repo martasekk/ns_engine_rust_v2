@@ -229,6 +229,103 @@ fn tenant_auth(tenant: &TenantConfig) -> Result<TenantAuth, StartupError> {
     })
 }
 
+/// The platforms this shard answers webhooks for, built out of the set.
+///
+/// The division is the same one `[serve]` and `[auth]` already draw, and it
+/// is worth stating because it is the whole reason a hundred companies can
+/// share one endpoint: the *endpoint* is the process's — one URL, one
+/// verification token, one file of already-answered message ids — while the
+/// *account* is the company's. A delivery is routed to a company by the
+/// business number inside its own signed payload, so two companies on one
+/// URL are separated by something neither of them can write.
+///
+/// A company with no `[whatsapp]` section is simply not reachable that way;
+/// a company with one whose secrets are not exported is a named refusal
+/// rather than an account that would fail every signature at run time.
+pub(crate) fn shard_platforms(
+    set: &[TenantConfig],
+    http: &crate::config::HttpSection,
+) -> Result<Vec<Arc<nschannel_http::PlatformEndpoint>>, StartupError> {
+    let mut accounts = Vec::new();
+    for tenant in set {
+        let Some(cfg) = &tenant.app.whatsapp else {
+            continue;
+        };
+        let secret = |env: &str| -> Result<String, StartupError> {
+            std::env::var(env)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    StartupError::Config(format!(
+                        "tenant {:?} configures [whatsapp] but {env} is unset: an account whose \
+                         secrets are missing would refuse every delivery Meta sent it",
+                        tenant.id
+                    ))
+                })
+        };
+        accounts.push(nschannel_http::whatsapp::Account {
+            phone_number_id: cfg.phone_number_id.clone(),
+            tenant: tenant.id.clone(),
+            access_token: secret(&cfg.access_token_env)?,
+            app_secret: secret(&cfg.app_secret_env)?,
+            session_salt: secret(&cfg.session_salt_env)?,
+        });
+    }
+    if accounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Two companies on one business number would each receive the other's
+    // customers. Refused here, with both named, for the same reason two
+    // companies on one store path are (plan H9).
+    for (i, account) in accounts.iter().enumerate() {
+        if let Some(other) = accounts[..i]
+            .iter()
+            .find(|a| a.phone_number_id == account.phone_number_id)
+        {
+            return Err(StartupError::Config(format!(
+                "tenants {:?} and {:?} both claim WhatsApp number {}: a delivery for it could \
+                 only be given to one of them",
+                other.tenant, account.tenant, account.phone_number_id
+            )));
+        }
+    }
+    let graph_version = set
+        .iter()
+        .find_map(|t| t.app.whatsapp.as_ref().map(|w| w.graph_version.clone()))
+        .unwrap_or_else(crate::config::default_graph_version);
+    let verify_env = http.whatsapp_verify_token_env.trim();
+    if verify_env.is_empty() {
+        return Err(StartupError::Config(
+            "a [whatsapp] account is configured but [http] whatsapp_verify_token_env names no \
+             variable: Meta will not deliver to an endpoint that cannot answer its verification"
+                .into(),
+        ));
+    }
+    let verify_token = std::env::var(verify_env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            StartupError::Config(format!(
+                "[http] whatsapp_verify_token_env names {verify_env}, which is unset"
+            ))
+        })?;
+    let adapter = nschannel_http::whatsapp::WhatsApp::new(accounts, verify_token)
+        .with_graph_version(graph_version);
+    let seen = match http.seen_path.trim() {
+        // Deliberately in memory: the operator has said they would rather
+        // answer the occasional redelivery twice than keep the file.
+        "" => nschannel_http::SeenIds::in_memory(),
+        path => nschannel_http::SeenIds::open(path),
+    };
+    Ok(vec![nschannel_http::PlatformEndpoint::new(
+        Arc::new(adapter),
+        Arc::new(nschannel_http::platform::ReqwestReplyTransport::new()),
+        seen,
+    )])
+}
+
 /// The resolver for a whole shard: one listener, every company in the set
 /// (plan B9).
 ///
@@ -954,6 +1051,124 @@ mod tests {
             .expect("overlay");
         }
         crate::tenant::load_set(&base, root, "local").expect("the fixture tenants")
+    }
+
+    /// A tenant set where each named company has a WhatsApp account on the
+    /// number given, with its secrets in env vars named after it.
+    /// Every environment variable is named for `scope` as well as for the
+    /// company, because the environment is the process's and these tests run
+    /// beside each other: one that unsets a variable to prove a refusal would
+    /// otherwise unset it under another test that is mid-assertion.
+    fn whatsapp_fixture(
+        root: &std::path::Path,
+        scope: &str,
+        accounts: &[(&str, &str)],
+    ) -> Vec<crate::tenant::TenantConfig> {
+        let addr: SocketAddr = "127.0.0.1:7399".parse().expect("a literal address");
+        let ids: Vec<&str> = accounts.iter().map(|(id, _)| *id).collect();
+        let mut set = serve_fixture(root, addr, &ids);
+        for (tenant, (id, number)) in set.iter_mut().zip(accounts) {
+            assert_eq!(&tenant.id, id, "the fixture keeps the order it was given");
+            let up = format!("{}_{}", scope.to_uppercase(), id.to_uppercase());
+            tenant.app.whatsapp = Some(crate::config::WhatsAppSection {
+                phone_number_id: (*number).to_string(),
+                access_token_env: format!("NS_TEST_WA_TOKEN_{up}"),
+                app_secret_env: format!("NS_TEST_WA_SECRET_{up}"),
+                session_salt_env: format!("NS_TEST_WA_SALT_{up}"),
+                graph_version: "v21.0".into(),
+            });
+            std::env::set_var(format!("NS_TEST_WA_TOKEN_{up}"), "a-graph-token");
+            std::env::set_var(format!("NS_TEST_WA_SECRET_{up}"), "an-app-secret");
+            std::env::set_var(format!("NS_TEST_WA_SALT_{up}"), "a-salt");
+        }
+        set
+    }
+
+    fn http_with_verify(env: &str) -> crate::config::HttpSection {
+        std::env::set_var(env, "verify-me");
+        crate::config::HttpSection {
+            listen: "127.0.0.1:0".into(),
+            whatsapp_verify_token_env: env.into(),
+            // In memory: a test must not write a dedupe file beside the
+            // repository, and what the file does is `SeenIds`' own test.
+            seen_path: String::new(),
+            ..crate::config::HttpSection::default()
+        }
+    }
+
+    /// A company with no `[whatsapp]` is simply not reachable that way, and
+    /// a shard of such companies opens no webhook endpoint at all.
+    #[test]
+    fn a_set_with_no_platform_account_serves_no_webhooks() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let addr: SocketAddr = "127.0.0.1:7399".parse().expect("a literal address");
+        let set = serve_fixture(root.path(), addr, &["acme"]);
+        let platforms = shard_platforms(&set, &http_with_verify("NS_TEST_WA_VERIFY_NONE"))
+            .expect("nothing to configure");
+        assert!(platforms.is_empty());
+    }
+
+    #[test]
+    fn two_tenants_claiming_one_whatsapp_number_are_refused_naming_both() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // The copy-pasted overlay, which is the likeliest way one company's
+        // customers ever reach another's engine.
+        let set = whatsapp_fixture(root.path(), "dup", &[("acme", "111"), ("globex", "111")]);
+        let err = match shard_platforms(&set, &http_with_verify("NS_TEST_WA_VERIFY_DUP")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("two companies on one business number must be refused"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("globex"), "{err}");
+        assert!(err.contains("111"), "{err}");
+
+        // Their own numbers, and the same set is fine.
+        let set = whatsapp_fixture(root.path(), "dup", &[("acme", "111"), ("globex", "222")]);
+        assert_eq!(
+            shard_platforms(&set, &http_with_verify("NS_TEST_WA_VERIFY_DUP"))
+                .expect("two accounts, one endpoint")
+                .len(),
+            1,
+            "one endpoint serves every company on the platform"
+        );
+    }
+
+    #[test]
+    fn a_whatsapp_account_whose_secret_is_unset_is_refused_by_name() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let set = whatsapp_fixture(root.path(), "secret", &[("acme", "111")]);
+        std::env::remove_var("NS_TEST_WA_SECRET_SECRET_ACME");
+        let err = match shard_platforms(&set, &http_with_verify("NS_TEST_WA_VERIFY_SECRET")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an account with no secret would refuse every delivery"),
+        };
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("NS_TEST_WA_SECRET_SECRET_ACME"), "{err}");
+    }
+
+    /// Meta will not deliver to an endpoint that cannot answer its
+    /// verification handshake, so a shard that could never be subscribed to
+    /// says so at startup rather than waiting silently for traffic.
+    #[test]
+    fn a_platform_with_no_verification_token_is_refused_at_startup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let set = whatsapp_fixture(root.path(), "verify", &[("acme", "111")]);
+        let mut http = http_with_verify("NS_TEST_WA_VERIFY_MISSING");
+        http.whatsapp_verify_token_env = String::new();
+        let err = match shard_platforms(&set, &http) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an endpoint Meta cannot verify must be refused"),
+        };
+        assert!(err.contains("whatsapp_verify_token_env"), "{err}");
+
+        // Named but unset is the same refusal, with the variable in it.
+        http.whatsapp_verify_token_env = "NS_TEST_WA_VERIFY_UNSET".into();
+        std::env::remove_var("NS_TEST_WA_VERIFY_UNSET");
+        let err = match shard_platforms(&set, &http) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unset verification token must be refused"),
+        };
+        assert!(err.contains("NS_TEST_WA_VERIFY_UNSET"), "{err}");
     }
 
     /// One company's side of a listener the caller has bound: what a
