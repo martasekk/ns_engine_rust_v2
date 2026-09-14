@@ -11,9 +11,10 @@
 use crate::config::{AppConfig, Role, RoleTarget};
 use crate::env_override;
 use crate::tenant::TenantConfig;
-use nscore::{HarnessBuilder, SessionId, Tool};
+use nscore::{Channel, HarnessBuilder, SessionId, Tool};
 use nsengine::store::NoopConsolidator;
 use nsengine::turn::{Engine, EngineConfig};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub(crate) type RulesHandle = Arc<nsengine::arc_swap::ArcSwap<nscore::LearnedRules>>;
@@ -25,8 +26,15 @@ pub(crate) enum Mode {
     /// The interactive CLI: stdin plus the desktop's compose box, one
     /// `global` fact scope, the session id this run was given.
     Cli { session: String },
-    /// `ns-app serve`: the TCP channel, a fact scope per session.
-    Serve,
+    /// `ns-app serve`: the caller's already-bound channel and the address it
+    /// landed on, a fact scope per session. The listener belongs to the
+    /// caller because one socket feeds every company in the process, and a
+    /// factory that bound one for itself could only ever build one engine
+    /// (plan A1).
+    Serve {
+        channel: Arc<dyn Channel>,
+        addr: SocketAddr,
+    },
 }
 
 /// A startup the tenant refused, with the text `main` used to print before
@@ -112,8 +120,9 @@ impl std::error::Error for StartupError {}
 ///
 /// The order of construction is load-bearing and is the order `main` used:
 /// every semantic check the chat path needs happens before anything is
-/// dialled, the listener binds before the pointer socket is opened, and the
-/// three startup banners print between `Engine::new` and the first turn.
+/// dialled, and the three startup banners print between `Engine::new` and
+/// the first turn. The listener is no longer among them: `serve` hands one
+/// in already bound (plan A1).
 pub(crate) async fn build_engine(
     tenant: &TenantConfig,
     mode: Mode,
@@ -128,11 +137,11 @@ pub(crate) async fn build_engine(
     // the factory a function of the tenant's config alone.
     let schema_profile = cfg.llm.schema_profile().map_err(StartupError::Llm)?;
     let capability = cfg.llm.capability().map_err(StartupError::Llm)?;
-    let serve = matches!(mode, Mode::Serve);
-    let cli_session = match &mode {
-        Mode::Cli { session } => session.clone(),
-        Mode::Serve => String::new(),
+    let (tcp, cli_session) = match mode {
+        Mode::Cli { session } => (None, session),
+        Mode::Serve { channel, addr } => (Some((channel, addr)), String::new()),
     };
+    let serve = tcp.is_some();
 
     // Each role resolves on its own, so the emitter can sit on a local
     // model while the replier stays in the cloud (or the other way round).
@@ -153,28 +162,6 @@ pub(crate) async fn build_engine(
         .map_err(StartupError::Config)?;
     let budget_mode = cfg.memory.budget_mode().map_err(StartupError::Config)?;
     let worker_slots = cfg.engine.worker_slots().map_err(StartupError::Config)?;
-    // The listener too, for the same reason: a missing token or a bad
-    // address is refused here, before the pointer has been dialled.
-    let tcp = if serve {
-        let Some(token) = cfg.serve.token() else {
-            return Err(StartupError::MissingServeToken {
-                env: cfg.serve.token_env.clone(),
-            });
-        };
-        match nschannel_tcp::TcpChannel::bind(
-            &cfg.serve.listen,
-            token,
-            cfg.serve.max_connections,
-            cfg.serve.allow_remote,
-        )
-        .await
-        {
-            Ok(channel) => Some(channel),
-            Err(e) => return Err(StartupError::Serve(e.to_string())),
-        }
-    } else {
-        None
-    };
 
     let transport = Arc::new(nsllm::transport::ReqwestTransport::new());
     let rules = load_rules(cfg)?;
@@ -222,9 +209,9 @@ pub(crate) async fn build_engine(
     // for. Before the channel so the line lands with the other startup
     // reports rather than in the middle of the first turn.
     crate::models::announce(&cfg.models).await;
-    let serve_addr = tcp.as_ref().map(|c| c.local_addr());
-    if let Some(channel) = tcp {
-        // `serve`: the TCP channel and nothing else — no stdin, and no
+    let serve_addr = tcp.as_ref().map(|(_, addr)| *addr);
+    if let Some((channel, _)) = tcp {
+        // `serve`: the caller's channel and nothing else — no stdin, and no
         // compose box, which joins a desktop to *one* session.
         b.set_shared_channel(channel);
     } else {
@@ -705,6 +692,100 @@ pub(crate) fn build_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture tenant set whose base config reaches nothing: the local
+    /// provider resolves a key without one being exported, and every path it
+    /// writes to lives under `root`. `listen` is the address the caller has
+    /// already bound, which is the whole point of the serve tests below.
+    fn serve_fixture(
+        root: &std::path::Path,
+        listen: SocketAddr,
+        ids: &[&str],
+    ) -> Vec<TenantConfig> {
+        std::fs::create_dir_all(root.join(crate::tenant::TENANT_DIR)).expect("tenants dir");
+        let base = format!(
+            "[llm]\nprovider = \"ollama\"\n\
+             [serve]\nlisten = {:?}\n\
+             [evolution]\nlearned_path = {:?}\n",
+            listen.to_string(),
+            root.join("learned.toml").display().to_string()
+        );
+        for id in ids {
+            std::fs::write(
+                root.join(crate::tenant::TENANT_DIR)
+                    .join(format!("{id}.toml")),
+                format!(
+                    "[store]\npath = {:?}\n",
+                    root.join(format!("ns-{id}.sqlite")).display().to_string()
+                ),
+            )
+            .expect("overlay");
+        }
+        crate::tenant::load_set(&base, root, "local").expect("the fixture tenants")
+    }
+
+    /// The listener is the caller's (plan A1). The factory installs the
+    /// channel it was handed rather than opening one of its own, so the
+    /// caller's handle is still alive — and shared — once the engine is up.
+    #[tokio::test]
+    async fn build_engine_takes_its_serve_channel_from_the_caller() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t".into(), 4, false)
+            .await
+            .expect("the caller's listener");
+        let addr = channel.local_addr();
+        let set = serve_fixture(root.path(), addr, &["acme"]);
+        assert_eq!(
+            Arc::strong_count(&channel),
+            1,
+            "only the caller holds it yet"
+        );
+
+        let engine = build_engine(
+            &set[0],
+            Mode::Serve {
+                channel: channel.clone(),
+                addr,
+            },
+            None,
+        )
+        .await
+        .expect("the tenant's engine");
+
+        assert_eq!(Arc::strong_count(&engine), 1);
+        assert!(
+            Arc::strong_count(&channel) > 1,
+            "the engine holds the caller's channel, not one it bound itself"
+        );
+    }
+
+    /// Why the bind moved out: one engine per company, in one process. The
+    /// factory binding for itself would reach for the same socket a second
+    /// time and fail with `StartupError::Serve`, so the fixture points both
+    /// tenants at the address the caller has already taken.
+    #[tokio::test]
+    async fn build_engine_no_longer_binds_a_socket() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let channel = nschannel_tcp::TcpChannel::bind("127.0.0.1:0", "t".into(), 4, false)
+            .await
+            .expect("the caller's listener");
+        let addr = channel.local_addr();
+        let set = serve_fixture(root.path(), addr, &["acme", "beta"]);
+        assert_eq!(set.len(), 2);
+
+        for tenant in &set {
+            build_engine(
+                tenant,
+                Mode::Serve {
+                    channel: channel.clone(),
+                    addr,
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{} could not be built: {e}", tenant.id));
+        }
+    }
 
     /// A cap the idle pass never sees is not a cap. Driver B runs between
     /// turns on its own timer and spends real requests, so a metered run

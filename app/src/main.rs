@@ -511,7 +511,7 @@ async fn main() {
     // refuses rather than exits, so the shard that will host many of these
     // survives one bad config; here, where the process is this tenant's,
     // `exit` prints and stops exactly as the inlined version did.
-    let mode = if serve {
+    if serve {
         // Serving is the multi-tenant shape even at one tenant, so the wire
         // trace is per tenant from here on (plan H10). Until Phase 3 gives
         // the process a tenant set, that tenant is the plan's `local`.
@@ -519,12 +519,7 @@ async fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         }
-        factory::Mode::Serve
-    } else {
-        factory::Mode::Cli {
-            session: cli_session,
-        }
-    };
+    }
     // The tenant set this working directory serves (plan T1.2). With no
     // `tenants/` directory that is one tenant called `local` built from
     // `config.toml` alone, which is this process exactly as it was; the
@@ -551,6 +546,38 @@ async fn main() {
         .llm
         .apply_overrides(env_override("NS_PROVIDER"), env_override("NS_MODEL"));
     let tenant = tenant;
+    // One socket serves the whole process, so the bind is the caller's and
+    // not the factory's (plan A1): a shard building one engine per company
+    // would otherwise reach for the same address once per tenant. A missing
+    // token or an address that will not bind is still refused here, before
+    // the pointer has been dialled, and with the same words as before.
+    let mode = if serve {
+        let serve_cfg = &tenant.app.serve;
+        let Some(token) = serve_cfg.token() else {
+            factory::StartupError::MissingServeToken {
+                env: serve_cfg.token_env.clone(),
+            }
+            .exit()
+        };
+        match nschannel_tcp::TcpChannel::bind(
+            &serve_cfg.listen,
+            token,
+            serve_cfg.max_connections,
+            serve_cfg.allow_remote,
+        )
+        .await
+        {
+            Ok(channel) => factory::Mode::Serve {
+                addr: channel.local_addr(),
+                channel,
+            },
+            Err(e) => factory::StartupError::Serve(e.to_string()).exit(),
+        }
+    } else {
+        factory::Mode::Cli {
+            session: cli_session,
+        }
+    };
     let engine = factory::build_engine(&tenant, mode, max_requests)
         .await
         .unwrap_or_else(|e| e.exit());
