@@ -1,5 +1,5 @@
 use nscore::*;
-use nsengine::dispatch::{Dispatcher, ShardSlots, TurnFailure};
+use nsengine::dispatch::{panic_message, Dispatcher, ShardSlots, TurnFailure};
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
@@ -6630,5 +6630,52 @@ async fn a_session_whose_turn_failed_accepts_the_next_message_and_verifies() {
     assert!(
         EventLog::from_events(sid, events).verify_chain().is_ok(),
         "the log a failed turn left behind still verifies"
+    );
+}
+
+/// T2.2: the panic payload is not dropped. A contained panic ends one session
+/// and the operator gets one log line about it, so that line has to carry
+/// what the panic said — the assertion text, not just "it panicked". The
+/// payloads here are raised the way a turn raises them: `assert!` with
+/// arguments (a `String`, which is what `PanicsFor` produces), a bare
+/// `panic!` (a `&'static str`), and one that is neither, which only has to
+/// describe itself rather than be lost.
+#[test]
+fn a_panicking_turns_message_reaches_the_log() {
+    let hook = std::panic::take_hook();
+    // The payloads below are the point; the default hook's output for them
+    // would be noise in a passing test's stderr.
+    std::panic::set_hook(Box::new(|_| {}));
+    let from_assert = std::panic::catch_unwind(|| {
+        // `PanicsFor`'s shape: a session id known only at run time in an
+        // `assert!` message, which makes the payload a `String`.
+        let session = SessionId("a".into());
+        assert!(
+            session.0.is_empty(),
+            "the emitter panicked on session {}",
+            session.0
+        );
+    })
+    .expect_err("the assertion must panic");
+    let from_panic = std::panic::catch_unwind(|| panic!("the replier lost the widget"))
+        .expect_err("the `panic!` must panic");
+    let from_other = std::panic::catch_unwind(|| std::panic::panic_any(7u8))
+        .expect_err("`panic_any` must panic");
+    std::panic::set_hook(hook);
+
+    assert_eq!(
+        panic_message(from_assert.as_ref()),
+        "the emitter panicked on session a",
+        "an assertion's message is what an operator triages with"
+    );
+    assert_eq!(
+        panic_message(from_panic.as_ref()),
+        "the replier lost the widget",
+        "a `panic!` literal arrives as a `&'static str` and must survive too"
+    );
+    let other = panic_message(from_other.as_ref());
+    assert!(
+        !other.is_empty() && !other.contains('7'),
+        "a payload of another type cannot be read, so it is described: {other}"
     );
 }

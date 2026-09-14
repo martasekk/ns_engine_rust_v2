@@ -191,9 +191,29 @@ enum Failure {
     /// The turn returned an error, to be classified by [`TurnFailure`].
     Turn(EngineError),
     /// The turn panicked and the panic was contained in the session task
-    /// (T2.2). Only ever produced under [`TurnFailure::Isolate`]; under
-    /// `Fatal` the panic unwinds the task and is resumed in `reap`.
-    Panic,
+    /// (T2.2), carrying what it was raised with — see [`panic_message`].
+    /// Only ever produced under [`TurnFailure::Isolate`]; under `Fatal` the
+    /// panic unwinds the task and is resumed in `reap`.
+    Panic(String),
+}
+
+/// What a panic was raised with, recovered from the payload `catch_unwind`
+/// hands back, so the one line the operator gets about a contained panic says
+/// more than that there was one.
+///
+/// `panic!`, `assert!`, `unwrap` and `expect` all produce a `String` or a
+/// `&'static str` — the text a test harness prints — so those two downcasts
+/// cover every panic a turn is likely to raise. A payload of any other type
+/// (`panic_any`) cannot be read without knowing the type, so it is described
+/// instead of dropped.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "a panic payload of neither String nor &str".to_string()
+    }
 }
 
 /// What one wait — on the channel, or on a mailbox — produced.
@@ -396,7 +416,12 @@ impl Dispatcher {
                 Verdict::EndTheSession => eprintln!("session {}: {e}", stopped.session.0),
             },
             // Contained, so it can only ever have cost one session (T2.2).
-            Some(Failure::Panic) => eprintln!("session {}: the turn panicked", stopped.session.0),
+            Some(Failure::Panic(message)) => {
+                eprintln!(
+                    "session {}: the turn panicked: {message}",
+                    stopped.session.0
+                )
+            }
         }
         let current = self
             .sessions
@@ -503,7 +528,7 @@ async fn session_task(
         TurnFailure::Isolate => match catch_unwind(session_turns(&shared, &session, &mut rx)).await
         {
             Ok(outcome) => outcome,
-            Err(_panic) => Some(Failure::Panic),
+            Err(payload) => Some(Failure::Panic(panic_message(payload.as_ref()))),
         },
         // Under `Fatal` a panic is not caught at all: it unwinds the task
         // and `reap` resumes it, which is what the CLI did and still does.
