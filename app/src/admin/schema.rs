@@ -122,27 +122,12 @@ pub(crate) const PROCESS: &[Section] = &[
             ),
             field(
                 "llm.emitter.model",
-                "Emitter model",
+                "Model",
                 Kind::Text,
-                "The model that proposes actions. This is the one that decides how good \
-                 the agent is.",
+                "The model that chooses the actions and writes the reply. There were two \
+                 of these — one to act and one to narrate what happened — and they are \
+                 one call now, so this is the choice that decides how good the agent is.",
                 "the provider's default",
-            ),
-            field(
-                "llm.replier.model",
-                "Replier model",
-                Kind::Text,
-                "The model that writes the reply from the trace of what actually \
-                 happened. It never decides what was done.",
-                "the emitter's",
-            ),
-            choice(
-                "llm.capability",
-                "Model class",
-                &["small", "strong"],
-                "`strong` stands down the scaffolding that exists to compensate for a \
-                 weak emitter. It never adds any.",
-                "small",
             ),
         ],
     },
@@ -497,8 +482,6 @@ mod tests {
     fn a_choice_field_offers_the_values_the_config_accepts() {
         let auth = field_of(PROCESS, "serve.auth").expect("the field");
         assert_eq!(auth.choices, &["shared", "jwt"]);
-        let capability = field_of(PROCESS, "llm.capability").expect("the field");
-        assert_eq!(capability.choices, &["small", "strong"]);
     }
 
     #[test]

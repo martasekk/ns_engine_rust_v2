@@ -419,7 +419,7 @@ pub(crate) async fn build_engine(
     // they are still reported from; re-resolving here is pure, and keeps
     // the factory a function of the tenant's config alone.
     let schema_profile = cfg.llm.schema_profile().map_err(StartupError::Llm)?;
-    let capability = cfg.llm.capability().map_err(StartupError::Llm)?;
+
     let (tcp, cli_session) = match mode {
         Mode::Cli { session } => (None, session),
         Mode::Serve { channel, addr } => (Some((channel, addr)), String::new()),
@@ -430,12 +430,11 @@ pub(crate) async fn build_engine(
     // file itself and always has.
     let trace_tenant: Option<&str> = serve.then_some(tenant.id.as_str());
 
-    // Each role resolves on its own, so the emitter can sit on a local
-    // model while the replier stays in the cloud (or the other way round).
+    // One model writes the reply and chooses the actions, so there is one
+    // target to resolve. The summarizer still resolves on its own, and can
+    // still sit on a different model from the turn loop.
     let emitter_target = role(cfg, Role::Emitter)?;
-    let replier_target = role(cfg, Role::Replier)?;
     let emitter_key = key(&emitter_target)?;
-    let replier_key = key(&replier_target)?;
 
     // Settled before anything is built or dialled. `build_tools` opens the
     // pointer socket and arms an agent; failing after that on a typo in
@@ -482,27 +481,7 @@ pub(crate) async fn build_engine(
         // M10 P4. Both halves have to hold: the endpoint must forward a
         // breakpoint at all, and the operator must have said the emitter
         // prefix is worth one. Either off means the request is today's.
-        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter)
-        // M12 T1.1.
-        .with_capability(capability),
-    ));
-    b.set_replier(Box::new(
-        nsllm::replier::CloudReplier::new(
-            crate::client_for(
-                &replier_target,
-                transport.clone(),
-                &replier_key,
-                trace_tenant,
-            )
-            .with_usage_sink(usage.clone(), "replier"),
-            replier_target.model.clone(),
-        )
-        .with_shape(shape(
-            cfg,
-            &replier_target,
-            nsllm::replier::default_shape(),
-        )?)
-        .with_prompt_cache(replier_target.prompt_cache),
+        .with_prompt_cache(emitter_target.prompt_cache && cfg.llm.prompt_cache_emitter),
     ));
     b.set_memory(Arc::new(crate::models::store(cfg)));
     // Says whether the local model service is answering, when one is asked
@@ -613,13 +592,13 @@ pub(crate) async fn build_engine(
         caps: cfg.memory.caps(),
         facts_in_context: cfg.memory.facts_in_context,
         reply_grounding_check: cfg.memory.reply_grounding_check,
-        // M12 T1.2: a strong model is flagged and logged, never regenerated
-        // at — the second call buys nothing it did not already do.
-        reply_regenerate: capability != nscore::Capability::Strong,
-        // M12 T4.3: chat-tier act-or-answer, on unless `[llm]` says otherwise.
-        chat_act_or_answer: cfg.llm.chat_act_or_answer,
-        // M13 T2.1: and the same offer on Task and Deep, off unless asked.
-        act_or_answer_every_tier: cfg.llm.act_or_answer_every_tier,
+        // A flagged draft is logged and stands as written. This was the
+        // `Strong` half of a capability knob that no longer exists
+        // (2026-09-14): every deployment is now the strong one, and the
+        // second call the weak setting bought was a rewrite by the same
+        // model that had just been told what it got wrong.
+        reply_regenerate: false,
+
         // M13 T3.1: and the third branch, act *and* answer, likewise.
         act_and_answer: cfg.llm.act_and_answer,
         max_echo_ratio: cfg.memory.max_echo_ratio,
@@ -649,7 +628,7 @@ pub(crate) async fn build_engine(
         tool_result_max_chars: cfg.memory.tool_result_max_chars,
         recall_sessions: cfg.memory.recall_sessions,
         schema_profile,
-        capability,
+
         prune_inapplicable: true,
         router: cfg
             .router
@@ -669,11 +648,7 @@ pub(crate) async fn build_engine(
         max_requests,
     };
     let engine = Arc::new(Engine::new(parts, engine_cfg));
-    println!(
-        "ns-harness — {}  |  {}",
-        emitter_target.describe(),
-        replier_target.describe()
-    );
+    println!("ns-harness — {}", emitter_target.describe());
     if !cfg.engine.confirm_irreversible {
         // Said out loud because it is the one thing a glance at the process
         // cannot tell you, and because the gate it names is the one that would

@@ -50,14 +50,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // M12 T1.1, checked beside it: the emitter's preamble, the engine and
-    // the reply path all read the same one fact about the model in play.
-    // The factory resolves it again for the tenant it builds; refusing it
-    // here keeps a bad `[llm]` a startup error for every subcommand.
-    if let Err(e) = cfg.llm.capability() {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
     // M10 T2.3, resolved here for the same reason: an unreadable depth is a
     // startup error, not a turn that silently runs at the default.
     if let Err(e) = cfg.router.depth() {

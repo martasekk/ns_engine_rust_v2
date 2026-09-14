@@ -966,7 +966,7 @@ impl MemorySection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Emitter,
-    Replier,
+
     Summarizer,
 }
 
@@ -974,7 +974,6 @@ impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Emitter => "emitter",
-            Role::Replier => "replier",
             Role::Summarizer => "summarizer",
         }
     }
@@ -1117,47 +1116,11 @@ pub struct LlmConfig {
     /// M10 T1.6 say `slim` holds.
     #[serde(default)]
     pub schema_profile: Option<String>,
-    /// M12 T1.1: `"small"` (the default) or `"strong"` — which class of
-    /// model this deployment drives. `small` is today's behaviour byte for
-    /// byte; `strong` stands down the scaffolding that exists to compensate
-    /// for a weak emitter, and never adds any.
-    #[serde(default)]
-    pub capability: Option<String>,
-    /// M12 T4.3: on a chat-tier turn, let the one emitter call either act or
-    /// answer, and take its answer as the reply. Default **true** since M13,
-    /// the first default here that is not the behaviour which shipped before
-    /// its knob existed.
-    ///
-    /// It moved on the rule M12 wrote for it: a live reading below 2.00
-    /// requests per chat turn. M12 read exactly 2.00 and left it off, because
-    /// the array it sent still carried `respond_directly` and the model kept
-    /// calling it. With that tool gone (M13 T1.1) the same shape of script
-    /// read **1.80** over 10 chat-tier turns, 10 of 10 answered in the
-    /// emitter call, no grounding flag on any of them, 0 rejections, 0 text
-    /// fallbacks. `false` still buys the two-call chat turn byte for byte.
-    ///
-    /// Chat only, and only where a router is configured — the tier is what
-    /// decides it. On Task and Deep the emitter/replier split is doing real
-    /// work; on Chat the emitter call exists to say "no tool applies", which
-    /// is a sentence the same call could have spent on the user.
-    #[serde(default = "default_true")]
-    pub chat_act_or_answer: bool,
-    /// M13 T2.1: make the same offer on Task and Deep, so every iteration of
-    /// the loop is the model choosing between the next tool and the reply.
-    /// Default **false**, which is the chat-only offer above; it does nothing
-    /// unless `chat_act_or_answer` is on, because that knob is the offer.
-    ///
-    /// On a task turn the emitter is already holding the trace the replier
-    /// would narrate from, so ending the turn is a judgement it can make.
-    /// What the second call buys is a reading of that trace by a model which
-    /// did not choose the actions. That is worth a request on a long task and
-    /// not on a short one, and no reading yet says where the line falls.
-    #[serde(default)]
-    pub act_or_answer_every_tier: bool,
     /// M13 T3.1: let one call run the action *and* speak the line it came
     /// with, instead of that text becoming rationale and the turn buying a
     /// second call to say what it just did. Default **false**, and inert
-    /// unless `chat_act_or_answer` is on.
+    /// inert unless the model is offered the answer at all, which it always
+    /// is.
     ///
     /// Acting and answering were alternatives, which left the commonest task
     /// turn there is — do this, and tell me you did — costing two requests to
@@ -1166,10 +1129,9 @@ pub struct LlmConfig {
     /// instruction says so in as many words.
     #[serde(default)]
     pub act_and_answer: bool,
+    /// The model that chooses the actions and writes the reply.
     #[serde(default)]
     pub emitter: RoleSection,
-    #[serde(default)]
-    pub replier: RoleSection,
     /// The rolling-summary model (M6 §5.1). Falls back to the emitter's
     /// model and provider; any field can point it elsewhere.
     #[serde(default)]
@@ -1199,19 +1161,9 @@ impl LlmConfig {
         }
     }
 
-    /// `[llm] capability`, resolved. Err carries the message a startup
-    /// error should print; unset is [`nscore::Capability::Small`].
-    pub fn capability(&self) -> Result<nscore::Capability, String> {
-        match self.capability.as_deref() {
-            None => Ok(nscore::Capability::Small),
-            Some(s) => nscore::Capability::parse(s).map_err(|e| format!("[llm] {e}")),
-        }
-    }
-
     fn section(&self, role: Role) -> &RoleSection {
         match role {
             Role::Emitter => &self.emitter,
-            Role::Replier => &self.replier,
             Role::Summarizer => &self.summarizer,
         }
     }
@@ -1240,7 +1192,7 @@ impl LlmConfig {
             if switching {
                 self.base_url = None;
                 self.api_key_env = None;
-                for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+                for s in [&mut self.emitter, &mut self.summarizer] {
                     s.model = None;
                     s.base_url = None;
                     s.api_key_env = None;
@@ -1255,7 +1207,7 @@ impl LlmConfig {
             }
         }
         if let Some(m) = model {
-            for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+            for s in [&mut self.emitter, &mut self.summarizer] {
                 s.model = Some(m.clone());
             }
         }
@@ -1400,7 +1352,7 @@ impl LlmConfig {
 
     /// Emitter, replier, summarizer — the order the banner prints them in.
     pub fn roles(&self) -> Result<Vec<RoleTarget>, String> {
-        [Role::Emitter, Role::Replier, Role::Summarizer]
+        [Role::Emitter, Role::Summarizer]
             .into_iter()
             .map(|r| self.role(r))
             .collect()
@@ -1676,7 +1628,47 @@ impl EvolutionSection {
 
 impl AppConfig {
     pub fn parse(toml_text: &str) -> Result<AppConfig, String> {
-        toml::from_str(toml_text).map_err(|e| e.to_string())
+        let parsed: AppConfig = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        parsed.refuse_retired_keys(toml_text)?;
+        Ok(parsed)
+    }
+
+    /// Keys that used to mean something and no longer do.
+    ///
+    /// Nothing here denies unknown fields, so a key that is removed from the
+    /// struct becomes a line that parses and is ignored — a deployment that
+    /// pinned its reply model to a cheap one would go on paying for the
+    /// expensive one with the file still saying otherwise. A refusal naming
+    /// the key is the only version of this that a reader can act on.
+    fn refuse_retired_keys(&self, toml_text: &str) -> Result<(), String> {
+        let table: toml::Value = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        let retired = [
+            (
+                "llm.replier",
+                "the model that wrote the reply is the model that chooses the actions \
+                 (2026-09-14); set [llm.emitter] instead",
+            ),
+            (
+                "llm.capability",
+                "every deployment is the `strong` one now; the knob it selected is gone",
+            ),
+            (
+                "llm.chat_act_or_answer",
+                "the offer to answer is unconditional; there is no second model to \
+                 decline it in favour of",
+            ),
+            ("llm.act_or_answer_every_tier", "every tier is offered it"),
+        ];
+        for (path, why) in retired {
+            let mut here = Some(&table);
+            for segment in path.split('.') {
+                here = here.and_then(|t| t.get(segment));
+            }
+            if here.is_some() {
+                return Err(format!("[{path}] is no longer read: {why}"));
+            }
+        }
+        Ok(())
     }
 
     /// The agent to drive, if any. `NS_POINTER_ADDR` — the same variable
@@ -1718,7 +1710,7 @@ mod tests {
             base_url = "http://localhost:9999"
             [llm.emitter]
             model = "anthropic/claude-haiku-4.5"
-            [llm.replier]
+            [llm.summarizer]
             model = "anthropic/claude-sonnet-5"
             [engine]
             max_iterations = 4
@@ -1744,43 +1736,6 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
-    }
-
-    /// M13. On is the one-call chat turn the 2026-09-12 run measured at 1.80,
-    /// so an absent key and an absent `[llm]` table must both be `true`, an
-    /// explicit `false` must still buy the two-call turn back, and the key
-    /// has to survive being written down.
-    ///
-    /// The every-tier knob is the other way round: absent means Chat only,
-    /// which is what M12 shipped.
-    #[test]
-    fn chat_act_or_answer_defaults_to_on_and_round_trips() {
-        assert!(AppConfig::parse("").unwrap().llm.chat_act_or_answer);
-        assert!(
-            AppConfig::parse("[llm]\ncapability = \"strong\"")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(
-            !AppConfig::parse("[llm]\nchat_act_or_answer = false")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(
-            AppConfig::parse("[llm]\nchat_act_or_answer = true")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(!AppConfig::parse("").unwrap().llm.act_or_answer_every_tier);
-        assert!(
-            AppConfig::parse("[llm]\nact_or_answer_every_tier = true")
-                .unwrap()
-                .llm
-                .act_or_answer_every_tier
-        );
     }
 
     /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an
@@ -1852,36 +1807,6 @@ mod tests {
             .schema_profile()
             .unwrap_err();
         assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
-    }
-
-    /// M12 T1.1. Which class of model is driving decides how much scaffolding
-    /// the engine spends on it. `small` is today's behaviour byte for byte,
-    /// and an unknown spelling is a startup error rather than a silent
-    /// fallback: a deployment that asked for `strong` and got `small` would
-    /// pay for the regeneration it thought it had turned off.
-    #[test]
-    fn capability_defaults_to_small_and_rejects_an_unknown_name() {
-        assert_eq!(
-            AppConfig::parse("").unwrap().llm.capability().unwrap(),
-            nscore::Capability::Small
-        );
-        assert_eq!(
-            AppConfig::parse("[llm]\ncapability = \"strong\"")
-                .unwrap()
-                .llm
-                .capability()
-                .unwrap(),
-            nscore::Capability::Strong
-        );
-        let err = AppConfig::parse("[llm]\ncapability = \"huge\"")
-            .unwrap()
-            .llm
-            .capability()
-            .unwrap_err();
-        assert!(
-            err.contains("huge") && err.contains("small, strong"),
-            "{err}"
-        );
     }
 
     #[test]
@@ -1994,29 +1919,25 @@ mod tests {
             e.api_key_env, "OLLAMA_API_KEY",
             "preset still supplies the key env"
         );
-        // The replier keeps the preset's default model.
-        assert_eq!(cfg.llm.role(Role::Replier).unwrap().model, "qwen2.5:3b");
+        // And the summarizer follows the emitter, which is what it falls
+        // back to when it names no model of its own.
+        assert_eq!(cfg.llm.role(Role::Summarizer).unwrap().model, "gemma3:4b");
     }
 
     #[test]
     fn a_role_prefix_points_one_role_at_another_provider() {
         let cfg = AppConfig::parse(
-            "[llm]\nprovider = \"ollama\"\n[llm.replier]\nmodel = \"mistral:mistral-small-latest\"\n",
+            "[llm]\nprovider = \"ollama\"\n[llm.summarizer]\nmodel = \"mistral:mistral-small-latest\"\n",
         )
         .unwrap();
         let e = cfg.llm.role(Role::Emitter).unwrap();
         assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434"));
-        let r = cfg.llm.role(Role::Replier).unwrap();
+        let r = cfg.llm.role(Role::Summarizer).unwrap();
         assert_eq!(r.model, "mistral-small-latest");
         assert_eq!(r.base_url.as_deref(), Some("https://api.mistral.ai"));
         assert_eq!(r.api_key_env, "MISTRAL_API_KEY");
         assert_eq!(r.min_interval_ms, 1100);
         assert!(!r.local);
-        // The summarizer inherits the emitter, not the replier.
-        assert_eq!(
-            cfg.llm.role(Role::Summarizer).unwrap().base_url.as_deref(),
-            Some("http://localhost:11434")
-        );
     }
 
     #[test]
@@ -2040,7 +1961,7 @@ mod tests {
         let cfg = AppConfig::parse("[llm]\nprovider = \"openai\"").unwrap();
         let err = cfg.llm.role(Role::Emitter).unwrap_err();
         assert!(err.contains("[llm.emitter]"), "{err}");
-        let ok = AppConfig::parse("[llm]\nprovider = \"openai\"\n[llm.emitter]\nmodel = \"some-model\"\n[llm.replier]\nmodel = \"some-model\"\n").unwrap();
+        let ok = AppConfig::parse("[llm]\nprovider = \"openai\"\n[llm.emitter]\nmodel = \"some-model\"\n[llm.summarizer]\nmodel = \"some-model\"\n").unwrap();
         assert_eq!(ok.llm.role(Role::Emitter).unwrap().model, "some-model");
         assert_eq!(
             ok.llm.role(Role::Summarizer).unwrap().model,
@@ -2065,7 +1986,7 @@ mod tests {
         // Switching backends drops the old backend's model ids: asking
         // Ollama for "google/gemini-3.8-flash" is a 404, not a swap.
         let mut cloud = AppConfig::parse(
-            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n[llm.replier]\nmodel = \"google/gemini-3.8-flash\"\n",
+            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n[llm.summarizer]\nmodel = \"google/gemini-3.8-flash\"\n",
         )
         .unwrap();
         cloud.llm.apply_overrides(Some("ollama".into()), None);
@@ -2116,7 +2037,7 @@ mod tests {
             "openrouter/free"
         );
         assert_eq!(
-            cfg.llm.role(Role::Replier).unwrap().model,
+            cfg.llm.role(Role::Summarizer).unwrap().model,
             "openrouter/free"
         );
         assert_eq!(cfg.engine.max_iterations, 5);
@@ -2143,7 +2064,7 @@ mod tests {
     #[test]
     fn role_shaping_fields_default_to_none() {
         let cfg = AppConfig::parse("[llm]\nprovider = \"openrouter\"\n[llm.emitter]\n").unwrap();
-        for role in [Role::Emitter, Role::Replier, Role::Summarizer] {
+        for role in [Role::Emitter, Role::Summarizer, Role::Summarizer] {
             let shaping = cfg.llm.shaping(role).expect("an empty section parses");
             assert_eq!(shaping, nsllm::provider::RoleShaping::default(), "{role:?}");
         }
@@ -2173,7 +2094,7 @@ mod tests {
         assert_eq!(shaping.thinking, Some(false));
         // and only for the role that set them.
         assert_eq!(
-            cfg.llm.shaping(Role::Replier).unwrap(),
+            cfg.llm.shaping(Role::Summarizer).unwrap(),
             nsllm::provider::RoleShaping::default()
         );
     }
@@ -2182,9 +2103,9 @@ mod tests {
     /// in this file — not a silently dropped shape.
     #[test]
     fn unknown_shaping_values_are_rejected_at_parse() {
-        let cfg = AppConfig::parse("[llm.replier]\nreasoning = \"maximum\"\n").unwrap();
-        let err = cfg.llm.shaping(Role::Replier).unwrap_err();
-        assert!(err.starts_with("[llm.replier]"), "{err}");
+        let cfg = AppConfig::parse("[llm.summarizer]\nreasoning = \"maximum\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
+        assert!(err.starts_with("[llm.summarizer]"), "{err}");
         assert!(
             err.contains("maximum") && err.contains("\"medium\""),
             "{err}"

@@ -1,6 +1,6 @@
 use crate::traits::{
-    Channel, Consolidator, Emitter, Guard, MemoryStore, Replier, SummarizeError, Summarizer,
-    SummaryDraft, SummaryInput, Tool,
+    Channel, Consolidator, Emitter, Guard, MemoryStore, SummarizeError, Summarizer, SummaryDraft,
+    SummaryInput, Tool,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -26,7 +26,6 @@ impl Summarizer for NoopSummarizer {
 #[derive(Default)]
 pub struct HarnessBuilder {
     emitter: Option<Box<dyn Emitter>>,
-    replier: Option<Box<dyn Replier>>,
     memory: Option<Arc<dyn MemoryStore>>,
     channel: Option<Arc<dyn Channel>>,
     consolidator: Option<Box<dyn Consolidator>>,
@@ -52,7 +51,6 @@ pub enum BuildError {
 /// Validated wiring, consumed by the engine crate.
 pub struct HarnessParts {
     pub emitter: Box<dyn Emitter>,
-    pub replier: Box<dyn Replier>,
     pub memory: Arc<dyn MemoryStore>,
     /// Shared, not owned: the dispatcher's session tasks all send through
     /// the one channel while its `recv` is pending (multi-conversation plan
@@ -79,13 +77,6 @@ impl HarnessBuilder {
             self.dup.push("emitter");
         }
         self.emitter = Some(e);
-    }
-
-    pub fn set_replier(&mut self, r: Box<dyn Replier>) {
-        if self.replier.is_some() {
-            self.dup.push("replier");
-        }
-        self.replier = Some(r);
     }
 
     pub fn set_memory(&mut self, m: Arc<dyn MemoryStore>) {
@@ -133,20 +124,12 @@ impl HarnessBuilder {
     }
 
     pub fn build(self) -> Result<HarnessParts, BuildError> {
-        for slot in [
-            "emitter",
-            "replier",
-            "memory",
-            "channel",
-            "consolidator",
-            "summarizer",
-        ] {
+        for slot in ["emitter", "memory", "channel", "consolidator", "summarizer"] {
             if self.dup.contains(&slot) {
                 return Err(BuildError::DuplicateSlot(slot));
             }
         }
         let emitter = self.emitter.ok_or(BuildError::MissingSlot("emitter"))?;
-        let replier = self.replier.ok_or(BuildError::MissingSlot("replier"))?;
         let memory = self.memory.ok_or(BuildError::MissingSlot("memory"))?;
         let channel = self.channel.ok_or(BuildError::MissingSlot("channel"))?;
         let consolidator = self
@@ -166,7 +149,6 @@ impl HarnessBuilder {
         }
         Ok(HarnessParts {
             emitter,
-            replier,
             memory,
             channel,
             consolidator,
@@ -195,14 +177,6 @@ mod tests {
             _legal: &LegalActionSet,
         ) -> Result<Proposal, EmitError> {
             Err(EmitError::Malformed("null".into()))
-        }
-    }
-
-    struct NullReplier;
-    #[async_trait]
-    impl Replier for NullReplier {
-        async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-            Ok("".into())
         }
     }
 
@@ -344,7 +318,6 @@ mod tests {
     }
 
     fn fill_rest(b: &mut HarnessBuilder) {
-        b.set_replier(Box::new(NullReplier));
         b.set_memory(Arc::new(NullStore));
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NullConsolidator));

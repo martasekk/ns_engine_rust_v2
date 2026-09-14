@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use nscore::{
     ActionSpec, ClassifiedProposal, Emission, EmitError, Emitter, EmitterContext, Guard, GuardCtx,
-    LegalActionSet, Proposal, Replier, ReplyContext, ReplyError, SideEffect, Tool, ToolCtx,
-    ToolError, ToolOutput, Trust, Verdict,
+    LegalActionSet, Proposal, SideEffect, Tool, ToolCtx, ToolError, ToolOutput, Trust, Verdict,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -67,20 +66,19 @@ impl Emitter for ScriptedEmitter {
 
     async fn propose_or_answer(
         &self,
-        _ctx: EmitterContext,
+        ctx: EmitterContext,
         _legal: &LegalActionSet,
     ) -> Result<Emission, EmitError> {
-        Ok(self.pop())
-    }
-}
-
-/// Echoes the turn trace back: "TRACE:\n<turn_trace>".
-pub struct ScriptedReplier;
-
-#[async_trait]
-impl Replier for ScriptedReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        Ok(format!("TRACE:\n{}", ctx.turn_trace))
+        let mut emission = self.pop();
+        // A script that ends the turn without saying what to say answers
+        // with the trace, which is what `ScriptedReplier` did before the
+        // second model went (2026-09-14). It is the same double in the same
+        // place: the trace is what the reply was always narrated from, and
+        // the emitter is now the thing holding it.
+        if emission.answer.is_none() && emission.proposal.action == "respond_directly" {
+            emission.answer = Some(format!("TRACE:\n{}", ctx.trace_so_far.join("\n")));
+        }
+        Ok(emission)
     }
 }
 
@@ -238,9 +236,11 @@ mod tests {
         assert_eq!(p2.action, "respond_directly");
     }
 
-    /// M12 T4.4a. `answering` is the only way a script carries a reply text,
-    /// and `new` must keep meaning "act, never answer" — every test written
-    /// before M12 builds its emitter that way.
+    /// `answering` is how a script says what the reply should be. A script
+    /// that ends the turn without saying answers with the trace instead —
+    /// which is what the scripted *replier* did before the second model went
+    /// (2026-09-14), and is why the tests that used to set one did not have
+    /// to be told what to answer.
     #[tokio::test]
     async fn a_scripted_emission_can_answer_instead_of_acting() {
         let e = ScriptedEmitter::answering(vec![Emission {
@@ -255,12 +255,20 @@ mod tests {
         let first = e.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
         assert_eq!(first.answer.as_deref(), Some("it is 10:41"));
         assert_eq!(first.proposal.action, "respond_directly");
-        // Exhausted, it falls back to the same respond_directly as `new`.
+        // Exhausted, it ends the turn and narrates the trace.
         let second = e.propose_or_answer(ctx(), &legal_echo()).await.unwrap();
-        assert_eq!(second.answer, None);
         assert_eq!(second.proposal.action, "respond_directly");
+        assert!(
+            second
+                .answer
+                .as_deref()
+                .is_some_and(|a| a.starts_with("TRACE:")),
+            "an unscripted ending answers with the trace: {:?}",
+            second.answer
+        );
 
-        // And a plain script never answers, whichever method is called.
+        // A script that is still acting answers nothing: the text belongs to
+        // the call that ends the turn.
         let plain = ScriptedEmitter::new(vec![Proposal {
             rationale: "r".into(),
             action: "echo".into(),

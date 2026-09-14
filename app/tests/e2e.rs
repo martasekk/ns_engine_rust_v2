@@ -1,5 +1,5 @@
 use nscore::*;
-use nsengine::script::{EchoTool, ScriptedEmitter, ScriptedReplier};
+use nsengine::script::{EchoTool, ScriptedEmitter};
 use nsengine::store::NoopConsolidator;
 use nsengine::turn::{Engine, EngineConfig};
 use nsmemory_sqlite::SqliteStore;
@@ -31,7 +31,6 @@ async fn full_turn_persists_to_sqlite_and_chain_survives_reopen() {
             action: "echo".into(),
             args: serde_json::json!({"text": "hello"}),
         }])));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store);
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -63,7 +62,6 @@ async fn full_turn_persists_to_sqlite_and_chain_survives_reopen() {
 
         let mut b = HarnessBuilder::new();
         b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -120,7 +118,6 @@ async fn two_overlapping_turns_on_one_session_lose_one_silently() {
     let sid = SessionId("one".into());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(YieldingEmitter(ScriptedEmitter::new(vec![]))));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -206,7 +203,6 @@ async fn serve_answers_a_tcp_client_through_the_dispatcher() {
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_shared_channel(channel);
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -344,7 +340,6 @@ async fn one_process_serves_two_tenants_with_different_personas_over_one_port() 
             action: "echo".into(),
             args: serde_json::json!({ "text": format!("{tenant} speaking") }),
         }])));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_shared_channel(channel.clone());
         b.set_consolidator(Box::new(NoopConsolidator));

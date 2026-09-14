@@ -13,17 +13,25 @@ uses (`→`), and prints what each role resolves to. Start there.
 
 ---
 
-## 1. The three roles
+## 1. The two roles
 
 | Role | What it does | Needs |
 | --- | --- | --- |
-| `emitter` | turns your message into one tool call | **function calling** |
-| `replier` | writes the sentence you read, from the turn's results | instruction-following prose |
+| `emitter` | turns your message into one tool call, or into the reply | **function calling**, and prose |
 | `summarizer` | folds old turns into a rolling summary | JSON out; cheap is fine |
 
-They resolve **independently**. Unset roles fall back to `[llm]`; the
-summarizer falls back to the emitter. So you can put the emitter on a local
-model and the replier on a cloud one, or vice versa.
+There were three until 2026-09-14, when the `replier` — a second model that
+wrote the sentence you read from the turn's results — was folded into the
+first. One call now chooses the action and writes the reply, so the model
+that does it needs both function calling and prose worth reading.
+
+They resolve **independently**. An unset role falls back to `[llm]`; the
+summarizer falls back to the emitter. So the turn can run on a cloud model
+while the summarizer stays local, or the other way round.
+
+`[llm.replier]` is refused at startup by name rather than ignored: a config
+that still pins a reply model would otherwise go on paying for a model it no
+longer names.
 
 ## 2. Three ways to swap
 
@@ -43,8 +51,8 @@ NS_PROVIDER=ollama NS_MODEL=qwen2.5:7b cargo run -p ns-app
 # just one role — "provider:model" in that role's model field
 [llm]
 provider = "ollama"                              # emitter + summarizer local
-[llm.replier]
-model = "mistral:mistral-small-latest"           # replier in the cloud
+[llm.summarizer]
+model = "mistral:mistral-small-latest"           # the summarizer in the cloud
 ```
 
 Only a **known provider name** counts as a `provider:` prefix, so model ids
@@ -125,7 +133,7 @@ api_key_env = "EXAMPLE_API_KEY"
 min_interval_ms = 500
 [llm.emitter]
 model = "their-model-id"
-[llm.replier]
+[llm.summarizer]
 model = "their-model-id"
 ```
 
@@ -142,9 +150,10 @@ To make it a preset instead, add one row to `PROVIDERS` in
 
 ## 7. Picking a model (this box: 4 vCPU, 11 GB RAM, no GPU)
 
-The emitter's job — choose one tool call — is easy. The **replier's** job is
-where small models fall apart: it must turn a structured trace (recall hits,
-tool outputs, fact lines) into a sentence.
+Choosing one tool call is the easy half. Turning a structured trace (recall
+hits, tool outputs, fact lines) into a sentence is where small models fall
+apart — and since 2026-09-14 the same call does both, so the model you pick
+has to be good at the hard half.
 
 - `qwen2.5:3b` — ~12 s/turn on CPU. Calls tools correctly. But it **copies
   its context instead of writing prose**: asked "whats my name" it has
@@ -155,15 +164,18 @@ tool outputs, fact lines) into a sentence.
   engine; poor as a conversationalist.
 - Larger local (7–8B) — noticeably better prose, ~3× slower on CPU. Worth it
   if the replies matter more than latency.
-- **Split the roles** — the cheapest fix. Keep tool selection local and put
-  only the replier on a cloud model:
+- **Put the turn on a cloud model and keep the summarizer local** — the
+  summarizer's output is never read by a person, so it is the half that can
+  stay cheap:
   ```toml
   [llm]
-  provider = "ollama"
-  [llm.replier]
-  model = "mistral:mistral-small-latest"
+  provider = "mistral"
+  [llm.summarizer]
+  model = "ollama:qwen2.5:3b"
   ```
-  Most requests in a turn are emitter calls, so this stays mostly local.
+  Splitting the other way was the advice until the reply model went: it is no
+  longer available, because there is no role left that writes prose nobody
+  reads.
 - Avoid reasoning/"thinking" models through Ollama's OpenAI endpoint (see
   the `ollama` row above).
 
@@ -177,7 +189,7 @@ cargo run -p ns-app                     # the banner names each role's model
 The banner is the ground truth:
 
 ```
-ns-harness — emitter: qwen2.5:3b @ http://localhost:11434  |  replier: …
+ns-harness — emitter: qwen2.5:3b @ http://localhost:11434
 ```
 
 Then ask something that uses a tool (`what time is it?`) and something that
@@ -190,13 +202,13 @@ JSONL — every proposal, rejection and tool result for the turn.
 | --- | --- | --- |
 | `X_API_KEY is not set — the emitter role needs a provider API key.` | No key in the environment for the resolved provider | `export X_API_KEY=…`, or switch to a local backend: `NS_PROVIDER=ollama` |
 | `[llm] provider "ollamma" is unknown — known providers: …` | Typo in the preset name | Use a listed name (startup fails deliberately rather than falling back to someone else's endpoint — and someone else's bill) |
-| `[llm.emitter] model is not set and provider "openai" has no default` | That preset ships no default model | Add `[llm.emitter] model = "…"` (and `[llm.replier]`) |
+| `[llm.emitter] model is not set and provider "openai" has no default` | That preset ships no default model | Add `[llm.emitter] model = "…"` (and `[llm.summarizer]`) |
 | `[llm.emitter] model is not set and base_url "…" matches no preset` | Custom endpoint, no model named | Name the model per role |
 | `Sorry, I couldn't complete that. Reason: … transport: status 429` | Rate limit | Raise `min_interval_ms`, or move to a local provider. 429/5xx already retry at 1 s / 2 s / 4 s |
 | `… transport: status 402` | Out of credit/quota | Provider-side, not the harness |
 | `… transport: status 422` | Provider rejected the request shape | Usually a strict provider and an unknown field: try `prompt_cache = false` |
 | Replies take minutes locally | A thinking model on CPU | Use a non-thinking model (`qwen2.5:3b`, `gemma3`) |
-| Replies echo the harness's internals (`fact user.name = "Peter"`), repeat, or continue the transcript | The replier model is too small to compose from structured context, and its own output is fed back through the verbatim window | Bigger replier model, or put just the replier on a cloud provider (§7) |
+| Replies echo the harness's internals (`fact user.name = "Peter"`), repeat, or continue the transcript | The model is too small to compose from structured context, and its own output is fed back through the verbatim window | A bigger model for the turn, or put the turn on a cloud provider (§7) |
 | `ran out of steps after 5 actions` | The emitter loops on tool calls instead of answering | Small-model behaviour; raise `[engine] max_iterations`, or use a stronger emitter |
 | Everything answers "Sorry, I couldn't complete that." | Usually the provider, not the engine | `cargo run -p ns-app -- dump cli \| tail` shows the real `Rejected` reason |
 

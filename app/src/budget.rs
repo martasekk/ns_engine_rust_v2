@@ -62,11 +62,10 @@ struct Measured {
     /// T2.3 reads is a *level* against the provider's 1,024-token floor, and
     /// a sum over four calls clears a floor no single call does.
     emitter_prefix: Vec<u32>,
-    replier_prefix: Vec<u32>,
 }
 
 impl Measured {
-    fn add_call(&mut self, usage: &Usage, manifest: &ContextManifest, persona_chars: usize) {
+    fn add_call(&mut self, usage: &Usage, manifest: &ContextManifest) {
         self.calls += 1;
         self.requests += usage.attempts;
         match usage.role.as_str() {
@@ -103,9 +102,6 @@ impl Measured {
                 "emitter" => self
                     .emitter_prefix
                     .push(nscore::estimate_tokens(stable + manifest.window_chars)),
-                "replier" => self
-                    .replier_prefix
-                    .push(nscore::estimate_tokens(persona_chars + stable)),
                 _ => {}
             }
         }
@@ -130,7 +126,6 @@ impl Measured {
         self.clipped_chars += other.clipped_chars;
         self.tool_calls += other.tool_calls;
         self.emitter_prefix.extend_from_slice(&other.emitter_prefix);
-        self.replier_prefix.extend_from_slice(&other.replier_prefix);
     }
 
     fn cells(&self, label: String) -> Vec<String> {
@@ -250,7 +245,6 @@ pub fn render_budget(
     caps: Caps,
     verbatim_lines: usize,
     tool_result_max_chars: usize,
-    persona_chars: usize,
     specs: &[nscore::ActionSpec],
 ) -> String {
     if events.is_empty() {
@@ -261,7 +255,7 @@ pub fn render_budget(
         .iter()
         .any(|e| matches!(e.kind, EventKind::ModelCall { .. }))
     {
-        render_measured(events, persona_chars, specs)
+        render_measured(events, specs)
     } else {
         render_reconstructed(
             events,
@@ -320,12 +314,13 @@ fn chat_counter_line(events: &[Event]) -> String {
     let answered = chat_turns
         .iter()
         .filter(|turn| {
-            let mut proposals = events.iter().filter(|e| e.turn == **turn).filter_map(|e| {
-                match &e.kind {
+            let mut proposals = events
+                .iter()
+                .filter(|e| e.turn == **turn)
+                .filter_map(|e| match &e.kind {
                     EventKind::Proposed { proposal } => Some(proposal.action.as_str()),
                     _ => None,
-                }
-            });
+                });
             // "Only `respond_directly`" means at least one proposal and
             // nothing else. A turn that proposed nothing at all answered
             // through a fallback, and counting it here would flatter the
@@ -372,7 +367,7 @@ fn chat_counter_line(events: &[Event]) -> String {
     )
 }
 
-fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::ActionSpec]) -> String {
+fn render_measured(events: &[Event], specs: &[nscore::ActionSpec]) -> String {
     let mut rows: Vec<Measured> = Vec::new();
     for e in events {
         if !rows.iter().any(|r| r.turn == e.turn) {
@@ -386,9 +381,7 @@ fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::Acti
             .find(|r| r.turn == e.turn)
             .expect("just inserted");
         match &e.kind {
-            EventKind::ModelCall { usage, manifest } => {
-                row.add_call(usage, manifest, persona_chars)
-            }
+            EventKind::ModelCall { usage, manifest } => row.add_call(usage, manifest),
             EventKind::ToolCalled { .. } => row.tool_calls += 1,
             _ => {}
         }
@@ -457,19 +450,16 @@ fn render_measured(events: &[Event], persona_chars: usize, specs: &[nscore::Acti
     // what a typical call would cache, the max whether any call clears the
     // floor at all.
     out.push_str(&format!(
-        "stable prefix (est.): emitter {} (facts+summary+window) \u{b7}          replier {} (persona+facts+summary) \u{b7} breakpoint floor 1,024\n",
+        "stable prefix (est.): {} (facts+summary+window) \u{b7} breakpoint floor 1,024\n",
         prefix_summary(&total.emitter_prefix),
-        prefix_summary(&total.replier_prefix),
     ));
-    // M12 T1.4. The system prompt rides every emitter call and every
-    // iteration of every turn, so what the trimmed preamble saves is read
-    // per call, not per session — which is why both numbers are printed and
-    // neither is multiplied out here.
-    let (small, strong) = nsllm::emitter::system_prompts();
+    // The system prompt rides every emitter call and every iteration of
+    // every turn, so it is read per call rather than per session and is not
+    // multiplied out here. There were two of these until the capability knob
+    // went (2026-09-14); now there is one, and it is the short one.
     out.push_str(&format!(
-        "emitter system prompt (est.): small {} tokens \u{b7} strong {} tokens\n",
-        nscore::estimate_tokens(small.len()),
-        nscore::estimate_tokens(strong.len()),
+        "emitter system prompt (est.): {} tokens\n",
+        nscore::estimate_tokens(nsllm::emitter::system_prompts().len()),
     ));
     out.push_str(&render_tool_table(events, specs));
     // M13 T3.3: only where it is true. OpenRouter's daily allowance counts
@@ -929,7 +919,7 @@ mod tests {
             usage("replier", 1, 800, 0),
             manifest(0, 900, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -968,7 +958,7 @@ mod tests {
             usage("replier", 1, 2_000, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         assert!(row.contains("20.0%"), "200 of 1000 emitter tokens: {row}");
@@ -1003,7 +993,7 @@ mod tests {
         let mut guessed = cached("replier", 5_000, 999);
         guessed.estimated = true;
         call(&mut log, 1, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let row = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = row.split_whitespace().collect();
@@ -1036,7 +1026,7 @@ mod tests {
             usage("summarizer", 1, 100, 0),
             manifest(0, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let line = out
             .lines()
@@ -1044,15 +1034,11 @@ mod tests {
             .expect("a stable prefix line");
         assert!(
             line.contains(&format!(
-                "emitter median {} tok, max {} (facts+summary+window)",
+                "median {} tok, max {} (facts+summary+window)",
                 nscore::estimate_tokens(8_000),
                 nscore::estimate_tokens(12_000)
             )),
             "median is the middle of 4k/8k/12k and the summarizer is out: {line}"
-        );
-        assert!(
-            line.contains("replier n/a (persona+facts+summary)"),
-            "no replier called, so no replier prefix: {line}"
         );
         assert!(line.contains("breakpoint floor 1,024"), "{line}");
     }
@@ -1066,7 +1052,7 @@ mod tests {
         let mut guessed = usage("replier", 1, 100, 0);
         guessed.estimated = true;
         call(&mut log, 2, guessed, manifest(0, 0, 0));
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         assert!(
             out.lines().any(|l| l.starts_with("t1 ")),
@@ -1097,7 +1083,7 @@ mod tests {
             },
         );
         replied(&mut log, 2, "je poledne");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         assert!(out.contains("estimated (reconstructed)"), "{out}");
         assert!(out.contains("A floor, not a measurement"), "{out}");
@@ -1173,7 +1159,7 @@ mod tests {
             },
         );
         replied(&mut log, 1, "a browser window");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let t1 = out.lines().find(|l| l.starts_with("t1")).expect("a t1 row");
         let cells: Vec<&str> = t1.split_whitespace().collect();
@@ -1222,9 +1208,13 @@ mod tests {
                     "button": {"type": "string", "enum": ["left", "right", "middle"]},
                 }),
             ),
-            spec("ask_clarification", "Ask one short question.", serde_json::json!({
-                "question": {"type": "string"}
-            })),
+            spec(
+                "ask_clarification",
+                "Ask one short question.",
+                serde_json::json!({
+                    "question": {"type": "string"}
+                }),
+            ),
             spec("recall", "Search earlier turns.", serde_json::json!({})),
         ];
         // Turn 1 was legal for all three, turn 2 for one — the narrowing the
@@ -1260,7 +1250,7 @@ mod tests {
             usage("replier", 1, 500, 0),
             ContextManifest::default(),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &specs);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &specs);
 
         let table: Vec<&str> = out
             .lines()
@@ -1332,7 +1322,7 @@ mod tests {
             usage("emitter", 1, 1_000, 731),
             manifest(17, 0, 0),
         );
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         assert!(out.contains("per-tool schemas: n/a"), "{out}");
         assert!(
             out.contains("1 call carried tools but recorded no names"),
@@ -1392,7 +1382,7 @@ mod tests {
                 },
             );
         }
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
 
         let line = out
             .lines()
@@ -1441,7 +1431,7 @@ mod tests {
                 },
             );
         }
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         let lines: Vec<&str> = out.lines().collect();
         let at = lines
             .iter()
@@ -1497,15 +1487,14 @@ mod tests {
         proposed(&mut log, 3, "respond_directly", "done");
         call(&mut log, 3, usage("replier", 1, 100, 0), chat());
 
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         let line = out
             .lines()
             .find(|l| l.starts_with("answered in the emitter call"))
             .expect("an act-or-answer counter line");
         // (1 + 2 + 3) / 3 = 2.00.
         assert_eq!(
-            line,
-            "answered in the emitter call: 1 of 3; requests per chat turn: 2.00",
+            line, "answered in the emitter call: 1 of 3; requests per chat turn: 2.00",
             "{out}"
         );
         // It sits with the line it qualifies, not somewhere else on the page.
@@ -1545,22 +1534,42 @@ mod tests {
 
         let mut log = log();
         // Turn 1: chat, answered outright.
-        call(&mut log, 1, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+        call(
+            &mut log,
+            1,
+            usage("emitter", 1, 100, 0),
+            tiered(nscore::Tier::Chat),
+        );
         proposed(&mut log, 1, "respond_directly");
         // Turn 2: chat, but it reached for a tool first — the case the
         // single-call path would have to keep working.
-        call(&mut log, 2, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+        call(
+            &mut log,
+            2,
+            usage("emitter", 1, 100, 0),
+            tiered(nscore::Tier::Chat),
+        );
         proposed(&mut log, 2, "get_time");
         proposed(&mut log, 2, "respond_directly");
         // Turn 3: a task turn. Not in either half of the fraction.
-        call(&mut log, 3, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Task));
+        call(
+            &mut log,
+            3,
+            usage("emitter", 1, 100, 0),
+            tiered(nscore::Tier::Task),
+        );
         proposed(&mut log, 3, "respond_directly");
         // Turn 4: chat, no proposal at all — a fallback answered it, and
         // counting that as "answered without a tool" would flatter the
         // number the decision is waiting on.
-        call(&mut log, 4, usage("emitter", 1, 100, 0), tiered(nscore::Tier::Chat));
+        call(
+            &mut log,
+            4,
+            usage("emitter", 1, 100, 0),
+            tiered(nscore::Tier::Chat),
+        );
 
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         let line = out
             .lines()
             .find(|l| l.starts_with("chat turns answered without a tool"))
@@ -1574,7 +1583,7 @@ mod tests {
         // "0 of 0" would read as a chat path that always reached for a tool.
         let mut plain = EventLog::new(SessionId("b".into()));
         said(&mut plain, 1, "ahoj");
-        let out = render_budget(plain.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(plain.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         assert!(out.contains("no chat-tier turns in this log"), "{out}");
     }
 
@@ -1585,7 +1594,7 @@ mod tests {
         let mut log = log();
         said(&mut log, 1, "ahoj");
         replied(&mut log, 1, "zdravím");
-        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(log.events(), 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         assert!(
             out.contains("rejections by reason: no proposals in this log"),
             "{out}"
@@ -1595,7 +1604,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_says_so_instead_of_printing_a_table() {
-        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP, 0, &[]);
+        let out = render_budget(&[], 6, Caps::default(), 5, DEFAULT_CAP, &[]);
         assert!(out.contains("no events for this session"), "{out}");
         assert!(!out.contains("turn"), "no header for nothing: {out}");
     }

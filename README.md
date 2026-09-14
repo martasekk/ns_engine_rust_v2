@@ -2,9 +2,9 @@
 
 A Rust workspace for an agent that emits **actions**, not prose. A language
 model proposes structured actions against a declared schema; a deterministic
-engine validates, guards, stages and executes them; a second model writes the
-reply from the trace of what actually happened. The model never gets to say
-that something was done — the trace does.
+engine validates, guards, stages and executes them; the reply is written from
+the trace of what actually happened and checked against it. The model never
+gets to say that something was done — the trace does.
 
 One of the action families is **pointer control**: moving the mouse, clicking,
 typing and reading the UI tree of *another machine*, over an authenticated
@@ -13,7 +13,7 @@ socket, behind two independent confirmation gates.
 ```
 crates/core           actions, events, values, validation, learned rules
 crates/engine         the turn loop: emit → validate → guard → execute → reply
-crates/llm            provider-agnostic chat client, emitter/replier/summarizer
+crates/llm            provider-agnostic chat client: the turn model and the summarizer
 crates/memory-sqlite  the event log and an FTS5 index over it
 crates/provenance     where a fact came from
 crates/evolution      the self-improvement pass: mine → propose → gate → apply
@@ -39,9 +39,20 @@ The engine is the part that must not be clever. Each turn:
    `confirm_pending` action that is valid for exactly one turn. Nothing with a
    side effect happens without a confirmation crossing the loop.
 4. Surviving actions execute; each outcome is appended to the log.
-5. The **replier** model writes the user-facing text from the trace, and a
-   grounding check regenerates a reply once if it invents numbers or names
-   that appear nowhere in its material.
+5. The loop ends when the model answers instead of acting. Every call is
+   offered both, on every tier, so the turn is over when the model says it is
+   — and the text it wrote is the reply, checked against the trace for
+   numbers and names that appear nowhere in its material and flagged in the
+   log when it finds them.
+
+There were two models here until 2026-09-14: one to choose the actions and a
+second to narrate what happened. The second was already skipped on chat
+turns, and what it bought elsewhere was a reading of the trace by a model
+that had not chosen the actions — worth a request on a long task, dead weight
+on a short one. It is one call now. The grounding, echo and citation checks
+still run against the same material; what went with the second model is the
+ability to *rewrite* a flagged draft, which only ever fired for a model too
+weak to be trusted with the first one.
 
 Working memory keeps the last few turns verbatim, pins user facts, and folds
 everything older into a rolling summary. `recall` searches the whole log.
@@ -96,7 +107,7 @@ refused instead of finding out from the refusal.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 922 tests, no network required
+cargo test  --workspace          # 907 tests, no network required
 
 cp config.example.toml config.toml
 cargo run -p ns-app -- providers # which providers exist, which keys are set

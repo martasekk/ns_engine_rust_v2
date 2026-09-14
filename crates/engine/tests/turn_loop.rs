@@ -16,6 +16,82 @@ impl Channel for NullChannel {
     }
 }
 
+/// An emission that ends the turn with one sentence.
+///
+/// The shape every test that used to script a replier takes now: the model
+/// that chose the actions is the model that writes the reply, so a test
+/// saying what the user should be told says it here.
+fn answers(text: &str) -> Emission {
+    Emission {
+        proposal: Proposal {
+            rationale: format!("{} {text}", nscore::ANSWERED_IN_EMITTER_PREFIX),
+            action: "respond_directly".into(),
+            args: serde_json::json!({}),
+        },
+        answer: Some(text.into()),
+        say: None,
+    }
+}
+
+/// An emitter that answers with one thing it was shown.
+///
+/// These were reply-side probes until the second model went (2026-09-14),
+/// and they asked the same question: does what the config and the store put
+/// in reach the model that writes the sentence the user reads. That model is
+/// the emitter now, so the probe moved rather than the question.
+struct ContextProbe {
+    render: fn(&EmitterContext) -> String,
+    /// Acted out first, so a probe can report a context that has a trace in
+    /// it. Empty is "answer immediately".
+    before: std::sync::Mutex<std::collections::VecDeque<Proposal>>,
+}
+
+impl ContextProbe {
+    fn new(render: fn(&EmitterContext) -> String) -> Self {
+        Self {
+            render,
+            before: Default::default(),
+        }
+    }
+
+    fn after(proposals: Vec<Proposal>, render: fn(&EmitterContext) -> String) -> Self {
+        Self {
+            render,
+            before: std::sync::Mutex::new(proposals.into()),
+        }
+    }
+
+    fn next(&self, ctx: &EmitterContext) -> Emission {
+        match self.before.lock().expect("probe lock").pop_front() {
+            Some(proposal) => Emission {
+                proposal,
+                answer: None,
+                say: None,
+            },
+            None => answers(&(self.render)(ctx)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Emitter for ContextProbe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Ok(self.next(&ctx).proposal)
+    }
+
+    async fn propose_or_answer(
+        &self,
+        ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        Ok(self.next(&ctx))
+    }
+}
+
 fn engine_with(
     proposals: Vec<Proposal>,
     guards: Vec<Box<dyn Guard>>,
@@ -23,7 +99,6 @@ fn engine_with(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -33,10 +108,11 @@ fn engine_with(
     }
     Engine::with_clock(
         b.build().unwrap(),
-        // `ScriptedReplier` answers with the turn trace verbatim — that is
-        // its whole job, so tests can assert on what the replier was shown.
-        // The copy bound would (correctly) flag every one of its replies, so
-        // it is off here and exercised on its own double instead.
+        // A scripted emitter that is not told what to answer answers with
+        // the turn trace verbatim, so tests can assert on what the turn had
+        // to narrate from. The copy bound would (correctly) flag every one
+        // of those replies, so it is off here and exercised on its own
+        // double instead.
         EngineConfig {
             max_echo_ratio: 1.1,
             ..EngineConfig::default()
@@ -208,74 +284,16 @@ fn kind_name(k: &EventKind) -> &'static str {
     }
 }
 
-/// First draft invents a count and a city; the second draft reports what it
-/// was told not to state.
-struct InventingReplier(std::sync::atomic::AtomicU32);
-#[async_trait::async_trait]
-impl Replier for InventingReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if n == 0 {
-            assert!(ctx.do_not_state.is_empty());
-            Ok("You have 42 orders waiting in Oslo.".into())
-        } else {
-            Ok(format!(
-                "Nothing to report. Avoided: {}",
-                ctx.do_not_state.join(",")
-            ))
-        }
-    }
-}
-
+/// The grounding check observes and does not act. It used to name the
+/// unsupported claims and buy a second call to write the sentence again
+/// without them; there is no second model to ask now, and the draft the
+/// emitter wrote is what the user is told.
+///
+/// What survives is the part that was always doing the work: the flag is
+/// free, it is written every time, and the evolution pass mines it. An
+/// ungrounded reply is still a fact about the turn.
 #[tokio::test]
-async fn ungrounded_reply_is_flagged_logged_and_regenerated_once() {
-    let store = Arc::new(InMemoryStore::new());
-    let sid = SessionId("ground".into());
-    let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
-    b.set_replier(Box::new(InventingReplier(Default::default())));
-    b.set_memory(store.clone());
-    b.set_channel(Box::new(NullChannel));
-    b.set_consolidator(Box::new(NoopConsolidator));
-    b.add_tool(Arc::new(EchoTool::new()));
-    let e = Engine::with_clock(
-        b.build().unwrap(),
-        EngineConfig::default(),
-        Box::new(|| Timestamp(42)),
-    );
-    let reply = e
-        .run_turn(Incoming {
-            session: sid.clone(),
-            text: "anything new?".into(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(reply, "Nothing to report. Avoided: 42,Oslo");
-    let events = store.load(&sid).await.unwrap();
-    let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
-    assert_eq!(
-        kinds,
-        vec!["UserSaid", "Proposed", "Settled", "ReplyFlagged", "Replied"]
-    );
-    assert!(events.iter().any(|ev| matches!(
-        &ev.kind,
-        EventKind::ReplyFlagged { draft, spans }
-            if draft == "You have 42 orders waiting in Oslo." && spans == &["42", "Oslo"]
-    )));
-    // The recording replays clean: the interceptor is off under doubles and
-    // ReplyFlagged is not a behavioral line.
-    nsengine::replay::replay_session(sid, &events, vec![])
-        .await
-        .unwrap();
-}
-
-/// M12 T1.2. On a strong model the flag stays and the second call goes: the
-/// observation is what the log is graded on and it is free, while the
-/// regeneration is a billed request that exists to talk a weak model out of
-/// a fabrication. The first draft is what the user is told, and it flows
-/// down the same citation path any unflagged draft does.
-#[tokio::test]
-async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
+async fn an_ungrounded_reply_is_flagged_logged_and_still_the_reply() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("ground_strong".into());
     // A fact the draft states, so the draft has something to cite while
@@ -292,20 +310,18 @@ async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
         })
         .await
         .unwrap();
-    let replier = Arc::new(InventingReplier(Default::default()));
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
-    b.set_replier(Box::new(CountingReplier(replier.clone())));
+    // The city is a fact it may state; the count is invented.
+    b.set_emitter(Box::new(ScriptedEmitter::answering(vec![answers(
+        "You have 42 orders waiting in Oslo.",
+    )])));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
     b.add_tool(Arc::new(EchoTool::new()));
     let e = Engine::with_clock(
         b.build().unwrap(),
-        EngineConfig {
-            reply_regenerate: false,
-            ..EngineConfig::default()
-        },
+        EngineConfig::default(),
         Box::new(|| Timestamp(42)),
     );
     let reply = e
@@ -315,13 +331,8 @@ async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
         })
         .await
         .unwrap();
-    // The first draft, verbatim.
+    // What the emitter wrote, verbatim.
     assert_eq!(reply, "You have 42 orders waiting in Oslo.");
-    assert_eq!(
-        replier.0.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "one replier request, not two"
-    );
     let events = store.load(&sid).await.unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
     assert!(kinds.contains(&"ReplyFlagged"), "{kinds:?}");
@@ -337,40 +348,26 @@ async fn a_flagged_reply_is_logged_but_not_regenerated_under_strong() {
     )));
 }
 
-/// Hands every reply to the inner double so a test can count the calls the
-/// engine made without owning the double.
-struct CountingReplier(Arc<InventingReplier>);
-#[async_trait::async_trait]
-impl Replier for CountingReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        self.0.reply(ctx).await
-    }
-}
-
-/// The live failure, as a double: a draft that copies a line out of the turn
-/// trace instead of answering.
-struct ParrotingReplier(std::sync::atomic::AtomicU32);
-#[async_trait::async_trait]
-impl Replier for ParrotingReplier {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Session `cli` t141, in shape: the tool line, handed back.
-        Ok("ToolReturned(ok: echo: from memory, user.name is Peter)".into())
-    }
-}
+/// The live failure, as a script: a turn that answers by handing back a line
+/// out of its own trace. Session `cli` t141, in shape.
+const PARROTED: &str = "ToolReturned(ok: echo: from memory, user.name is Peter)";
 
 /// Plan §8: the copy bound observes and does not act. It logs `ReplyEchoed`
 /// and the draft is sent unchanged — the ablation put its true-positive rate
-/// at zero, so it must not spend a reply call or override the model.
+/// at zero, so it must not override what the model wrote.
 #[tokio::test]
 async fn a_reply_copied_out_of_its_own_prompt_is_logged_but_not_regenerated() {
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("echo".into());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal(
-        "from memory, user.name is Peter",
-    )])));
-    b.set_replier(Box::new(ParrotingReplier(Default::default())));
+    b.set_emitter(Box::new(ScriptedEmitter::answering(vec![
+        Emission {
+            proposal: echo_proposal("from memory, user.name is Peter"),
+            answer: None,
+            say: None,
+        },
+        answers(PARROTED),
+    ])));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -432,8 +429,9 @@ async fn grounded_reply_is_not_flagged_and_check_can_be_disabled() {
 
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(InventingReplier(Default::default())));
+    b.set_emitter(Box::new(ScriptedEmitter::answering(vec![answers(
+        "You have 42 orders waiting in Oslo.",
+    )])));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -495,7 +493,6 @@ async fn emitter_context_includes_this_turn_actions() {
         calls: std::sync::Mutex::new(0),
         seen: seen.clone(),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -526,20 +523,21 @@ async fn emitter_context_includes_this_turn_actions() {
     );
 }
 
-struct PersonaProbe;
-#[async_trait::async_trait]
-impl Replier for PersonaProbe {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        Ok(format!("persona was: {}", ctx.persona))
-    }
-}
-
 #[tokio::test]
-async fn persona_flows_from_config_to_reply_context() {
+async fn persona_flows_from_config_to_the_model_that_answers() {
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly immediately
-    b.set_replier(Box::new(PersonaProbe));
+    b.set_emitter(Box::new(ContextProbe::new(|ctx| {
+        // The persona reaches the model that answers in the answer blocks,
+        // which is the whole of what the offer carries beyond the tools.
+        format!(
+            "persona was: {}",
+            ctx.answer
+                .as_ref()
+                .map(|a| a.persona.as_str())
+                .unwrap_or("(not offered)")
+        )
+    })));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -559,31 +557,25 @@ async fn persona_flows_from_config_to_reply_context() {
     assert_eq!(reply, "persona was: Tomáš the salesbot");
 }
 
-/// Renders what the reply model can actually see: the current user text and
-/// the verbatim window of earlier turns.
-struct WindowProbe;
-#[async_trait::async_trait]
-impl Replier for WindowProbe {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        Ok(format!(
-            "USER={} | WINDOW={} | FACTS={}",
-            ctx.user_text,
-            nscore::render_window(&ctx.window, ctx.window.len(), &ctx.caps),
-            ctx.facts.len()
-        ))
-    }
-}
-
 #[tokio::test]
-async fn reply_context_carries_the_user_text_and_the_verbatim_window() {
-    // Seen live (turns 63–117 of the recorded session): the replier received
-    // only facts, a counter and "Proposed(respond_directly)", never the
-    // user's message or earlier turns, and improvised greetings.
+async fn the_answering_call_sees_the_user_text_and_the_verbatim_window() {
+    // Seen live (turns 63-117 of the recorded session): the model that wrote
+    // the reply received only facts, a counter and a proposal line, never
+    // the user's message or earlier turns, and improvised greetings.
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId("win".into());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal("first")])));
-    b.set_replier(Box::new(WindowProbe));
+    b.set_emitter(Box::new(ContextProbe::after(
+        vec![echo_proposal("first")],
+        |ctx| {
+            format!(
+                "USER={} | WINDOW={} | FACTS={}",
+                ctx.user_text,
+                nscore::render_window(&ctx.window, ctx.window.len(), &ctx.caps),
+                ctx.facts.len()
+            )
+        },
+    )));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -707,7 +699,6 @@ fn engine_with_tools(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -1009,19 +1000,6 @@ async fn pending_confirmation_expires_after_one_turn() {
     )));
 }
 
-struct FactsProbe;
-#[async_trait::async_trait]
-impl Replier for FactsProbe {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        let lines: Vec<String> = ctx
-            .facts
-            .iter()
-            .map(|f| format!("{}={} uses={}", f.key, f.value, f.uses))
-            .collect();
-        Ok(format!("FACTS[{}]", lines.join(";")))
-    }
-}
-
 #[tokio::test]
 async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
     let store = Arc::new(InMemoryStore::new());
@@ -1029,12 +1007,21 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
     // Turn 1: remember the user's name (value is a span of the user's words).
     {
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(ScriptedEmitter::new(vec![Proposal {
-            rationale: "durable".into(),
-            action: "remember_fact".into(),
-            args: serde_json::json!({"key": "user.name", "value": "Martin"}),
-        }])));
-        b.set_replier(Box::new(FactsProbe));
+        b.set_emitter(Box::new(ContextProbe::after(
+            vec![Proposal {
+                rationale: "durable".into(),
+                action: "remember_fact".into(),
+                args: serde_json::json!({"key": "user.name", "value": "Martin"}),
+            }],
+            |ctx| {
+                let lines: Vec<String> = ctx
+                    .facts
+                    .iter()
+                    .map(|f| format!("{}={} uses={}", f.key, f.value, f.uses))
+                    .collect();
+                format!("FACTS[{}]", lines.join(";"))
+            },
+        )));
         b.set_memory(store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -1051,9 +1038,13 @@ async fn remember_fact_stores_classified_fact_and_recall_bumps_uses() {
             })
             .await
             .unwrap();
-        // Generate path recalls the just-stored fact (uses already bumped to 1)
+        // The turn recalls the fact it just stored. `uses` is still 0 in
+        // what the model was shown: the recall bump is the reply phase's,
+        // and the reply phase now runs *after* the call that wrote the
+        // answer rather than before it. The bump itself is asserted against
+        // the store below, which is where it matters.
         assert!(
-            reply.contains("user.name=\"Martin\" uses=1"),
+            reply.contains("user.name=\"Martin\" uses=0"),
             "got: {reply}"
         );
     }
@@ -1176,20 +1167,6 @@ async fn remember_fact_restatement_keeps_uses_and_raises_confidence() {
     );
 }
 
-/// Renders the fact views exactly as the cloud replier would.
-struct FactLinesProbe;
-#[async_trait::async_trait]
-impl Replier for FactLinesProbe {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        Ok(ctx
-            .facts
-            .iter()
-            .map(nscore::render_fact)
-            .collect::<Vec<_>>()
-            .join(" | "))
-    }
-}
-
 #[tokio::test]
 async fn facts_in_context_are_pinned_plus_relevant_with_previous_values() {
     // Seen live: 20 facts by alphabet, and "what was my name before" was
@@ -1218,8 +1195,14 @@ async fn facts_in_context_are_pinned_plus_relevant_with_previous_values() {
         put(format!("misc.{i:02}"), "noise", 1).await;
     }
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly
-    b.set_replier(Box::new(FactLinesProbe));
+    // Renders the fact views exactly as the emitter's own prompt would.
+    b.set_emitter(Box::new(ContextProbe::new(|ctx| {
+        ctx.facts
+            .iter()
+            .map(nscore::render_fact)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -1296,7 +1279,6 @@ fn summarizing_engine(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -1362,19 +1344,13 @@ async fn rolling_summary_follows_the_window_rebuilds_periodically_and_carries_tr
     );
     assert_eq!(state.summaries, 3);
     // The models see it on the next turn: the summary block precedes the window.
-    struct SummaryProbe;
-    #[async_trait::async_trait]
-    impl Replier for SummaryProbe {
-        async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-            Ok(ctx
-                .summary
-                .map(|s| nscore::render_summary(&s))
-                .unwrap_or_default())
-        }
-    }
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(SummaryProbe));
+    b.set_emitter(Box::new(ContextProbe::new(|ctx| {
+        ctx.summary
+            .as_ref()
+            .map(nscore::render_summary)
+            .unwrap_or_default()
+    })));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -1585,7 +1561,6 @@ async fn remember_fact_never_residual_policy_denies_ungrounded_values() {
         action: "remember_fact".into(),
         args: serde_json::json!({"key": "memory_reset_requested", "value": "true"}),
     }])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2117,20 +2092,9 @@ impl Emitter for EmitFailsWith {
     }
 }
 
-/// Replier that always fails with the given transport detail.
-struct ReplyFailsWith(&'static str);
-
-#[async_trait::async_trait]
-impl Replier for ReplyFailsWith {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        Err(ReplyError::Transport(self.0.to_string()))
-    }
-}
-
-fn engine_from(emitter: Box<dyn Emitter>, replier: Box<dyn Replier>, cfg: EngineConfig) -> Engine {
+fn engine_from(emitter: Box<dyn Emitter>, cfg: EngineConfig) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(emitter);
-    b.set_replier(replier);
     b.set_memory(Arc::new(InMemoryStore::new()));
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2147,7 +2111,6 @@ async fn fallback_reply_explains_provider_error() {
     // the cause was only visible in the event log.
     let e = engine_from(
         Box::new(EmitFailsWith(RATE_LIMITED)),
-        Box::new(ScriptedReplier),
         EngineConfig::default(),
     );
     let reply = e
@@ -2195,7 +2158,6 @@ async fn a_terminal_provider_status_is_not_retried() {
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(EmitProviderStatus(404, calls.clone())));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2253,7 +2215,6 @@ async fn a_transient_provider_status_uses_the_retry_budget() {
     let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let e = engine_from(
         Box::new(EmitProviderStatus(429, calls.clone())),
-        Box::new(ScriptedReplier),
         EngineConfig::default(), // max_emit_retries = 3
     );
     e.run_turn(Incoming {
@@ -2273,7 +2234,6 @@ async fn fallback_reply_explains_step_exhaustion() {
         .collect();
     let e = engine_from(
         Box::new(ScriptedEmitter::new(proposals)),
-        Box::new(ScriptedReplier),
         EngineConfig::default(), // max_iterations = 5
     );
     let reply = e
@@ -2290,14 +2250,42 @@ async fn fallback_reply_explains_step_exhaustion() {
     assert!(reply.contains("ran out of steps"), "{reply}");
 }
 
+/// A model that ends the turn and says nothing — the one shape that leaves
+/// a `Generate` settle with no text behind it.
+struct EndsWithoutAnswering;
+
+#[async_trait::async_trait]
+impl Emitter for EndsWithoutAnswering {
+    async fn propose(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Ok(answers("").proposal)
+    }
+
+    async fn propose_or_answer(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        Ok(Emission {
+            proposal: answers("").proposal,
+            answer: None,
+            say: None,
+        })
+    }
+}
+
+/// The defensive branch, pinned. Every normal turn now ends because the
+/// model chose to answer, so a settle with nothing behind it is a bug
+/// somewhere above — and it must reach the user as a sentence and the log as
+/// a failure, not as an empty reply or a panic.
 #[tokio::test]
-async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
+async fn a_turn_that_settles_without_an_answer_falls_back_and_says_so() {
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(vec![]))); // respond_directly immediately
-    b.set_replier(Box::new(ReplyFailsWith(
-        "status 402: {\"error\":{\"message\":\"This request requires more credits\"}}",
-    )));
+    b.set_emitter(Box::new(EndsWithoutAnswering));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2319,10 +2307,7 @@ async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
         reply.starts_with("Sorry, I couldn't complete that."),
         "{reply}"
     );
-    assert!(
-        reply.contains("402") && reply.contains("more credits"),
-        "{reply}"
-    );
+    assert!(reply.contains("without a reply"), "{reply}");
     // F7: the failure is an event, placed between Settled and the fallback Replied.
     let events = store.load(&sid).await.unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| kind_name(&e.kind)).collect();
@@ -2330,10 +2315,6 @@ async fn generate_fallback_explains_replier_error_and_logs_reply_failed() {
         kinds,
         vec!["UserSaid", "Proposed", "Settled", "ReplyFailed", "Replied"]
     );
-    assert!(events.iter().any(|ev| matches!(
-        &ev.kind,
-        EventKind::ReplyFailed { detail } if detail.contains("402")
-    )));
     // Replay ignores infrastructure events: the recording still replays clean.
     nsengine::replay::replay_session(sid, &events, vec![])
         .await
@@ -2348,11 +2329,7 @@ async fn cant_help_template_receives_reason_var() {
             .collect(),
         ..Default::default()
     };
-    let e = engine_from(
-        Box::new(EmitFailsWith(RATE_LIMITED)),
-        Box::new(ScriptedReplier),
-        cfg,
-    );
+    let e = engine_from(Box::new(EmitFailsWith(RATE_LIMITED)), cfg);
     let reply = e
         .run_turn(Incoming {
             session: SessionId("why4".into()),
@@ -2372,7 +2349,6 @@ async fn registered_cant_help_template_replaces_fallback() {
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(FailingEmitter));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2434,7 +2410,6 @@ fn engine_with_rules(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2521,7 +2496,6 @@ async fn aliased_action_still_goes_through_guards() {
         action: "eko".into(),
         args: serde_json::json!({"text": "hi"}),
     }])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2565,7 +2539,6 @@ async fn guidance_reaches_the_emitter_scoped_to_legal_actions() {
     let probe = GuidanceProbe(seen.clone());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(probe));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -2681,7 +2654,6 @@ async fn idle_timer_runs_the_consolidator_once_per_quiet_period_with_new_turns()
             args: serde_json::json!({"text": "hi"}),
         },
     ])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(ScriptedChannel(std::sync::Mutex::new(
         [
@@ -2788,7 +2760,6 @@ async fn rolling_summary_runs_while_the_loop_waits_for_the_next_message() {
 
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(HandshakeChannel {
         received: std::sync::atomic::AtomicUsize::new(0),
@@ -2931,7 +2902,6 @@ fn routed_engine(
         inner: ScriptedEmitter::new(proposals),
         legal,
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -3037,7 +3007,6 @@ async fn a_time_question_on_the_chat_tier_carries_exactly_get_time() {
         arrays: Default::default(),
         traces: Default::default(),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -3161,7 +3130,6 @@ async fn budgeted_run(mode: BudgetMode, limit: u32, turns: u32) -> Vec<(Usage, C
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![]),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -3347,7 +3315,6 @@ async fn a_clipped_result_is_addressable_and_inspect_result_reaches_past_the_cap
         traces: traces.clone(),
         legal: legal.clone(),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -3475,7 +3442,6 @@ async fn a_turn_records_what_a_model_call_cost_and_was_shown() {
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![echo_proposal("hi")]),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -3551,15 +3517,46 @@ struct StoreAtReplyTime {
     seen: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+/// Acts out its script, then snapshots the store on the call that answers —
+/// which is the moment the reply is written, now that one model does both.
+struct StoreAtReplyTimeEmitter {
+    watch: StoreAtReplyTime,
+    before: std::sync::Mutex<std::collections::VecDeque<Proposal>>,
+}
+
 #[async_trait::async_trait]
-impl Replier for StoreAtReplyTime {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        let events = self.store.load(&self.session).await.unwrap_or_default();
-        *self.seen.lock().expect("seen") = events
+impl Emitter for StoreAtReplyTimeEmitter {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Ok(self.propose_or_answer(ctx, legal).await?.proposal)
+    }
+
+    async fn propose_or_answer(
+        &self,
+        _ctx: EmitterContext,
+        _legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        if let Some(proposal) = self.before.lock().expect("script lock").pop_front() {
+            return Ok(Emission {
+                proposal,
+                answer: None,
+                say: None,
+            });
+        }
+        let events = self
+            .watch
+            .store
+            .load(&self.watch.session)
+            .await
+            .unwrap_or_default();
+        *self.watch.seen.lock().expect("seen") = events
             .iter()
             .map(|e| kind_name(&e.kind).to_string())
             .collect();
-        Ok("ok".into())
+        Ok(answers("ok"))
     }
 }
 
@@ -3570,11 +3567,13 @@ fn engine_watching_the_store(
     seen: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Engine {
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(StoreAtReplyTime {
-        store: store.clone(),
-        session: session.clone(),
-        seen,
+    b.set_emitter(Box::new(StoreAtReplyTimeEmitter {
+        watch: StoreAtReplyTime {
+            store: store.clone(),
+            session: session.clone(),
+            seen,
+        },
+        before: std::sync::Mutex::new(proposals.into()),
     }));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
@@ -3696,7 +3695,6 @@ async fn two_sessions_interleaved_through_one_channel_keep_separate_intact_logs(
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
         [
@@ -3814,27 +3812,6 @@ impl Emitter for SessionTaggedEmitter {
     }
 }
 
-struct SessionTaggedReplier {
-    records: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl Replier for SessionTaggedReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        tokio::task::yield_now().await;
-        let session = session_of(&ctx.user_text);
-        let sink = ctx
-            .usage
-            .as_ref()
-            .expect("the engine hands every call a sink");
-        sink.record(usage_tagged("replier", &session));
-        self.records
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        Ok(format!("hello back, {session}"))
-    }
-}
-
 /// Multi-conversation plan Phase 1 (findings §2.6): what a call cost travels
 /// with the call. Two turns on two sessions run at once, each role records
 /// into the sink its context carries and yields around the record, and every
@@ -3846,9 +3823,6 @@ async fn usage_from_two_overlapping_turns_lands_on_their_own_model_calls() {
     let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(SessionTaggedEmitter {
-        records: records.clone(),
-    }));
-    b.set_replier(Box::new(SessionTaggedReplier {
         records: records.clone(),
     }));
     b.set_memory(store.clone());
@@ -3880,7 +3854,7 @@ async fn usage_from_two_overlapping_turns_lands_on_their_own_model_calls() {
                 _ => None,
             })
             .collect();
-        for role in ["emitter", "replier"] {
+        for role in ["emitter"] {
             assert!(
                 calls.iter().any(|u| u.role == role),
                 "session {sid} has a ModelCall for its {role}"
@@ -3956,7 +3930,6 @@ async fn two_messages_for_one_session_through_the_dispatcher_become_two_turns() 
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(YieldingEmitter(ScriptedEmitter::new(vec![]))));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
         [("a", "first"), ("a", "second")].into_iter().collect(),
@@ -4042,7 +4015,6 @@ async fn two_sessions_run_concurrently_under_two_slots() {
     b.set_emitter(Box::new(ParkedEmitter {
         release_a: release_a.clone(),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(ReleasingChannel {
         script: SessionsChannel(std::sync::Mutex::new(
@@ -4115,7 +4087,6 @@ async fn one_slot_serializes_across_sessions() {
         in_flight: in_flight.clone(),
         high_water: high_water.clone(),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(SessionsChannel(std::sync::Mutex::new(
         [("a", "hello from a"), ("b", "hello from b")]
@@ -4202,7 +4173,6 @@ fn tenant_dispatcher(
 ) -> Dispatcher {
     let mut b = HarnessBuilder::new();
     b.set_emitter(emitter);
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_shared_channel(channel.clone());
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -4331,13 +4301,15 @@ async fn a_dispatcher_with_no_shard_cap_behaves_exactly_as_before() {
 // general-harness design §5.2b asked for — "two scopes, a fact stated in
 // one, and a recall in the other that must return nothing".
 
-/// Renders everything the reply model is shown — facts, summary, window,
-/// trace — so a test can assert on what did *not* reach it, not only on the
-/// trace `ScriptedReplier` echoes.
-struct ContextDump;
-#[async_trait::async_trait]
-impl Replier for ContextDump {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+/// An engine whose `scope_for` maps each session to its own scope — what
+/// `ns-app serve` does (M6 §6.6: global facts are correct for a single-user
+/// CLI and a leak on a multi-user channel).
+fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>) -> Engine {
+    let mut b = HarnessBuilder::new();
+    // Answers with everything it was shown — facts, summary, window, trace —
+    // so a test can assert on what did *not* reach it, and not only on what
+    // the turn did.
+    b.set_emitter(Box::new(ContextProbe::after(proposals, |ctx| {
         let mut out = String::new();
         for f in &ctx.facts {
             out.push_str(&render_fact(f));
@@ -4349,18 +4321,9 @@ impl Replier for ContextDump {
         }
         out.push_str(&render_window(&ctx.window, ctx.window.len(), &ctx.caps));
         out.push('\n');
-        out.push_str(&ctx.turn_trace);
-        Ok(out)
-    }
-}
-
-/// An engine whose `scope_for` maps each session to its own scope — what
-/// `ns-app serve` does (M6 §6.6: global facts are correct for a single-user
-/// CLI and a leak on a multi-user channel).
-fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>) -> Engine {
-    let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-    b.set_replier(Box::new(ContextDump));
+        out.push_str(&ctx.trace_so_far.join("\n"));
+        out
+    })));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -4368,7 +4331,7 @@ fn per_session_scope_engine(proposals: Vec<Proposal>, store: Arc<InMemoryStore>)
         b.build().unwrap(),
         EngineConfig {
             scope_for: Arc::new(|sid| sid.0.clone()),
-            // `ContextDump` copies its prompt by design; see `engine_with`.
+            // The probe copies its prompt by design; see `engine_with`.
             max_echo_ratio: 1.1,
             // What this fixture is about is scope, not applicability: with no
             // verbatim window there is nothing in sight, so M10 T1.4 keeps
@@ -4549,7 +4512,6 @@ async fn probed_turn(
     let seen: Arc<std::sync::Mutex<Vec<EmitterContext>>> = Default::default();
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(MeteredProbe(seen.clone())));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -4688,7 +4650,6 @@ async fn obligations_drop_after_the_window_and_before_facts() {
     b.set_emitter(Box::new(MeteredEmitter {
         inner: ScriptedEmitter::new(vec![]),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -4750,40 +4711,24 @@ async fn obligations_drop_after_the_window_and_before_facts() {
     );
 }
 
-/// The first draft answers nothing the user asked. Counts its calls and
-/// records the guidance each one carried.
-struct ObligationBlindReplier {
-    calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
-}
-#[async_trait::async_trait]
-impl Replier for ObligationBlindReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        let mut calls = self.calls.lock().unwrap();
-        calls.push(ctx.guidance.clone());
-        if calls.len() == 1 {
-            // No content word in common with "where is my order".
-            Ok("Nothing to report just now.".into())
-        } else {
-            Ok("Your order left the warehouse.".into())
-        }
-    }
-}
-
-/// M9 T2.1. The interceptor reuses the `ReplyFlagged` path's mechanics — one
-/// regeneration, the manifest re-recorded, no new event kind — with a
-/// distinct guidance line. It fires at most once, and only when its knob is
-/// on: the extraction is measured weak, and the cost of a false positive is
-/// a second billed call.
+/// M9 T2.1, as it stands after the second model went. The interceptor used
+/// to buy a regeneration carrying the unmet obligation as guidance; with one
+/// model writing the reply there is nothing to ask again, so it writes the
+/// clause down and the draft the user gets is unchanged.
+///
+/// It still fires only when its knob is on, which is off by default: the
+/// extraction is measured weak, and a false positive now costs a misleading
+/// line in the log rather than a billed call.
 #[tokio::test]
-async fn a_reply_leaving_an_obligation_unaddressed_regenerates_once() {
-    async fn run(obligation_check: bool) -> (Vec<Vec<String>>, String) {
+async fn a_reply_leaving_an_obligation_unaddressed_is_flagged_and_still_sent() {
+    async fn run(obligation_check: bool) -> (Vec<String>, String) {
         let store = Arc::new(InMemoryStore::new());
-        let calls: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let sid = SessionId("oblig".into());
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-        b.set_replier(Box::new(ObligationBlindReplier {
-            calls: calls.clone(),
-        }));
+        // No content word in common with "where is my order".
+        b.set_emitter(Box::new(ScriptedEmitter::answering(vec![answers(
+            "Nothing to report just now.",
+        )])));
         b.set_memory(store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -4799,38 +4744,39 @@ async fn a_reply_leaving_an_obligation_unaddressed_regenerates_once() {
         );
         let reply = e
             .run_turn(Incoming {
-                session: SessionId("oblig".into()),
+                session: sid.clone(),
                 text: "where is my order?".into(),
             })
             .await
             .unwrap();
-        let seen = calls.lock().unwrap().clone();
-        (seen, reply)
+        let flagged = store
+            .load(&sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::ReplyFlagged { spans, .. } => Some(spans.join(",")),
+                _ => None,
+            })
+            .collect();
+        (flagged, reply)
     }
 
-    let (seen, reply) = run(true).await;
-    assert_eq!(seen.len(), 2, "exactly one regeneration: {seen:?}");
-    assert!(seen[0].is_empty(), "the first draft is asked plainly");
+    let (flagged, reply) = run(true).await;
     assert_eq!(
-        seen[1],
-        vec!["Not yet addressed: where is my order".to_string()],
-        "the second carries the unmet obligation as guidance"
+        flagged,
+        vec!["not yet addressed: where is my order".to_string()],
+        "the unmet obligation is written down"
     );
-    assert_eq!(reply, "Your order left the warehouse.");
+    assert_eq!(
+        reply, "Nothing to report just now.",
+        "and the draft is what the user gets"
+    );
 
-    // Off by default, and off means one call and the first draft sent.
-    let (seen, reply) = run(false).await;
-    assert_eq!(seen.len(), 1, "{seen:?}");
+    // Off by default, and off means nothing is written and the same reply.
+    let (flagged, reply) = run(false).await;
+    assert!(flagged.is_empty(), "{flagged:?}");
     assert_eq!(reply, "Nothing to report just now.");
-}
-
-/// A replier that says exactly what the test scripted, whatever it was shown.
-struct FixedReplier(&'static str);
-#[async_trait::async_trait]
-impl Replier for FixedReplier {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        Ok(self.0.to_string())
-    }
 }
 
 /// M9 T4.2. A grade says a turn went well; a citation says what was in the
@@ -4850,8 +4796,7 @@ async fn a_reply_quoting_a_fact_value_records_that_fact_as_cited() {
             .await
             .unwrap();
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-        b.set_replier(Box::new(FixedReplier(reply)));
+        b.set_emitter(Box::new(ScriptedEmitter::answering(vec![answers(reply)])));
         b.set_memory(store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -4919,7 +4864,6 @@ fn probe_engine(
         inner: ScriptedEmitter::new(vec![]),
         legal,
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -5159,7 +5103,6 @@ async fn depth_run(depth: nscore::Depth, text: &str, proposals: Vec<Proposal>) -
         arrays: Arc::clone(&arrays),
         traces: Arc::clone(&traces),
     }));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -5440,7 +5383,6 @@ fn hybrid_engine(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![echo_proposal("ok")])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -5706,7 +5648,6 @@ fn fact_engine(store: Arc<nsmemory_sqlite::SqliteStore>, tier: Tier, cfg: Engine
         action: "respond_directly".into(),
         args: serde_json::json!({}),
     }])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(Box::new(NullChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -5890,7 +5831,6 @@ async fn a_due_summary_completes_when_the_next_message_is_already_queued() {
     let calls: Arc<std::sync::Mutex<Vec<(bool, u32, u32)>>> = Default::default();
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(ScriptedEmitter::new(vec![])));
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store.clone());
     b.set_channel(Box::new(BurstChannel(std::sync::Mutex::new(
         ["one", "two", "three", "four", "five"].into(),
@@ -5990,9 +5930,6 @@ async fn every_manifest_of_a_turn_names_the_session_scope() {
     b.set_emitter(Box::new(SessionTaggedEmitter {
         records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }));
-    b.set_replier(Box::new(SessionTaggedReplier {
-        records: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    }));
     b.set_summarizer(Box::new(MeteredSummarizer));
     b.set_memory(store.clone());
     b.set_channel(Box::new(NullChannel));
@@ -6031,7 +5968,7 @@ async fn every_manifest_of_a_turn_names_the_session_scope() {
             _ => None,
         })
         .collect();
-    for role in ["emitter", "replier", "summarizer"] {
+    for role in ["emitter", "summarizer"] {
         assert!(
             calls.iter().any(|(r, _)| r == role),
             "the {role} call was recorded: {:?}",
@@ -6238,7 +6175,6 @@ async fn a_failing_turn_ends_the_whole_dispatcher() {
         b_parked: b_parked.clone(),
         release_b: release_b.clone(),
     }));
-    builder.set_replier(Box::new(ScriptedReplier));
     builder.set_memory(store.clone());
     builder.set_channel(Box::new(SendFailsFor {
         script: SessionsChannel(std::sync::Mutex::new(
@@ -6296,7 +6232,6 @@ fn isolating_engine(
 ) -> Engine {
     let mut b = HarnessBuilder::new();
     b.set_emitter(emitter);
-    b.set_replier(Box::new(ScriptedReplier));
     b.set_memory(store);
     b.set_channel(channel);
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -6484,12 +6419,10 @@ async fn a_request_cap_ends_one_tenant_and_not_the_shard() {
     let store = Arc::new(InMemoryStore::new());
     let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut b = HarnessBuilder::new();
-    // Two requests per turn, so a cap of two lets the first turn finish and
+    // One request per turn now that the call which chooses the action also
+    // writes the reply, so a cap of one lets the first turn finish and
     // refuses the second (`the_engine_stops_at_the_request_cap`).
     b.set_emitter(Box::new(SessionTaggedEmitter {
-        records: records.clone(),
-    }));
-    b.set_replier(Box::new(SessionTaggedReplier {
         records: records.clone(),
     }));
     b.set_memory(store.clone());
@@ -6502,7 +6435,7 @@ async fn a_request_cap_ends_one_tenant_and_not_the_shard() {
     let e = Engine::with_clock(
         b.build().unwrap(),
         EngineConfig {
-            max_requests: Some(2),
+            max_requests: Some(1),
             ..dispatcher_config(2)
         },
         Box::new(|| Timestamp(42)),

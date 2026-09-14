@@ -167,9 +167,15 @@ pub trait Emitter: Send + Sync {
     ) -> Result<Proposal, EmitError>;
 
     /// The same call, with the option of answering instead of acting (M12
-    /// T4.2). Defaulted, because only the two emitters that can read
-    /// `ctx.answer` have anything to add: everything else keeps `propose`
-    /// and never returns an answer, which is today's behaviour exactly.
+    /// T4.2). This is the one the engine calls.
+    ///
+    /// **An implementor that ends a turn must answer.** Since 2026-09-14
+    /// there is no second model to write the reply, so a `respond_directly`
+    /// carrying `answer: None` ends the turn on the fallback sentence and
+    /// logs a `ReplyFailed`. The default below is kept for the doubles that
+    /// only ever act, and it is exactly the trap to watch for in a new one:
+    /// it cannot invent a reply, so an emitter that settles through it will
+    /// settle on nothing.
     async fn propose_or_answer(
         &self,
         ctx: EmitterContext,
@@ -183,8 +189,15 @@ pub trait Emitter: Send + Sync {
     }
 }
 
-/// What the reply model sees (M6 spec §4.2–4.3). Block order is stable-first
-/// for prefix caching: persona → facts → summary → window → current turn.
+/// The material a reply is measured against (M6 spec §4.2–4.3). Block order
+/// is stable-first for prefix caching: persona → facts → summary → window →
+/// current turn.
+///
+/// It was the reply *model's* prompt until 2026-09-14, when the second model
+/// went and the emitter's own answer became the reply. What it is now is the
+/// material the grounding, echo and citation checks read: the same blocks,
+/// assembled the same way, and still the definition of what a reply was
+/// allowed to know.
 pub struct ReplyContext {
     pub persona: String,
     pub facts: Vec<crate::memory::FactView>,
@@ -213,17 +226,6 @@ pub struct ReplyContext {
     pub do_not_repeat: Vec<String>,
     /// The sink this call records into; see [`EmitterContext::usage`].
     pub usage: Option<std::sync::Arc<crate::usage::UsageSink>>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReplyError {
-    #[error("transport: {0}")]
-    Transport(String),
-}
-
-#[async_trait]
-pub trait Replier: Send + Sync {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError>;
 }
 
 /// What the summarizer folds in (M6 §5.1): the previous summary for

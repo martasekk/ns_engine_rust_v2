@@ -162,7 +162,6 @@ pub(crate) async fn run_oneshot(
                 cfg.memory.caps(),
                 cfg.memory.trace_verbatim_lines,
                 cfg.memory.tool_result_max_chars,
-                cfg.persona.text.len(),
                 &budget_specs(schema_profile),
             )
         );
@@ -289,7 +288,7 @@ fn render_providers(cfg: &AppConfig) -> String {
         "Providers — one word swaps the agent.\n\n\
          \x20 in config.toml   [llm] provider = \"<name>\"\n\
          \x20 for one run      NS_PROVIDER=<name> [NS_MODEL=<id>] cargo run -p ns-app\n\
-         \x20 for one role     [llm.replier] model = \"<name>:<model-id>\"\n\n",
+         \x20 for one role     [llm.summarizer] model = \"<name>:<model-id>\"\n\n",
     );
     let row = |mark: &str, name: &str, url: &str, env: &str, key: &str, model: &str| {
         format!("  {mark:<2}{name:<12}{url:<32}{env:<21}{key:<9}{model}\n")
@@ -501,7 +500,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("replier     qwen2.5:3b @ http://localhost:11434"),
+            out.contains("summarizer  qwen2.5:3b @ http://localhost:11434"),
             "{out}"
         );
         assert!(

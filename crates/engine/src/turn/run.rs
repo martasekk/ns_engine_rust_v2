@@ -15,10 +15,7 @@ use super::reply::{render_template, Draft, FALLBACK_REPLY};
 use super::specs::*;
 use super::{Engine, EngineError};
 use crate::state::fold;
-use nscore::{
-    EventKind, EventLog, Incoming, RejectReason, ReplyPolicy,
-};
-
+use nscore::{EventKind, EventLog, Incoming, RejectReason, ReplyPolicy};
 
 impl Engine {
     pub async fn run_turn(&self, incoming: Incoming) -> Result<String, EngineError> {
@@ -123,9 +120,7 @@ impl Engine {
                         },
                     )
                     .id;
-                let outcome = self
-                    .exemplars_outcome(&sid, &scope, &incoming.text)
-                    .await;
+                let outcome = self.exemplars_outcome(&sid, &scope, &incoming.text).await;
                 log.append(
                     turn,
                     now(),
@@ -160,18 +155,19 @@ impl Engine {
         // Recall is worth its schema when there is something out of sight:
         // turns older than the verbatim window, or an earlier conversation
         // in the same scope.
-        let recall_applies = !self.cfg.prune_inapplicable || turn > self.cfg.window_turns as u32 || {
-            self.cfg.recall_sessions > 0
-                && match self
-                    .parts
-                    .memory
-                    .session_digests(&scope, self.cfg.recall_sessions + 1)
-                    .await
-                {
-                    Ok(digests) => digests.into_iter().any(|d| d.session != sid),
-                    Err(_) => true,
-                }
-        };
+        let recall_applies =
+            !self.cfg.prune_inapplicable || turn > self.cfg.window_turns as u32 || {
+                self.cfg.recall_sessions > 0
+                    && match self
+                        .parts
+                        .memory
+                        .session_digests(&scope, self.cfg.recall_sessions + 1)
+                        .await
+                    {
+                        Ok(digests) => digests.into_iter().any(|d| d.session != sid),
+                        Err(_) => true,
+                    }
+            };
 
         // What this turn accumulates as it goes: the refusals the emitter is
         // shown, the actions it may no longer propose, the calls that really
@@ -484,7 +480,8 @@ impl Engine {
                         reason,
                     },
                 );
-                book.rejections.push(format!("illegal action: {}", proposal.action));
+                book.rejections
+                    .push(format!("illegal action: {}", proposal.action));
                 book.denied.insert(proposal.action.clone());
                 continue;
             }
@@ -500,8 +497,7 @@ impl Engine {
             // simply false — the same call is how the next page is asked
             // for. It cannot run away either: the pages end, and an
             // exhausted result leaves the schema.
-            if proposal.action != INSPECT_RESULT
-                && book.calls.contains(&Self::call_key(&proposal))
+            if proposal.action != INSPECT_RESULT && book.calls.contains(&Self::call_key(&proposal))
             {
                 let reason = format!(
                     "identical call to '{}' already executed this turn",

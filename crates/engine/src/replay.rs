@@ -1,6 +1,6 @@
 //! Replay harness (spec §11): a recorded session log is the fixture. The
 //! recorded proposals drive a scripted emitter, recorded tool outcomes drive
-//! replay tools, recorded generated replies drive a queue replier — then the
+//! replay tools, recorded generated replies ride back on the emissions that wrote them — then the
 //! re-run log is normalized and diffed against the recording. This is the
 //! hard dependency of all future self-improvement (verified-before-write).
 
@@ -9,9 +9,9 @@ use crate::store::{InMemoryStore, NoopConsolidator};
 use crate::turn::{Engine, EngineConfig};
 use async_trait::async_trait;
 use nscore::{
-    ActionSpec, Channel, ChannelError, Event, EventKind, EventLog, Guard, HarnessBuilder, Incoming,
-    LearnedRules, MemoryStore, Proposal, Replier, ReplyContext, ReplyError, ReplyPolicy, SessionId,
-    SideEffect, Timestamp, Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput, Trust,
+    ActionSpec, Channel, ChannelError, Emission, Event, EventKind, EventLog, Guard, HarnessBuilder,
+    Incoming, LearnedRules, MemoryStore, Proposal, ReplyPolicy, SessionId, SideEffect, Timestamp,
+    Tool, ToolCtx, ToolError, ToolOutcome, ToolOutput, Trust,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -131,9 +131,8 @@ pub struct Replayed {
 /// Scripted doubles reconstructed from a recording.
 pub struct Doubles {
     pub user_inputs: Vec<String>,
-    pub proposals: Vec<Proposal>,
+    pub emissions: Vec<Emission>,
     pub tools: Vec<Arc<dyn Tool>>,
-    pub replier: Box<dyn Replier>,
 }
 
 /// Engine-synthetic actions never need tool doubles.
@@ -197,23 +196,6 @@ impl Tool for ReplayTool {
                 detail: "outcome queue exhausted".into(),
             }),
         }
-    }
-}
-
-/// Replays the recorded GENERATED replies front-to-back (Verbatim/Template
-/// replies are reproduced by the engine itself and never reach the replier).
-struct QueueReplier {
-    texts: Mutex<VecDeque<String>>,
-}
-
-#[async_trait]
-impl Replier for QueueReplier {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        self.texts
-            .lock()
-            .expect("replay replier lock")
-            .pop_front()
-            .ok_or_else(|| ReplyError::Transport("replay reply queue exhausted".into()))
     }
 }
 
@@ -288,13 +270,28 @@ pub fn doubles_from(recorded: &[Event], known_specs: &[ActionSpec], synthetic_ok
             synthetic_ok,
         )));
     }
+    // The recorded generated replies ride back in on the emissions that
+    // produced them. They were a queue behind a second model until
+    // 2026-09-14; with one model writing both the action and the answer, a
+    // recorded reply belongs to the emission that ended its turn — which is
+    // the `respond_directly` proposal, in the order they were recorded.
+    let emissions = proposals
+        .into_iter()
+        .map(|proposal| {
+            let answer = (proposal.action == "respond_directly")
+                .then(|| generated_replies.pop_front())
+                .flatten();
+            Emission {
+                proposal,
+                answer,
+                say: None,
+            }
+        })
+        .collect();
     Doubles {
         user_inputs,
-        proposals,
+        emissions,
         tools,
-        replier: Box::new(QueueReplier {
-            texts: Mutex::new(generated_replies),
-        }),
     }
 }
 
@@ -315,8 +312,7 @@ pub async fn replay_with(
     let d = doubles_from(recorded, &opts.known_specs, opts.synthetic_ok_for_new_calls);
     let store = Arc::new(InMemoryStore::new());
     let mut b = HarnessBuilder::new();
-    b.set_emitter(Box::new(ScriptedEmitter::new(d.proposals)));
-    b.set_replier(d.replier);
+    b.set_emitter(Box::new(ScriptedEmitter::answering(d.emissions)));
     b.set_memory(store.clone());
     b.set_channel(Box::new(ReplayChannel));
     b.set_consolidator(Box::new(NoopConsolidator));
@@ -397,7 +393,7 @@ pub async fn replay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::{DenyAction, EchoTool, ScriptedReplier};
+    use crate::script::{DenyAction, EchoTool};
 
     struct ClosedChannel;
     #[async_trait::async_trait]
@@ -419,7 +415,6 @@ mod tests {
             action: "echo".into(),
             args: serde_json::json!({"text": "replay me"}),
         }])));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(ClosedChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -496,7 +491,6 @@ mod tests {
             action: "eko".into(),
             args: serde_json::json!({"text": "hi"}),
         }])));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(ClosedChannel));
         b.set_consolidator(Box::new(NoopConsolidator));

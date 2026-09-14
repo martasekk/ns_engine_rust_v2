@@ -69,23 +69,29 @@ impl Engine {
             self.cfg.trace_verbatim_lines,
             self.cfg.tool_result_max_chars,
         );
-        // The pinned core is shown at every tier — it is what stops the
-        // emitter asking again for a name it already has (M6 F2). The
-        // query-relevant slice is what a `Chat` turn does without.
-        let selected = if c.tier.allows_relevant_facts() {
-            // M11 T1.1 follow-up: the same gate `recall_outcome` takes. Read
-            // per iteration rather than once per turn because the tier still
-            // moves — a tool-cued turn is upgraded to `Task` mid-loop, and
-            // the next iteration must see it.
-            self.select_facts(
+        // The pinned core plus the query-relevant slice, at every tier.
+        //
+        // `Tier::Chat` used to do without the relevant slice, and that was
+        // right while a second model wrote the reply: the emitter only had
+        // to pick a tool, and the replier was handed the facts afterwards.
+        // This call writes the reply now (2026-09-14), so withholding them
+        // here would mean a chat turn answering from the pinned core alone —
+        // which the fixture suite measures directly, and which took every
+        // ability in it from 5/5 to 0/5 the moment the replier went.
+        //
+        // The saving it was for is still made, and made better: the turn
+        // that used to pay for a second call with the facts in it now pays
+        // for one call with them in it.
+        //
+        // `recall_hybrid` stays gated on the tier: that is a retrieval
+        // *method* and its cost argument is untouched.
+        let selected = self
+            .select_facts(
                 c.scope,
                 c.user_text,
                 self.cfg.recall_hybrid && c.tier != nscore::Tier::Chat,
             )
-            .await
-        } else {
-            self.pinned_facts(c.scope).await
-        };
+            .await;
         let facts = self.fact_views(c.scope, &selected).await;
         let legal_names: Vec<String> = c.legal.actions.iter().map(|a| a.name.clone()).collect();
         // Notes and their hashes together, so the manifest can say which note
@@ -150,17 +156,31 @@ impl Engine {
         // the fit and the ablation, so `memory_silent` is a statement about
         // the context as sent rather than as composed — the same thing the
         // replier's silence line says.
-        // M13 T2.1: on every tier the offer is the same sentence — call the
-        // next tool or write the reply — so the loop ends when the model says
-        // it is done rather than when it names the action that says so.
-        let offered_answer = self.cfg.chat_act_or_answer
-            && (self.cfg.act_or_answer_every_tier || c.tier == nscore::Tier::Chat);
-        if offered_answer {
+        // On every tier the offer is the same sentence — call the next tool
+        // or write the reply — so the loop ends when the model says it is
+        // done rather than when it names the action that says so.
+        //
+        // It is unconditional since 2026-09-14, and it has to be: there is
+        // no second model to hand an unfinished turn to, so a call that was
+        // not offered the answer could only end the turn with a fallback.
+        // The knobs that used to gate it by tier are gone with it.
+        let offered_answer = true;
+        {
             let reply_guidance = if self.cfg.archive_foreign_notes {
                 c.rules
                     .guidance_for_reply_model(self.cfg.learning_model.as_deref())
             } else {
                 c.rules.guidance_for_reply()
+            };
+            // The `guidance` ablation reaches these too. They are reply-scoped
+            // notes and they used to be blanked in the reply context, which
+            // is where they were rendered; they ride on this call now, so an
+            // arm that blanked only `ctx.guidance` would report that guidance
+            // costs nothing — which is the blindness that ablation arm exists
+            // to have been fixed.
+            let reply_guidance = match self.cfg.ablate {
+                Some(nscore::Ablate::Guidance) => Vec::new(),
+                _ => reply_guidance,
             };
             ctx.answer = Some(nscore::AnswerBlocks {
                 persona: self.cfg.persona.clone(),
