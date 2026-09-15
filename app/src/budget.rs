@@ -1781,11 +1781,20 @@ mod tests {
     /// per axis, and (T1.5) an argument example. What is asserted instead is
     /// the cut that is actually available: 235 → 176 and 174 → 143 on this
     /// branch's own text, a quarter and a fifth.
+    ///
+    /// The ceilings rose by nine and two on 2026-09-15, and the reason is not
+    /// a description growing back. `strict: true` obliges `required` to name
+    /// every key in `properties`, so the arguments that used to be simply
+    /// absent from that list are now in it and carry `"null"` in their type:
+    /// three of them on `pointer_click`, one on `pointer_move`. That is the
+    /// whole of the increase, and it buys a request the provider accepts —
+    /// the alternative measured 0 tokens and a 400. The comparison that
+    /// matters is still to 235 and 174, and both cuts survive it.
     #[test]
     fn the_two_top_carriers_lost_a_quarter_of_their_tokens() {
         for (profile, click_max, move_max) in [
-            (SchemaProfile::Full, 180u32, 150u32),
-            (SchemaProfile::Slim, 172, 140),
+            (SchemaProfile::Full, 190u32, 150u32),
+            (SchemaProfile::Slim, 182, 142),
         ] {
             for (name, ceiling, was) in [
                 ("pointer_click", click_max, 235),

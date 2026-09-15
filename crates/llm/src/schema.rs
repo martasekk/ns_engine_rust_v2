@@ -148,6 +148,33 @@ fn say_prop() -> serde_json::Value {
     })
 }
 
+/// Let a property's `type` also be `null`, which is how strict mode spells
+/// "optional": the key must be present, and `null` is how the model says it
+/// has nothing to put there.
+///
+/// Idempotent, and a no-op on a property with no `type` at all (a `$ref` or a
+/// bare `{}`), which is already permissive enough to accept `null`.
+fn widen_to_nullable(prop: &mut serde_json::Value) {
+    let Some(obj) = prop.as_object_mut() else {
+        return;
+    };
+    match obj.get("type") {
+        Some(serde_json::Value::String(t)) => {
+            if t != "null" {
+                obj["type"] = serde_json::json!([t, "null"]);
+            }
+        }
+        Some(serde_json::Value::Array(ts))
+            if !ts.iter().any(|t| t.as_str() == Some("null")) =>
+        {
+            let mut ts = ts.clone();
+            ts.push(serde_json::json!("null"));
+            obj["type"] = serde_json::Value::Array(ts);
+        }
+        _ => {}
+    }
+}
+
 /// One spec compiled to the one element `build_tools` would put in the
 /// array. Split out of `build_tools` (M10 T0.1) so a report can price a
 /// single tool with the same bytes the request paid for: an apportionment
@@ -175,6 +202,38 @@ pub fn tool_schema_with(spec: &nscore::ActionSpec, with_reply: bool) -> serde_js
     }
     if let Some(existing) = obj.get("required").and_then(|r| r.as_array()) {
         required.extend(existing.iter().cloned());
+    }
+    // `strict: true` below means the provider validates this schema, and its
+    // rule is that `required` names *every* key in `properties`. A spec that
+    // lists only its mandatory arguments is therefore rejected outright --
+    // OpenAI answers 400 `invalid_function_parameters` and names the first
+    // offender, so the whole turn fails, not just that one tool. Five specs
+    // were shaped that way (`pointer_move`'s `screen`, `pointer_click`'s
+    // `button`/`count`/`screen`, `pointer_scroll`'s `dx`, `pointer_type`'s
+    // `text`/`key`/`modifiers`, `pointer_ui_read`'s `query`).
+    //
+    // Optionality is kept the way strict mode expects it: the key becomes
+    // required and its type gains `null`, which every reader here already
+    // treats as absent -- the arguments are read with
+    // `args.get(k).and_then(as_str)`, and `null` yields `None` exactly as a
+    // missing key does. Done here rather than in each spec so a new tool
+    // cannot reintroduce the bug by omitting one line.
+    let declared: std::collections::HashSet<String> = required
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let optional: Vec<String> = obj["properties"]
+        .as_object()
+        .map(|p| {
+            p.keys()
+                .filter(|k| !declared.contains(*k))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in optional {
+        widen_to_nullable(&mut obj["properties"][&key]);
+        required.push(serde_json::json!(key));
     }
     obj.insert("required".into(), serde_json::Value::Array(required));
     obj.insert("additionalProperties".into(), serde_json::json!(false));
@@ -449,5 +508,103 @@ mod tests {
             arr[0]["function"]["parameters"]["properties"][RATIONALE].is_object(),
             "the one tool that is always legal carries the rationale too"
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_schema_tests {
+    use super::*;
+
+    fn spec_with(args_schema: serde_json::Value) -> nscore::ActionSpec {
+        nscore::ActionSpec {
+            name: "probe".into(),
+            description: "a probe".into(),
+            args_schema,
+            side_effect: nscore::SideEffect::Pure,
+            residual_policy: Default::default(),
+            dedupe_tag: None,
+        }
+    }
+
+    fn required_of(t: &serde_json::Value) -> Vec<String> {
+        t["function"]["parameters"]["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// `strict: true` binds us to the provider's rule: `required` must name
+    /// every key in `properties`. This is the shape that produced the 400 --
+    /// OpenAI rejected `pointer_move` for leaving `screen` out, and the whole
+    /// turn failed with it, not just that one tool.
+    #[test]
+    fn a_property_left_out_of_required_is_added_to_it() {
+        let t = tool_schema_with(
+            &spec_with(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "screen": {"type": "string"},
+                },
+                "required": ["x"]
+            })),
+            true,
+        );
+        let required = required_of(&t);
+        for key in ["x", "screen", RATIONALE, REPLY, SAY] {
+            assert!(
+                required.contains(&key.to_string()),
+                "`{key}` must be required under strict mode: {required:?}"
+            );
+        }
+    }
+
+    /// The other half of the rule: a key that used to be omitted must stay
+    /// omittable in meaning, which strict mode spells as a `null` type. Every
+    /// reader of these arguments uses `args.get(k).and_then(as_str)`, where
+    /// `null` yields `None` exactly as a missing key does.
+    #[test]
+    fn an_argument_that_was_optional_becomes_nullable() {
+        let t = tool_schema_with(
+            &spec_with(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "screen": {"type": "string"},
+                    "modifiers": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["x"]
+            })),
+            false,
+        );
+        let props = &t["function"]["parameters"]["properties"];
+        assert_eq!(props["screen"]["type"], serde_json::json!(["string", "null"]));
+        assert_eq!(
+            props["modifiers"]["type"],
+            serde_json::json!(["array", "null"])
+        );
+        assert_eq!(
+            props["x"]["type"],
+            serde_json::json!("number"),
+            "a genuinely mandatory argument must not become nullable"
+        );
+    }
+
+    #[test]
+    fn widening_a_type_twice_changes_nothing() {
+        let mut p = serde_json::json!({"type": "string"});
+        widen_to_nullable(&mut p);
+        let once = p.clone();
+        widen_to_nullable(&mut p);
+        assert_eq!(p, once, "widening must be idempotent");
+    }
+
+    #[test]
+    fn a_property_with_no_type_is_left_alone() {
+        let mut p = serde_json::json!({"description": "anything"});
+        widen_to_nullable(&mut p);
+        assert_eq!(p, serde_json::json!({"description": "anything"}));
     }
 }
