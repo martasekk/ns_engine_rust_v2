@@ -93,6 +93,31 @@ async fn a_bad_location_is_refused_rather_than_bent_into_a_plausible_one() {
     assert!(s.resolve(&Loc::absolute(100, 100)).is_ok());
 }
 
+/// A pixel coordinate sent with a `screen` is the commonest way to land
+/// outside `0.0..=1.0`, because that is what reading a position and passing it
+/// on produces: `pointer_ui_find` reports pixels, and adding the screen turns
+/// them into fractions nobody meant. The refusal has to name the argument to
+/// drop, or the caller cannot tell a wrong coordinate from a wrong mode -- a
+/// real run spent its whole budget on that and concluded no click tool
+/// existed.
+#[tokio::test]
+async fn an_out_of_range_fraction_says_how_to_send_pixels_instead() {
+    let s = session().await;
+    let Err(InputError::NoSuchLocation(detail)) =
+        s.resolve(&Loc::normalized("PRIMARY-EDID-A1", 38.0, 448.0))
+    else {
+        panic!("pixels passed as fractions must be refused");
+    };
+    assert!(
+        detail.contains("no `screen`"),
+        "the refusal must name the way out, got: {detail}"
+    );
+    assert!(
+        detail.contains("pointer_ui_find"),
+        "and where such coordinates come from, got: {detail}"
+    );
+}
+
 /// The failure this whole design exists to prevent. A capture taken by a
 /// process that is not per-monitor DPI aware comes back virtualized:
 /// 2560×1440 at 150% arrives as 1707×960. Sending the image's own pixel

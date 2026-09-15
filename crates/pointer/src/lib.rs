@@ -205,7 +205,25 @@ impl<P: Pointer> Session<P> {
                     InputError::NoSuchLocation(format!("no screen {:?}", screen.0))
                 })?;
                 s.normalized_to_physical(*x, *y).ok_or_else(|| {
-                    InputError::NoSuchLocation(format!("({x}, {y}) is outside 0.0..=1.0"))
+                    // The refusal names the way out, because the caller that
+                    // lands here is almost always one that read a position
+                    // somewhere else and passed it on faithfully:
+                    // `pointer_ui_find` reports pixels, and adding `screen` to
+                    // those pixels is what turns them into fractions nobody
+                    // meant. A model told only that (38, 448) is "outside
+                    // 0.0..=1.0" has no reason to suspect the argument it
+                    // should drop, and observably does not find it -- one run
+                    // spent its whole budget hunting for a click that worked
+                    // and then reported that no click tool existed.
+                    //
+                    // Said here rather than in the tool description because
+                    // the description is paid for on every request and this
+                    // is paid for only when it happens.
+                    InputError::NoSuchLocation(format!(
+                        "({x}, {y}) is outside 0.0..=1.0: with `screen` set, x and y are \
+                         fractions of that screen. For desktop pixels, such as the \
+                         coordinates pointer_ui_find reports, send x and y with no `screen`."
+                    ))
                 })
             }
         }
