@@ -48,6 +48,28 @@ enum Act {
     OcrFind,
 }
 
+/// Every desktop action, once.
+///
+/// `tools` builds these and `specs` describes them, and until this list
+/// existed they each carried their own copy. They drifted the first time one
+/// changed: `pointer_ocr_find` was added to the described set and not to the
+/// built one, so it was priced in every budget and present in every snapshot
+/// while the running engine never offered it — and the model, asked to use
+/// it, correctly reported that no such tool existed.
+const ALL: [Act; 11] = [
+    Act::Screens,
+    Act::Position,
+    Act::Move,
+    Act::Click,
+    Act::Scroll,
+    Act::Type,
+    Act::ClipRead,
+    Act::ClipWrite,
+    Act::UiRead,
+    Act::UiFind,
+    Act::OcrFind,
+];
+
 pub struct PointerTool {
     spec: ActionSpec,
     act: Act,
@@ -66,21 +88,10 @@ pub async fn tools(
     let pointer: Arc<dyn Pointer> = Arc::new(WaitOutOverride::new(pointer));
     let session = Session::open(pointer).await.map_err(|e| e.to_string())?;
     let shared: Shared = Arc::new(Mutex::new(session));
-    Ok([
-        Act::Screens,
-        Act::Position,
-        Act::Move,
-        Act::Click,
-        Act::Scroll,
-        Act::Type,
-        Act::ClipRead,
-        Act::ClipWrite,
-        Act::UiRead,
-        Act::UiFind,
-    ]
-    .into_iter()
-    .map(|act| Arc::new(PointerTool::new(act, shared.clone(), profile)) as Arc<dyn Tool>)
-    .collect())
+    Ok(ALL
+        .into_iter()
+        .map(|act| Arc::new(PointerTool::new(act, shared.clone(), profile)) as Arc<dyn Tool>)
+        .collect())
 }
 
 /// The coordinate convention, written once (M10 T1.2).
@@ -128,22 +139,7 @@ fn xy_schema(extra: serde_json::Value) -> serde_json::Value {
 /// manifest, and it has to do that on a box where the pointer daemon is not
 /// running — the log is the measurement, not the machine.
 pub fn specs(profile: SchemaProfile) -> Vec<ActionSpec> {
-    [
-        Act::Screens,
-        Act::Position,
-        Act::Move,
-        Act::Click,
-        Act::Scroll,
-        Act::Type,
-        Act::ClipRead,
-        Act::ClipWrite,
-        Act::UiRead,
-        Act::UiFind,
-        Act::OcrFind,
-    ]
-    .into_iter()
-    .map(|a| spec_of(a, profile))
-    .collect()
+    ALL.into_iter().map(|a| spec_of(a, profile)).collect()
 }
 
 /// The one place an action's name, description and argument schema are
@@ -912,7 +908,7 @@ mod tests {
     #[tokio::test]
     async fn every_action_shares_one_session() {
         let (t, mock) = built().await;
-        assert_eq!(t.len(), 10);
+        assert_eq!(t.len(), ALL.len());
         find(&t, "pointer_move")
             .call(&serde_json::json!({"x": 100, "y": 100}), &ctx())
             .await
@@ -1020,6 +1016,36 @@ mod tests {
     /// `pointer_click: missing required arg "x"`, and its two
     /// `IllegalAction`s both name `pointer_move`. One argument example each,
     /// in both profiles, kept short enough to be free.
+    /// Every action `specs` describes is an action `tools` actually builds.
+    ///
+    /// They were two hand-kept lists, and the drift was silent in the worst
+    /// way: `pointer_ocr_find` was described, priced into every budget
+    /// assertion and stored in the description snapshot, while the engine
+    /// registered ten tools and never offered it. Nothing failed. The model
+    /// was simply told, correctly, that there was no such tool.
+    ///
+    /// `tools` needs a live agent, so what is compared here is the list both
+    /// of them read — the assertion is that there is only one.
+    #[test]
+    fn everything_described_is_something_built() {
+        let described: Vec<String> = specs(SchemaProfile::Full)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let built: Vec<String> = ALL
+            .into_iter()
+            .map(|a| spec_of(a, SchemaProfile::Full).name)
+            .collect();
+        assert_eq!(
+            described, built,
+            "the described set and the built set have drifted"
+        );
+        assert!(
+            described.iter().any(|n| n == "pointer_ocr_find"),
+            "the action added when this test was written is gone: {described:?}"
+        );
+    }
+
     #[test]
     fn the_two_tools_the_rejections_name_carry_an_argument_example() {
         for profile in [SchemaProfile::Full, SchemaProfile::Slim] {

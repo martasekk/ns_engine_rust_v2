@@ -1260,10 +1260,10 @@ mod tests {
     }
 
     /// The whole client hop, against an agent that records and touches
-    /// nothing: the ten desktop actions arrive, and a bad token is refused
+    /// nothing: every desktop action arrives, and a bad token is refused
     /// with the agent's reason rather than a hang.
     #[tokio::test]
-    async fn a_configured_pointer_agent_becomes_ten_harness_actions() {
+    async fn a_configured_pointer_agent_becomes_every_harness_action() {
         use nspointer::agent::{bind, serve_listener, Agent, AgentConfig, Limits, Listen};
         use nspointer::platform::NullPlatform;
         use nspointer::{Rect, Screen, ScreenId, Screens};
@@ -1298,8 +1298,12 @@ mod tests {
 
         let tools = connect_pointer(&addr, "t0k", nscore::SchemaProfile::Full).await.unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.spec().name.as_str()).collect();
-        assert_eq!(names.len(), 10, "{names:?}");
+        assert_eq!(names.len(), 11, "{names:?}");
         assert!(names.contains(&"pointer_click") && names.contains(&"pointer_ui_read"));
+        // The eleventh, and the reason this number is worth asserting at all:
+        // a real agent connection is what proves the action is *registered*,
+        // not merely described. It was described and not registered once.
+        assert!(names.contains(&"pointer_ocr_find"), "{names:?}");
 
         let err = match connect_pointer(&addr, "wrong", nscore::SchemaProfile::Full).await {
             Err(e) => e,
