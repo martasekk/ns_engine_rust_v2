@@ -181,6 +181,27 @@ where
             other => Err(unexpected(other)),
         }
     }
+
+    async fn ocr(
+        &self,
+        region: (i32, i32, i32, i32),
+        needle: Option<&str>,
+    ) -> Result<Vec<crate::wire::TextBox>, InputError> {
+        let (x, y, width, height) = region;
+        match self
+            .call(Op::Ocr {
+                x,
+                y,
+                width,
+                height,
+                needle: needle.map(str::to_string),
+            })
+            .await?
+        {
+            ResultBody::Text { boxes, .. } => Ok(boxes),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 fn unexpected(body: ResultBody) -> InputError {

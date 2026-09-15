@@ -64,6 +64,24 @@ pub trait Pointer: Send + Sync {
     async fn ui_tree(&self, _visible_only: bool) -> Result<Vec<ui::UiNode>, InputError> {
         Err(unsupported())
     }
+
+    /// Optional (protocol 2). The text the screen is showing in a region,
+    /// placed in desktop pixels, as the fallback behind [`Pointer::ui_tree`].
+    ///
+    /// Not a competitor to the tree: UI Automation reports real roles, names
+    /// and bounds, and OCR infers all three from pixels. Reach for this where
+    /// the tree comes back empty — Electron, canvas-drawn UIs, games, remote
+    /// desktops — and prefer the tree everywhere else.
+    ///
+    /// `needle` is matched by the agent, which is where the boxes already
+    /// are: a full-screen read is hundreds of them and the caller wants two.
+    async fn ocr(
+        &self,
+        _region: (i32, i32, i32, i32),
+        _needle: Option<&str>,
+    ) -> Result<Vec<wire::TextBox>, InputError> {
+        Err(unsupported())
+    }
 }
 
 fn unsupported() -> InputError {
@@ -95,6 +113,13 @@ impl<P: Pointer + ?Sized> Pointer for std::sync::Arc<P> {
     }
     async fn ui_tree(&self, visible_only: bool) -> Result<Vec<ui::UiNode>, InputError> {
         (**self).ui_tree(visible_only).await
+    }
+    async fn ocr(
+        &self,
+        region: (i32, i32, i32, i32),
+        needle: Option<&str>,
+    ) -> Result<Vec<wire::TextBox>, InputError> {
+        (**self).ocr(region, needle).await
     }
 }
 
@@ -319,6 +344,33 @@ impl<P: Pointer> Session<P> {
     /// The target's controls, compressed for a prompt. Keeps the previous
     /// tree so the next call can tell what just appeared — the temporal half
     /// of modal detection.
+    /// Text read off the pixels, as the fallback behind [`Session::ui_read`].
+    ///
+    /// A region of `None` means the whole desktop, which is what a caller that
+    /// has just had `ui_read` come back empty actually wants: it does not know
+    /// where the thing is, or it would not be asking.
+    pub async fn ocr_find(
+        &self,
+        needle: Option<&str>,
+        region: Option<(i32, i32, i32, i32)>,
+    ) -> Result<Vec<wire::TextBox>, InputError> {
+        let region = match region {
+            Some(r) => r,
+            None => {
+                let s = self.pointer.screens().await?;
+                let b = s
+                    .primary()
+                    .or_else(|| s.screens.first())
+                    .map(|s| s.bounds)
+                    .ok_or_else(|| {
+                        InputError::NoSuchLocation("this machine reports no screens".into())
+                    })?;
+                (b.x, b.y, b.w as i32, b.h as i32)
+            }
+        };
+        self.pointer.ocr(region, needle).await
+    }
+
     pub async fn ui_read(&self, query: Option<&str>) -> Result<ui::UiView, InputError> {
         // Visible only. `compress` drops off-screen nodes first thing, and on
         // a real desktop they were 73% of the tree — ~300 KB per read, over

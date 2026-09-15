@@ -1648,6 +1648,23 @@ mod tests {
     /// of an empty store.
     const CHAT_FLOOR: [&str; 2] = ["ask_clarification", "remember_fact"];
 
+    /// The desktop as it stood when the 2,477-token baseline was measured.
+    /// Frozen on purpose: it is the other half of a ratio, and a list that
+    /// grew with the array would quietly restate the claim every time a tool
+    /// was added.
+    const PRE_OCR_DESKTOP: [&str; 10] = [
+        "pointer_screens",
+        "pointer_position",
+        "pointer_move",
+        "pointer_click",
+        "pointer_scroll",
+        "pointer_type",
+        "pointer_clipboard_read",
+        "pointer_clipboard_write",
+        "pointer_ui_read",
+        "pointer_ui_find",
+    ];
+
     /// The per-tool envelope, measured rather than assumed — every number
     /// below is an argument about how much of an array is text you can cut
     /// and how much is JSON you cannot.
@@ -1718,14 +1735,25 @@ mod tests {
         // of P1 does buy against the recorded 2,613-token array is asserted
         // here instead, and `slim` has to be the smaller of the two.
         let baseline = 2477u32;
+        // The 2,477 was measured over the ten actions the desktop had then,
+        // so the ratio is asserted over those ten and not over whatever the
+        // array holds today. `pointer_ocr_find` was added afterwards, and
+        // letting a new tool make P1's compression look worse would be
+        // comparing two different arrays and calling it a regression.
+        let ten = named(SchemaProfile::Slim, &PRE_OCR_DESKTOP);
+        let st_ten = array_tokens(&ten);
         assert!(
-            st <= 1850,
-            "the slim desktop array is {st} tokens, over 1,850 (full is {ft})"
+            st_ten * 100 <= baseline * 75,
+            "slim is {st_ten} tokens over the original ten, only {:.1}% below the pre-P1 \
+             {baseline}",
+            100.0 - 100.0 * st_ten as f64 / baseline as f64
         );
+        // The whole array still has a ceiling, and it moved once, by one
+        // tool: OCR is the fallback for the desktops UI Automation cannot
+        // see, and it costs ~120 tokens of envelope and description to carry.
         assert!(
-            st * 100 <= baseline * 75,
-            "slim is {st} tokens, only {:.1}% below the pre-P1 {baseline}",
-            100.0 - 100.0 * st as f64 / baseline as f64
+            st <= 1990,
+            "the slim desktop array is {st} tokens, over 1,990 (full is {ft})"
         );
         assert!(st < ft, "slim ({st}) is not smaller than full ({ft})");
         // And the saving is text. Every name, and every required parameter,

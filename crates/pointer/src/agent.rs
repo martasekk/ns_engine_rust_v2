@@ -15,8 +15,9 @@
 
 use crate::platform::Platform;
 use crate::wire::{
-    Button, ErrorKind, InputError, Key, Op, Request, Response, ResultBody, Step, PROTOCOL,
+    Button, ErrorKind, InputError, Key, Op, Request, Response, ResultBody, Step, TextBox, PROTOCOL,
 };
+use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -31,6 +32,28 @@ pub trait Audit: Send + Sync {
 pub struct NoAudit;
 impl Audit for NoAudit {
     fn record(&self, _entry: &serde_json::Value) {}
+}
+
+/// Reads the text a region of this desktop is showing.
+///
+/// A hook rather than a `Platform` method because the two halves live in
+/// different places: capturing pixels is this machine's business, and turning
+/// them into text is a model somewhere else. This crate does not want to know
+/// about either, and `ns-pointerd` already owns both — it captures the region
+/// and posts it to the OCR server it was started with.
+///
+/// Absent by default, which is what makes `Op::Ocr` optional: an agent with no
+/// reader answers `Unsupported`, exactly as one built before the op did.
+#[async_trait]
+pub trait OcrReader: Send + Sync {
+    /// The region is in desktop pixels, and so are the coordinates coming
+    /// back: the caller is going to click one of these, and only this side
+    /// knows where the capture sat or at what scale.
+    async fn read(
+        &self,
+        region: (i32, i32, i32, i32),
+        needle: Option<&str>,
+    ) -> Result<Vec<TextBox>, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +192,8 @@ pub struct Agent<P: Platform> {
     platform: Arc<P>,
     cfg: AgentConfig,
     audit: Box<dyn Audit>,
+    /// `None` means this agent cannot read pixels, and `Op::Ocr` says so.
+    ocr: Option<Box<dyn OcrReader>>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Machine-wide, not per connection: the override and the rate ceiling
     /// both protect one desktop, so both are shared.
@@ -192,6 +217,7 @@ impl<P: Platform + 'static> Agent<P> {
             platform: Arc::new(platform),
             cfg,
             audit: Box::new(NoAudit),
+            ocr: None,
             clock: Box::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -215,6 +241,13 @@ impl<P: Platform + 'static> Agent<P> {
 
     pub fn with_audit(mut self, audit: Box<dyn Audit>) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// Give this agent a way to read the screen's text. Without one, `Op::Ocr`
+    /// answers `Unsupported`.
+    pub fn with_ocr(mut self, ocr: Box<dyn OcrReader>) -> Self {
+        self.ocr = Some(ocr);
         self
     }
 
@@ -421,6 +454,41 @@ impl<P: Platform + 'static> Agent<P> {
                 }
             }
             Op::Perform { steps } => self.perform(id, steps, held).await,
+            Op::Ocr {
+                x,
+                y,
+                width,
+                height,
+                needle,
+            } => {
+                let Some(reader) = self.ocr.as_ref() else {
+                    return Response::err(
+                        id,
+                        ErrorKind::Unsupported,
+                        "this agent was started without an OCR server; \
+                         use ui_tree, or restart it with --ocr",
+                    );
+                };
+                // Not rate-limited and not gated on the override: reading the
+                // screen injects nothing, which is the same reason `ui_tree`
+                // and the clipboard reads are where they are.
+                match reader.read((x, y, width, height), needle.as_deref()).await {
+                    Ok(boxes) => {
+                        self.audit.record(&serde_json::json!({
+                            "at": (self.clock)(), "event": "ocr",
+                            "region": [x, y, width, height], "boxes": boxes.len(),
+                        }));
+                        Response::ok(
+                            id,
+                            ResultBody::Text {
+                                boxes,
+                                state: self.platform.state(),
+                            },
+                        )
+                    }
+                    Err(detail) => Response::err(id, ErrorKind::Internal, &detail),
+                }
+            }
             // The three slow, synchronous platform calls run on a blocking
             // thread. Not `block_in_place`: that panics on a `current_thread`
             // runtime, which is what `#[tokio::test]` hands out.

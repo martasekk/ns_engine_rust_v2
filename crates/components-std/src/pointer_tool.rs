@@ -45,6 +45,7 @@ enum Act {
     ClipWrite,
     UiRead,
     UiFind,
+    OcrFind,
 }
 
 pub struct PointerTool {
@@ -138,6 +139,7 @@ pub fn specs(profile: SchemaProfile) -> Vec<ActionSpec> {
         Act::ClipWrite,
         Act::UiRead,
         Act::UiFind,
+        Act::OcrFind,
     ]
     .into_iter()
     .map(|a| spec_of(a, profile))
@@ -294,6 +296,32 @@ fn spec_of(act: Act, profile: SchemaProfile) -> ActionSpec {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"]
+            }),
+        ),
+        Act::OcrFind => (
+            "pointer_ocr_find",
+            profile.pick(
+                "Find text by reading the pixels, when pointer_ui_find has come back \
+                 empty. That happens with Electron apps, canvas-drawn interfaces, games \
+                 and remote desktop windows. Returns each match with the desktop pixels \
+                 to click, which pointer_click takes with no `screen`. Slower and it \
+                 guesses from an image, so try pointer_ui_find first, every time."
+                    .to_string(),
+                "Read text from pixels when pointer_ui_find found nothing; returns \
+                 clickable desktop pixels."
+                    .to_string(),
+            ),
+            SideEffect::Pure,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "width": {"type": "integer"},
+                    "height": {"type": "integer"},
+                },
+                "required": ["text"]
             }),
         ),
     };
@@ -538,6 +566,40 @@ impl Tool for PointerTool {
                         format!(
                             "{} \"{}\" at ({}, {})",
                             n.role, n.name, n.center.x, n.center.y
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "))
+            }
+            Act::OcrFind => {
+                let Some(text) = args.get("text").and_then(serde_json::Value::as_str) else {
+                    return Err(failed("args", "needs text"));
+                };
+                let int = |k: &str| args.get(k).and_then(serde_json::Value::as_i64);
+                // All four or none: three of them describe no rectangle, and
+                // guessing the fourth would read a region the caller did not
+                // ask for and report coordinates from it as if they had.
+                let region = match (int("x"), int("y"), int("width"), int("height")) {
+                    (Some(x), Some(y), Some(w), Some(h)) => {
+                        Some((x as i32, y as i32, w as i32, h as i32))
+                    }
+                    _ => None,
+                };
+                let s = self.shared.lock().await;
+                let hits = s
+                    .ocr_find(Some(text), region)
+                    .await
+                    .map_err(|e| failed("pointer", e))?;
+                if hits.is_empty() {
+                    return ok(format!("no text matching {text}"));
+                }
+                ok(hits
+                    .iter()
+                    .take(5)
+                    .map(|b| {
+                        format!(
+                            "\"{}\" at ({}, {}) conf {:.2}",
+                            b.text, b.x, b.y, b.confidence
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1010,6 +1072,8 @@ mod tests {
         );
     }
 
-    const FULL_SNAPSHOT: u64 = 9396470299233653983;
-    const SLIM_SNAPSHOT: u64 = 8071011069512019417;
+    // Moved when `pointer_ocr_find` joined the array. The diff to review was
+    // one added tool and no change to the other ten.
+    const FULL_SNAPSHOT: u64 = 7182663464776869624;
+    const SLIM_SNAPSHOT: u64 = 10082830252112739069;
 }

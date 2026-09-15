@@ -154,6 +154,16 @@ impl<P: Pointer> Pointer for WaitOutOverride<P> {
     async fn ui_tree(&self, visible_only: bool) -> Result<Vec<UiNode>, InputError> {
         self.inner.ui_tree(visible_only).await
     }
+
+    /// Passed straight through, like the other reads: the override suspends
+    /// injection, and reading the screen injects nothing.
+    async fn ocr(
+        &self,
+        region: (i32, i32, i32, i32),
+        needle: Option<&str>,
+    ) -> Result<Vec<crate::wire::TextBox>, InputError> {
+        self.inner.ocr(region, needle).await
+    }
 }
 
 #[cfg(test)]

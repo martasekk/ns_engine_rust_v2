@@ -177,6 +177,27 @@ pub enum Op {
         #[serde(default)]
         visible_only: bool,
     },
+    /// Read the text the screen is *showing*, in a region of the desktop.
+    /// Protocol 2, optional — like `UiTree`, an agent built without it
+    /// answers `Unsupported` rather than forcing a version bump.
+    ///
+    /// This is the fallback behind `UiTree`, never a second path competing
+    /// with it. UI Automation gives real roles, names and bounds; OCR guesses
+    /// all three from pixels. It earns its place only where UIA returns
+    /// nothing — Electron apps, canvas-drawn UIs, games, remote desktop
+    /// windows — which is exactly where a caller would otherwise be stuck.
+    ///
+    /// `needle` filters agent-side on purpose. The alternative is shipping
+    /// every box back and filtering here, and a full-screen read is hundreds
+    /// of them: the caller wants the two that say "Add to basket".
+    Ocr {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        needle: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +250,28 @@ pub enum ResultBody {
         nodes: Vec<crate::ui::UiNode>,
         state: u64,
     },
+    Text {
+        boxes: Vec<TextBox>,
+        state: u64,
+    },
+}
+
+/// One piece of text OCR found, placed on the desktop.
+///
+/// `x` and `y` are the centre of the text, in the same desktop pixels
+/// `Loc::Absolute` takes — so a caller can click a result without converting
+/// anything. The agent does that translation, because only the agent knows
+/// where the region it captured sat and at what scale.
+///
+/// `confidence` is carried rather than filtered on: 0.6 is worth showing for a
+/// price and not for a button you are about to press, and only the caller
+/// knows which it is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextBox {
+    pub text: String,
+    pub confidence: f32,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

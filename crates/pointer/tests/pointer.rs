@@ -716,4 +716,53 @@ fn older_messages_still_parse_with_the_old_meaning() {
         serde_json::from_str(r#"{"role":"Button","name":"Save","center":{"x":1,"y":2}}"#).unwrap();
     assert!(n.visible && n.enabled && !n.focused && !n.focusable);
     assert_eq!((n.depth, n.window), (0, 0));
+
+    // `ocr` without a needle is a read of the whole region, and omitting the
+    // field has to keep meaning that — it is how a caller asks "what does
+    // this say", as against "where does it say this".
+    let r: Request =
+        serde_json::from_str(r#"{"id":9,"op":"ocr","x":0,"y":0,"width":800,"height":600}"#).unwrap();
+    assert_eq!(
+        r.op,
+        Op::Ocr {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            needle: None
+        }
+    );
+}
+
+/// The wire carries OCR results in desktop pixels, which is the only reason
+/// they are useful: a caller clicks one of these next, and `Loc::Absolute`
+/// takes exactly these numbers.
+#[test]
+fn an_ocr_result_round_trips_with_its_desktop_coordinates() {
+    use nspointer::wire::{Response, ResultBody, TextBox};
+    let body = ResultBody::Text {
+        boxes: vec![TextBox {
+            text: "Přidat do košíku".into(),
+            confidence: 0.91,
+            x: 1204,
+            y: 668,
+        }],
+        state: 3,
+    };
+    let json = serde_json::to_string(&Response {
+        id: 1,
+        ok: true,
+        result: Some(body.clone()),
+        error: None,
+    })
+    .unwrap();
+    let back: Response = serde_json::from_str(&json).unwrap();
+    match back.result.unwrap() {
+        ResultBody::Text { boxes, state } => {
+            assert_eq!(state, 3);
+            assert_eq!(boxes[0].text, "Přidat do košíku", "non-ASCII text survives");
+            assert_eq!((boxes[0].x, boxes[0].y), (1204, 668));
+        }
+        other => panic!("{other:?}"),
+    }
 }
