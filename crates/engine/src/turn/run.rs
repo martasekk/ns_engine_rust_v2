@@ -519,7 +519,23 @@ impl Engine {
                     },
                 );
                 book.rejections.push(format!("guard repeat_gate: {reason}"));
-                book.denied.insert(proposal.action.clone());
+                // The call is refused either way. Whether the *action* also
+                // leaves the schema depends on whether repeating it could ever
+                // have told the model anything: for an engine-owned call it
+                // could not, and withdrawing it ends the loop for good.
+                //
+                // For a registered tool it could. The desktop moves — pages
+                // load, dialogs open — so the same click is a different act a
+                // second later, and withdrawing the action takes away the only
+                // way to perform it. Measured on a browsing run: one repeat
+                // each of `pointer_click`, `pointer_type`, `pointer_ui_find`
+                // and `pointer_clipboard_write` left the model, by iteration
+                // 35, with no way to click or type at all. It reported to the
+                // user that no such tools were available, which by then was
+                // exactly true.
+                if is_engine_owned(&proposal.action) {
+                    book.denied.insert(proposal.action.clone());
+                }
                 continue;
             }
 

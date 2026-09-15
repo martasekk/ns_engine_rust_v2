@@ -222,6 +222,27 @@ pub(super) fn inspect_result_spec(profile: nscore::SchemaProfile) -> nscore::Act
     }
 }
 
+/// Does the engine answer this action itself, rather than handing it to a
+/// registered tool?
+///
+/// The list is `run_builtin`'s, and the two must agree: that function is the
+/// one place that knows which actions the engine answers, and this is the one
+/// place that asks the question without dispatching.
+///
+/// It exists for the repeat gate. Repeating an engine-owned call really does
+/// yield nothing new — the store does not move between two `recall`s inside
+/// one turn — so dropping the action from the rest of the turn costs the model
+/// nothing it could have used. A registered tool is the opposite: it reads or
+/// moves a world that changes underneath it, and two identical calls can have
+/// entirely different results. Clicking (1200, 300) before a page loads and
+/// after it loads is the same call and not the same act.
+pub(super) fn is_engine_owned(action: &str) -> bool {
+    matches!(
+        action,
+        ASK_CLARIFICATION | REMEMBER_FACT | RECALL | INSPECT_RESULT | FORGET_FACT | FORGET_ALL
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +250,39 @@ mod tests {
     /// The builtin specs never pass through `HarnessBuilder::add_tool`, so
     /// the assembly gate does not see them. They need the same check, or the
     /// half of the legal set the engine owns itself is the unchecked half.
+    /// `is_engine_owned` decides whether a repeated call costs the model the
+    /// action for the rest of the turn, so it has to name exactly the actions
+    /// `run_builtin` answers. A builtin added there and forgotten here would
+    /// be refused forever instead of withdrawn; a registered tool wrongly
+    /// listed here would be taken away mid-task, which is the failure this
+    /// whole change is about.
+    #[test]
+    fn engine_owned_is_exactly_the_builtins() {
+        for name in [
+            ASK_CLARIFICATION,
+            REMEMBER_FACT,
+            RECALL,
+            INSPECT_RESULT,
+            FORGET_FACT,
+            FORGET_ALL,
+        ] {
+            assert!(is_engine_owned(name), "{name} is answered by the engine");
+        }
+        for name in [
+            "pointer_click",
+            "pointer_type",
+            "pointer_ui_find",
+            "pointer_clipboard_write",
+            "get_time",
+            "echo",
+        ] {
+            assert!(
+                !is_engine_owned(name),
+                "{name} is a registered tool and must keep its place in the schema"
+            );
+        }
+    }
+
     #[test]
     fn every_builtin_spec_keeps_the_rationale_first() {
         for spec in [nscore::SchemaProfile::Full, nscore::SchemaProfile::Slim]

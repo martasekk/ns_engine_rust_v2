@@ -1961,11 +1961,19 @@ fn tool_calls(events: &[Event], action: &str) -> usize {
 }
 
 #[tokio::test]
-async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
+async fn identical_call_repeated_in_one_turn_is_denied_every_time() {
     // Seen live with qwen2.5:3b: the emitter re-proposes the exact completed
     // call until max_iterations exhausts. An identical (action, args) pair
-    // yields no new information — the engine must refuse it, and the
-    // narrowed schema must then remove the action entirely.
+    // yields no new information, so the engine refuses it — every time, and
+    // without taking the tool away.
+    //
+    // `echo` is a registered tool, and a registered tool reads or moves a
+    // world that does not hold still: the same call a second later can have a
+    // different result. Withdrawing the action would end the loop by ending
+    // the model's ability to act at all, which on a browsing run left it with
+    // no way to click or type by iteration 35. The refusal is per call; the
+    // offer stands. `is_engine_owned` names the actions where withdrawal is
+    // still right, and the test below covers one.
     let store = Arc::new(InMemoryStore::new());
     let e = engine_with(
         vec![
@@ -1993,8 +2001,9 @@ async fn identical_call_repeated_in_one_turn_is_denied_then_narrowed() {
         reasons[0]
     );
     assert!(
-        matches!(reasons[1], RejectReason::IllegalAction { .. }),
-        "second repeat is illegal under the narrowed set, got {:?}",
+        matches!(reasons[1], RejectReason::GuardDenied { guard, .. } if guard == "repeat_gate"),
+        "the second repeat is denied by the gate too, not made illegal by \
+         withdrawing the tool, got {:?}",
         reasons[1]
     );
     assert!(
