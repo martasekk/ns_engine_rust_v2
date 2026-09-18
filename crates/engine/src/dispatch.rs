@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nscore::{Channel, ChannelError, Incoming, SessionId};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Semaphore, SemaphorePermit};
 use tokio::task::{JoinError, JoinSet};
 
 use crate::turn::{Engine, EngineError};
@@ -43,13 +43,105 @@ use crate::turn::{Engine, EngineError};
 /// never a drop: the `WithDesktop` rule.
 const MAILBOX_DEPTH: usize = 16;
 
+/// What a dispatcher does with a turn that failed (plan
+/// `docs/superpowers/plans/2026-09-13-multi-tenant-runtime.md` Phase 2, T2.1).
+///
+/// One process used to serve one conversation, so any failure was the
+/// process's failure. A shard serving many tenants needs the question asked
+/// once, at the one place a session's failure is seen: hazard H2 is that
+/// today one tenant's widget disappearing mid-reply ends a process serving
+/// every other tenant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TurnFailure {
+    /// The CLI's, and the default: a failed turn ends the run, and a panic
+    /// is resumed on the dispatcher's own task. Today's behaviour exactly.
+    #[default]
+    Fatal,
+    /// Serve's: a failed session ends that session, and the dispatcher keeps
+    /// serving every other one. What still ends the run is in
+    /// [`TurnFailure::verdict`], which is where the whole policy lives.
+    Isolate,
+}
+
+/// What one failure costs: everything, or one session.
+enum Verdict {
+    EndTheRun,
+    EndTheSession,
+}
+
+impl TurnFailure {
+    /// The classification, exhaustive over `EngineError` with no wildcard
+    /// arm on purpose: a fourth variant added later cannot inherit a policy
+    /// by accident, because this will not compile until someone has decided
+    /// what it costs.
+    fn verdict(self, e: &EngineError) -> Verdict {
+        match e {
+            // The disk is gone. Fatal for the shard under either policy:
+            // every other tenant here writes to a store too.
+            EngineError::Store(_) => Verdict::EndTheRun,
+            // Not a fault at all - a metered run reaching its ceiling. It
+            // ends this tenant's dispatcher and nothing wider, which under
+            // `Isolate` is one tenant of the shard rather than the shard.
+            EngineError::RequestCap { .. } => Verdict::EndTheRun,
+            // H2 itself: one session's connection went away.
+            EngineError::Channel(_) => match self {
+                TurnFailure::Fatal => Verdict::EndTheRun,
+                TurnFailure::Isolate => Verdict::EndTheSession,
+            },
+        }
+    }
+}
+
+/// A ceiling on the turns a whole *process* runs at once, shared by every
+/// dispatcher in it (plan `.claude/plans/continue-polymorphic-pearl.md`
+/// Part B, B1).
+///
+/// One dispatcher per tenant means one `worker_slots` pool per tenant, so N
+/// tenants bound N turns each and the process nothing at all. This is the
+/// missing outer bound: clone it into every dispatcher on the shard and the
+/// turns in flight across all of them cannot exceed it.
+///
+/// # The acquisition order is the safety property
+///
+/// A turn takes its tenant's permit **first** and the shard's **second**,
+/// never the other way round. That order is total, so the wait-for graph has
+/// no cycle: a task may hold a tenant permit while waiting for a shard
+/// permit, but nothing holding a shard permit ever waits for a tenant one.
+/// Reverse it anywhere and two tenants deadlock, each holding what the other
+/// waits for.
+///
+/// The order is the *type's* to enforce, not this paragraph's:
+/// [`ShardSlots::acquire`] takes the tenant permit by reference, so a shard
+/// permit is unobtainable without a tenant permit in hand, and the borrow
+/// keeps that permit held for at least the whole wait.
+#[derive(Clone)]
+pub struct ShardSlots(Arc<Semaphore>);
+
+impl ShardSlots {
+    /// A ceiling of `slots` turns at once, floored at 1 for the reason the
+    /// worker slots are: zero permits would park every turn forever.
+    pub fn new(slots: usize) -> Self {
+        Self(Arc::new(Semaphore::new(slots.max(1))))
+    }
+
+    /// A shard permit, given the tenant permit already held. `held` is never
+    /// read — it is the proof of order documented on the type.
+    async fn acquire<'a>(&'a self, held: &SemaphorePermit<'_>) -> SemaphorePermit<'a> {
+        let _ = held;
+        self.0
+            .acquire()
+            .await
+            .expect("the shard semaphore is never closed")
+    }
+}
+
 /// Reads one channel and runs its sessions, each on its own task.
 pub struct Dispatcher {
     shared: Arc<Shared>,
     n_slots: usize,
     /// The live sessions, by id.
     sessions: HashMap<SessionId, Mailbox>,
-    tasks: JoinSet<Result<Stopped, EngineError>>,
+    tasks: JoinSet<Stopped>,
     /// Numbers each incarnation of a session's task, so a stop report from
     /// an old one can never evict a newer mailbox.
     generations: u64,
@@ -64,10 +156,15 @@ struct Shared {
     channel: Arc<dyn Channel>,
     /// One permit per worker slot.
     slots: Semaphore,
+    /// The shard-wide ceiling, when this dispatcher is one of several in one
+    /// process. `None` for every caller that has not asked for one, and that
+    /// is today's behaviour exactly: `slots` is then the only bound.
+    shard: Option<ShardSlots>,
     /// Turns completed since the consolidator last ran: the session tasks
     /// count, the dispatcher resets.
     turns_since_pass: AtomicU32,
     idle_after: Option<Duration>,
+    policy: TurnFailure,
 }
 
 struct Mailbox {
@@ -84,6 +181,39 @@ struct Stopped {
     /// and left them to the dispatcher rather than run them itself beside a
     /// fresh task for the same session.
     leftovers: Vec<Incoming>,
+    /// Set when the session stopped because its turn went wrong, rather
+    /// than because its mailbox closed or it went quiet.
+    failure: Option<Failure>,
+}
+
+/// Why a session stopped, when it stopped badly.
+enum Failure {
+    /// The turn returned an error, to be classified by [`TurnFailure`].
+    Turn(EngineError),
+    /// The turn panicked and the panic was contained in the session task
+    /// (T2.2), carrying what it was raised with — see [`panic_message`].
+    /// Only ever produced under [`TurnFailure::Isolate`]; under `Fatal` the
+    /// panic unwinds the task and is resumed in `reap`.
+    Panic(String),
+}
+
+/// What a panic was raised with, recovered from the payload `catch_unwind`
+/// hands back, so the one line the operator gets about a contained panic says
+/// more than that there was one.
+///
+/// `panic!`, `assert!`, `unwrap` and `expect` all produce a `String` or a
+/// `&'static str` — the text a test harness prints — so those two downcasts
+/// cover every panic a turn is likely to raise. A payload of any other type
+/// (`panic_any`) cannot be read without knowing the type, so it is described
+/// instead of dropped.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "a panic payload of neither String nor &str".to_string()
+    }
 }
 
 /// What one wait — on the channel, or on a mailbox — produced.
@@ -94,7 +224,7 @@ enum Next {
     Closed,
 }
 
-type TaskResult = Result<Result<Stopped, EngineError>, JoinError>;
+type TaskResult = Result<Stopped, JoinError>;
 
 /// Which of the dispatcher's two waits woke it.
 enum Woke {
@@ -103,7 +233,19 @@ enum Woke {
 }
 
 impl Dispatcher {
+    /// A dispatcher under the default policy, [`TurnFailure::Fatal`]: the
+    /// CLI's, and every caller that has not said otherwise.
     pub fn new(engine: Arc<Engine>, channel: Arc<dyn Channel>, slots: usize) -> Self {
+        Self::with_failure_policy(engine, channel, slots, TurnFailure::Fatal)
+    }
+
+    /// A dispatcher that answers a failed turn the way `policy` says.
+    pub fn with_failure_policy(
+        engine: Arc<Engine>,
+        channel: Arc<dyn Channel>,
+        slots: usize,
+        policy: TurnFailure,
+    ) -> Self {
         // Zero permits would park every turn forever. The config rejects 0;
         // this is the same floor for a caller that did not go through it.
         let n_slots = slots.max(1);
@@ -113,8 +255,10 @@ impl Dispatcher {
                 engine,
                 channel,
                 slots: Semaphore::new(n_slots),
+                shard: None,
                 turns_since_pass: AtomicU32::new(0),
                 idle_after,
+                policy,
             }),
             n_slots,
             sessions: HashMap::new(),
@@ -124,9 +268,22 @@ impl Dispatcher {
         }
     }
 
+    /// Also bounded by a ceiling it shares with the other dispatchers in the
+    /// process ([`ShardSlots`]). Without this the dispatcher keeps only its
+    /// own `slots`, which is what every existing caller gets.
+    pub fn with_shard_slots(mut self, shard: ShardSlots) -> Self {
+        // Unique here by construction: `Shared` is cloned into a session
+        // task only once `run` starts, and `run` takes `self` by value.
+        Arc::get_mut(&mut self.shared)
+            .expect("no session task exists before the dispatcher runs")
+            .shard = Some(shard);
+        self
+    }
+
     /// Reads the channel until it closes, then lets every session finish.
-    /// A turn that fails is fatal for the process, as it was when the loop
-    /// ran the turn itself.
+    /// What a turn that fails costs is the dispatcher's [`TurnFailure`]
+    /// policy: under `Fatal` the process, as it was when the loop ran the
+    /// turn itself; under `Isolate` usually just that session.
     pub async fn run(mut self) -> Result<(), EngineError> {
         let channel = self.shared.channel.clone();
         // One `recv` at a time, and never dropped half-way: `CliChannel`'s is
@@ -232,15 +389,19 @@ impl Dispatcher {
         Ok(Vec::new())
     }
 
-    /// One task's result. `Err` from a turn is fatal for the process, as it
-    /// was when the loop ran the turn itself; a panic is resumed for the
-    /// same reason.
+    /// One task's result, classified by the dispatcher's policy. A failure
+    /// [`TurnFailure::verdict`] calls `EndTheRun` leaves here as `Err`, as
+    /// every failure did when the loop ran the turn itself; one it calls
+    /// `EndTheSession` is a stop like any other, so the mailbox goes and
+    /// whatever was queued behind it is handed back for a fresh task.
     fn reap(&mut self, result: TaskResult) -> Result<Stopped, EngineError> {
-        let stopped = match result {
-            Ok(Ok(stopped)) => stopped,
-            Ok(Err(e)) => return Err(e),
+        let mut stopped = match result {
+            Ok(stopped) => stopped,
             Err(join) => {
-                if join.is_panic() {
+                // Under `Isolate` a panic is contained in the session task
+                // and arrives as `Failure::Panic`, so this is `Fatal`'s
+                // path - and a cancellation's, under either policy.
+                if join.is_panic() && self.shared.policy == TurnFailure::Fatal {
                     std::panic::resume_unwind(join.into_panic());
                 }
                 // Never aborted from here; a cancellation is the runtime
@@ -248,6 +409,20 @@ impl Dispatcher {
                 return Err(EngineError::Channel(format!("session task: {join}")));
             }
         };
+        match stopped.failure.take() {
+            None => {}
+            Some(Failure::Turn(e)) => match self.shared.policy.verdict(&e) {
+                Verdict::EndTheRun => return Err(e),
+                Verdict::EndTheSession => eprintln!("session {}: {e}", stopped.session.0),
+            },
+            // Contained, so it can only ever have cost one session (T2.2).
+            Some(Failure::Panic(message)) => {
+                eprintln!(
+                    "session {}: the turn panicked: {message}",
+                    stopped.session.0
+                )
+            }
+        }
         let current = self
             .sessions
             .get(&stopped.session)
@@ -329,20 +504,82 @@ async fn next_in_mailbox(rx: &mut mpsc::Receiver<Incoming>, idle_after: Option<D
 }
 
 /// One session's task: drains its mailbox one turn at a time, holding a
-/// worker slot for each turn, and stops when the mailbox closes or the
-/// session has been quiet for `idle_after`.
+/// worker slot for each turn, and stops when the mailbox closes, when the
+/// session has been quiet for `idle_after`, or when its turn goes wrong.
+///
+/// However it stops, it stops the same way: the mailbox closes here and
+/// whatever was already in it is handed back, so the message that arrived
+/// one instant before a failure is re-delivered to a fresh task rather than
+/// dropped with this one. No message is lost to a failure, exactly as none
+/// is lost to an idle eviction.
 async fn session_task(
     shared: Arc<Shared>,
     session: SessionId,
     generation: u64,
     mut rx: mpsc::Receiver<Incoming>,
-) -> Result<Stopped, EngineError> {
+) -> Stopped {
+    let failure = match shared.policy {
+        // T2.2: the panic is contained here, so the task reports a failed
+        // session instead of unwinding and taking the dispatcher with it.
+        // Safe for a reason worth recording: the store's lock is a
+        // `tokio::sync::Mutex`, which does not poison the way `std`'s does,
+        // and `run_turn` takes `&self`, so a panic leaves no unusable lock
+        // behind and little in-memory state to corrupt.
+        TurnFailure::Isolate => match catch_unwind(session_turns(&shared, &session, &mut rx)).await
+        {
+            Ok(outcome) => outcome,
+            Err(payload) => Some(Failure::Panic(panic_message(payload.as_ref()))),
+        },
+        // Under `Fatal` a panic is not caught at all: it unwinds the task
+        // and `reap` resumes it, which is what the CLI did and still does.
+        TurnFailure::Fatal => session_turns(&shared, &session, &mut rx).await,
+    };
+    // Closing first makes the dispatcher's next `send` on this mailbox fail
+    // rather than land; whatever landed before the close is handed back, to
+    // run on a fresh task once this one is gone - not here, beside it.
+    rx.close();
+    let mut leftovers = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        leftovers.push(m);
+    }
+    Stopped {
+        session,
+        generation,
+        leftovers,
+        failure,
+    }
+}
+
+/// `catch_unwind` for a future: polls it inside [`std::panic::catch_unwind`],
+/// so a panic becomes a value the caller can report. Boxed rather than
+/// pin-projected so this needs no `unsafe`.
+async fn catch_unwind<F: Future>(fut: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut fut = Box::pin(fut);
+    std::future::poll_fn(move |cx| {
+        let polled =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(cx)));
+        match polled {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    })
+    .await
+}
+
+/// The turns themselves: `None` when the session stopped because there was
+/// nothing more to do, `Some` when a turn failed.
+async fn session_turns(
+    shared: &Shared,
+    session: &SessionId,
+    rx: &mut mpsc::Receiver<Incoming>,
+) -> Option<Failure> {
     let engine = &shared.engine;
     // Whether the turn that just ended may owe a rolling summary.
     let mut summary_due = false;
     loop {
         let next = {
-            let mut pending = std::pin::pin!(next_in_mailbox(&mut rx, shared.idle_after));
+            let mut pending = std::pin::pin!(next_in_mailbox(rx, shared.idle_after));
             if !summary_due {
                 pending.await
             } else {
@@ -382,12 +619,12 @@ async fn session_task(
                 tokio::select! {
                     biased;
                     next = &mut pending => {
-                        if let Err(e) = engine.maybe_summarize(&session).await {
+                        if let Err(e) = engine.maybe_summarize(session).await {
                             eprintln!("summary: {e}");
                         }
                         next
                     }
-                    summarized = engine.maybe_summarize(&session) => {
+                    summarized = engine.maybe_summarize(session) => {
                         if let Err(e) = summarized {
                             eprintln!("summary: {e}");
                         }
@@ -403,41 +640,34 @@ async fn session_task(
                     .acquire()
                     .await
                     .expect("the slot semaphore is never closed");
-                let text = engine.run_turn(incoming).await?;
+                // Second, and only ever second: the order the whole
+                // deadlock-freedom argument on `ShardSlots` rests on, which
+                // is why this takes the tenant permit it already holds.
+                let shard_permit = match &shared.shard {
+                    Some(shard) => Some(shard.acquire(&permit).await),
+                    None => None,
+                };
+                let text = match engine.run_turn(incoming).await {
+                    Ok(text) => text,
+                    Err(e) => return Some(Failure::Turn(e)),
+                };
                 // Counted while the slot is still held, so the dispatcher
                 // can never see every slot free and this turn uncounted.
                 shared.turns_since_pass.fetch_add(1, Ordering::SeqCst);
+                // Released in the reverse of the order they were taken, and
+                // both before the reply goes out: a send that blocks holds
+                // up neither this tenant's slots nor the shard's.
+                drop(shard_permit);
                 drop(permit);
-                shared
-                    .channel
-                    .send(&session, &text)
-                    .await
-                    .map_err(|e| EngineError::Channel(e.to_string()))?;
+                if let Err(e) = shared.channel.send(session, &text).await {
+                    return Some(Failure::Turn(EngineError::Channel(e.to_string())));
+                }
                 summary_due = true;
             }
-            Next::Closed => {
-                return Ok(Stopped {
-                    session,
-                    generation,
-                    leftovers: Vec::new(),
-                });
-            }
-            Next::Idle => {
-                // Quiet for `idle_after`: let the mailbox go. Closing it first
-                // makes the dispatcher's next `send` fail rather than land;
-                // whatever landed before the close is handed back, to run on
-                // a fresh task once this one is gone — not here, beside it.
-                rx.close();
-                let mut leftovers = Vec::new();
-                while let Ok(m) = rx.try_recv() {
-                    leftovers.push(m);
-                }
-                return Ok(Stopped {
-                    session,
-                    generation,
-                    leftovers,
-                });
-            }
+            // The mailbox closed, or the session has been quiet for
+            // `idle_after`: either way this task is done, and `session_task`
+            // hands back whatever is left in the mailbox.
+            Next::Closed | Next::Idle => return None,
         }
     }
 }

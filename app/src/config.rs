@@ -10,9 +10,28 @@ pub struct AppConfig {
     pub store: StoreSection,
     #[serde(default, rename = "http_component")]
     pub http_components: Vec<nscomponents_std::http_tool::HttpToolConfig>,
+    /// [library] — the shared persona and modules this company uses, each
+    /// named rather than copied. Resolved against `personas/` and
+    /// `modules/` beside `tenants/` when the tenant set is loaded.
+    #[serde(default)]
+    pub library: LibrarySection,
     /// [templates] table: id = "text with {placeholders}".
     #[serde(default)]
     pub templates: std::collections::HashMap<String, String>,
+    /// [groups] table: name = ["module", …] — which of this company's
+    /// modules a group of its people may reach.
+    ///
+    /// **Stored and not enforced.** Nothing reads this to filter anything
+    /// yet; the multi-tenant plan's Phase 8 owns the enforcement, where a
+    /// group reaches a session through the token's `grants` claim. The hard
+    /// part is named there and is not solved here: tools are registered once
+    /// at assembly, so a per-session subset needs a filter the turn loop
+    /// does not have. A second mechanism invented here would be one more way
+    /// to say who may reach a tool than anybody can hold in their head.
+    ///
+    /// Ordered, so the page lists them the same way on every box.
+    #[serde(default)]
+    pub groups: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub evolution: EvolutionSection,
     #[serde(default)]
@@ -35,6 +54,115 @@ pub struct AppConfig {
     /// var holds its token.
     #[serde(default)]
     pub serve: ServeSection,
+    /// [auth] — this company's signing material for `auth = "jwt"` (plan
+    /// A6). Deliberately *not* process-owned: the listener is the process's,
+    /// but the keys that say who a caller is are the company's.
+    #[serde(default)]
+    pub auth: AuthSection,
+    /// [http] — the second way in: a browser's chat window, a request from a
+    /// script, and every platform webhook. Absent, or with no `listen`,
+    /// means the process serves the socket alone and exactly as before.
+    #[serde(default)]
+    pub http: HttpSection,
+    /// [whatsapp] — this company's WhatsApp business account, if it has one.
+    /// Per tenant and overlayable, because the account, the token and the
+    /// salt are the company's; the endpoint they all arrive on is the
+    /// process's and lives in `[http]`.
+    #[serde(default)]
+    pub whatsapp: Option<WhatsAppSection>,
+}
+
+/// [http] — `ns-app serve`'s HTTP endpoint (`nschannel_http`): the way in
+/// for anything that is not a raw socket.
+///
+/// Process-owned in its entirety, for the reason `[serve] listen` is: one
+/// port belongs to the process however many companies arrive on it, and a
+/// company that could move it could take another company's callers.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct HttpSection {
+    /// `host:port`, or empty for "do not open it at all" — which is the
+    /// default, so a config written before this key existed serves exactly
+    /// what it served before.
+    #[serde(default)]
+    pub listen: String,
+    /// Whether a non-loopback `listen` is meant. Off, a bind to one is
+    /// refused at startup: there is no TLS here, and terminating it belongs
+    /// in front of this process.
+    #[serde(default)]
+    pub allow_remote: bool,
+    #[serde(default = "default_http_max_connections")]
+    pub max_connections: usize,
+    /// How long a caller has to send its first line, or its hello once
+    /// upgraded.
+    #[serde(default = "default_hello_timeout_ms")]
+    pub hello_timeout_ms: u64,
+    /// How long `POST /v1/messages` holds a request open waiting for the
+    /// turn's reply before it answers 504.
+    #[serde(default = "default_reply_timeout_ms")]
+    pub reply_timeout_ms: u64,
+    /// The most a request body may be; a webhook batch is the large case.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Which browser origins may call the JSON route and open a chat
+    /// window. Empty means none, which is right for a page served beside
+    /// this process; `["*"]` means any, which is what a widget embedded on
+    /// customer sites needs.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Where the ids of already-answered platform messages are kept, so a
+    /// retry after a restart is still a retry. Empty means in memory only,
+    /// which is a deliberate choice to answer some redeliveries twice.
+    #[serde(default = "default_seen_path")]
+    pub seen_path: String,
+    /// The env var holding the token a platform echoes during its one-off
+    /// verification handshake. One per process, because the endpoint is.
+    #[serde(default)]
+    pub whatsapp_verify_token_env: String,
+}
+
+impl Default for HttpSection {
+    fn default() -> Self {
+        Self {
+            listen: String::new(),
+            allow_remote: false,
+            max_connections: default_http_max_connections(),
+            hello_timeout_ms: default_hello_timeout_ms(),
+            reply_timeout_ms: default_reply_timeout_ms(),
+            max_body_bytes: default_max_body_bytes(),
+            origins: Vec::new(),
+            seen_path: default_seen_path(),
+            whatsapp_verify_token_env: String::new(),
+        }
+    }
+}
+
+impl HttpSection {
+    /// Whether this process opens the endpoint at all.
+    pub fn enabled(&self) -> bool {
+        !self.listen.trim().is_empty()
+    }
+}
+
+/// [whatsapp] — one company's WhatsApp business account.
+///
+/// Every secret is named rather than held, exactly as the provider keys and
+/// the serve token are: a repository is not where an access token lives.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct WhatsAppSection {
+    /// Meta's id for the business number. What a delivery is routed to this
+    /// company by, and the only thing in the payload that says so.
+    pub phone_number_id: String,
+    /// The env var holding the token replies are sent with.
+    pub access_token_env: String,
+    /// The env var holding the app secret deliveries are signed with.
+    pub app_secret_env: String,
+    /// The env var holding the salt customer ids are hashed under, so a
+    /// phone number never becomes a session id. Per company, so the same
+    /// person at two companies is two unrelated subjects.
+    pub session_salt_env: String,
+    /// The Graph API version replies go to.
+    #[serde(default = "default_graph_version")]
+    pub graph_version: String,
 }
 
 /// [models] — the local CPU model service, for the evaluation lane only
@@ -406,6 +534,67 @@ pub struct ServeSection {
     /// TLS, so on the network it would be the whole conversation in clear.
     #[serde(default)]
     pub allow_remote: bool,
+    /// How a client proves who it is (plan A6). `shared` is today's single
+    /// token in `token_env` and is the default, so a config written before
+    /// this key existed behaves exactly as it did.
+    #[serde(default)]
+    pub auth: AuthMode,
+    /// How long a connection has to send its hello before it is dropped. A
+    /// socket that opens and then says nothing costs a task and a slot.
+    #[serde(default = "default_hello_timeout_ms")]
+    pub hello_timeout_ms: u64,
+}
+
+/// How `serve` decides who a client is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// One token for everyone, from `[serve] token_env`. It proves the
+    /// caller read an env var and nothing else, so it is loopback only.
+    #[default]
+    Shared,
+    /// A signed HS256 token per person, verified against `[auth]`.
+    Jwt,
+}
+
+/// [auth] — the signing material `auth = "jwt"` verifies against. Per tenant
+/// and overlayable: each company signs with its own key.
+///
+/// The keys themselves are never in the file, for the reason no other
+/// credential here is: `signing_key_envs` names the variables they are read
+/// from. Two names mean a rotation is in progress — the first is what tokens
+/// are signed with now, the second the key it replaced, still accepted until
+/// everything minted under it has expired.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct AuthSection {
+    /// One or two env var names, current first. Empty under `auth = "jwt"`
+    /// is a named startup refusal rather than a process that accepts nothing.
+    #[serde(default)]
+    pub signing_key_envs: Vec<String>,
+    /// Tokens issued before this Unix second are refused however well
+    /// signed: this company's way of revoking everything minted up to a
+    /// breach. 0 means no floor.
+    #[serde(default)]
+    pub iat_floor: u64,
+}
+
+impl AuthSection {
+    /// The keys, in the order they are tried. A variable that is named and
+    /// unset is the operator's mistake rather than an invitation to run on
+    /// one fewer key, so it comes back as its own name for the refusal to
+    /// print.
+    pub fn signing_keys(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut keys = Vec::new();
+        for name in &self.signing_key_envs {
+            let value = std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| name.clone())?;
+            keys.push(value.into_bytes());
+        }
+        Ok(keys)
+    }
 }
 
 fn default_serve_listen() -> String {
@@ -420,6 +609,31 @@ fn default_serve_max_connections() -> usize {
     8
 }
 
+fn default_hello_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_http_max_connections() -> usize {
+    256
+}
+
+/// Two minutes: longer than a turn, shorter than any client's patience.
+fn default_reply_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_max_body_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_seen_path() -> String {
+    "ns-webhooks-seen.tsv".into()
+}
+
+pub(crate) fn default_graph_version() -> String {
+    nschannel_http::whatsapp::DEFAULT_GRAPH_VERSION.into()
+}
+
 impl Default for ServeSection {
     fn default() -> Self {
         Self {
@@ -427,6 +641,8 @@ impl Default for ServeSection {
             token_env: default_serve_token_env(),
             max_connections: default_serve_max_connections(),
             allow_remote: false,
+            auth: AuthMode::Shared,
+            hello_timeout_ms: default_hello_timeout_ms(),
         }
     }
 }
@@ -769,7 +985,7 @@ impl MemorySection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Emitter,
-    Replier,
+
     Summarizer,
 }
 
@@ -777,7 +993,6 @@ impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Emitter => "emitter",
-            Role::Replier => "replier",
             Role::Summarizer => "summarizer",
         }
     }
@@ -920,47 +1135,11 @@ pub struct LlmConfig {
     /// M10 T1.6 say `slim` holds.
     #[serde(default)]
     pub schema_profile: Option<String>,
-    /// M12 T1.1: `"small"` (the default) or `"strong"` — which class of
-    /// model this deployment drives. `small` is today's behaviour byte for
-    /// byte; `strong` stands down the scaffolding that exists to compensate
-    /// for a weak emitter, and never adds any.
-    #[serde(default)]
-    pub capability: Option<String>,
-    /// M12 T4.3: on a chat-tier turn, let the one emitter call either act or
-    /// answer, and take its answer as the reply. Default **true** since M13,
-    /// the first default here that is not the behaviour which shipped before
-    /// its knob existed.
-    ///
-    /// It moved on the rule M12 wrote for it: a live reading below 2.00
-    /// requests per chat turn. M12 read exactly 2.00 and left it off, because
-    /// the array it sent still carried `respond_directly` and the model kept
-    /// calling it. With that tool gone (M13 T1.1) the same shape of script
-    /// read **1.80** over 10 chat-tier turns, 10 of 10 answered in the
-    /// emitter call, no grounding flag on any of them, 0 rejections, 0 text
-    /// fallbacks. `false` still buys the two-call chat turn byte for byte.
-    ///
-    /// Chat only, and only where a router is configured — the tier is what
-    /// decides it. On Task and Deep the emitter/replier split is doing real
-    /// work; on Chat the emitter call exists to say "no tool applies", which
-    /// is a sentence the same call could have spent on the user.
-    #[serde(default = "default_true")]
-    pub chat_act_or_answer: bool,
-    /// M13 T2.1: make the same offer on Task and Deep, so every iteration of
-    /// the loop is the model choosing between the next tool and the reply.
-    /// Default **false**, which is the chat-only offer above; it does nothing
-    /// unless `chat_act_or_answer` is on, because that knob is the offer.
-    ///
-    /// On a task turn the emitter is already holding the trace the replier
-    /// would narrate from, so ending the turn is a judgement it can make.
-    /// What the second call buys is a reading of that trace by a model which
-    /// did not choose the actions. That is worth a request on a long task and
-    /// not on a short one, and no reading yet says where the line falls.
-    #[serde(default)]
-    pub act_or_answer_every_tier: bool,
     /// M13 T3.1: let one call run the action *and* speak the line it came
     /// with, instead of that text becoming rationale and the turn buying a
     /// second call to say what it just did. Default **false**, and inert
-    /// unless `chat_act_or_answer` is on.
+    /// inert unless the model is offered the answer at all, which it always
+    /// is.
     ///
     /// Acting and answering were alternatives, which left the commonest task
     /// turn there is — do this, and tell me you did — costing two requests to
@@ -969,10 +1148,9 @@ pub struct LlmConfig {
     /// instruction says so in as many words.
     #[serde(default)]
     pub act_and_answer: bool,
+    /// The model that chooses the actions and writes the reply.
     #[serde(default)]
     pub emitter: RoleSection,
-    #[serde(default)]
-    pub replier: RoleSection,
     /// The rolling-summary model (M6 §5.1). Falls back to the emitter's
     /// model and provider; any field can point it elsewhere.
     #[serde(default)]
@@ -1002,19 +1180,9 @@ impl LlmConfig {
         }
     }
 
-    /// `[llm] capability`, resolved. Err carries the message a startup
-    /// error should print; unset is [`nscore::Capability::Small`].
-    pub fn capability(&self) -> Result<nscore::Capability, String> {
-        match self.capability.as_deref() {
-            None => Ok(nscore::Capability::Small),
-            Some(s) => nscore::Capability::parse(s).map_err(|e| format!("[llm] {e}")),
-        }
-    }
-
     fn section(&self, role: Role) -> &RoleSection {
         match role {
             Role::Emitter => &self.emitter,
-            Role::Replier => &self.replier,
             Role::Summarizer => &self.summarizer,
         }
     }
@@ -1043,7 +1211,7 @@ impl LlmConfig {
             if switching {
                 self.base_url = None;
                 self.api_key_env = None;
-                for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+                for s in [&mut self.emitter, &mut self.summarizer] {
                     s.model = None;
                     s.base_url = None;
                     s.api_key_env = None;
@@ -1058,7 +1226,7 @@ impl LlmConfig {
             }
         }
         if let Some(m) = model {
-            for s in [&mut self.emitter, &mut self.replier, &mut self.summarizer] {
+            for s in [&mut self.emitter, &mut self.summarizer] {
                 s.model = Some(m.clone());
             }
         }
@@ -1168,9 +1336,9 @@ impl LlmConfig {
         let where_ = role.as_str();
         let sampling = match &s.sampling {
             None => None,
-            Some(v) => {
-                Some(nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?)
-            }
+            Some(v) => Some(
+                nsllm::provider::Sampling::parse(v).map_err(|e| format!("[llm.{where_}] {e}"))?,
+            ),
         };
         let reasoning = match &s.reasoning {
             None => None,
@@ -1203,7 +1371,7 @@ impl LlmConfig {
 
     /// Emitter, replier, summarizer — the order the banner prints them in.
     pub fn roles(&self) -> Result<Vec<RoleTarget>, String> {
-        [Role::Emitter, Role::Replier, Role::Summarizer]
+        [Role::Emitter, Role::Summarizer]
             .into_iter()
             .map(|r| self.role(r))
             .collect()
@@ -1233,6 +1401,25 @@ pub struct EngineSection {
     /// stay global. Read through `worker_slots()`, which refuses 0.
     #[serde(default = "default_worker_slots")]
     pub worker_slots: usize,
+    /// The same, for `ns-app serve`, and the reason it is a second key: the
+    /// terminal is one person typing, so `worker_slots = 1` is right there
+    /// and inherited here it is a latency bug — the second client to speak
+    /// waits out the first client's model calls, which are seconds.
+    ///
+    /// What a slot overlaps is *waiting*, not requests: pacing hangs off the
+    /// credential (one throttle per endpoint and key) and the daily
+    /// allowance stays global, so the extra slots buy latency and cost
+    /// nothing. Read through `slots_for(true)`, which refuses 0.
+    #[serde(default = "default_serve_worker_slots")]
+    pub serve_worker_slots: usize,
+    /// The ceiling on turns running at once across *every* tenant in the
+    /// process, handed to `ShardSlots`. Twenty companies at four slots each
+    /// is eighty concurrent turns on one box, which is a memory and file
+    /// handle number rather than a latency one — so the shard keeps its own
+    /// bound below the sum. Process-owned (`tenant::PROCESS_OWNED`): a
+    /// company sets how many turns *it* runs at once, never the shard's.
+    #[serde(default = "default_shard_worker_slots")]
+    pub shard_worker_slots: usize,
 }
 
 fn default_confirm_irreversible() -> bool {
@@ -1243,6 +1430,14 @@ fn default_worker_slots() -> usize {
     1
 }
 
+fn default_serve_worker_slots() -> usize {
+    4
+}
+
+fn default_shard_worker_slots() -> usize {
+    16
+}
+
 impl Default for EngineSection {
     fn default() -> Self {
         Self {
@@ -1250,6 +1445,8 @@ impl Default for EngineSection {
             max_emit_retries: 3,
             confirm_irreversible: default_confirm_irreversible(),
             worker_slots: default_worker_slots(),
+            serve_worker_slots: default_serve_worker_slots(),
+            shard_worker_slots: default_shard_worker_slots(),
         }
     }
 }
@@ -1263,12 +1460,61 @@ impl EngineSection {
             n => Ok(n),
         }
     }
+
+    /// How many turns one tenant runs at once, for the mode being built:
+    /// `serve_worker_slots` when serving, `worker_slots` in the terminal
+    /// (plan B6). Which key the error names is which key was read.
+    pub fn slots_for(&self, serve: bool) -> Result<usize, String> {
+        if !serve {
+            return self.worker_slots();
+        }
+        match self.serve_worker_slots {
+            0 => Err("[engine] serve_worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
+        }
+    }
+
+    /// The process's ceiling across every tenant. `ShardSlots` floors a 0 at
+    /// 1 rather than parking every turn forever; refusing it here means an
+    /// operator who typed one is told, instead of running one turn at a time
+    /// across the whole shard and wondering why.
+    pub fn shard_worker_slots(&self) -> Result<usize, String> {
+        match self.shard_worker_slots {
+            0 => Err("[engine] shard_worker_slots must be at least 1, got 0".into()),
+            n => Ok(n),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct PersonaSection {
     #[serde(default)]
     pub text: String,
+}
+
+/// [library] — what this company uses out of the shared library, by name.
+///
+/// Files, referenced rather than copied. Copying the text into each overlay
+/// would let two companies meant to share a persona drift apart silently,
+/// which is the thing "shared" exists to prevent; a database would give up
+/// the property that makes the tenant overlays reviewable, which is that
+/// they are files you can read and diff.
+///
+/// The names are spelled here rather than at the top level because
+/// `[persona]` is already a table: `persona = "support-brief"` beside
+/// `[persona] text = "…"` is a config that cannot be parsed at all.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LibrarySection {
+    /// `personas/<name>.md`. Ignored, and reported as overridden, when this
+    /// company writes its own `[persona] text`.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// `modules/<name>.toml`, each a file of `[[http_component]]` entries.
+    /// These *add* to whatever the company defines inline: "this company
+    /// also has X" is the normal case, and "this company has none of the
+    /// shared ones" is not.
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1426,7 +1672,47 @@ impl EvolutionSection {
 
 impl AppConfig {
     pub fn parse(toml_text: &str) -> Result<AppConfig, String> {
-        toml::from_str(toml_text).map_err(|e| e.to_string())
+        let parsed: AppConfig = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        parsed.refuse_retired_keys(toml_text)?;
+        Ok(parsed)
+    }
+
+    /// Keys that used to mean something and no longer do.
+    ///
+    /// Nothing here denies unknown fields, so a key that is removed from the
+    /// struct becomes a line that parses and is ignored — a deployment that
+    /// pinned its reply model to a cheap one would go on paying for the
+    /// expensive one with the file still saying otherwise. A refusal naming
+    /// the key is the only version of this that a reader can act on.
+    fn refuse_retired_keys(&self, toml_text: &str) -> Result<(), String> {
+        let table: toml::Value = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        let retired = [
+            (
+                "llm.replier",
+                "the model that wrote the reply is the model that chooses the actions \
+                 (2026-09-14); set [llm.emitter] instead",
+            ),
+            (
+                "llm.capability",
+                "every deployment is the `strong` one now; the knob it selected is gone",
+            ),
+            (
+                "llm.chat_act_or_answer",
+                "the offer to answer is unconditional; there is no second model to \
+                 decline it in favour of",
+            ),
+            ("llm.act_or_answer_every_tier", "every tier is offered it"),
+        ];
+        for (path, why) in retired {
+            let mut here = Some(&table);
+            for segment in path.split('.') {
+                here = here.and_then(|t| t.get(segment));
+            }
+            if here.is_some() {
+                return Err(format!("[{path}] is no longer read: {why}"));
+            }
+        }
+        Ok(())
     }
 
     /// The agent to drive, if any. `NS_POINTER_ADDR` — the same variable
@@ -1468,7 +1754,7 @@ mod tests {
             base_url = "http://localhost:9999"
             [llm.emitter]
             model = "anthropic/claude-haiku-4.5"
-            [llm.replier]
+            [llm.summarizer]
             model = "anthropic/claude-sonnet-5"
             [engine]
             max_iterations = 4
@@ -1494,43 +1780,6 @@ mod tests {
         assert_eq!(cfg.persona.text, "You are Tomáš.");
         assert_eq!(cfg.http_components.len(), 1);
         assert_eq!(cfg.http_components[0].name, "check_stock");
-    }
-
-    /// M13. On is the one-call chat turn the 2026-09-12 run measured at 1.80,
-    /// so an absent key and an absent `[llm]` table must both be `true`, an
-    /// explicit `false` must still buy the two-call turn back, and the key
-    /// has to survive being written down.
-    ///
-    /// The every-tier knob is the other way round: absent means Chat only,
-    /// which is what M12 shipped.
-    #[test]
-    fn chat_act_or_answer_defaults_to_on_and_round_trips() {
-        assert!(AppConfig::parse("").unwrap().llm.chat_act_or_answer);
-        assert!(
-            AppConfig::parse("[llm]\ncapability = \"strong\"")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(
-            !AppConfig::parse("[llm]\nchat_act_or_answer = false")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(
-            AppConfig::parse("[llm]\nchat_act_or_answer = true")
-                .unwrap()
-                .llm
-                .chat_act_or_answer
-        );
-        assert!(!AppConfig::parse("").unwrap().llm.act_or_answer_every_tier);
-        assert!(
-            AppConfig::parse("[llm]\nact_or_answer_every_tier = true")
-                .unwrap()
-                .llm
-                .act_or_answer_every_tier
-        );
     }
 
     /// M10 T2.3 and P4. Both knobs default to today's behaviour, and an
@@ -1572,7 +1821,10 @@ mod tests {
         let on = AppConfig::parse("[memory]\narchive_foreign_notes = true\n").unwrap();
         assert!(on.memory.archive_foreign_notes);
         // The rest of [memory] is untouched by the knob.
-        assert_eq!(on.memory.window_turns, MemorySection::default().window_turns);
+        assert_eq!(
+            on.memory.window_turns,
+            MemorySection::default().window_turns
+        );
     }
 
     /// M10 T1.3. The knob defaults to today's behaviour, the way every knob
@@ -1599,33 +1851,6 @@ mod tests {
             .schema_profile()
             .unwrap_err();
         assert!(err.contains("tiny") && err.contains("full, slim"), "{err}");
-    }
-
-    /// M12 T1.1. Which class of model is driving decides how much scaffolding
-    /// the engine spends on it. `small` is today's behaviour byte for byte,
-    /// and an unknown spelling is a startup error rather than a silent
-    /// fallback: a deployment that asked for `strong` and got `small` would
-    /// pay for the regeneration it thought it had turned off.
-    #[test]
-    fn capability_defaults_to_small_and_rejects_an_unknown_name() {
-        assert_eq!(
-            AppConfig::parse("").unwrap().llm.capability().unwrap(),
-            nscore::Capability::Small
-        );
-        assert_eq!(
-            AppConfig::parse("[llm]\ncapability = \"strong\"")
-                .unwrap()
-                .llm
-                .capability()
-                .unwrap(),
-            nscore::Capability::Strong
-        );
-        let err = AppConfig::parse("[llm]\ncapability = \"huge\"")
-            .unwrap()
-            .llm
-            .capability()
-            .unwrap_err();
-        assert!(err.contains("huge") && err.contains("small, strong"), "{err}");
     }
 
     #[test]
@@ -1671,9 +1896,7 @@ mod tests {
         assert_eq!(set.recall.coarse_k, 20);
         assert_eq!(set.recall.rerank_budget_ms, 1500);
         assert_eq!(set.memory.exemplars_max, 2);
-        let pc = set
-            .evolution
-            .pass_config(true, &set.memory, &set.models);
+        let pc = set.evolution.pass_config(true, &set.memory, &set.models);
         assert_eq!(pc.embed_backfill_batch, 8);
     }
 
@@ -1740,29 +1963,25 @@ mod tests {
             e.api_key_env, "OLLAMA_API_KEY",
             "preset still supplies the key env"
         );
-        // The replier keeps the preset's default model.
-        assert_eq!(cfg.llm.role(Role::Replier).unwrap().model, "qwen2.5:3b");
+        // And the summarizer follows the emitter, which is what it falls
+        // back to when it names no model of its own.
+        assert_eq!(cfg.llm.role(Role::Summarizer).unwrap().model, "gemma3:4b");
     }
 
     #[test]
     fn a_role_prefix_points_one_role_at_another_provider() {
         let cfg = AppConfig::parse(
-            "[llm]\nprovider = \"ollama\"\n[llm.replier]\nmodel = \"mistral:mistral-small-latest\"\n",
+            "[llm]\nprovider = \"ollama\"\n[llm.summarizer]\nmodel = \"mistral:mistral-small-latest\"\n",
         )
         .unwrap();
         let e = cfg.llm.role(Role::Emitter).unwrap();
         assert_eq!(e.base_url.as_deref(), Some("http://localhost:11434"));
-        let r = cfg.llm.role(Role::Replier).unwrap();
+        let r = cfg.llm.role(Role::Summarizer).unwrap();
         assert_eq!(r.model, "mistral-small-latest");
         assert_eq!(r.base_url.as_deref(), Some("https://api.mistral.ai"));
         assert_eq!(r.api_key_env, "MISTRAL_API_KEY");
         assert_eq!(r.min_interval_ms, 1100);
         assert!(!r.local);
-        // The summarizer inherits the emitter, not the replier.
-        assert_eq!(
-            cfg.llm.role(Role::Summarizer).unwrap().base_url.as_deref(),
-            Some("http://localhost:11434")
-        );
     }
 
     #[test]
@@ -1786,7 +2005,7 @@ mod tests {
         let cfg = AppConfig::parse("[llm]\nprovider = \"openai\"").unwrap();
         let err = cfg.llm.role(Role::Emitter).unwrap_err();
         assert!(err.contains("[llm.emitter]"), "{err}");
-        let ok = AppConfig::parse("[llm]\nprovider = \"openai\"\n[llm.emitter]\nmodel = \"some-model\"\n[llm.replier]\nmodel = \"some-model\"\n").unwrap();
+        let ok = AppConfig::parse("[llm]\nprovider = \"openai\"\n[llm.emitter]\nmodel = \"some-model\"\n[llm.summarizer]\nmodel = \"some-model\"\n").unwrap();
         assert_eq!(ok.llm.role(Role::Emitter).unwrap().model, "some-model");
         assert_eq!(
             ok.llm.role(Role::Summarizer).unwrap().model,
@@ -1811,7 +2030,7 @@ mod tests {
         // Switching backends drops the old backend's model ids: asking
         // Ollama for "google/gemini-3.8-flash" is a 404, not a swap.
         let mut cloud = AppConfig::parse(
-            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n[llm.replier]\nmodel = \"google/gemini-3.8-flash\"\n",
+            "[llm]\nprovider = \"openrouter\"\n[llm.emitter]\nmodel = \"google/gemini-3.8-flash\"\n[llm.summarizer]\nmodel = \"google/gemini-3.8-flash\"\n",
         )
         .unwrap();
         cloud.llm.apply_overrides(Some("ollama".into()), None);
@@ -1862,7 +2081,7 @@ mod tests {
             "openrouter/free"
         );
         assert_eq!(
-            cfg.llm.role(Role::Replier).unwrap().model,
+            cfg.llm.role(Role::Summarizer).unwrap().model,
             "openrouter/free"
         );
         assert_eq!(cfg.engine.max_iterations, 5);
@@ -1889,7 +2108,7 @@ mod tests {
     #[test]
     fn role_shaping_fields_default_to_none() {
         let cfg = AppConfig::parse("[llm]\nprovider = \"openrouter\"\n[llm.emitter]\n").unwrap();
-        for role in [Role::Emitter, Role::Replier, Role::Summarizer] {
+        for role in [Role::Emitter, Role::Summarizer, Role::Summarizer] {
             let shaping = cfg.llm.shaping(role).expect("an empty section parses");
             assert_eq!(shaping, nsllm::provider::RoleShaping::default(), "{role:?}");
         }
@@ -1919,7 +2138,7 @@ mod tests {
         assert_eq!(shaping.thinking, Some(false));
         // and only for the role that set them.
         assert_eq!(
-            cfg.llm.shaping(Role::Replier).unwrap(),
+            cfg.llm.shaping(Role::Summarizer).unwrap(),
             nsllm::provider::RoleShaping::default()
         );
     }
@@ -1928,10 +2147,13 @@ mod tests {
     /// in this file — not a silently dropped shape.
     #[test]
     fn unknown_shaping_values_are_rejected_at_parse() {
-        let cfg = AppConfig::parse("[llm.replier]\nreasoning = \"maximum\"\n").unwrap();
-        let err = cfg.llm.shaping(Role::Replier).unwrap_err();
-        assert!(err.starts_with("[llm.replier]"), "{err}");
-        assert!(err.contains("maximum") && err.contains("\"medium\""), "{err}");
+        let cfg = AppConfig::parse("[llm.summarizer]\nreasoning = \"maximum\"\n").unwrap();
+        let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
+        assert!(err.starts_with("[llm.summarizer]"), "{err}");
+        assert!(
+            err.contains("maximum") && err.contains("\"medium\""),
+            "{err}"
+        );
 
         let cfg = AppConfig::parse("[llm.summarizer]\nsampling = \"off\"\n").unwrap();
         let err = cfg.llm.shaping(Role::Summarizer).unwrap_err();
@@ -1951,7 +2173,11 @@ mod tests {
         let target = cfg.llm.role(Role::Emitter).unwrap();
         let (shape, note) = cfg
             .llm
-            .shape(Role::Emitter, &target.model, nsllm::emitter::default_shape())
+            .shape(
+                Role::Emitter,
+                &target.model,
+                nsllm::emitter::default_shape(),
+            )
             .unwrap();
         assert!(shape.temperature.is_none());
         let line = note.expect("the coercion is announced");
@@ -2182,6 +2408,52 @@ mod tests {
         assert!(err.contains("[engine] worker_slots"), "{err}");
     }
 
+    /// `[engine]` with its two required keys and one more line.
+    fn engine_toml(line: &str) -> String {
+        format!("[engine]\nmax_iterations = 5\nmax_emit_retries = 3\n{line}\n")
+    }
+
+    /// Plan B6. What a slot overlaps is waiting, not requests, so serving
+    /// does not inherit the terminal's one slot: the second client to speak
+    /// would otherwise queue behind the first one's model calls.
+    #[test]
+    fn serve_mode_defaults_to_more_than_one_worker_slot() {
+        let cfg = AppConfig::parse("").unwrap();
+        let slots = cfg.engine.slots_for(true).unwrap();
+        assert!(
+            slots > 1,
+            "serve must overlap turns by default, got {slots}"
+        );
+        assert_eq!(slots, 4);
+        // And the ceiling every tenant in the process shares.
+        assert_eq!(cfg.engine.shard_worker_slots().unwrap(), 16);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(true).unwrap(), 9);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 0")).unwrap();
+        let err = cfg.engine.slots_for(true).unwrap_err();
+        assert!(err.contains("[engine] serve_worker_slots"), "{err}");
+        let cfg = AppConfig::parse(&engine_toml("shard_worker_slots = 0")).unwrap();
+        let err = cfg.engine.shard_worker_slots().unwrap_err();
+        assert!(err.contains("[engine] shard_worker_slots"), "{err}");
+    }
+
+    /// Plan B6, the other half: the terminal is unchanged. One slot, even
+    /// when the serve knob names a larger number.
+    #[test]
+    fn cli_mode_still_defaults_to_one_worker_slot() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 1);
+        let cfg = AppConfig::parse(&engine_toml("serve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 1);
+        // `worker_slots` is still what the terminal reads when it is set.
+        let cfg =
+            AppConfig::parse(&engine_toml("worker_slots = 3\nserve_worker_slots = 9")).unwrap();
+        assert_eq!(cfg.engine.slots_for(false).unwrap(), 3);
+        let cfg = AppConfig::parse(&engine_toml("worker_slots = 0")).unwrap();
+        let err = cfg.engine.slots_for(false).unwrap_err();
+        assert!(err.contains("[engine] worker_slots"), "{err}");
+    }
+
     #[test]
     fn templates_section_parses_and_defaults_empty() {
         let cfg = AppConfig::parse("[templates]\ncant_help = \"Sorry.\"\n").unwrap();
@@ -2217,6 +2489,42 @@ mod tests {
         );
         let cfg = AppConfig::parse("[evolution]\nidle_after_secs = 0\n").unwrap();
         assert_eq!(cfg.evolution.idle_after(), None);
+    }
+
+    /// Plan A6, the CLI invariant: a config written before `auth` existed
+    /// means shared auth with today's token, and a config with no `[auth]`
+    /// section at all names no keys. `jwt` is only ever reached by asking
+    /// for it.
+    #[test]
+    fn auth_defaults_to_shared_so_todays_config_is_unchanged() {
+        let cfg = AppConfig::parse("").unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Shared);
+        assert_eq!(cfg.serve.hello_timeout_ms, 5_000);
+        assert_eq!(cfg.auth, AuthSection::default());
+        assert!(cfg.auth.signing_key_envs.is_empty());
+        assert_eq!(cfg.auth.iat_floor, 0);
+        // The whole `[serve]` table is still the default one: two new keys
+        // did not move any other.
+        assert_eq!(cfg.serve, ServeSection::default());
+
+        // A config that sets `[serve] listen` alone — the shape every
+        // deployment before A6 has — still gets shared auth.
+        let cfg = AppConfig::parse("[serve]\nlisten = \"127.0.0.1:7400\"\n").unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Shared);
+
+        // Asked for, both parse, and `[auth]` is read beside them.
+        let cfg = AppConfig::parse(
+            "[serve]\nauth = \"jwt\"\nhello_timeout_ms = 250\n\
+             [auth]\nsigning_key_envs = [\"NOW\", \"BEFORE\"]\niat_floor = 1700000000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.serve.auth, AuthMode::Jwt);
+        assert_eq!(cfg.serve.hello_timeout_ms, 250);
+        assert_eq!(cfg.auth.signing_key_envs, ["NOW", "BEFORE"]);
+        assert_eq!(cfg.auth.iat_floor, 1_700_000_000);
+
+        // A mode nobody implements is refused rather than defaulted.
+        assert!(AppConfig::parse("[serve]\nauth = \"none\"\n").is_err());
     }
 
     /// `[serve]` defaults to loopback 7375, `NS_SERVE_TOKEN`, eight

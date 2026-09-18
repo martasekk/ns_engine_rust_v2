@@ -84,10 +84,17 @@ impl Channel for NullChannel {
 /// characters" a number about this harness rather than about a provider's
 /// tokenizer: it counts what the engine put in front of the model, in the
 /// engine's own rendering.
-fn render_prompt(ctx: &ReplyContext) -> String {
+fn render_prompt(ctx: &EmitterContext) -> String {
     let mut s = String::new();
-    if !ctx.persona.is_empty() {
-        s.push_str(&ctx.persona);
+    // The persona reaches the call that answers in the offer blocks, which
+    // is where it lives now that one model does both jobs.
+    let persona = ctx
+        .answer
+        .as_ref()
+        .map(|a| a.persona.as_str())
+        .unwrap_or("");
+    if !persona.is_empty() {
+        s.push_str(persona);
         s.push('\n');
     }
     for f in &ctx.facts {
@@ -103,11 +110,28 @@ fn render_prompt(ctx: &ReplyContext) -> String {
     }
     s.push_str(&ctx.user_text);
     s.push('\n');
-    s.push_str(&ctx.turn_trace);
-    for g in &ctx.guidance {
+    s.push_str(&ctx.trace_so_far.join(
+        "
+",
+    ));
+    for g in all_guidance(ctx) {
         s.push_str(&format!("\n- {g}"));
     }
     s
+}
+
+/// Every note the call was given: its own, and the reply-scoped ones that
+/// ride in the answer blocks.
+///
+/// They were two contexts until 2026-09-14 and are one call now, so a
+/// fixture asking "did this note reach the model that answered" has one
+/// place to look.
+fn all_guidance(ctx: &EmitterContext) -> Vec<String> {
+    let mut notes = ctx.guidance.clone();
+    if let Some(answer) = &ctx.answer {
+        notes.extend(answer.reply_guidance.iter().cloned());
+    }
+    notes
 }
 
 /// One reply context, kept as strings so a fixture can ask what the model
@@ -127,7 +151,6 @@ pub(crate) struct Shown {
     pub(crate) fact_keys: Vec<String>,
     pub(crate) window: String,
     pub(crate) trace: String,
-    pub(crate) do_not_state: Vec<String>,
     pub(crate) prompt: String,
     /// The rolling summary block exactly as the prompt carries it, or `None`
     /// when the engine had no summary to show (M10 T5.1).
@@ -143,16 +166,18 @@ pub(crate) struct Shown {
 }
 
 impl Shown {
-    fn capture(ctx: &ReplyContext) -> Self {
+    fn capture(ctx: &EmitterContext) -> Self {
         Self {
             facts: ctx.facts.iter().map(render_fact).collect(),
             fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
             window: render_window(&ctx.window, ctx.window.len(), &ctx.caps),
-            trace: ctx.turn_trace.clone(),
-            do_not_state: ctx.do_not_state.clone(),
+            trace: ctx.trace_so_far.join(
+                "
+",
+            ),
             prompt: render_prompt(ctx),
             summary: ctx.summary.as_ref().map(render_summary),
-            guidance: ctx.guidance.clone(),
+            guidance: all_guidance(ctx),
         }
     }
 
@@ -189,6 +214,8 @@ impl Shown {
 /// (M6 §4.5) — which is harness, not model — instead of the double's manners.
 /// The regeneration falls back to the inert marker.
 pub(crate) struct Probe {
+    /// The fixture's own emitter, wrapped rather than replaced.
+    pub(crate) inner: Box<dyn Emitter>,
     pub(crate) shown: Arc<Mutex<Vec<Shown>>>,
     pub(crate) first_draft: Option<&'static str>,
     pub(crate) drafts: AtomicU32,
@@ -200,17 +227,47 @@ pub(crate) struct Probe {
 const INERT: &str = "(scripted reply)";
 
 #[async_trait::async_trait]
-impl Replier for Probe {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
+impl Emitter for Probe {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        Ok(self.propose_or_answer(ctx, legal).await?.proposal)
+    }
+
+    /// Wraps the fixture's own emitter, and takes over the call that ends
+    /// the turn.
+    ///
+    /// This was a replier until 2026-09-14, and it captured once per turn
+    /// because the reply model was called once per turn. It still captures
+    /// once per turn, on the call that answers — which is the same moment,
+    /// reached from the other side.
+    async fn propose_or_answer(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Emission, EmitError> {
+        // Taken before the context moves into the inner emitter, and kept
+        // only if this call turns out to be the one that ends the turn.
+        let captured = Shown::capture(&ctx);
+        let mut emission = self.inner.propose_or_answer(ctx, legal).await?;
+        if emission.proposal.action != "respond_directly" {
+            return Ok(emission);
+        }
         let n = self.drafts.fetch_add(1, Ordering::SeqCst);
-        self.shown.lock().unwrap().push(Shown::capture(&ctx));
-        if let Some(sink) = &ctx.usage {
-            sink.record(spent("replier"));
+        self.shown.lock().unwrap().push(captured);
+        // `first_draft` is the fixture saying what this turn answers, and it
+        // wins: the abstention arm injects a draft stating something nothing
+        // showed it, and the grounding interceptor firing on that draft is
+        // the whole measurement. Otherwise a scripted answer stands, and a
+        // turn that said nothing gets the inert marker.
+        match (self.first_draft, n) {
+            (Some(draft), 0) => emission.answer = Some(draft.to_string()),
+            _ if emission.answer.is_none() => emission.answer = Some(INERT.to_string()),
+            _ => {}
         }
-        match self.first_draft {
-            Some(draft) if n == 0 => Ok(draft.into()),
-            _ => Ok(INERT.into()),
-        }
+        Ok(emission)
     }
 }
 
@@ -900,13 +957,6 @@ pub struct Run {
     /// [`summarizer_honours_guidelines`], which is this arm's finding, not an
     /// oversight. A `&'static` slice for [`Run`]'s `Copy`, as `withhold`.
     pub summary_guidelines: &'static [&'static str],
-    /// `[llm] chat_act_or_answer` for this arm (M12 T4.3/T4.4b).
-    ///
-    /// `false` on every existing run, and false is the two-call chat turn
-    /// the whole table was measured on. On, a chat-tier turn's emitter call
-    /// may answer, and what moves is the request count and the `ReplyEchoed`
-    /// column — the reply is no longer written by a double that cannot echo.
-    pub act_or_answer: bool,
 }
 
 /// Whether the summarizer the fixtures run can see `summary_guidelines` at
@@ -1070,11 +1120,13 @@ impl Harness {
         }
         let before = self.shown.lock().unwrap().len();
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(MeteredEmitter { inner: emitter }));
-        b.set_replier(Box::new(Probe {
-            shown: self.shown.clone(),
-            first_draft,
-            drafts: AtomicU32::new(0),
+        b.set_emitter(Box::new(MeteredEmitter {
+            inner: Box::new(Probe {
+                inner: emitter,
+                shown: self.shown.clone(),
+                first_draft,
+                drafts: AtomicU32::new(0),
+            }),
         }));
         b.set_memory(self.store.clone());
         b.set_channel(Box::new(NullChannel));
@@ -1107,7 +1159,6 @@ impl Harness {
             obligation_check: self.run.obligation_check,
             // M12 T4.4b. `false` on every existing run, and it needs a
             // router to bite at all — only the desktop arm has one.
-            chat_act_or_answer: self.run.act_or_answer,
             window_turns: self
                 .window_turns
                 .unwrap_or(EngineConfig::default().window_turns),
@@ -1296,7 +1347,19 @@ impl Harness {
                             c.inspections += 1;
                         }
                     }
-                    EventKind::ReplyFlagged { .. } => c.flags += 1,
+                    // Grounding flags only. The obligation check writes the
+                    // same event for a different finding — the reply left
+                    // something unanswered rather than made something up —
+                    // and counting both would make `obligation_check = true`
+                    // read as a fabrication the arm did not cause.
+                    EventKind::ReplyFlagged { spans, .. } => {
+                        if !spans
+                            .iter()
+                            .all(|s| s.starts_with(nscore::UNADDRESSED_PREFIX))
+                        {
+                            c.flags += 1;
+                        }
+                    }
                     // What each model call was shown (M7 T0.1). Read off the
                     // manifest rather than recomputed here: the manifest is
                     // built from the context immediately before it is moved
@@ -2117,24 +2180,16 @@ async fn abstention(run: Run) -> Ability {
             c.flags
         )
     });
-    require(&mut fails, shown.len() == 2, || {
-        format!(
-            "{} drafts; the flagged reply was not regenerated",
-            shown.len()
-        )
+    // One draft, and it is the one the user gets.
+    //
+    // This asked for two until 2026-09-14, when the second model went: a
+    // flagged draft bought a regeneration that was handed the invented span
+    // by name. What the arm measures is unchanged — the interceptor sees the
+    // value nothing showed the model — and what it no longer measures is
+    // what the engine did about it, because there is nothing left to ask.
+    require(&mut fails, shown.len() == 1, || {
+        format!("{} drafts; the turn answers once", shown.len())
     });
-    if let Some(second) = shown.get(1) {
-        require(
-            &mut fails,
-            second.do_not_state.iter().any(|s| s == INVENTED),
-            || {
-                format!(
-                    "the regeneration was not told what to drop: {:?}",
-                    second.do_not_state
-                )
-            },
-        );
-    }
     Ability::build("abstention", RECALL, graded, &h, &c, fails)
 }
 

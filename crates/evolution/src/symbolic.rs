@@ -210,7 +210,7 @@ mod tests {
     use super::*;
     use crate::mine::{mine, Signature, SignatureKind};
     use nscore::*;
-    use nsengine::script::{EchoTool, ScriptedEmitter, ScriptedReplier};
+    use nsengine::script::{EchoTool, ScriptedEmitter};
     use nsengine::store::{InMemoryStore, NoopConsolidator};
     use nsengine::turn::{Engine, EngineConfig};
     use std::sync::Arc;
@@ -232,7 +232,6 @@ mod tests {
         let sid = SessionId(name.into());
         let mut b = HarnessBuilder::new();
         b.set_emitter(Box::new(ScriptedEmitter::new(turns.clone())));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(Closed));
         b.set_consolidator(Box::new(NoopConsolidator));

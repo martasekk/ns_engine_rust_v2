@@ -252,6 +252,16 @@ pub const TEXT_FALLBACK_PREFIX: &str = "model answered in text:";
 /// request that bought the whole turn.
 pub const ANSWERED_IN_EMITTER_PREFIX: &str = "answered in the emitter call:";
 
+/// How the obligation check labels the span it writes into `ReplyFlagged`.
+///
+/// Both checks write that event, and they are different findings: the
+/// grounding one says the reply stated something nothing showed it, this one
+/// says the reply answered something the user did not ask about instead of
+/// something they did. A reader counting fabrications must be able to leave
+/// this one out, which is the whole reason it is a named prefix rather than
+/// a sentence written at the call site.
+pub const UNADDRESSED_PREFIX: &str = "not yet addressed:";
+
 /// How many proposals in this log came from the emitter's text fallback.
 ///
 /// A fallback is a request that bought no tool call, so it belongs next to

@@ -9,7 +9,6 @@ use nscore::{
     MemoryStore, Note, SessionId, Timestamp,
 };
 use nsengine::replay::doubles_from;
-use nsengine::script::ScriptedReplier;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
 use std::collections::BTreeMap;
@@ -285,7 +284,6 @@ impl ProbeRunner for LiveProbe {
         let mut b = HarnessBuilder::new();
         b.set_emitter((self.emitter)());
         // The reply text is irrelevant to classification.
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(ClosedChannel));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -948,6 +946,22 @@ mod tests {
                 rationale: "".into(),
                 action: action.into(),
                 args: serde_json::json!({"text": "hi"}),
+            })
+        }
+
+        /// The call that ends the turn also writes the reply, so a double
+        /// that only proposes would end every turn on the fallback.
+        async fn propose_or_answer(
+            &self,
+            ctx: EmitterContext,
+            legal: &LegalActionSet,
+        ) -> Result<nscore::Emission, EmitError> {
+            let proposal = self.propose(ctx, legal).await?;
+            let answer = (proposal.action == "respond_directly").then(|| "done".to_string());
+            Ok(nscore::Emission {
+                proposal,
+                answer,
+                say: None,
             })
         }
     }

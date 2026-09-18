@@ -9,7 +9,7 @@ use nscore::*;
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::sync::{Arc, Mutex};
 
 /// Records what the engine pushed to the user before the turn returned
@@ -82,22 +82,10 @@ impl Emitter for AnswerProbe {
     }
 }
 
-/// Counts its calls and says something the grounding check cannot fault.
-/// Books no cost, so every `ModelCall` in these logs is an emitter call.
-struct CountingReplier(Arc<AtomicUsize>);
-#[async_trait::async_trait]
-impl Replier for CountingReplier {
-    async fn reply(&self, _ctx: ReplyContext) -> Result<String, ReplyError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok("the replier drafted this".into())
-    }
-}
-
 struct Run {
     reply: String,
     events: Vec<Event>,
     answer_offered: Vec<bool>,
-    reply_calls: usize,
     /// Lines the engine pushed mid-turn, in order.
     sent: Vec<String>,
 }
@@ -182,13 +170,11 @@ async fn run_at(tier: Tier, name: &str, emissions: Vec<Emission>, cfg: EngineCon
     let store = Arc::new(InMemoryStore::new());
     let sid = SessionId(name.into());
     let answer_offered = Arc::new(Mutex::new(Vec::new()));
-    let reply_calls = Arc::new(AtomicUsize::new(0));
     let mut b = HarnessBuilder::new();
     b.set_emitter(Box::new(AnswerProbe {
         inner: ScriptedEmitter::answering(emissions),
         answer_offered: Arc::clone(&answer_offered),
     }));
-    b.set_replier(Box::new(CountingReplier(Arc::clone(&reply_calls))));
     b.set_memory(store.clone());
     let sent = Arc::new(Mutex::new(Vec::new()));
     b.set_channel(Box::new(RecordingChannel(Arc::clone(&sent))));
@@ -215,14 +201,12 @@ async fn run_at(tier: Tier, name: &str, emissions: Vec<Emission>, cfg: EngineCon
         reply,
         events: store.load(&sid).await.unwrap(),
         answer_offered: taken,
-        reply_calls: reply_calls.load(Ordering::SeqCst),
         sent: delivered,
     }
 }
 
 fn on() -> EngineConfig {
     EngineConfig {
-        chat_act_or_answer: true,
         max_echo_ratio: 1.1,
         reply_grounding_check: false,
         ..EngineConfig::default()
@@ -237,7 +221,6 @@ fn on() -> EngineConfig {
 async fn an_emitted_answer_is_the_reply_and_costs_one_request() {
     let r = run("aoa-one", vec![answers("It is 10:41.")], on()).await;
     assert_eq!(r.reply, "It is 10:41.");
-    assert_eq!(r.reply_calls, 0, "the replier was called anyway");
     assert_eq!(r.model_calls(), 1, "{:?}", r.kinds());
     assert_eq!(r.answer_offered, vec![true]);
     // The same shape as a replier turn: Settled { Generate }, then Replied.
@@ -292,7 +275,6 @@ fn says_and_acts(action: &str, args: serde_json::Value, say: &str) -> Emission {
 
 fn both() -> EngineConfig {
     EngineConfig {
-        act_or_answer_every_tier: true,
         act_and_answer: true,
         ..on()
     }
@@ -315,7 +297,6 @@ async fn an_action_and_an_answer_in_one_call_cost_one_request() {
     )
     .await;
     assert_eq!(r.reply, "Sending that now.");
-    assert_eq!(r.reply_calls, 0, "the replier was called anyway");
     assert_eq!(r.model_calls(), 1, "{:?}", r.kinds());
     // The action really ran, and the turn settled after it rather than on
     // the strength of the text alone.
@@ -375,7 +356,6 @@ async fn a_said_line_reaches_the_user_and_the_turn_keeps_looping() {
             .count(),
         1
     );
-    assert_eq!(r.reply_calls, 0);
     assert_eq!(r.model_calls(), 2);
 }
 
@@ -439,10 +419,7 @@ async fn an_answer_beside_a_refused_action_is_dropped() {
 /// for a task turn that used to cost three, and the replier never runs.
 #[tokio::test]
 async fn a_task_turn_can_act_then_answer_in_the_loop() {
-    let cfg = EngineConfig {
-        act_or_answer_every_tier: true,
-        ..on()
-    };
+    let cfg = EngineConfig { ..on() };
     let r = run_at(
         Tier::Task,
         "aoa-task",
@@ -454,7 +431,6 @@ async fn a_task_turn_can_act_then_answer_in_the_loop() {
     )
     .await;
     assert_eq!(r.reply, "It is 10:41.");
-    assert_eq!(r.reply_calls, 0, "the replier was called anyway");
     assert_eq!(r.model_calls(), 2, "{:?}", r.kinds());
     // Both iterations were offered the choice, including the one that acted.
     assert_eq!(r.answer_offered, vec![true, true]);
@@ -474,10 +450,10 @@ async fn a_task_turn_can_act_then_answer_in_the_loop() {
 /// offered the answer unless this deployment asked for it, so the shape of
 /// every task turn that ships today is unchanged.
 #[tokio::test]
-async fn a_task_turn_is_not_offered_the_answer_by_default() {
+async fn a_task_turn_is_offered_the_answer_like_every_other_tier() {
     let r = run_at(
         Tier::Task,
-        "aoa-task-off",
+        "aoa-task",
         vec![
             acts("echo", serde_json::json!({"text": "10:41"})),
             answers("It is 10:41."),
@@ -485,8 +461,11 @@ async fn a_task_turn_is_not_offered_the_answer_by_default() {
         on(),
     )
     .await;
-    assert_eq!(r.answer_offered, vec![false, false]);
-    assert_eq!(r.reply_calls, 1, "the replier still narrates the task turn");
+    // Both iterations: the loop is the model choosing between the next tool
+    // and the reply, every time, on every tier. There is no second model to
+    // hand an unfinished turn to.
+    assert_eq!(r.answer_offered, vec![true, true]);
+    assert_eq!(r.reply, "It is 10:41.");
 }
 
 /// An emitted answer is a draft like any other and is owed the same check:
@@ -509,31 +488,15 @@ async fn an_emitted_answer_that_is_ungrounded_is_still_flagged() {
         EventKind::ReplyFlagged { draft, spans }
             if draft == "You have 42 orders waiting in Oslo." && spans == &["42", "Oslo"]
     )));
-    // reply_regenerate defaults on: the replier regenerates exactly once,
-    // and its draft is what the user is told — the same rule a replier's own
-    // flagged draft gets.
-    assert_eq!(r.reply_calls, 1);
-    assert_eq!(r.reply, "the replier drafted this");
-
-    // With regeneration stood down (M12 T1.2) the flag stays and the
-    // emitted answer stands as written.
-    let strong = run(
-        "aoa-flagged-strong",
-        vec![answers("You have 42 orders waiting in Oslo.")],
-        EngineConfig {
-            reply_regenerate: false,
-            ..cfg()
-        },
-    )
-    .await;
-    assert!(strong.kinds().contains(&"ReplyFlagged"));
-    assert_eq!(strong.reply_calls, 0);
-    assert_eq!(strong.reply, "You have 42 orders waiting in Oslo.");
+    // The flag stays and the answer stands as written: there is no second
+    // model to ask for a version without the part it was just told was
+    // unsupported.
+    assert_eq!(r.reply, "You have 42 orders waiting in Oslo.");
 }
 
 /// The saving is only available to a turn that had nothing to do. A chat
-/// turn that reaches for a tool pays the emitter twice and the replier
-/// once, exactly as it did before M12.
+/// turn that reaches for a tool pays for two calls — the one that acts and
+/// the one that answers once it has the result.
 #[tokio::test]
 async fn a_chat_turn_that_proposes_a_tool_still_costs_two_calls() {
     let r = run(
@@ -543,70 +506,17 @@ async fn a_chat_turn_that_proposes_a_tool_still_costs_two_calls() {
                 "remember_fact",
                 serde_json::json!({"key": "user.name", "value": "Martin"}),
             ),
-            Emission {
-                proposal: Proposal {
-                    rationale: "done".into(),
-                    action: "respond_directly".into(),
-                    args: serde_json::json!({}),
-                },
-                answer: None,
-                say: None,
-            },
+            answers("Noted."),
         ],
         on(),
     )
     .await;
-    // Two emitter calls; the replier books no cost, so the count is theirs.
+    // Two emitter calls: the one that acted, and the one that answered once
+    // it could see the result.
     assert_eq!(r.model_calls(), 2, "{:?}", r.kinds());
-    assert_eq!(r.reply_calls, 1, "the replier still drafts");
-    assert_eq!(r.reply, "the replier drafted this");
+    assert_eq!(r.reply, "Noted.");
     assert_eq!(r.answer_offered, vec![true, true]);
     assert!(r.kinds().contains(&"ToolCalled"), "{:?}", r.kinds());
-}
-
-/// Off is off: not "the emitter may answer and the engine ignores it" but
-/// "the emitter is never offered the choice", because the offer is what
-/// changes the request bytes.
-#[tokio::test]
-async fn with_the_knob_off_an_answering_emitter_is_never_asked() {
-    let r = run(
-        "aoa-off",
-        vec![answers("It is 10:41.")],
-        EngineConfig {
-            max_echo_ratio: 1.1,
-            reply_grounding_check: false,
-            ..EngineConfig::default()
-        },
-    )
-    .await;
-    assert_eq!(r.answer_offered, vec![false]);
-    // The scripted answer still comes back — and is not used, because a
-    // turn that was never offered the choice did not make one.
-    assert_eq!(r.reply_calls, 1);
-    assert_eq!(r.reply, "the replier drafted this");
-}
-
-/// Books a nominal cost so a replier call lands as a `ModelCall` too: the
-/// cap counts every role's requests, not the emitter's alone.
-struct BillingReplier;
-#[async_trait::async_trait]
-impl Replier for BillingReplier {
-    async fn reply(&self, ctx: ReplyContext) -> Result<String, ReplyError> {
-        if let Some(sink) = ctx.usage.as_deref() {
-            sink.record(Usage {
-                role: "replier".into(),
-                model: "probe".into(),
-                prompt_tokens: 10,
-                completion_tokens: 1,
-                estimated: true,
-                attempts: 1,
-                latency_ms: 0,
-                tools_tokens: 0,
-                cached_tokens: 0,
-            });
-        }
-        Ok("the replier drafted this".into())
-    }
 }
 
 /// M12 T6.1: a metered session stops itself. Two turns at two requests each
@@ -618,14 +528,17 @@ async fn the_engine_stops_at_the_request_cap() {
         let store = Arc::new(InMemoryStore::new());
         let sid = SessionId("cap".into());
         let mut b = HarnessBuilder::new();
+        // Two requests per turn, which is now two emitter calls: one that
+        // acts and one that answers with the result in front of it.
         b.set_emitter(Box::new(AnswerProbe {
             inner: ScriptedEmitter::answering(vec![
-                acts("respond_directly", serde_json::json!({})),
-                acts("respond_directly", serde_json::json!({})),
+                acts("echo", serde_json::json!({"text": "one"})),
+                answers("done"),
+                acts("echo", serde_json::json!({"text": "two"})),
+                answers("done"),
             ]),
             answer_offered: Arc::new(Mutex::new(Vec::new())),
         }));
-        b.set_replier(Box::new(BillingReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(NullChannel));
         b.set_consolidator(Box::new(NoopConsolidator));

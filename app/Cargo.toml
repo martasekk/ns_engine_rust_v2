@@ -12,6 +12,9 @@ ns-core = { path = "../crates/core" }
 ns-engine = { path = "../crates/engine" }
 ns-channel-cli = { path = "../crates/channel-cli" }
 ns-channel-tcp = { path = "../crates/channel-tcp" }
+ns-channel-http = { path = "../crates/channel-http" }
+ns-channel-hub = { path = "../crates/channel-hub" }
+ns-identity = { path = "../crates/identity" }
 ns-llm = { path = "../crates/llm" }
 ns-components-std = { path = "../crates/components-std" }
 ns-memory-sqlite = { path = "../crates/memory-sqlite" }
@@ -23,6 +26,8 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+toml_edit = "0.22"
+thiserror = { workspace = true }
 async-trait = { workspace = true }
 # Runtime, not just tests: `ns-app eval --paraphrase` measures the sqlite
 # retriever in a throwaway database rather than the live one.

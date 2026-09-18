@@ -545,40 +545,6 @@ pub(crate) fn emitter_manifest(
     }
 }
 
-/// What the replier was shown. `tools` is zero: the reply model is given no
-/// action schema at all, which is half of why it is the cheaper of the two.
-pub(crate) fn reply_manifest(
-    scope: &str,
-    ctx: &nscore::ReplyContext,
-    clipped_chars: usize,
-    note_hashes: Vec<String>,
-) -> nscore::ContextManifest {
-    nscore::ContextManifest {
-        fact_keys: ctx.facts.iter().map(|f| f.key.clone()).collect(),
-        summary_through: ctx.summary.as_ref().map(|s| s.through_turn),
-        window: window_range(&ctx.window),
-        trace_lines: ctx.turn_trace.lines().count(),
-        trace_chars: ctx.turn_trace.chars().count(),
-        clipped_chars,
-        // The replier is never offered the choice; it carries no array at all.
-        answer_offered: false,
-        reply_arg: false,
-        tools: 0,
-        tool_names: Vec::new(),
-        guidance: ctx.guidance.len(),
-        note_hashes,
-        obligations: ctx.obligations.len(),
-        facts_chars: nscore::facts_chars(&ctx.facts),
-        summary_chars: nscore::summary_chars(ctx.summary.as_ref()),
-        window_chars: nscore::window_chars(&ctx.window, &ctx.caps),
-        ablated: None,
-        tier: None,
-        route_cues: Vec::new(),
-        scope: Some(scope.to_string()),
-        budget: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

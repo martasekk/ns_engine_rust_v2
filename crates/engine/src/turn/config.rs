@@ -45,33 +45,6 @@ pub struct EngineConfig {
     /// `main.rs` turns it off under `Capability::Strong`, where the draft
     /// is still flagged and still logged but stands as written.
     pub reply_regenerate: bool,
-    /// M12 T4.3: on a chat-tier turn, let the emitter call either act or
-    /// answer, and take its answer as the reply. Off by default, and off is
-    /// today's two-call chat turn, request for request and event for event.
-    ///
-    /// Chat only unless [`Self::act_or_answer_every_tier`] is on. A chat turn
-    /// has no loop to speak of: its emitter call exists to say "no tool
-    /// applies", which is a sentence the same call could have spent on the
-    /// user instead.
-    pub chat_act_or_answer: bool,
-    /// M13 T2.1: make the offer on every tier, so each iteration of the loop
-    /// is the model's own choice between calling the next tool and writing
-    /// the reply. Off by default; off is the chat-only offer above.
-    ///
-    /// M12 kept this to Chat on the argument that the split is doing real
-    /// work on Task and Deep — one model chooses, the other narrates what
-    /// happened — and that a model answering mid-loop would be answering
-    /// before the turn is over. The counter-argument, and the reason this
-    /// knob exists: the emitter is holding the same trace the replier would
-    /// narrate from, so "the turn is over" is a judgement it is in a position
-    /// to make, and `respond_directly` was always that judgement in the shape
-    /// of a tool call. What it costs is the second reading of the trace by a
-    /// model that did not choose the actions, which is a real check on a long
-    /// task and dead weight on a short one.
-    ///
-    /// Only ever read beside `chat_act_or_answer`: on its own it offers
-    /// nothing, because the offer itself is that knob.
-    pub act_or_answer_every_tier: bool,
     /// M13 T3.1: let one call do both — run the action *and* speak the text
     /// it came with, instead of the text becoming rationale and the turn
     /// buying a second call to say what it just did. Off by default, and
@@ -186,9 +159,6 @@ pub struct EngineConfig {
     /// M10 T1.3: which spelling of every tool description the emitter is
     /// shown. `Full` — the default — is today's text unchanged.
     pub schema_profile: nscore::SchemaProfile,
-    /// M12 T1.1: which class of model this deployment drives. `Small` — the
-    /// default — is today's behaviour in every place that reads it.
-    pub capability: nscore::Capability,
     /// M10 T1.4: whether the synthetic tools that cannot apply are left out
     /// of the legal set. On by default, and **off under replay**.
     ///
@@ -283,8 +253,6 @@ impl Default for EngineConfig {
             facts_in_context: 10,
             reply_grounding_check: true,
             reply_regenerate: true,
-            chat_act_or_answer: false,
-            act_or_answer_every_tier: false,
             act_and_answer: false,
             max_echo_ratio: 0.6,
             scope_for: std::sync::Arc::new(|_| "global".to_string()),
@@ -311,7 +279,6 @@ impl Default for EngineConfig {
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             recall_sessions: 3,
             schema_profile: nscore::SchemaProfile::Full,
-            capability: nscore::Capability::Small,
             prune_inapplicable: true,
             router: None,
             prompt_budget_tokens: 6000,

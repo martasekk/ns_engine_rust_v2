@@ -2,9 +2,9 @@
 
 A Rust workspace for an agent that emits **actions**, not prose. A language
 model proposes structured actions against a declared schema; a deterministic
-engine validates, guards, stages and executes them; a second model writes the
-reply from the trace of what actually happened. The model never gets to say
-that something was done — the trace does.
+engine validates, guards, stages and executes them; the reply is written from
+the trace of what actually happened and checked against it. The model never
+gets to say that something was done — the trace does.
 
 One of the action families is **pointer control**: moving the mouse, clicking,
 typing and reading the UI tree of *another machine*, over an authenticated
@@ -13,11 +13,15 @@ socket, behind two independent confirmation gates.
 ```
 crates/core           actions, events, values, validation, learned rules
 crates/engine         the turn loop: emit → validate → guard → execute → reply
-crates/llm            provider-agnostic chat client, emitter/replier/summarizer
+crates/llm            provider-agnostic chat client: the turn model and the summarizer
 crates/memory-sqlite  the event log and an FTS5 index over it
 crates/provenance     where a fact came from
 crates/evolution      the self-improvement pass: mine → propose → gate → apply
 crates/channel-cli    a REPL channel, generic over reader/writer
+crates/channel-hub    one queue per company, one set of windows per session
+crates/channel-tcp    the socket: one JSON object per line
+crates/channel-http   web chat windows, one-shot requests, platform webhooks
+crates/identity       who a caller is, per channel, before anything downstream
 crates/components-std time, HTTP and pointer tools
 crates/pointer        remote pointer, keyboard, clipboard and UI reading
 app                   ns-app: wires a config file into a running harness
@@ -35,9 +39,20 @@ The engine is the part that must not be clever. Each turn:
    `confirm_pending` action that is valid for exactly one turn. Nothing with a
    side effect happens without a confirmation crossing the loop.
 4. Surviving actions execute; each outcome is appended to the log.
-5. The **replier** model writes the user-facing text from the trace, and a
-   grounding check regenerates a reply once if it invents numbers or names
-   that appear nowhere in its material.
+5. The loop ends when the model answers instead of acting. Every call is
+   offered both, on every tier, so the turn is over when the model says it is
+   — and the text it wrote is the reply, checked against the trace for
+   numbers and names that appear nowhere in its material and flagged in the
+   log when it finds them.
+
+There were two models here until 2026-09-14: one to choose the actions and a
+second to narrate what happened. The second was already skipped on chat
+turns, and what it bought elsewhere was a reading of the trace by a model
+that had not chosen the actions — worth a request on a long task, dead weight
+on a short one. It is one call now. The grounding, echo and citation checks
+still run against the same material; what went with the second model is the
+ability to *rewrite* a flagged draft, which only ever fired for a model too
+weak to be trusted with the first one.
 
 Working memory keeps the last few turns verbatim, pins user facts, and folds
 everything older into a rolling summary. `recall` searches the whole log.
@@ -92,7 +107,7 @@ refused instead of finding out from the refusal.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace          # 334 tests, no network required
+cargo test  --workspace          # 907 tests, no network required
 
 cp config.example.toml config.toml
 cargo run -p ns-app -- providers # which providers exist, which keys are set
@@ -112,6 +127,47 @@ To drive a desktop, uncomment `[pointer]` in `config.toml`, point `addr` at a
 machine running the agent (started with `allow_remote` for a non-loopback
 bind), and export the token. `NS_POINTER_ADDR` overrides the address.
 
+## Setting it up
+
+```sh
+ns-app admin      # a settings page on loopback, with a one-time token
+```
+
+Provider and models, the listen addresses, the companies this process hosts,
+and the credentials each of them needs. It edits `config.toml` and
+`tenants/*.toml` in place with their comments intact, and refuses any save
+that would not load — so a mistake is a message on screen rather than a
+process that will not start.
+
+Keys are the part worth knowing about. The config never holds one: it names
+an environment variable, and that is what keeps a credential out of a file
+somebody commits. The page keeps that rule — it writes *values* to a
+gitignored `.env` beside the config, and never sends one back to the browser,
+only whether each variable is set.
+
+## Connecting things to it
+
+`ns-app serve` hosts many companies in one process, and each can be reached
+four ways at once — a raw socket, a browser's WebSocket, a one-shot HTTP
+request, and a platform's signed webhook:
+
+| way in | who it is for | reply arrives |
+|---|---|---|
+| TCP, one JSON object per line | desktop apps, scripts | on the same socket |
+| `GET /chat`, upgraded | a custom web chat window | on the same socket |
+| `POST /v1/messages` | `curl`, a cron job, another back end | in the response |
+| `POST /hooks/<platform>` | WhatsApp, and platforms shaped like it | as a call to the platform's API |
+
+They are four envelopes, not four conversations. A customer with a tab open,
+that customer's desktop app and that customer on WhatsApp share one session,
+one engine and one log; the engine has no field with which to ask which is
+which. The socket and the WebSocket speak the same three JSON objects, so one
+client library serves both.
+
+`docs/connecting-clients.md` is the guide, with a worked client of each kind in
+`crates/channel-http/examples/` — a complete chat page, a desktop client, and
+the `[serve]`/`[http]`/`[whatsapp]` config they need.
+
 ## Docs
 
 | | |
@@ -120,6 +176,7 @@ bind), and export the token. `NS_POINTER_ADDR` overrides the address.
 | `docs/pointer-work-split.md` | which half implements what, and why |
 | `docs/windows-handoff.md` | notes to and from the Windows agent maintainer |
 | `docs/providers.md` | swapping the model, per role or per run |
+| `docs/connecting-clients.md` | every way in: sockets, web chat windows, webhooks |
 | `docs/superpowers/` | specs and plans |
 | `docs/research/` | the literature the design leans on |
 

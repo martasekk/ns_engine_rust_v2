@@ -142,6 +142,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -296,6 +297,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
 ]
 
 [[package]]
@@ -598,11 +608,14 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "ns-channel-cli",
+ "ns-channel-http",
+ "ns-channel-hub",
  "ns-channel-tcp",
  "ns-components-std",
  "ns-core",
  "ns-engine",
  "ns-evolution",
+ "ns-identity",
  "ns-llm",
  "ns-memory-sqlite",
  "ns-pointer",
@@ -610,8 +623,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -624,11 +639,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "ns-channel-tcp"
+name = "ns-channel-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hmac",
+ "ns-channel-hub",
+ "ns-channel-tcp",
+ "ns-core",
+ "ns-identity",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ns-channel-hub"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "ns-core",
+ "tokio",
+]
+
+[[package]]
+name = "ns-channel-tcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "ns-channel-hub",
+ "ns-core",
+ "ns-identity",
  "serde",
  "serde_json",
  "thiserror",
@@ -694,6 +742,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "ns-identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hmac",
+ "ns-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -1087,6 +1149,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

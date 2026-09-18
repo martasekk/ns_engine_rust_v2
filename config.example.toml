@@ -8,7 +8,7 @@
 #
 #   whole config   [llm] provider = "ollama"
 #   one run        NS_PROVIDER=ollama [NS_MODEL=qwen2.5:3b] ns-app
-#   one role       [llm.replier] model = "mistral:mistral-small-latest"
+#   one role       [llm.summarizer] model = "mistral:mistral-small-latest"
 #
 # A preset supplies base_url, api_key_env, a default model, the provider's
 # request spacing and whether Anthropic cache breakpoints survive the hop.
@@ -35,7 +35,7 @@ provider = "openrouter"
 # back to the emitter. Each role may sit on a different provider.
 # [llm.emitter]
 # model = "openrouter/free"
-# [llm.replier]
+# [llm.summarizer]
 # model = "openrouter/free"
 
 # ── Capability profile (M12) ──────────────────────────────────────────────
@@ -83,7 +83,7 @@ provider = "openrouter"
 # the answer written later from the result - "let me check the clock", then
 # the time. Logged as `Said`, which is not a second reply: a turn still has
 # exactly one answer. Measured 2026-09-12 on luna, 4 turns: 6 requests, 0
-# replier calls, and the two turns whose answer needed a tool result each
+# summarizer calls, and the two turns whose answer needed a tool result each
 # narrated first. The pair costs ~60 tokens per tool, which took the schema
 # share of the prompt from 75% to 88% - fewer requests, fatter requests.
 #   act_and_answer = true
@@ -93,7 +93,7 @@ provider = "openrouter"
 # request this engine has always sent.
 #
 #   reasoning   "low" | "medium" | "high" — OpenRouter's reasoning effort.
-#   max_tokens  output cap. Unset: emitter and replier 4096, summarizer 400.
+#   max_tokens  output cap. Unset: the turn model 4096, summarizer 400.
 #   sampling    "default" (temperature 0 where the role had one) or "none"
 #               (no sampling param at all — not a different value, no key).
 #   thinking    false sends reasoning {"enabled": false}, for models that
@@ -102,14 +102,14 @@ provider = "openrouter"
 # Claude Sonnet 5 rejects temperature/top_p/top_k and manual thinking budgets
 # with a 400, so any `anthropic/claude-sonnet-5*` id defaults sampling to
 # "none" on its own and says so at startup. These are the recommended shapes
-# for it — the emitter's job is one tool call, the replier's is the prose:
+# for it — the turn does a tool call and the prose:
 #
 #   [llm.emitter]
 #   model = "anthropic/claude-sonnet-5"
 #   reasoning = "low"
 #   max_tokens = 2048
 #
-#   [llm.replier]
+#   [llm.summarizer]
 #   model = "anthropic/claude-sonnet-5"
 #   reasoning = "medium"
 #   max_tokens = 4096
@@ -123,14 +123,14 @@ provider = "openrouter"
 # (no safety net needed) and honours the reasoning block, at $0.20 / $1.20 per
 # MTok against Sonnet's $2 / $10. `reasoning = "low"` in all three roles is
 # what the M11 measurement ran; the emitter's job is one tool call, the
-# replier's is the prose, and 1024 is enough for the summarizer's four fields:
+# the turn writes prose, and 1024 is enough for the summarizer fields:
 #
 #   [llm.emitter]
 #   model = "openai/gpt-5.6-luna"
 #   reasoning = "low"
 #   max_tokens = 2048
 #
-#   [llm.replier]
+#   [llm.summarizer]
 #   model = "openai/gpt-5.6-luna"
 #   reasoning = "low"
 #   max_tokens = 4096
@@ -157,6 +157,34 @@ text = "You are a helpful, concise assistant."
 
 [store]
 path = "ns.sqlite"
+
+# The shared library, for a deployment hosting more than one company.
+# `personas/<name>.md` is prose; `modules/<name>.toml` is a file of
+# [[http_component]] entries — the same TOML you would otherwise paste into
+# every overlay. Both directories sit beside `tenants/`.
+#
+# A company names what it uses instead of holding a copy, so a correction to
+# one persona reaches everybody using it rather than the one file somebody
+# remembered to edit. A name that is not in the library is refused at
+# startup, naming the file it should have been: a company that silently ran
+# without the persona it asked for would just look like a bad model.
+#
+# A company that writes its own [persona] text gets that, and the reference
+# is left unused. Modules *add* to whatever the company defines for itself.
+# [library]
+# persona = "support-brief"
+# modules = ["orders", "stock"]
+
+# Which of this company's modules a group of its people may reach.
+#
+# STORED AND NOT ENFORCED. Nothing reads this yet. The multi-tenant plan's
+# Phase 8 owns the enforcement, where a group reaches a session through the
+# token's `grants` claim; the hard part is that tools are registered once at
+# assembly, so a per-session subset needs a filter the turn loop does not
+# have. Until then every person at a company reaches every tool it has.
+# [groups]
+# agents = ["orders", "stock"]
+# readonly = ["stock"]
 
 # Evolution pass (self-improvement, spec 2026-09-02). Both drivers:
 #   batch:  ns-app evolve [--dry-run]      (cron-friendly; audit via git diff learned.toml)
@@ -277,3 +305,10 @@ recall_sessions = 3
 # [pointer]
 # addr = "192.168.1.40:7373"      # the agent must be started with allow_remote for a non-loopback bind
 # token_env = "NS_POINTER_TOKEN"  # default
+
+# `ns-app serve` — who may connect, and how: `[serve]` (the socket),
+# `[http]` (chat windows, one-shot requests, platform webhooks) and
+# `[whatsapp]` (one company's account, per tenant). None of it is read by
+# the CLI, so it lives beside a worked client of each kind rather than here:
+# crates/channel-http/examples/serve-config.toml, explained in
+# docs/connecting-clients.md.

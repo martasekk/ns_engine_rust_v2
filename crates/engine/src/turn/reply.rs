@@ -4,10 +4,9 @@
 //! module turns that policy into text and records what the text was grounded
 //! in.
 
-use super::diagnostics::explain_error;
 use super::Engine;
 use crate::state::fold;
-use crate::trace::{reply_manifest, trace_for_prompt};
+use crate::trace::trace_for_prompt;
 use nscore::{EventKind, EventLog, ReplyContext};
 
 pub const FALLBACK_REPLY: &str = "Sorry, I couldn't complete that.";
@@ -62,7 +61,7 @@ impl Engine {
         // stays uncapped: `render_echo` measures the reply against the
         // full material, and capping there would change what that
         // number means.
-        let (trace_lines, reply_clipped_chars) = trace_for_prompt(
+        let (trace_lines, _clipped) = trace_for_prompt(
             log.events(),
             turn,
             self.cfg.trace_verbatim_lines,
@@ -114,47 +113,35 @@ impl Engine {
                     usage: Some(usage.clone()),
                 }
             };
-        // The reply context is fitted too, and reported on the same
-        // way. Its `turn_trace` is exempt: it is the material the
-        // reply narrates from, and the grounding interceptor flags a
-        // reply for stating anything absent from it — trimming it
-        // would manufacture the fabrications the interceptor catches.
-        let mut budgeted = make_ctx(vec![], vec![], vec![]);
-        let budget = nscore::fit_reply(
-            &mut budgeted,
-            self.cfg.prompt_budget_tokens,
-            self.cfg.budget_mode,
-            &self.cfg.pinned_prefixes,
-            self.cfg.guidance_max,
-        );
-        // M9 T0.4, as on the emitter path: after the fit, so only the
-        // rendered prompt and the manifest's keys change.
-        match self.cfg.ablate {
-            Some(nscore::Ablate::Facts) => budgeted.facts.clear(),
-            Some(nscore::Ablate::Summary) => budgeted.summary = None,
-            Some(nscore::Ablate::Guidance) => budgeted.guidance.clear(),
-            None => {}
-        }
-        let note_hashes: Vec<String> = guidance_notes
-            .iter()
-            .take(budgeted.guidance.len())
-            .map(|(h, _)| h.clone())
-            .collect();
-        let mut manifest = reply_manifest(scope, &budgeted, reply_clipped_chars, note_hashes);
-        manifest.budget = Some(budget);
-        manifest.ablated = self.cfg.ablate;
-        // M12 T4.3. An emitted answer is already drafted and already paid
-        // for; everything below it is the same.
-        let drafted = match pre_draft {
-            Some(text) => Ok(text),
-            None => {
-                let d = self.parts.replier.reply(budgeted).await;
-                self.record_model_calls(usage, log, turn, &manifest);
-                d
-            }
+        // The draft is the emitter's own answer, and there is nothing else
+        // it could be: the second model went on 2026-09-14, and with it the
+        // fitting, the manifest and the budget report that existed to build
+        // its prompt. What the emitter saw is already on its own `ModelCall`,
+        // so the turn still records what the text that reached the user was
+        // allowed to know — once, on the call that wrote it.
+        //
+        // `None` is a turn that settled on `Generate` while holding no
+        // answer. The offer is unconditional now, so the emitter is asked to
+        // answer on every iteration of every tier and this is not reachable
+        // from a turn that ran normally; it stays as a sentence rather than
+        // an `unwrap`, because "the reply is whatever the loop left behind"
+        // is exactly the assumption that should fail loudly in the log and
+        // quietly for the user.
+        let Some(draft) = pre_draft else {
+            log.append(
+                turn,
+                now(),
+                EventKind::ReplyFailed {
+                    detail: "the turn settled on a generated reply without one".into(),
+                },
+            );
+            return format!("{FALLBACK_REPLY} Reason: the turn ended without a reply.");
         };
-        match drafted {
-            Ok(draft) if self.cfg.reply_grounding_check => {
+        if !self.cfg.reply_grounding_check {
+            return draft;
+        }
+        {
+            {
                 // M6 §4.5. Two checks, one of which acts.
                 //
                 // `ungrounded` gates: a claim nothing above supports
@@ -200,76 +187,37 @@ impl Engine {
                             spans: spans.clone(),
                         },
                     );
-                    // M12 T1.2: the flag above is free and always written;
-                    // the call below is billed and exists to talk a weak
-                    // model out of its fabrication. Where the model is not
-                    // weak, the draft stands and falls through to the same
-                    // obligations and citation path any draft takes.
-                    if self.cfg.reply_regenerate {
-                        let regenerated = self
-                            .parts
-                            .replier
-                            .reply(make_ctx(spans, vec![], vec![]))
-                            .await;
-                        // The regeneration is a second billed call, and
-                        // the point of counting it is to know what the
-                        // grounding check costs.
-                        self.record_model_calls(usage, log, turn, &manifest);
-                        let final_reply = regenerated.unwrap_or(draft);
-                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
-                        return final_reply;
-                    }
+                    // The flag is free and always written. What used to
+                    // follow it was a billed second call asking a weaker
+                    // model to write the sentence again without the part it
+                    // had just been told was unsupported — and there is no
+                    // second model to ask now. The draft stands, flagged, in
+                    // a log the evolution pass mines: an ungrounded reply is
+                    // still a fact about the turn, it is just no longer a
+                    // fact the turn pays to hide.
                 }
-                // M9 T2.1. The obligation interceptor, behind its own
-                // knob and *after* grounding: a draft that already had
-                // to be regenerated has spent this turn's one spare
-                // call. No new event kind — the mechanics are the
-                // `ReplyFlagged` path's, with a distinct guidance
-                // line, because the extraction is measured weak and a
-                // signature written from it would be counted as if it
-                // were not.
-                match self
+                // M9 T2.1. The obligation interceptor, after grounding and
+                // behind its own knob, which is off by default. It reports
+                // for the same reason and by the same means: the clause the
+                // reply left unanswered is written down, and the draft the
+                // user gets is the one the emitter wrote.
+                if let Some(clause) = self
                     .cfg
                     .obligation_check
                     .then(|| crate::ground::unaddressed(&obligations, &draft))
                     .flatten()
                 {
-                    Some(clause) => {
-                        let regenerated = self
-                            .parts
-                            .replier
-                            .reply(make_ctx(
-                                vec![],
-                                vec![],
-                                vec![format!("Not yet addressed: {clause}")],
-                            ))
-                            .await;
-                        self.record_model_calls(usage, log, turn, &manifest);
-                        let final_reply = regenerated.unwrap_or(draft);
-                        Self::record_cited(log, turn, now(), &ctx, &final_reply);
-                        final_reply
-                    }
-                    None => {
-                        Self::record_cited(log, turn, now(), &ctx, &draft);
-                        draft
-                    }
+                    log.append(
+                        turn,
+                        now(),
+                        EventKind::ReplyFlagged {
+                            draft: draft.clone(),
+                            spans: vec![format!("{} {clause}", nscore::UNADDRESSED_PREFIX)],
+                        },
+                    );
                 }
-            }
-            Ok(draft) => draft,
-            Err(e) => {
-                // F7: a replier failure is an event, not just a
-                // fallback text — mining and audits must see it.
-                log.append(
-                    turn,
-                    now(),
-                    EventKind::ReplyFailed {
-                        detail: e.to_string(),
-                    },
-                );
-                format!(
-                    "{FALLBACK_REPLY} Reason: the reply could not be generated — {}.",
-                    explain_error(&e.to_string())
-                )
+                Self::record_cited(log, turn, now(), &ctx, &draft);
+                draft
             }
         }
     }

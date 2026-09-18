@@ -1186,7 +1186,7 @@ mod tests {
     use crate::ledger::Verdict;
     use crate::notes::{NoteProposer, ProbeRunner, TurnOutcome};
     use nscore::*;
-    use nsengine::script::{EchoTool, ScriptedEmitter, ScriptedReplier};
+    use nsengine::script::{EchoTool, ScriptedEmitter};
     use nsengine::store::{InMemoryStore, NoopConsolidator};
     use nsengine::turn::{Engine, EngineConfig};
 
@@ -1204,7 +1204,6 @@ mod tests {
     async fn record_into(store: Arc<InMemoryStore>, name: &str, proposals: Vec<Proposal>) {
         let mut b = HarnessBuilder::new();
         b.set_emitter(Box::new(ScriptedEmitter::new(proposals)));
-        b.set_replier(Box::new(ScriptedReplier));
         b.set_memory(store.clone());
         b.set_channel(Box::new(Closed));
         b.set_consolidator(Box::new(NoopConsolidator));
@@ -1228,19 +1227,47 @@ mod tests {
     /// A κ table whose reference never changes its mind is the prevalence
     /// paradox rather than a measurement, so the fixture has to be able to
     /// make the symbolic checks say *yes* on some turns and *no* on others.
-    /// `ScriptedReplier` cannot: it echoes the whole turn trace, which the
-    /// grounding check reads as a page of unsupported claims on every turn.
-    /// The three invented claims below are what `ground::ungrounded` is
-    /// built to catch — a name, a number and a place nothing showed it.
-    struct PlainReplier;
+    /// A scripted emitter that is not told what to answer cannot: it echoes
+    /// the whole turn trace, which the grounding check reads as a page of
+    /// unsupported claims on every turn. The three invented claims below are
+    /// what `ground::ungrounded` is built to catch — a name, a number and a
+    /// place nothing showed it.
+    struct PlainAnswers(std::sync::Mutex<std::collections::VecDeque<Proposal>>);
     #[async_trait::async_trait]
-    impl nscore::Replier for PlainReplier {
-        async fn reply(&self, ctx: nscore::ReplyContext) -> Result<String, nscore::ReplyError> {
-            let mut r = format!("sure, about {}: done", ctx.user_text);
-            if ctx.user_text.contains("details") {
-                r.push_str(", Martin has 42 orders in Oslo");
+    impl nscore::Emitter for PlainAnswers {
+        async fn propose(
+            &self,
+            ctx: nscore::EmitterContext,
+            legal: &nscore::LegalActionSet,
+        ) -> Result<Proposal, nscore::EmitError> {
+            Ok(self.propose_or_answer(ctx, legal).await?.proposal)
+        }
+
+        async fn propose_or_answer(
+            &self,
+            ctx: nscore::EmitterContext,
+            _legal: &nscore::LegalActionSet,
+        ) -> Result<nscore::Emission, nscore::EmitError> {
+            if let Some(proposal) = self.0.lock().expect("script lock").pop_front() {
+                return Ok(nscore::Emission {
+                    proposal,
+                    answer: None,
+                    say: None,
+                });
             }
-            Ok(r)
+            let mut text = format!("sure, about {}: done", ctx.user_text);
+            if ctx.user_text.contains("details") {
+                text.push_str(", Martin has 42 orders in Oslo");
+            }
+            Ok(nscore::Emission {
+                proposal: Proposal {
+                    rationale: format!("{} {text}", nscore::ANSWERED_IN_EMITTER_PREFIX),
+                    action: "respond_directly".into(),
+                    args: serde_json::json!({}),
+                },
+                answer: Some(text),
+                say: None,
+            })
         }
     }
 
@@ -1248,8 +1275,7 @@ mod tests {
     /// scorer can be scripted per turn without a session id it cannot see.
     async fn record_asking(store: Arc<InMemoryStore>, name: &str, text: &str, p: Vec<Proposal>) {
         let mut b = HarnessBuilder::new();
-        b.set_emitter(Box::new(ScriptedEmitter::new(p)));
-        b.set_replier(Box::new(PlainReplier));
+        b.set_emitter(Box::new(PlainAnswers(std::sync::Mutex::new(p.into()))));
         b.set_memory(store.clone());
         b.set_channel(Box::new(Closed));
         b.set_consolidator(Box::new(NoopConsolidator));
