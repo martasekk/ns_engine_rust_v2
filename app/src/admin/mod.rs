@@ -173,6 +173,9 @@ async fn route(admin: &Arc<Admin>, request: &Request) -> Response {
     if !authorised(admin, request) {
         return Response::refused(401);
     }
+    if let Some(response) = flows::route(admin, request) {
+        return response;
+    }
     match (request.method.as_str(), request.path()) {
         ("GET", "/api/state") => admin.state(),
         ("GET", "/api/vault") => admin.vault(),

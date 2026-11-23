@@ -1,8 +1,6 @@
 //! Flow files on disk: `<root>/flows/<id>/<version>.json`, beside `personas/` and `modules/`.
 //! Every save is a new file, so a version once written never changes.
 //! The admin page decides what may be saved; this module only reads and writes.
-#![allow(dead_code)] // shortcut: used from chunk 5 (tenant) and chunk 7 (admin); remove when they land
-
 use nscore::flow::FlowDef;
 use std::io::Write;
 use std::path::{Path, PathBuf};

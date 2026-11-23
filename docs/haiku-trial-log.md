@@ -25,6 +25,7 @@ One line per mistake. A fix run is a new attempt on the same chunk.
 | 3 engine narrows tools, adds note | 1 | 0 |
 | 4 flow files on disk | 1 | 0 |
 | 5 `[library] flow` → startup → engine | 1 | 0 |
+| 6 save-time report | 1 | 0 |
 
 PROCESS = an instruction about how to work (e.g. tests first) not followed, with no effect on the result.
 

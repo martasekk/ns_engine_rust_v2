@@ -1,9 +1,199 @@
-//! The operator's Flows page: list, read, check and save flows. This file holds the
-//! save-time check now; the routes arrive in chunk 7. A flow holds no code and no URLs,
+//! The operator's Flows page: list, read, check and save flows. A flow holds no code and no URLs,
 //! so the worst a bad save does is narrow one company's tools.
-#![allow(dead_code)] // shortcut: the routes arrive in chunk 7; remove then
 
+use nschannel_http::http::{Request, Response};
 use nscore::flow::{FlowDef, Guard};
+
+use crate::flowlib;
+
+/// The flow endpoints, or None when the request is not one of them. Called after the token check.
+pub(super) fn route(admin: &super::Admin, request: &Request) -> Option<Response> {
+    let root = admin.root.as_path();
+    let path = request.path();
+    let method = request.method.as_str();
+    match (method, path) {
+        ("GET", "/api/flows") => {
+            return Some(match flowlib::list(root) {
+                Ok(flows) => Response::json(200, &serde_json::json!({ "flows": flows })),
+                Err(e) => server_error(e),
+            });
+        }
+        ("POST", "/api/validate-flow") => {
+            return Some(
+                match serde_json::from_slice::<serde_json::Value>(&request.body) {
+                    Ok(body) => {
+                        let report = check_flow(&body);
+                        Response::json(
+                            200,
+                            &serde_json::json!({
+                                "ok": report.errors.is_empty(),
+                                "errors": report.errors,
+                                "warnings": report.warnings,
+                            }),
+                        )
+                    }
+                    Err(e) => super::bad_request(format!("the body is not JSON: {e}")),
+                },
+            );
+        }
+        _ => {}
+    }
+    let segments: Vec<&str> = path.strip_prefix("/api/flows/")?.split('/').collect();
+    let shape = matches!(
+        (method, segments.as_slice()),
+        ("GET", [_]) | ("POST", [_]) | ("GET", [_, "versions"]) | ("DELETE", [_, "versions", _])
+    );
+    if !shape {
+        return Some(Response::refused(404));
+    }
+    let id = segments[0];
+    if !crate::tenant::valid_library_name(id) {
+        return Some(super::bad_request(format!(
+            "{id:?} is not a usable flow name: letters, digits, - and _ only"
+        )));
+    }
+    Some(match (method, segments.as_slice()) {
+        ("GET", [_]) => get_flow(root, id, request),
+        ("POST", [_]) => save_flow(root, id, &request.body),
+        ("GET", [_, _]) => match flowlib::versions(root, id) {
+            Ok(versions) => Response::json(200, &serde_json::json!({ "versions": versions })),
+            Err(e) => server_error(e),
+        },
+        ("DELETE", [_, _, n]) => delete_version(root, id, n),
+        _ => Response::refused(404),
+    })
+}
+
+fn server_error(e: String) -> Response {
+    Response::json(500, &serde_json::json!({ "error": e }))
+}
+
+/// `?version=N` is optional; present but not a whole number is a bad request.
+fn get_flow(root: &std::path::Path, id: &str, request: &Request) -> Response {
+    let version = match request.query("version") {
+        None => None,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => return super::bad_request(format!("version {v:?} is not a whole number")),
+        },
+    };
+    match flowlib::load(root, id, version) {
+        Ok(Some(flow)) => match serde_json::to_value(&flow) {
+            Ok(value) => Response::json(200, &value),
+            Err(e) => server_error(e.to_string()),
+        },
+        Ok(None) => {
+            let error = match version {
+                Some(v) => format!("no version {v} of flow {id}"),
+                None => format!("no flow named {id}"),
+            };
+            Response::json(404, &serde_json::json!({ "error": error }))
+        }
+        Err(e) => server_error(e),
+    }
+}
+
+/// Mirrors the old engine's save: check, match the path id, then demand a version bump.
+fn save_flow(root: &std::path::Path, id: &str, body: &[u8]) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return super::bad_request(format!("the body is not JSON: {e}")),
+    };
+    let report = check_flow(&value);
+    if !report.errors.is_empty() {
+        return Response::json(
+            422,
+            &serde_json::json!({ "errors": report.errors, "warnings": report.warnings }),
+        );
+    }
+    // check_flow has already proved this deserializes; the error arm is only a guard.
+    let flow: FlowDef = match serde_json::from_value(value) {
+        Ok(f) => f,
+        Err(e) => {
+            return Response::json(
+                422,
+                &serde_json::json!({ "errors": [e.to_string()], "warnings": report.warnings }),
+            )
+        }
+    };
+    if flow.id != id {
+        return Response::json(
+            422,
+            &serde_json::json!({
+                "errors": [format!("body id `{}` does not match path id `{id}`", flow.id)],
+                "warnings": report.warnings,
+            }),
+        );
+    }
+    let latest = match flowlib::versions(root, id) {
+        Ok(versions) => versions.into_iter().max(),
+        Err(e) => return server_error(e),
+    };
+    if let Some(max) = latest {
+        if flow.version <= max {
+            return Response::json(
+                409,
+                &serde_json::json!({
+                    "error": format!(
+                        "version {} is not above the stored latest {max}; a save must bump the version, so an old version is never rewritten",
+                        flow.version
+                    ),
+                    "latest_version": max,
+                }),
+            );
+        }
+    }
+    match flowlib::put(root, &flow) {
+        Ok(_) => Response::json(
+            200,
+            &serde_json::json!({
+                "saved": { "id": flow.id, "version": flow.version },
+                "warnings": report.warnings,
+                "note": "saved; restart ns-app for companies running this flow to pick it up",
+            }),
+        ),
+        Err(e) => server_error(e),
+    }
+}
+
+/// Rolls back one version. The last remaining version is refused, and so is a version that does not exist.
+fn delete_version(root: &std::path::Path, id: &str, n: &str) -> Response {
+    let version: u32 = match n.parse() {
+        Ok(v) => v,
+        Err(_) => return super::bad_request(format!("version {n:?} is not a whole number")),
+    };
+    let versions = match flowlib::versions(root, id) {
+        Ok(v) => v,
+        Err(e) => return server_error(e),
+    };
+    if !versions.contains(&version) {
+        return Response::json(
+            404,
+            &serde_json::json!({ "error": format!("no version {version} of flow {id}") }),
+        );
+    }
+    if versions.len() == 1 {
+        return Response::json(
+            409,
+            &serde_json::json!({ "error": format!(
+                "version {version} is the only version of {id}; delete the flow's directory by hand if you mean to remove it, after taking it off every company that names it"
+            ) }),
+        );
+    }
+    match flowlib::delete(root, id, version) {
+        Ok(()) => {
+            let latest = versions.iter().copied().filter(|v| *v != version).max();
+            Response::json(
+                200,
+                &serde_json::json!({
+                    "deleted": { "id": id, "version": version },
+                    "latest_version": latest,
+                }),
+            )
+        }
+        Err(e) => server_error(e),
+    }
+}
 
 /// What a save would refuse (errors) and what it would only mention (warnings).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -271,5 +461,178 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("reads, writes and args are checked")));
+    }
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn admin(root: &Path) -> Arc<super::super::Admin> {
+        Arc::new(super::super::Admin {
+            root: root.to_path_buf(),
+            token: "the-token".into(),
+        })
+    }
+
+    fn request(method: &str, path: &str, token: Option<&str>, body: &str) -> Request {
+        Request {
+            method: method.into(),
+            target: path.into(),
+            headers: token
+                .map(|t| vec![("authorization".into(), format!("Bearer {t}"))])
+                .unwrap_or_default(),
+            body: body.as_bytes().to_vec(),
+            keep_alive: false,
+        }
+    }
+
+    async fn call(
+        admin: &Arc<super::super::Admin>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Response {
+        super::super::route(admin, &request(method, path, Some("the-token"), body)).await
+    }
+
+    fn json_of(response: &Response) -> serde_json::Value {
+        serde_json::from_slice(&response.body).expect("a JSON body")
+    }
+
+    fn flow(id: &str, version: u32) -> String {
+        json!({"id": id, "version": version, "roles": {}, "required_roles": [], "actions": [], "fast_path": [], "reply_template": null}).to_string()
+    }
+
+    const GHOST: &str = r#"{"id":"trip","version":1,"roles":{},"required_roles":["ghost"],"actions":[],"fast_path":[],"reply_template":null}"#;
+
+    #[tokio::test]
+    async fn listing_is_empty_then_shows_a_saved_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "GET", "/api/flows", "").await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r), json!({"flows": []}));
+
+        let r = call(&a, "POST", "/api/flows/trip", &flow("trip", 1)).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r)["saved"]["version"], 1);
+
+        let r = call(&a, "GET", "/api/flows", "").await;
+        assert_eq!(
+            json_of(&r),
+            json!({"flows": [{"id": "trip", "latest_version": 1}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_must_bump_the_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        assert_eq!(
+            call(&a, "POST", "/api/flows/trip", &flow("trip", 1))
+                .await
+                .status,
+            200
+        );
+
+        let r = call(&a, "POST", "/api/flows/trip", &flow("trip", 1)).await;
+        assert_eq!(r.status, 409);
+        assert_eq!(json_of(&r)["latest_version"], 1);
+
+        assert_eq!(
+            call(&a, "POST", "/api/flows/trip", &flow("trip", 2))
+                .await
+                .status,
+            200
+        );
+
+        let r = call(&a, "GET", "/api/flows/trip", "").await;
+        assert_eq!(json_of(&r)["version"], 2);
+        let r = call(&a, "GET", "/api/flows/trip?version=1", "").await;
+        assert_eq!(json_of(&r)["version"], 1);
+        let r = call(&a, "GET", "/api/flows/trip/versions", "").await;
+        assert_eq!(json_of(&r), json!({"versions": [1, 2]}));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_flow_is_422_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "POST", "/api/flows/trip", GHOST).await;
+        assert_eq!(r.status, 422);
+        let errors = json_of(&r)["errors"].to_string();
+        assert!(errors.contains("ghost"), "{errors}");
+        assert!(!dir.path().join("flows").join("trip").exists());
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_id_is_422() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "POST", "/api/flows/trip", &flow("other", 1)).await;
+        assert_eq!(r.status, 422);
+    }
+
+    #[tokio::test]
+    async fn delete_rolls_back_but_never_the_last() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        assert_eq!(
+            call(&a, "POST", "/api/flows/trip", &flow("trip", 1))
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            call(&a, "POST", "/api/flows/trip", &flow("trip", 2))
+                .await
+                .status,
+            200
+        );
+
+        let r = call(&a, "DELETE", "/api/flows/trip/versions/2", "").await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r)["latest_version"], 1);
+
+        let r = call(&a, "DELETE", "/api/flows/trip/versions/1", "").await;
+        assert_eq!(r.status, 409);
+
+        let r = call(&a, "DELETE", "/api/flows/trip/versions/7", "").await;
+        assert_eq!(r.status, 404);
+    }
+
+    #[tokio::test]
+    async fn unknown_flow_is_404() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "GET", "/api/flows/nope", "").await;
+        assert_eq!(r.status, 404);
+    }
+
+    #[tokio::test]
+    async fn a_bad_id_is_400() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "GET", "/api/flows/..%2Fx", "").await;
+        assert_eq!(r.status, 400);
+        let r = call(&a, "POST", "/api/flows/a.b", &flow("a.b", 1)).await;
+        assert_eq!(r.status, 400);
+    }
+
+    #[tokio::test]
+    async fn validate_reports_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = call(&a, "POST", "/api/validate-flow", GHOST).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r)["ok"], false);
+        assert!(!dir.path().join("flows").exists());
+    }
+
+    #[tokio::test]
+    async fn flow_routes_need_the_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = admin(dir.path());
+        let r = super::super::route(&a, &request("GET", "/api/flows", None, "")).await;
+        assert_eq!(r.status, 401);
     }
 }
