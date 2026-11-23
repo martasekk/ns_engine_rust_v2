@@ -42,6 +42,7 @@
 //! | this file    | the socket, the routes, and who may call them       |
 
 mod document;
+mod flows;
 mod library;
 mod schema;
 pub(crate) mod secrets;
