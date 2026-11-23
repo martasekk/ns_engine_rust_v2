@@ -106,7 +106,8 @@
     border-style: dashed; color: var(--dim); }
   #left .foot button:hover { color: var(--text); }
 
-  #right { top: 12px; right: 12px; width: 360px; max-height: calc(100vh - 24px);
+  /* The inspector starts below the top bar, which is centred at the same height, so on a narrow window it no longer covers Save. */
+  #right { top: 64px; right: 12px; width: 360px; max-height: calc(100vh - 76px);
     display: flex; flex-direction: column; padding: 12px; }
   #right h3 { margin: 0 0 2px; font-size: 13px; }
   #modetoggle { position: absolute; top: 10px; right: 12px; display: flex; gap: 2px; }
@@ -180,13 +181,13 @@
   <span id="history"></span>
   <button onclick="runValidate()">Validate</button>
   <button class="primary" onclick="save()"
-    title="takes effect on the next turn of every conversation in this flow, including ones already under way">Save</button>
+    title="saves a new version; restart ns-app for companies running this flow to pick it up">Save</button>
 </div>
 <div id="report"></div>
 
 <div id="left" class="panel">
   <h1>Flows</h1>
-  <a id="settingslink" href="/" style="font-size:13px">← Settings</a>
+  <a id="settingslink" href="/" style="display:block; margin: 0 0 8px; font-size:13px; color: var(--accent); text-decoration: none;">← Settings</a>
   <div id="flowlist" class="muted">loading…</div>
   <div id="tree"></div>
   <div class="foot">
