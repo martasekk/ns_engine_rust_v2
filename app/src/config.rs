@@ -1677,6 +1677,20 @@ impl AppConfig {
         Ok(parsed)
     }
 
+    /// What startup resolves out of a config that has already parsed, short
+    /// of anything the environment decides (keys, tokens): a file that parses
+    /// and fails this still does not start. An unknown provider is the
+    /// commonest case, and it is a string, so it parses.
+    pub fn resolves(&self) -> Result<(), String> {
+        self.llm.schema_profile()?;
+        self.router.depth()?;
+        self.memory.budget_mode()?;
+        for target in self.llm.roles()? {
+            self.llm.shaping(target.role)?;
+        }
+        Ok(())
+    }
+
     /// Keys that used to mean something and no longer do.
     ///
     /// Nothing here denies unknown fields, so a key that is removed from the

@@ -293,12 +293,7 @@ pub(crate) fn load_set(
         // the reference because there happened to be no `tenants/` would be
         // the silent failure H5 exists to stop — just without a company id
         // to blame it on.
-        let mut app = AppConfig::parse(base_text).map_err(TenantError::Base)?;
-        resolve_library(&mut app, base_text, base_text, root, default_id)?;
-        return Ok(vec![TenantConfig {
-            id: default_id.to_string(),
-            app,
-        }]);
+        return Ok(vec![load_base(base_text, root, default_id)?]);
     }
     let mut ids = Vec::new();
     let entries = std::fs::read_dir(&dir).map_err(|e| TenantError::Dir {
@@ -339,12 +334,42 @@ pub(crate) fn load_one(
     let shown = path.display().to_string();
     let overlay_text = std::fs::read_to_string(&path).map_err(|_| TenantError::Missing {
         tenant: id.to_string(),
-        path: shown.clone(),
+        path: shown,
     })?;
-    let mut app = overlay(base_text, &overlay_text, id, &shown)?;
-    resolve_library(&mut app, base_text, &overlay_text, root, id)?;
+    load_overlay(base_text, &overlay_text, root, id)
+}
+
+/// One tenant from an overlay already in hand: [`load_one`] after the read,
+/// and what the settings page runs on an overlay before it writes it.
+pub(crate) fn load_overlay(
+    base_text: &str,
+    overlay_text: &str,
+    root: &Path,
+    id: &str,
+) -> Result<TenantConfig, TenantError> {
+    let shown = root
+        .join(TENANT_DIR)
+        .join(format!("{id}.toml"))
+        .display()
+        .to_string();
+    let mut app = overlay(base_text, overlay_text, id, &shown)?;
+    resolve_library(&mut app, base_text, overlay_text, root, id)?;
     Ok(TenantConfig {
         id: id.to_string(),
+        app,
+    })
+}
+
+/// The base config on its own, as a set with no `tenants/` loads it.
+pub(crate) fn load_base(
+    base_text: &str,
+    root: &Path,
+    default_id: &str,
+) -> Result<TenantConfig, TenantError> {
+    let mut app = AppConfig::parse(base_text).map_err(TenantError::Base)?;
+    resolve_library(&mut app, base_text, base_text, root, default_id)?;
+    Ok(TenantConfig {
+        id: default_id.to_string(),
         app,
     })
 }

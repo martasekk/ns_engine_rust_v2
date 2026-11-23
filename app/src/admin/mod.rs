@@ -468,8 +468,8 @@ impl Admin {
         if let Err(e) = document::set(&mut doc, &format!("groups.{name}"), setting) {
             return bad_request(e.to_string());
         }
-        if let Err(e) = document::loads_as_config(&doc) {
-            return bad_request(e.to_string());
+        if let Err(e) = self.would_start(Some(id), &doc) {
+            return bad_request(e);
         }
         if let Err(e) = document::write(&path, &doc) {
             return bad_request(e.to_string());
@@ -565,6 +565,30 @@ impl Admin {
         })
     }
 
+    /// Whether the process would start on `doc` once it is written: it has
+    /// to parse, and then resolve the way startup resolves it — an unknown
+    /// provider parses fine and stops the process anyway. A company's overlay
+    /// is judged laid over the base, because that merge is what its engine is
+    /// built from. What the environment decides (keys, tokens) is not judged
+    /// here: the vault is where those are set, often after this save.
+    fn would_start(
+        &self,
+        company: Option<&str>,
+        doc: &toml_edit::DocumentMut,
+    ) -> Result<(), String> {
+        document::loads_as_config(doc).map_err(|e| e.to_string())?;
+        let text = doc.to_string();
+        let tenant = match company {
+            None => crate::tenant::load_base(&text, &self.root, crate::DEFAULT_TENANT),
+            Some(id) => {
+                let base = std::fs::read_to_string(self.config_path()).unwrap_or_default();
+                crate::tenant::load_overlay(&base, &text, &self.root, id)
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        tenant.app.resolves()
+    }
+
     fn company_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = std::fs::read_dir(self.root.join(crate::tenant::TENANT_DIR))
             .into_iter()
@@ -620,8 +644,8 @@ impl Admin {
         }
         // The gate: what is written must load, or the next start would fail
         // on a file this page wrote.
-        if let Err(e) = document::loads_as_config(&doc) {
-            return bad_request(e.to_string());
+        if let Err(e) = self.would_start(save.company.as_deref(), &doc) {
+            return bad_request(e);
         }
         if let Err(e) = document::write(&path, &doc) {
             return bad_request(e.to_string());
@@ -946,14 +970,14 @@ mod tests {
                 "POST",
                 "/api/settings",
                 Some("the-token"),
-                r#"{"values":{"llm.provider":"groq"}}"#,
+                r#"{"values":{"llm.provider":"mistral"}}"#,
             ),
         )
         .await;
         assert_eq!(saved.status, 200);
 
         let text = std::fs::read_to_string(dir.path().join("config.toml")).expect("reads");
-        assert!(text.contains("provider = \"groq\""), "{text}");
+        assert!(text.contains("provider = \"mistral\""), "{text}");
         assert!(text.contains("# chosen for a reason"), "{text}");
         assert!(text.contains("listen = \"127.0.0.1:7375\""), "{text}");
     }
@@ -1006,6 +1030,103 @@ mod tests {
             before,
             "the file on disk is what it was"
         );
+    }
+
+    async fn save(admin: &Arc<Admin>, body: &str) -> Response {
+        route(
+            admin,
+            &request("POST", "/api/settings", Some("the-token"), body),
+        )
+        .await
+    }
+
+    fn body_text(response: &Response) -> String {
+        String::from_utf8_lossy(&response.body).into_owned()
+    }
+
+    /// An unknown provider is a string, so it parses — and startup refuses
+    /// it. The gate is startup's, not the parser's.
+    #[tokio::test]
+    async fn a_provider_startup_does_not_know_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let before = "[llm]\nprovider = \"ollama\"\n";
+        std::fs::write(dir.path().join("config.toml"), before).expect("the config");
+        let admin = admin(dir.path());
+
+        let refused = save(&admin, r#"{"values":{"llm.provider":"nosuchprovider"}}"#).await;
+        assert_eq!(refused.status, 400);
+        assert!(
+            body_text(&refused).contains("is unknown"),
+            "{}",
+            body_text(&refused)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("reads"),
+            before,
+            "the file on disk is what it was"
+        );
+    }
+
+    /// A preset with no default model resolves only once a model is named,
+    /// and naming it in the same save is enough.
+    #[tokio::test]
+    async fn a_provider_without_a_default_model_needs_one_in_the_same_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+
+        let refused = save(&admin, r#"{"values":{"llm.provider":"groq"}}"#).await;
+        assert_eq!(refused.status, 400);
+        assert!(
+            body_text(&refused).contains("model is not set"),
+            "{}",
+            body_text(&refused)
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "nothing was written"
+        );
+
+        let saved = save(
+            &admin,
+            r#"{"values":{"llm.provider":"groq","llm.emitter.model":"llama-4-scout"}}"#,
+        )
+        .await;
+        assert_eq!(saved.status, 200, "{}", body_text(&saved));
+    }
+
+    /// A company's overlay is judged laid over the base, the way its engine
+    /// is built from it.
+    #[tokio::test]
+    async fn a_company_save_is_judged_merged_with_the_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[llm]\nprovider = \"ollama\"\n",
+        )
+        .expect("the config");
+        std::fs::create_dir(dir.path().join("tenants")).expect("tenants");
+        let overlay = "[store]\npath = \"ns-acme.sqlite\"\n";
+        std::fs::write(dir.path().join("tenants").join("acme.toml"), overlay).expect("overlay");
+        let admin = admin(dir.path());
+
+        let refused = save(
+            &admin,
+            r#"{"company":"acme","values":{"llm.provider":"nosuchprovider"}}"#,
+        )
+        .await;
+        assert_eq!(refused.status, 400);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tenants").join("acme.toml")).expect("reads"),
+            overlay
+        );
+
+        // A model on its own inherits the base's provider, which resolves.
+        let saved = save(
+            &admin,
+            r#"{"company":"acme","values":{"llm.emitter.model":"qwen2.5:7b"}}"#,
+        )
+        .await;
+        assert_eq!(saved.status, 200, "{}", body_text(&saved));
     }
 
     #[tokio::test]

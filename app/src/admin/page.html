@@ -108,6 +108,22 @@ async function api(path, body) {
   return answered;
 }
 
+// A save reloads the state and redraws the page, which takes the form's own
+// "saved" line with it. The line waits here, keyed by the form it belongs
+// to, and that form's next drawing shows it once.
+const savedLines = {};
+
+function savedLine(key) {
+  const text = savedLines[key];
+  delete savedLines[key];
+  return el("span", { class: text ? "msg ok" : "msg" }, text || null);
+}
+
+async function reloadSaying(key, text) {
+  savedLines[key] = text;
+  try { await load(); } finally { delete savedLines[key]; }
+}
+
 function el(tag, attrs = {}, ...kids) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -264,15 +280,15 @@ function settingsForm(sections, values, companyId) {
       ...section.fields.map((f) => control(f, values[f.path], companyId)),
     ));
   }
-  const msg = el("span", { class: "msg" });
+  const key = "settings:" + (companyId || "");
+  const msg = savedLine(key);
   form.append(el("div", { class: "bar" },
     el("button", { class: "do", onclick: async () => {
       msg.className = "msg"; msg.textContent = "Saving…";
       try {
         const out = await api("/api/settings", { company: companyId, values: collect(form) });
-        msg.className = "msg ok";
-        msg.textContent = "Saved to " + out.saved + " — restart ns-app for it to take effect.";
-        await load();
+        await reloadSaying(key,
+          "Saved to " + out.saved + " — restart ns-app for it to take effect.");
       } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
     } }, "Save"),
     msg,
@@ -513,7 +529,8 @@ function libraryOf(kind) {
 function libraryEntry(entry) {
   const area = el("textarea", { class: "tall" });
   area.value = entry.text;
-  const msg = el("span", { class: "msg" });
+  const key = "library:" + entry.kind + ":" + entry.name;
+  const msg = savedLine(key);
 
   const save = async () => {
     if (entry.used_by.length > 1) {
@@ -525,7 +542,7 @@ function libraryEntry(entry) {
     msg.className = "msg"; msg.textContent = "Saving…";
     try {
       await api("/api/library", { kind: entry.kind, name: entry.name, text: area.value });
-      await load();
+      await reloadSaying(key, "Saved — restart ns-app for it to take effect.");
     } catch (e) { msg.className = "msg bad"; msg.textContent = e.message; }
   };
 
