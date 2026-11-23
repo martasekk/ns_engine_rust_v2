@@ -77,6 +77,7 @@
     <button data-tab="companies" aria-selected="false">Companies</button>
     <button data-tab="library" aria-selected="false">Library</button>
     <button data-tab="secrets" aria-selected="false">Vault</button>
+    <a id="flows-link" href="/flows" style="padding: 8px 12px; font: inherit; border-bottom: 2px solid transparent; color: var(--dim); text-decoration: none;">Flows ↗</a>
   </nav>
 </header>
 <main id="main"></main>
@@ -86,6 +87,7 @@
 // read once, then taken out of the address bar.
 const TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || "";
 try { history.replaceState(null, "", location.pathname); } catch (e) {}
+document.getElementById("flows-link").href = "/flows#token=" + encodeURIComponent(TOKEN);
 
 const main = document.getElementById("main");
 let state = null;
