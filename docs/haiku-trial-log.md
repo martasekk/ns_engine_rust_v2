@@ -20,10 +20,14 @@ One line per mistake. A fix run is a new attempt on the same chunk.
 
 | chunk | attempts | mistakes |
 |---|---|---|
+| 1 flow types | 1 | 0 |
+| 2 validate / offer / note | 1 | 2 (minor) |
+
+PROCESS = an instruction about how to work (e.g. tests first) not followed, with no effect on the result.
 
 ## Mistakes
 
 | chunk | attempt | code | what | caught by | fixed by |
 |---|---|---|---|---|---|
-</content>
-</invoke>
+| 2 | 1 | CLAIM | report said 17 new tests; there are 15 (every case the brief listed is covered) | lead counted `#[test]` | not needed |
+| 2 | 1 | PROCESS | wrote code and tests together, not tests first (self-reported) | agent's own report | not needed |
