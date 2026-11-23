@@ -39,6 +39,8 @@ pub(super) struct Compose<'a> {
     pub turn: u32,
     pub tier: nscore::Tier,
     pub active_pending: bool,
+    /// The flow's "still needed" line, when it has one. Goes first in guidance.
+    pub flow_note: Option<&'a str>,
 }
 
 /// A composed prompt: what is sent, what describes it, and whether the call
@@ -99,12 +101,17 @@ impl Engine {
         // hashes are cut to whatever survived to be sent.
         // M12 T3.2: with the archive knob on, a note learned on another
         // emitter never reaches this prompt.
-        let guidance_notes = if self.cfg.archive_foreign_notes {
+        let mut guidance_notes = if self.cfg.archive_foreign_notes {
             c.rules
                 .guidance_notes_for_model(&legal_names, self.cfg.learning_model.as_deref())
         } else {
             c.rules.guidance_notes_for(&legal_names)
         };
+        // First, so the guidance clamp (which drops from the end) keeps it; with a hash of its own so the
+        // manifest's note_hashes stay aligned with the notes as sent.
+        if let Some(note) = c.flow_note {
+            guidance_notes.insert(0, ("flow".to_string(), note.to_string()));
+        }
         let mut ctx = EmitterContext {
             facts,
             summary: c.state.summary.clone(),

@@ -40,6 +40,8 @@ pub(super) struct Offer<'a> {
     pub scope_holds_facts: bool,
     /// Whether a staged proposal is still confirmable this turn.
     pub active_pending: bool,
+    /// The flow's allowance for this turn; `None` means no flow, so no narrowing.
+    pub flow_tools: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 impl Engine {
@@ -80,6 +82,8 @@ impl Engine {
                 // same names on every iteration and the array's bytes do not
                 // move.
                 .filter(|s| o.selected_tools.is_none_or(|sel| sel.contains(&s.name)))
+                // The flow narrows the registered tools to the ones it names this turn.
+                .filter(|s| o.flow_tools.is_none_or(|t| t.contains(&s.name)))
                 .collect()
         } else {
             Vec::new()

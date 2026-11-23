@@ -64,9 +64,10 @@ newtypes, so the JSON is identical).
 | GET | `/api/flows/<id>/versions` | – | `{"versions":[1,2,…]}` ascending; `[]` for unknown | |
 | POST | `/api/flows/<id>` | flow JSON | `{"saved":{"id","version"},"warnings":[…],"note":"…"}` | 422 `{"errors","warnings"}` invalid or id mismatch; 409 `{"error","latest_version"}` no bump |
 | DELETE | `/api/flows/<id>/versions/<N>` | – | `{"deleted":{"id","version"},"latest_version":M}` | 404 unknown; 409 last version |
-| POST | `/api/flows/validate` | flow JSON | `{"ok","errors","warnings"}` | |
+| POST | `/api/validate-flow` | flow JSON | `{"ok","errors","warnings"}` | |
 
-`<id>` must pass `library_names_are_usable`'s rule (`valid_library_name` in tenant.rs); otherwise 400.
+`<id>` must pass `valid_library_name` (tenant.rs); otherwise 400. (Validate is not under `/api/flows/` so
+that no flow id is reserved.)
 
 ## Chunks
 
@@ -90,5 +91,3 @@ newtypes, so the JSON is identical).
 - Gate: `bash C:/Users/Acemagic/ns_engine_rust_v2-flows/docs/flows-gate.sh "<-p crate …>" <cargo test args>`,
   e.g. `bash docs/flows-gate.sh "-p ns-core" --test flow`. Last line PASS or FAIL. Do not commit; the lead commits.
 - Never run `rustfmt` on a `lib.rs`, `main.rs` or `mod.rs`: it follows `mod` lines into the unformatted files.
-</content>
-</invoke>

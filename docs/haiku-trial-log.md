@@ -22,6 +22,7 @@ One line per mistake. A fix run is a new attempt on the same chunk.
 |---|---|---|
 | 1 flow types | 1 | 0 |
 | 2 validate / offer / note | 1 | 2 (minor) |
+| 3 engine narrows tools, adds note | 1 | 0 |
 
 PROCESS = an instruction about how to work (e.g. tests first) not followed, with no effect on the result.
 
