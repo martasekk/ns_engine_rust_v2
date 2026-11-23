@@ -87,6 +87,9 @@ pub enum FlowError {
     /// A role maps to a slot whose name starts with '$', which is reserved.
     #[error("role {role} maps to slot {slot}, but slot names may not begin with '$'")]
     ReservedSlotPrefix { role: String, slot: String },
+    /// A slot remember_fact could never write, so the role could never be filled.
+    #[error("role {role} maps to slot {slot:?}, which is not a fact key: use letters, digits, '.', '-' and '_', starting and ending with a letter, digit or '_'")]
+    UnwritableSlot { role: String, slot: String },
     /// A `$out:` reference is not of the shape `$out:action.field`.
     #[error("action {decl} has a malformed reference {raw}: the shape is $out:action.field")]
     BadRef { decl: String, raw: String },
@@ -100,6 +103,17 @@ pub enum FlowError {
         first: String,
         second: String,
     },
+}
+
+/// True when remember_fact can store a fact under `s`. The rule mirrors the key check in
+/// `crates/engine/src/turn/builtins.rs` (remember_fact), which trims edge characters first.
+fn writable_key(s: &str) -> bool {
+    let edge_ok = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+        && s.chars().next().is_some_and(edge_ok)
+        && s.chars().last().is_some_and(edge_ok)
 }
 
 impl FlowDef {
@@ -132,6 +146,11 @@ impl FlowDef {
         for (role, slot) in &self.roles {
             if slot.starts_with('$') {
                 found.push(FlowError::ReservedSlotPrefix {
+                    role: role.clone(),
+                    slot: slot.clone(),
+                });
+            } else if !writable_key(slot) {
+                found.push(FlowError::UnwritableSlot {
                     role: role.clone(),
                     slot: slot.clone(),
                 });

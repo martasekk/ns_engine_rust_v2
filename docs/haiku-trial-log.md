@@ -24,12 +24,17 @@ One line per mistake. A fix run is a new attempt on the same chunk.
 | 2 validate / offer / note | 1 | 2 (minor) |
 | 3 engine narrows tools, adds note | 1 | 0 |
 | 4 flow files on disk | 1 | 0 |
-| 5 `[library] flow` → startup → engine | 1 | 0 |
+| 5 `[library] flow` → startup → engine | 1 | 1 (minor) |
 | 6 save-time report | 1 | 0 |
 | 7 endpoints + routes | 1 | 0 |
 | 8 editor page + link | 1 | 1 (minor) |
 | 9 editor layout fixes | 1 | 0 |
-| **total** | **9 runs, 0 re-runs** | **3, all minor; 0 bugs, 0 gate failures, 0 out-of-scope edits** |
+| 10 slot keys + remember-unlocks test | 1 | 1 (minor) |
+| **total** | **10 runs, 0 re-runs** | **5, all minor (1 CLAIM, 4 PROCESS); 0 bugs, 0 gate failures, 0 out-of-scope edits** |
+
+Chunk 10 closed two gaps the lead found after the first finished version: the engine tests seeded the fact
+directly, so nothing proved that a `remember_fact` under the key the note names unlocks the flow; and a flow could
+name a slot `remember_fact` refuses as a key. Both were gaps in the lead's spec, not agent mistakes.
 
 PROCESS = an instruction about how to work (e.g. tests first) not followed, with no effect on the result.
 
@@ -50,4 +55,6 @@ copied v1 page, and every agent did what it was told:
 |---|---|---|---|---|---|
 | 2 | 1 | CLAIM | report said 17 new tests; there are 15 (every case the brief listed is covered) | lead counted `#[test]` | not needed |
 | 2 | 1 | PROCESS | wrote code and tests together, not tests first (self-reported) | agent's own report | not needed |
+| 5 | 1 | PROCESS | asked to check after rustfmt that it changed no lines but its own; did not inspect each hunk (self-reported). The lead read the diff: clean | agent's own report | not needed |
+| 10 | 1 | PROCESS | wrote Part A's test and code in one pass, never saw the test fail first (self-reported) | agent's own report | not needed |
 | 8 | 1 | PROCESS | asked to map each of the 13 diff hunks to the brief's items a-h; did not (self-reported). The lead mapped them: all 13 were correct | agent's own report | not needed |

@@ -211,6 +211,33 @@ fn reserved_slot_prefix_is_an_error() {
 }
 
 #[test]
+fn a_slot_remember_fact_cannot_write_is_an_error() {
+    for slot in ["trip date", "", ".x", "x-"] {
+        let flow = flow_with(json!({"x": slot}), json!([]), vec![]);
+        assert_eq!(
+            flow.validate(),
+            vec![FlowError::UnwritableSlot {
+                role: "x".into(),
+                slot: slot.into()
+            }],
+            "slot {slot:?}"
+        );
+    }
+    for slot in ["user.city", "trip_date", "_x", "a-b.c"] {
+        let flow = flow_with(json!({"x": slot}), json!([]), vec![]);
+        assert!(flow.validate().is_empty(), "slot {slot:?}");
+    }
+    let flow = flow_with(json!({"x": "$x"}), json!([]), vec![]);
+    assert_eq!(
+        flow.validate(),
+        vec![FlowError::ReservedSlotPrefix {
+            role: "x".into(),
+            slot: "$x".into()
+        }]
+    );
+}
+
+#[test]
 fn guard_naming_an_undefined_role_is_an_error() {
     let flow = flow_with(
         json!({}),

@@ -7,6 +7,7 @@ use nscore::*;
 use nsengine::script::*;
 use nsengine::store::{InMemoryStore, NoopConsolidator};
 use nsengine::turn::{Engine, EngineConfig};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct NullChannel;
@@ -174,6 +175,105 @@ async fn a_flow_hides_tools_it_does_not_name_and_says_what_is_missing() {
 #[tokio::test]
 async fn a_filled_role_unlocks_its_action() {
     let (names, guidance) = first_call(Some(Arc::new(city_flow())), true).await;
+    assert!(names.contains(&"echo".to_string()), "{names:?}");
+    assert!(!names.contains(&"other".to_string()), "{names:?}");
+    assert!(
+        !guidance.iter().any(|g| g.starts_with("Flow ")),
+        "{guidance:?}"
+    );
+}
+
+/// What one emitter call saw: the user text of its turn, the legal names and the guidance.
+type Call = (String, Vec<String>, Vec<String>);
+
+/// The first emitter call remembers the city; every later call answers directly.
+/// Records each call in order.
+struct RememberThenAnswer {
+    calls: Arc<std::sync::Mutex<Vec<Call>>>,
+    count: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl Emitter for RememberThenAnswer {
+    async fn propose(
+        &self,
+        ctx: EmitterContext,
+        legal: &LegalActionSet,
+    ) -> Result<Proposal, EmitError> {
+        let names = legal.actions.iter().map(|a| a.name.clone()).collect();
+        self.calls
+            .lock()
+            .unwrap()
+            .push((ctx.user_text.clone(), names, ctx.guidance.clone()));
+        let (action, args) = if self.count.fetch_add(1, Ordering::SeqCst) == 0 {
+            (
+                "remember_fact",
+                serde_json::json!({"key": "user.city", "value": "Prague"}),
+            )
+        } else {
+            ("respond_directly", serde_json::json!({}))
+        };
+        Ok(Proposal {
+            rationale: "".into(),
+            action: action.into(),
+            args,
+        })
+    }
+}
+
+#[tokio::test]
+async fn remembering_the_named_key_unlocks_the_action_next_turn() {
+    let store = Arc::new(InMemoryStore::new());
+    let calls: Arc<std::sync::Mutex<Vec<Call>>> = Default::default();
+    let mut b = HarnessBuilder::new();
+    b.set_emitter(Box::new(RememberThenAnswer {
+        calls: calls.clone(),
+        count: AtomicUsize::new(0),
+    }));
+    b.set_memory(store.clone());
+    b.set_channel(Box::new(NullChannel));
+    b.set_consolidator(Box::new(NoopConsolidator));
+    b.add_tool(Arc::new(EchoTool::new()));
+    b.add_tool(Arc::new(OtherTool::new()));
+    let cfg = EngineConfig {
+        flow: Some(Arc::new(city_flow())),
+        ..EngineConfig::default()
+    };
+    let e = Engine::with_clock(b.build().unwrap(), cfg, Box::new(|| Timestamp(42)));
+    for text in ["I live in Prague", "what can you do"] {
+        e.run_turn(Incoming {
+            session: SessionId("flow".into()),
+            text: text.into(),
+        })
+        .await
+        .unwrap();
+    }
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.len() >= 3, "{calls:?}");
+
+    // Turn 1: the city is still missing, so neither tool is offered.
+    let (text, names, guidance) = &calls[0];
+    assert_eq!(text, "I live in Prague");
+    assert!(!names.contains(&"echo".to_string()), "{names:?}");
+    assert!(!names.contains(&"other".to_string()), "{names:?}");
+    assert!(
+        guidance[0].starts_with("Flow f: still needed: city"),
+        "{guidance:?}"
+    );
+
+    // The remembered fact is stored under the key the flow names.
+    let facts = store.facts("global", "user.city").await.unwrap();
+    assert!(
+        facts
+            .iter()
+            .any(|f| f.key == "user.city" && f.value == serde_json::json!("Prague")),
+        "{facts:?}"
+    );
+
+    // Turn 2: the first call of that turn offers the unlocked action.
+    let (_, names, guidance) = calls
+        .iter()
+        .find(|(text, _, _)| text == "what can you do")
+        .expect("turn 2 made an emitter call");
     assert!(names.contains(&"echo".to_string()), "{names:?}");
     assert!(!names.contains(&"other".to_string()), "{names:?}");
     assert!(
