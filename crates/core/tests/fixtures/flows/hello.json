@@ -1,0 +1,21 @@
+{
+  "id": "hello",
+  "version": 1,
+  "roles": {},
+  "required_roles": [],
+  "actions": [],
+  "fast_path": [
+    {
+      "match_on": null,
+      "pattern": "ping",
+      "sets": {},
+      "reply_template": "pong"
+    }
+  ],
+  "reply_template": "greet",
+  "templates": {
+    "greet": "Engine online. This reply came from the hello flow's template — no model call was made.",
+    "pong": "pong — answered on the zero-LLM fast path."
+  },
+  "follow_up_ms": null
+}

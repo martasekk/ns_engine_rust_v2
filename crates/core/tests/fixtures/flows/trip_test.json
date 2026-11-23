@@ -1,0 +1,17 @@
+{
+  "id": "trip_test",
+  "version": 1,
+  "roles": {
+    "destination": "trip_destination",
+    "travel_date": "trip_date",
+    "travelers": "trip_travelers"
+  },
+  "required_roles": ["destination", "travel_date", "travelers"],
+  "actions": [],
+  "fast_path": [],
+  "reply_template": "booked",
+  "templates": {
+    "booked": "Noted: {{memory.conversation.trip_destination}} on {{memory.conversation.trip_date}} for {{memory.conversation.trip_travelers}} traveler(s)."
+  },
+  "follow_up_ms": null
+}
