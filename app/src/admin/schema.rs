@@ -345,6 +345,13 @@ pub(crate) const COMPANY: &[Section] = &[
                  defines for itself — this company also has X, rather than only X.",
                 "none",
             ),
+            field(
+                "library.flow",
+                "Flow",
+                Kind::Text,
+                "One of flows/ (edit them on the Flows page). Its newest version runs; the company is offered only the tools the flow names. Empty: no flow.",
+                "none",
+            ),
         ],
     },
     Section {

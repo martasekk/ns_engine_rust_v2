@@ -70,6 +70,10 @@ pub struct AppConfig {
     /// process's and lives in `[http]`.
     #[serde(default)]
     pub whatsapp: Option<WhatsAppSection>,
+    /// The flow `[library] flow` names, loaded and validated by `tenant::resolve_library`. Never read
+    /// from the file itself.
+    #[serde(skip)]
+    pub resolved_flow: Option<nscore::flow::FlowDef>,
 }
 
 /// [http] — `ns-app serve`'s HTTP endpoint (`nschannel_http`): the way in
@@ -1515,6 +1519,10 @@ pub struct LibrarySection {
     /// shared ones" is not.
     #[serde(default)]
     pub modules: Vec<String>,
+    /// `flows/<name>/`, the highest version. Narrows which tools the emitter is offered and names the
+    /// details still to collect (docs/flows-spec.md). One per company.
+    #[serde(default)]
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
