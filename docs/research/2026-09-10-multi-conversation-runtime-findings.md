@@ -302,9 +302,9 @@ session the Phase 3 channel keeps alive for weeks.
   https://crates.io/crates/temporalio-sdk · docs —
   https://docs.rs/temporalio-sdk/latest/temporalio_sdk/ · repo —
   https://github.com/temporalio/sdk-rust
-- This repo: `docs/superpowers/plans/2026-09-07-m7-context-budget.md` §3;
-  `docs/superpowers/specs/2026-09-08-general-harness-design.md` §5.2;
-  `docs/superpowers/specs/2026-09-08-engine-structure.md` §3, §5.6, §6;
+- This repo: `docs/plans/archive/2026-09-07-m7-context-budget.md` §3;
+  `docs/plans/archive/2026-09-08-general-harness-design.md` §5.2;
+  `docs/plans/archive/2026-09-08-engine-structure.md` §3, §5.6, §6;
   `docs/research/2026-09-08-context-composition-findings.md` §2;
   `docs/research/2026-09-08-local-retrieval-and-lane-findings.md` §2;
   `docs/windows-handoff.md` §1.

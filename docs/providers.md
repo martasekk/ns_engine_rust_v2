@@ -262,5 +262,5 @@ text.
 ---
 
 Related: `config.example.toml` (every option, commented),
-`docs/superpowers/plans/2026-09-03-swappable-provider.md` (why the
+`docs/plans/archive/2026-09-03-swappable-provider.md` (why the
 resolution rules are what they are).

@@ -1,7 +1,7 @@
 # Research findings — agent memory structures and optimization (2026 sweep)
 
 Compiled 2026-09-02 for the M6 memory redesign
-(`docs/superpowers/specs/2026-09-02-memory-redesign-design.md`, revision 2).
+(`docs/plans/archive/2026-09-02-memory-redesign-design.md`, revision 2).
 Method: 16 web searches, then the arXiv abstracts of 30 papers read directly; claims below
 are taken from those abstracts, not from search snippets or vendor blogs. Numbers are as
 reported by the authors and were not reproduced.

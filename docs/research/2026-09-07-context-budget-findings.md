@@ -1,7 +1,7 @@
 # Research findings — agent memory, context budgets, harness design (2026 sweep)
 
 Compiled 2026-09-05 as a standalone brief; filed here 2026-09-07 as the evidence base for
-`docs/superpowers/plans/2026-09-07-m7-context-budget.md`. Every arXiv ID was resolved
+`docs/plans/archive/2026-09-07-m7-context-budget.md`. Every arXiv ID was resolved
 against the arXiv API when the brief was compiled; numbers are the papers' own, not
 reproduced. Sections 1–6 are the brief as compiled. The disposition table is new and maps
 each finding onto what `ns-engine` already does, following the convention of

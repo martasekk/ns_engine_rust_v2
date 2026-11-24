@@ -1,7 +1,7 @@
 # Research findings — reply parroting, context entrainment, agent loops (2026 sweep)
 
 Compiled 2026-09-04 after diagnosing 16 parroted replies in the live `cli` session
-(`ns.sqlite`, turns 137–158). Plan: `docs/superpowers/plans/2026-09-04-reply-entrainment.md`.
+(`ns.sqlite`, turns 137–158). Plan: `docs/plans/archive/2026-09-04-reply-entrainment.md`.
 
 Method: 9 web searches, then the abstract or body of the primary papers read directly
 via fetch. Sources are marked **[read]** where the paper itself was retrieved and

@@ -4,7 +4,7 @@
 `cargo run -p ns-pointer --example protocol_samples`, so it is generated from
 the types rather than written beside them. Protocol version **2**.
 
-Plan: `docs/superpowers/plans/2026-09-04-remote-pointer.md`.
+Plan: `docs/plans/archive/2026-09-04-remote-pointer.md`.
 
 ---
 

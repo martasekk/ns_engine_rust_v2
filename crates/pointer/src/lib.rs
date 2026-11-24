@@ -10,7 +10,7 @@
 //! four operations over its platform's injection API and inherits every
 //! coordinate rule already proven here.
 //!
-//! Plan: `docs/superpowers/plans/2026-09-04-remote-pointer.md`.
+//! Plan: `docs/plans/archive/2026-09-04-remote-pointer.md`.
 //! Wire contract, for whoever writes the agent: `docs/pointer-protocol.md`.
 
 pub mod agent;

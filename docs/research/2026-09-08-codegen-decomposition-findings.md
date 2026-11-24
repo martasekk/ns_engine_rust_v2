@@ -1,7 +1,7 @@
 # Would this harness make code generation worse? Mostly yes — and the fix is not looser limits
 
 **Date:** 2026-09-08. **Status:** findings. Revises §4 of
-`docs/superpowers/specs/2026-09-08-general-harness-design.md`, which was too optimistic.
+`docs/plans/archive/2026-09-08-general-harness-design.md`, which was too optimistic.
 
 Written because the claim "the clip is exactly right for compiler output" was made without
 measuring anything, and it is half wrong.

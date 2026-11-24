@@ -1,7 +1,7 @@
 //! One turn at a time per session; `worker_slots` sessions at once.
 //!
 //! The two properties Temporal gives a workflow execution, provided here
-//! in-process (plan `docs/superpowers/plans/2026-09-10-multi-conversation-runtime.md`
+//! in-process (plan `docs/plans/archive/2026-09-10-multi-conversation-runtime.md`
 //! Phase 2; findings `docs/research/2026-09-10-multi-conversation-runtime-findings.md`
 //! §2.2, §2.3, §4):
 //!
@@ -44,7 +44,7 @@ use crate::turn::{Engine, EngineError};
 const MAILBOX_DEPTH: usize = 16;
 
 /// What a dispatcher does with a turn that failed (plan
-/// `docs/superpowers/plans/2026-09-13-multi-tenant-runtime.md` Phase 2, T2.1).
+/// `docs/plans/archive/2026-09-13-multi-tenant-runtime.md` Phase 2, T2.1).
 ///
 /// One process used to serve one conversation, so any failure was the
 /// process's failure. A shard serving many tenants needs the question asked

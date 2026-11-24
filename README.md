@@ -177,7 +177,7 @@ the `[serve]`/`[http]`/`[whatsapp]` config they need.
 | `docs/windows-handoff.md` | notes to and from the Windows agent maintainer |
 | `docs/providers.md` | swapping the model, per role or per run |
 | `docs/connecting-clients.md` | every way in: sockets, web chat windows, webhooks |
-| `docs/superpowers/` | specs and plans |
+| `docs/plans/` | plans, specs and design notes; `docs/plans/README.md` is the index of open ones |
 | `docs/research/` | the literature the design leans on |
 
 ## License

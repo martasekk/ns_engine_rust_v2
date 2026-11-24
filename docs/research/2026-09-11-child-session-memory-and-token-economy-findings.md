@@ -522,7 +522,7 @@ the M8 evaluation lane and cannot be measured without it. Rank 6 needs nothing. 
 only the idle pass. Building M8 Phase 2 is therefore the efficiency lever, before any of the
 architectures above.
 
-**Measured the same day, by M9** (`docs/superpowers/plans/2026-09-11-m9-memory-that-earns-its-context.md`
+**Measured the same day, by M9** (`docs/plans/archive/2026-09-11-m9-memory-that-earns-its-context.md`
 §Results, branch `worktree-m9-memory`): the instruments in rank 6 exist and the first live
 reading corrects two estimates in this document. Tool schemas are **45.9%** of the emitter
 prompt on the live box (§2 and §7.1 item 06 carried the docs' 13–20% estimate), which makes
@@ -537,7 +537,7 @@ all, which is why the smoke reply could not name the user.
 
 ## 8. What M9 measured, and the optimal moves it surfaced (2026-09-11, later)
 
-M9 built the instruments this document asked for (`docs/superpowers/plans/2026-09-11-m9-memory-that-earns-its-context.md`
+M9 built the instruments this document asked for (`docs/plans/archive/2026-09-11-m9-memory-that-earns-its-context.md`
 §Results). One live turn and one offline pass over the recorded 21-turn log then produced
 numbers that reorder the levers above. Three of this document's own assumptions were wrong;
 each is corrected here with the number that corrected it. A second web sweep, targeted at the
@@ -646,7 +646,7 @@ Not adopted, with the number: batching (5/81, irreversible-only), a new groundin
 (1/21, false positive), format swaps (accuracy loss), tool-RAG (17 tools), masking (no cache
 to protect), caching (prefix under the floor), passive fact extraction (no evidence of need).
 
-The plan that sequences these is `docs/superpowers/plans/2026-09-11-m10-tool-array-loop-and-recall.md`.
+The plan that sequences these is `docs/plans/archive/2026-09-11-m10-tool-array-loop-and-recall.md`.
 
 ## 9. Sources
 
