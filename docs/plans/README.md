@@ -10,7 +10,7 @@ live plans for one topic: extend the existing one.
 
 | Plan | What it is | State | Left |
 |---|---|---|---|
-| `2026-11-24-rules-rebuild.md` | Brings the code in line with the coding rules (structure, contract first, determinism, property/Miri/loom tests) and adds the project `CLAUDE.md` (step RR-0) | Planned 24 Nov, nothing started | All steps; see the plan's "How to run it" |
+| `2026-11-24-rules-rebuild.md` | Brings the code in line with the coding rules (structure, contract first, determinism, property/Miri/loom tests) and adds the project `CLAUDE.md` (step RR-0) | Planned and reviewed 24 Nov, fixes applied (`2026-11-24-rules-rebuild-review.md`); nothing started | All steps, gate zero (RR-G0) first; 8 open questions for the user (Q0-Q7); RR-14b may need a re-plan; see the plan's "How to run it" |
 
 ## Not in this folder yet
 
