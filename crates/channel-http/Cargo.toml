@@ -26,3 +26,6 @@ reqwest = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 ns-channel-tcp = { path = "../channel-tcp" }
+
+[lints]
+workspace = true

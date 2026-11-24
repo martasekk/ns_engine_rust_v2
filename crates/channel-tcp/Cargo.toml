@@ -19,3 +19,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 # The wire tests mint their own tokens and supply their own resolver.
 base64 = { workspace = true }
+
+[lints]
+workspace = true

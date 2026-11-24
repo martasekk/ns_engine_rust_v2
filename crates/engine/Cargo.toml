@@ -21,3 +21,6 @@ arc-swap = { workspace = true }
 [dev-dependencies]
 ns-memory-sqlite = { path = "../memory-sqlite" }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

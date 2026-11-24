@@ -10,3 +10,6 @@ name = "nschannel_hub"
 ns-core = { path = "../core" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

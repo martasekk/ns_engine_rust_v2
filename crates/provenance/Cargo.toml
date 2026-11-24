@@ -9,3 +9,6 @@ name = "nsprovenance"
 [dependencies]
 ns-core = { path = "../core" }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true
