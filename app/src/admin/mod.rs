@@ -42,6 +42,7 @@
 //! | this file    | the socket, the routes, and who may call them       |
 
 mod document;
+mod flows;
 mod library;
 mod schema;
 pub(crate) mod secrets;
@@ -61,6 +62,8 @@ use document::Setting;
 /// The page itself, compiled in: a setup tool that cannot find its own
 /// assets is worse than one file that is bigger than it looks.
 const PAGE: &str = include_str!("page.html");
+/// The flow editor (docs/flows-spec.md): the old flow engine's page, on this server's endpoints.
+const FLOWS_PAGE: &str = include_str!("flows.html");
 
 /// The most a save may be. A persona is prose; nothing here is a file
 /// upload.
@@ -169,8 +172,19 @@ async fn route(admin: &Arc<Admin>, request: &Request) -> Response {
             body: PAGE.as_bytes().to_vec(),
         };
     }
+    if request.method == "GET" && request.path() == "/flows" {
+        return Response {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            headers: Vec::new(),
+            body: FLOWS_PAGE.as_bytes().to_vec(),
+        };
+    }
     if !authorised(admin, request) {
         return Response::refused(401);
+    }
+    if let Some(response) = flows::route(admin, request) {
+        return response;
     }
     match (request.method.as_str(), request.path()) {
         ("GET", "/api/state") => admin.state(),
@@ -952,6 +966,18 @@ mod tests {
             let wrong = route(&admin, &request(method, path, Some("guess"), "{}")).await;
             assert_eq!(wrong.status, 401, "{method} {path}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_flow_editor_is_served_without_the_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let admin = admin(dir.path());
+        let page = route(&admin, &request("GET", "/flows", None, "")).await;
+        assert_eq!(page.status, 200);
+        let html = String::from_utf8(page.body).expect("the page is UTF-8");
+        assert!(html.contains("Flows"), "the editor");
+        assert!(html.contains("/api/flows"), "the flows endpoints it calls");
+        assert!(!html.contains("/admin/api"), "no call to the old paths");
     }
 
     #[tokio::test]

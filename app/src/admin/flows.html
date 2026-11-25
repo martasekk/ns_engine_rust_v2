@@ -1,0 +1,1588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow editor</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: rgba(28, 31, 38, .92); --line: #2a2e38; --text: #d7dae0;
+    --dim: #8a90a0; --accent: #5b9dd9; --ok: #4caf7d; --warn: #d9a441; --err: #d95b5b;
+    --node: #232733; --nodeline: #3a4152;
+  }
+  * { box-sizing: border-box; }
+  /* The script hides panels with the `hidden` attribute, and any rule here that
+     sets `display` (#right's flex) would otherwise win over it: the inspector
+     stayed on screen with nothing selected, and its Apply did nothing. */
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, sans-serif; overflow: hidden; }
+  button, input, select, textarea {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  input:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  .muted { color: var(--dim); }
+
+  /* ---- endless canvas: a fixed viewport, a transformed world ---- */
+  #viewport { position: fixed; inset: 0; overflow: hidden; cursor: grab;
+    background: radial-gradient(circle, #20242c 1px, transparent 1px) 0 0 / 22px 22px var(--bg); }
+  #viewport.panning { cursor: grabbing; }
+  #world { position: absolute; left: 0; top: 0; width: 0; height: 0;
+    transform-origin: 0 0; }
+  #edges { position: absolute; left: 0; top: 0; width: 1px; height: 1px;
+    overflow: visible; pointer-events: none; }
+  #edges path { fill: none; stroke-width: 2; pointer-events: stroke; cursor: pointer; }
+  #edges path.out { stroke: var(--accent); }
+  #edges path.replyout { stroke: var(--ok); }
+  #edges path.role { stroke: var(--warn); stroke-dasharray: 6 4; }
+  #edges path.mem { stroke: var(--dim); stroke-dasharray: 2 4; }
+  #edges text { fill: var(--dim); font-size: 11px; pointer-events: none; }
+  .node { position: absolute; min-width: 150px; max-width: 220px; background: var(--node);
+    border: 1px solid var(--nodeline); border-radius: 10px; padding: 8px 10px;
+    cursor: grab; user-select: none; box-shadow: 0 3px 10px rgba(0,0,0,.35); }
+  .node.sel { border-color: var(--accent); }
+  .node.pseudo { border-style: dashed; opacity: .8; }
+  .node h4 { margin: 0; font-size: 13px; }
+  .node .comp { color: var(--accent); font-size: 12px; }
+  .node .guard { color: var(--dim); font-size: 11px; }
+  .node .writes { color: var(--warn); font-size: 11px; }
+  .port { position: absolute; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent); top: 50%; transform: translateY(-50%); cursor: crosshair; }
+  .port.outp { right: -6px; }
+  .port.inp { left: -6px; background: var(--dim); }
+
+  /* ---- floating panels ---- */
+  .panel { position: fixed; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    backdrop-filter: blur(6px); z-index: 10; }
+  #topbar { top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px; align-items: center; padding: 8px 14px; max-width: 90vw; }
+  #topbar h2 { font-size: 15px; margin: 0 8px 0 0; white-space: nowrap; }
+  #topbar .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #history { white-space: nowrap; overflow-x: auto; max-width: 34vw; font-size: 13px; }
+  #history span.v { display: inline-block; padding: 1px 6px 1px 9px; margin: 0 3px 0 0;
+    border: 1px solid var(--line); border-radius: 12px; cursor: pointer; white-space: nowrap; }
+  #history span.v:hover { border-color: var(--accent); }
+  #history span.v.current { border-color: var(--ok); color: var(--ok); }
+  #history b.x { margin-left: 5px; color: var(--dim); font-weight: normal; cursor: pointer; }
+  #history b.x:hover { color: var(--err); }
+
+  #report { position: fixed; top: 64px; left: 50%; transform: translateX(-50%);
+    z-index: 11; max-width: 620px; width: max-content; }
+  #report div { padding: 6px 12px; border-radius: 8px; margin-bottom: 4px; font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  #report .e { background: #472525; color: #f0b0b0; }
+  #report .w { background: #453d22; color: #e8d29a; }
+  #report .k { background: #234233; color: #a9e2c3; }
+
+  #left { top: 12px; left: 12px; bottom: 12px; width: 250px;
+    display: flex; flex-direction: column; padding: 12px; }
+  #left h1 { font-size: 14px; margin: 0 0 8px; }
+  #flowlist { margin-bottom: 10px; max-height: 25vh; overflow-y: auto; }
+  #flowlist .flow { padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  #flowlist .flow:hover { background: var(--line); }
+  #flowlist .flow.active { background: var(--accent); color: #fff; }
+  #tree { flex: 1; overflow-y: auto; font-size: 13px; border-top: 1px solid var(--line);
+    padding-top: 8px; }
+  #tree .t-group { color: var(--dim); text-transform: uppercase; font-size: 11px;
+    letter-spacing: .05em; margin: 8px 0 2px; display: flex; align-items: center; }
+  #tree .t-group b { margin-left: auto; color: var(--dim); font-weight: normal;
+    cursor: pointer; padding: 0 4px; }
+  #tree .t-group b:hover { color: var(--text); }
+  #tree .t-item { padding: 2px 8px; border-radius: 5px; cursor: pointer;
+    display: flex; align-items: center; }
+  #tree .t-item:hover { background: var(--line); }
+  #tree .t-item.sel { background: var(--accent); color: #fff; }
+  #tree .t-item small { margin-left: 6px; opacity: .65; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  #tree .t-item b.x { margin-left: auto; color: inherit; opacity: .5; font-weight: normal;
+    cursor: pointer; padding: 0 3px; }
+  #tree .t-item b.x:hover { opacity: 1; color: var(--err); }
+  #left .foot { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px;
+    display: flex; gap: 6px; flex-wrap: wrap; }
+  #left .foot button { font-size: 12px; padding: 3px 8px; background: none;
+    border-style: dashed; color: var(--dim); }
+  #left .foot button:hover { color: var(--text); }
+
+  /* The inspector starts below the top bar, which is centred at the same height, so on a narrow window it no longer covers Save. */
+  #right { top: 64px; right: 12px; width: 360px; max-height: calc(100vh - 76px);
+    display: flex; flex-direction: column; padding: 12px; }
+  #right h3 { margin: 0 0 2px; font-size: 13px; }
+  #modetoggle { position: absolute; top: 10px; right: 12px; display: flex; gap: 2px; }
+  #modetoggle b { font-weight: normal; font-size: 11px; padding: 1px 8px; cursor: pointer;
+    border: 1px solid var(--line); color: var(--dim); }
+  #modetoggle b:first-child { border-radius: 6px 0 0 6px; }
+  #modetoggle b:last-child { border-radius: 0 6px 6px 0; }
+  #modetoggle b.on { color: var(--text); border-color: var(--accent); background: var(--node); }
+  #objform { flex: 1; overflow-y: auto; max-height: calc(100vh - 180px); }
+  #objform .f-row { margin-bottom: 10px; }
+  #objform label { display: block; font-size: 11px; color: var(--dim);
+    text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+  #objform input[type=text], #objform input[type=number], #objform select {
+    width: 100%; }
+  #objform .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  #objform .chip { display: inline-flex; align-items: center; gap: 5px;
+    border: 1px solid var(--line); border-radius: 12px; padding: 1px 8px; font-size: 12px; }
+  #objform .chip.out { border-color: var(--accent); }
+  #objform .chip b { color: var(--dim); cursor: pointer; font-weight: normal; }
+  #objform .chip b:hover { color: var(--err); }
+  #objform .adders { display: flex; gap: 4px; margin-top: 5px; flex-wrap: wrap; }
+  #objform .adders select, #objform .adders button { font-size: 12px; padding: 2px 6px;
+    width: auto; background: none; border-style: dashed; color: var(--dim); }
+  #objform .adders select:hover, #objform .adders button:hover { color: var(--text); }
+  #objform .check { display: flex; align-items: center; gap: 6px; font-size: 13px;
+    padding: 1px 0; }
+  #objform .check input { width: auto; }
+  #objform table { border-collapse: collapse; width: 100%; }
+  #objform td { padding: 2px 4px 2px 0; }
+  #objform td input { width: 100%; }
+  .node.replynode { border-color: var(--ok); }
+  .node.replynode h4 { color: var(--ok); }
+  #right .path { color: var(--dim); font-size: 12px; margin-bottom: 8px;
+    font-family: ui-monospace, monospace; }
+  #objedit { flex: 1; width: 100%; font: 12px/1.5 ui-monospace, monospace;
+    min-height: 200px; max-height: calc(100vh - 180px); white-space: pre; resize: vertical; }
+  #objedit.text { white-space: pre-wrap; font-family: inherit; }
+  #right .btns { display: flex; gap: 6px; margin-top: 8px; }
+  #right .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .row-del { color: var(--err); background: none; }
+
+  /* ---- context menu ---- */
+  #ctx { position: fixed; z-index: 30; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.6); backdrop-filter: blur(6px);
+    min-width: 180px; padding: 4px; font-size: 13px; }
+  #ctx .h { padding: 4px 10px 2px; color: var(--dim); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .05em; }
+  #ctx .i { padding: 5px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+  #ctx .i:hover { background: var(--accent); color: #fff; }
+  #ctx .i.danger:hover { background: var(--err); }
+  #ctx hr { border: none; border-top: 1px solid var(--line); margin: 4px 6px; }
+
+  #zoomhud { position: fixed; right: 386px; bottom: 12px; z-index: 10; font-size: 12px;
+    color: var(--dim); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 3px 10px; user-select: none; }
+  #zoomhud b { cursor: pointer; color: var(--text); font-weight: normal; padding: 0 4px; }
+
+  dialog { background: #1c1f26; color: var(--text); border: 1px solid var(--line);
+           border-radius: 10px; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+</style>
+</head>
+<body>
+
+<div id="viewport"><div id="world"><svg id="edges"></svg></div></div>
+
+<div id="topbar" class="panel" hidden>
+  <h2 id="title"></h2>
+  <span class="muted" style="white-space:nowrap">latest v<span id="latest">?</span>
+    → saves as v<span id="nextv">?</span></span>
+  <span id="history"></span>
+  <button onclick="runValidate()">Validate</button>
+  <button class="primary" onclick="save()"
+    title="saves a new version; restart ns-app for companies running this flow to pick it up">Save</button>
+</div>
+<div id="report"></div>
+
+<div id="left" class="panel">
+  <h1>Flows</h1>
+  <a id="settingslink" href="/" style="display:block; margin: 0 0 8px; font-size:13px; color: var(--accent); text-decoration: none;">← Settings</a>
+  <div id="flowlist" class="muted">loading…</div>
+  <div id="tree"></div>
+  <div class="foot">
+    <button onclick="newFlow()">+ flow</button>
+    <button onclick="fitView()">fit view</button>
+    <button onclick="autoLayout(true); fitView()">auto-layout</button>
+  </div>
+</div>
+
+<div id="right" class="panel" hidden>
+  <div id="modetoggle"><b id="mode-ui" onclick="setMode('ui')">UI</b><b id="mode-json"
+    onclick="setMode('json')">JSON</b></div>
+  <h3 id="objtitle">nothing selected</h3>
+  <div class="path" id="objpath"></div>
+  <div id="objform" hidden></div>
+  <textarea id="objedit"></textarea>
+  <div class="btns" id="jsonbtns">
+    <button class="primary" onclick="applyObj()">Apply</button>
+    <button class="row-del" id="objdel" onclick="deleteObj()" hidden>delete</button>
+  </div>
+  <div class="hint" id="objhint"></div>
+</div>
+
+<div id="zoomhud" hidden><b onclick="undo()" title="undo (Ctrl+Z)">↶</b><b onclick="redo()"
+    title="redo (Ctrl+Shift+Z)">↷</b> ·
+  <b onclick="zoomBy(1/1.2)">−</b>
+  <span id="zoomlvl">100%</span> <b onclick="zoomBy(1.2)">+</b>
+  <b onclick="fitView()" title="fit the whole flow into the window">fit</b>
+  <span class="muted" style="margin-left:6px"
+    title="Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+C/X/V copy/cut/paste the selected object · Ctrl+D duplicate · Del delete · Ctrl+S save · Esc cancel">keys?</span></div>
+
+<div id="ctx" hidden></div>
+
+<script>
+'use strict';
+let flow = null;
+let latest = null;
+let selectedId = null;
+let layout = {};
+let sel = null;
+// The endless canvas: world coords are unbounded; the view maps them to the
+// screen. screen = world * z + (x, y).
+let view = { x: 0, y: 0, z: 1 };
+let pendingConnect = null;   // action name a "connect from here" started at
+
+// ---- undo / clipboard ----
+// The undo unit is the whole flow document: dirty() snapshots the state a
+// mutation replaced, so every edit path gets undo for free. Layout and view
+// are cosmetic and deliberately not part of history.
+let undoStack = [];
+let redoStack = [];
+let docBaseline = null;      // JSON string of `flow` as of the last commit
+let clipboardObj = null;     // {kind, data} — internal clipboard
+let lastMouse = { x: 200, y: 200 };  // last cursor position, world coords (paste target)
+
+const $ = id => document.getElementById(id);
+// ns-app admin prints one link per run with the token in the fragment, which is never sent with a
+// request. Kept in sessionStorage so a reload of this tab still works, then taken out of the address bar.
+const TOKEN = (() => {
+  const fromHash = new URLSearchParams(location.hash.slice(1)).get('token');
+  if (fromHash) sessionStorage.setItem('ns_admin_token', fromHash);
+  try { history.replaceState(null, '', location.pathname); } catch (e) {}
+  return fromHash || sessionStorage.getItem('ns_admin_token') || '';
+})();
+const token = () => TOKEN;
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign(
+    { 'authorization': 'Bearer ' + token(), 'content-type': 'application/json' },
+    opts.headers || {});
+  const res = await fetch(path, opts);
+  if (res.status === 401) { $('flowlist').textContent = 'Not authorised: open the link ns-app admin printed (it carries this run\'s token).'; throw new Error('unauthorized'); }
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+// ================= flows =================
+async function boot() {
+  const { status, body } = await api('/api/flows');
+  if (status !== 200) { $('flowlist').textContent = 'failed to load'; return; }
+  const list = $('flowlist'); list.innerHTML = '';
+  for (const f of body.flows) {
+    const div = document.createElement('div');
+    div.className = 'flow' + (f.id === selectedId ? ' active' : '');
+    div.innerHTML = `${f.id} <small>v${f.latest_version}</small>`;
+    div.onclick = () => open(f.id);
+    list.appendChild(div);
+  }
+  if (!body.flows.length) list.innerHTML = '<span class="muted">none yet</span>';
+}
+
+async function open(id, version) {
+  const switching = id !== selectedId;
+  selectedId = id;
+  sel = null;
+  pendingConnect = null;
+  const q = version ? `?version=${version}` : '';
+  const { status, body } = await api(`/api/flows/${id}${q}`);
+  if (status !== 200) return;
+  flow = body;
+  undoStack = []; redoStack = [];
+  docBaseline = JSON.stringify(flow);
+  const vs = await api(`/api/flows/${id}/versions`);
+  latest = Math.max(...vs.body.versions);
+  loadLayout();
+  renderHistory(vs.body.versions, body.version);
+  renderAll();
+  if (switching) fitView();
+  boot();
+}
+
+function newFlow() {
+  const id = prompt('flow id (letters, digits, dashes):');
+  if (!id) return;
+  selectedId = id;
+  sel = null;
+  latest = null;
+  flow = { id, version: 1, roles: {}, required_roles: [], actions: [],
+           fast_path: [], reply_template: null, templates: {}, follow_up_ms: null };
+  undoStack = []; redoStack = [];
+  docBaseline = JSON.stringify(flow);
+  loadLayout();
+  renderHistory([], 1);
+  renderAll();
+  fitView();
+}
+
+function renderHistory(versions, current) {
+  $('history').innerHTML = '';
+  for (const v of versions) {
+    const s = document.createElement('span');
+    s.className = 'v' + (v === current ? ' current' : '');
+    s.textContent = 'v' + v;
+    s.title = 'load this version';
+    s.onclick = () => open(selectedId, v);
+    if (versions.length > 1) {
+      const x = document.createElement('b');
+      x.className = 'x'; x.textContent = '✕';
+      x.title = 'delete this version';
+      x.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!confirm(`Delete ${selectedId} v${v}? Deleting the latest rolls back to the previous version at the next restart.`)) return;
+        const { status, body } = await api(
+          `/api/flows/${selectedId}/versions/${v}`, { method: 'DELETE' });
+        if (status !== 200) { report(body ? { errors: [body.error], warnings: [] } : null); return; }
+        report({ errors: [], warnings: [] }, `deleted v${v} — latest is now v${body.latest_version}`);
+        open(selectedId);
+      };
+      s.appendChild(x);
+    }
+    $('history').appendChild(s);
+  }
+}
+
+function renderAll() {
+  $('topbar').hidden = false;
+  $('zoomhud').hidden = false;
+  $('title').textContent = flow.id;
+  $('latest').textContent = latest === null ? '—' : latest;
+  $('nextv').textContent = latest === null ? flow.version : latest + 1;
+  renderTree();
+  drawGraph();
+  renderInspector();
+}
+
+// ================= object tree (left) =================
+function treeGroup(label, addFn) {
+  const g = document.createElement('div');
+  g.className = 't-group';
+  g.textContent = label;
+  if (addFn) {
+    const b = document.createElement('b');
+    b.textContent = '+'; b.title = 'add';
+    b.onclick = addFn;
+    g.appendChild(b);
+  }
+  return g;
+}
+
+function treeItem(label, detail, s, delFn) {
+  const d = document.createElement('div');
+  d.className = 't-item' + (sameSel(s) ? ' sel' : '');
+  d.innerHTML = `${label}` + (detail ? ` <small>${detail}</small>` : '');
+  d.onclick = () => select(s);
+  if (delFn) {
+    const x = document.createElement('b');
+    x.className = 'x'; x.textContent = '✕';
+    x.onclick = (ev) => { ev.stopPropagation(); delFn(); };
+    d.appendChild(x);
+  }
+  return d;
+}
+
+function sameSel(s) {
+  return sel && JSON.stringify(s) === JSON.stringify(sel);
+}
+
+function addTemplatePrompt() {
+  const k = prompt('template id:');
+  if (!k) return;
+  flow.templates[k] = '';
+  dirty(); select({ kind: 'template', key: k });
+}
+
+function addFastPathRule() {
+  flow.fast_path.push({ match_on: null, pattern: '', sets: {}, reply_template: '' });
+  dirty(); select({ kind: 'fastpath', index: flow.fast_path.length - 1 });
+}
+
+function renderTree() {
+  const t = $('tree'); t.innerHTML = '';
+
+  t.appendChild(treeGroup('flow'));
+  t.appendChild(treeItem('whole document', `v${flow.version}`, { kind: 'root' }));
+
+  t.appendChild(treeGroup('actions', () => addAction()));
+  for (const a of flow.actions)
+    t.appendChild(treeItem(a.name, a.component, { kind: 'action', name: a.name },
+      () => removeAction(a.name)));
+
+  t.appendChild(treeGroup('templates', addTemplatePrompt));
+  for (const k of Object.keys(flow.templates))
+    t.appendChild(treeItem(k, flow.templates[k].slice(0, 24), { kind: 'template', key: k },
+      () => { delete flow.templates[k]; if (flow.reply_template === k) flow.reply_template = null; dirty(); }));
+
+  t.appendChild(treeGroup('fast path', addFastPathRule));
+  flow.fast_path.forEach((r, i) =>
+    t.appendChild(treeItem(`rule ${i}`, `${r.pattern ?? ''} → ${r.reply_template}`,
+      { kind: 'fastpath', index: i },
+      () => { flow.fast_path.splice(i, 1); dirty(); })));
+
+  t.appendChild(treeGroup('memory'));
+  t.appendChild(treeItem('roles → slots', Object.keys(flow.roles).length + ' role(s)',
+    { kind: 'roles' }));
+  t.appendChild(treeItem('required roles', flow.required_roles.join(', ') || 'none',
+    { kind: 'required' }));
+
+  t.appendChild(treeGroup('reply'));
+  const rt = flow.reply_template;
+  t.appendChild(treeItem('reply',
+    rt == null ? '(model-generated)' : rt === '' ? '(silent)'
+      : rt.startsWith('$out:') ? 'from ' + rt : 'template: ' + rt,
+    { kind: 'reply' }));
+  t.appendChild(treeItem('follow-up timer',
+    flow.follow_up_ms == null ? 'off' : flow.follow_up_ms + ' ms', { kind: 'followup' }));
+}
+
+function refresh() {
+  if (sel && !resolveSel(sel)) sel = null;
+  renderTree(); drawGraph(); renderInspector();
+}
+
+function dirty() {
+  const now = JSON.stringify(flow);
+  if (docBaseline !== null && now !== docBaseline) {
+    undoStack.push(docBaseline);
+    if (undoStack.length > 100) undoStack.shift();
+    redoStack = [];
+  }
+  docBaseline = now;
+  refresh();
+}
+
+function undo() {
+  if (!undoStack.length) { report({ errors: [], warnings: [] }, 'nothing to undo'); return; }
+  redoStack.push(JSON.stringify(flow));
+  const snap = undoStack.pop();
+  flow = JSON.parse(snap);
+  docBaseline = snap;
+  refresh();
+  report({ errors: [], warnings: [] }, `undo — ${undoStack.length} left`);
+}
+
+function redo() {
+  if (!redoStack.length) { report({ errors: [], warnings: [] }, 'nothing to redo'); return; }
+  undoStack.push(JSON.stringify(flow));
+  const snap = redoStack.pop();
+  flow = JSON.parse(snap);
+  docBaseline = snap;
+  refresh();
+  report({ errors: [], warnings: [] }, 'redo');
+}
+
+// ================= inspector (right) =================
+function resolveSel(s) {
+  switch (s.kind) {
+    case 'root': return [flow, false,
+      'the entire flow document — id and version included', false];
+    case 'action': {
+      const a = flow.actions.find(x => x.name === s.name);
+      return a ? [a, false,
+        'reads: role names or $out:action.field · writes: roles · the component must be registered in the server', true] : null;
+    }
+    case 'template': return s.key in flow.templates ? [flow.templates[s.key], true,
+      '{slot_name} placeholders are filled from memory; a missing one renders empty', true] : null;
+    case 'fastpath': return flow.fast_path[s.index] !== undefined
+      ? [flow.fast_path[s.index], false,
+        'match_on: null matches the message text, or name a field · sets: role → value', true] : null;
+    case 'roles': return [flow.roles, false,
+      'role (what the classifier hears) → slot (where it is remembered)', false];
+    case 'required': return [flow.required_roles, false,
+      'roles that must be filled before actions run', false];
+    case 'reply': return [flow.reply_template, false,
+      'a template id, or null to generate the reply with the model', false];
+    case 'followup': return [flow.follow_up_ms, false,
+      '⚠ re-arms every main-path turn, recurs without a count cap until the user replies · null = off', false];
+  }
+  return null;
+}
+
+function select(s) {
+  sel = s;
+  renderTree();
+  renderInspector();
+  document.querySelectorAll('.node').forEach(n =>
+    n.classList.toggle('sel', s && s.kind === 'action' && n.dataset.name === s.name));
+}
+
+function selTitle(s) {
+  switch (s.kind) {
+    case 'root': return ['whole document', 'flow'];
+    case 'action': return ['action: ' + s.name, `actions[${s.name}]`];
+    case 'template': return ['template: ' + s.key, `templates.${s.key}`];
+    case 'fastpath': return ['fast-path rule ' + s.index, `fast_path[${s.index}]`];
+    case 'roles': return ['roles → slots', 'roles'];
+    case 'required': return ['required roles', 'required_roles'];
+    case 'reply': return ['default reply template', 'reply_template'];
+    case 'followup': return ['follow-up timer', 'follow_up_ms'];
+  }
+}
+
+// 'ui' builds buttons and fields that commit immediately (undo covers every
+// step); 'json' is the raw view with an explicit Apply. The whole-document
+// selection is JSON-only; templates are always plain text.
+let inspectorMode = 'ui';
+function setMode(m) { inspectorMode = m; renderInspector(); }
+
+function renderInspector() {
+  const r = $('right');
+  if (!sel) { r.hidden = true; return; }
+  const resolved = resolveSel(sel);
+  if (!resolved) { r.hidden = true; return; }
+  const [value, isText, hint, deletable] = resolved;
+  r.hidden = false;
+  const [title, path] = selTitle(sel);
+  $('objtitle').textContent = title;
+  $('objpath').textContent = path;
+  $('objhint').textContent = hint;
+  $('objdel').hidden = !deletable;
+
+  const jsonOnly = sel.kind === 'root';
+  const uiMode = !jsonOnly && !isText && inspectorMode === 'ui';
+  $('mode-ui').classList.toggle('on', uiMode || isText);
+  $('mode-json').classList.toggle('on', !uiMode && !isText);
+
+  const ta = $('objedit');
+  if (uiMode) {
+    ta.hidden = true; $('jsonbtns').hidden = true;
+    const form = $('objform');
+    form.hidden = false;
+    form.innerHTML = '';
+    buildForm(form);
+    // Delete stays reachable from UI mode too.
+    if (deletable) {
+      const del = document.createElement('button');
+      del.className = 'row-del'; del.textContent = 'delete';
+      del.style.border = '1px solid var(--line)';
+      del.onclick = deleteObj;
+      form.appendChild(del);
+    }
+  } else {
+    $('objform').hidden = true;
+    ta.hidden = false; $('jsonbtns').hidden = false;
+    ta.classList.toggle('text', isText);
+    ta.value = isText ? value : JSON.stringify(value, null, 2);
+  }
+}
+
+// ---- friendly form builders (commit immediately via dirty()) ----
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'onchange' || k === 'onclick' || k === 'oninput') e[k] = v;
+    else if (k === 'checked' || k === 'selected' || k === 'value') e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.appendChild(typeof k === 'string' ? document.createTextNode(k) : k);
+  return e;
+}
+function frow(label, ...kids) {
+  return el('div', { class: 'f-row' }, el('label', {}, label), ...kids);
+}
+
+function buildForm(form) {
+  switch (sel.kind) {
+    case 'action': buildActionForm(form); break;
+    case 'fastpath': buildFastPathForm(form); break;
+    case 'roles': buildRolesForm(form); break;
+    case 'required': buildRequiredForm(form); break;
+    case 'reply': buildReplyForm(form); break;
+    case 'followup': buildFollowupForm(form); break;
+  }
+}
+
+function renameAction(oldName, newName) {
+  if (!newName || newName === oldName) return;
+  if (flow.actions.some(a => a.name === newName)) { alert('name already used'); return; }
+  for (const a of flow.actions) {
+    a.reads = (a.reads || []).map(r =>
+      r.replace(new RegExp(`^\\$out:${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`), `$out:${newName}.`));
+  }
+  flow.actions.find(a => a.name === oldName).name = newName;
+  layout[newName] = layout[oldName]; delete layout[oldName]; saveLayout();
+  sel = { kind: 'action', name: newName };
+  dirty();
+}
+
+function buildActionForm(form) {
+  const act = flow.actions.find(a => a.name === sel.name);
+  if (!act) return;
+  const roles = Object.keys(flow.roles);
+
+  form.appendChild(frow('name', el('input', { type: 'text', value: act.name,
+    onchange: e => renameAction(act.name, e.target.value.trim()) })));
+
+  form.appendChild(frow('component', el('input', { type: 'text', value: act.component,
+    placeholder: 'registered in the server',
+    onchange: e => { act.component = e.target.value.trim(); dirty(); } })));
+
+  // ---- guard ----
+  const kinds = ['always', 'never', 'roles_filled', 'role_missing', 'intent_is'];
+  const gsel = el('select', { onchange: e => {
+    const k = e.target.value;
+    act.when = k === 'roles_filled' ? { when: k, value: [] }
+      : k === 'role_missing' ? { when: k, value: roles[0] || '' }
+      : k === 'intent_is' ? { when: k, value: '' }
+      : { when: k };
+    dirty();
+  } }, ...kinds.map(k => el('option', { value: k, selected: (act.when?.when === k) }, k)));
+  const gval = el('div', { style: 'margin-top:4px' });
+  const w = act.when || { when: 'always' };
+  if (w.when === 'roles_filled') {
+    for (const r of roles) {
+      gval.appendChild(el('div', { class: 'check' },
+        el('input', { type: 'checkbox', checked: (w.value || []).includes(r),
+          onchange: e => {
+            w.value = w.value || [];
+            if (e.target.checked) w.value.push(r);
+            else w.value = w.value.filter(x => x !== r);
+            act.when = w; dirty();
+          } }),
+        r));
+    }
+    if (!roles.length) gval.appendChild(el('span', { class: 'muted' }, 'no roles declared yet'));
+  } else if (w.when === 'role_missing') {
+    gval.appendChild(el('select', { onchange: e => { w.value = e.target.value; act.when = w; dirty(); } },
+      ...roles.map(r => el('option', { value: r, selected: w.value === r }, r))));
+  } else if (w.when === 'intent_is') {
+    gval.appendChild(el('input', { type: 'text', value: w.value || '', placeholder: 'intent name',
+      onchange: e => { w.value = e.target.value.trim(); act.when = w; dirty(); } }));
+  }
+  form.appendChild(frow('when (guard)', gsel, gval));
+
+  // ---- reads ----
+  const chips = el('div', { class: 'chips' });
+  (act.reads || []).forEach((r, i) => {
+    const isOut = r.startsWith('$out:');
+    chips.appendChild(el('span', { class: 'chip' + (isOut ? ' out' : '') }, r,
+      el('b', { onclick: () => { act.reads.splice(i, 1); dirty(); } }, '✕')));
+  });
+  const addRole = el('select', { onchange: e => {
+    if (!e.target.value) return;
+    (act.reads = act.reads || []).push(e.target.value); dirty();
+  } }, el('option', { value: '' }, '+ role…'),
+     ...roles.map(r => el('option', { value: r }, r)));
+  const others = flow.actions.filter(a => a.name !== act.name).map(a => a.name);
+  const addOut = el('select', {},
+    el('option', { value: '' }, '+ $out…'),
+    ...others.map(o => el('option', { value: o }, o)));
+  addOut.onchange = e => {
+    // Capture before the prompt: the select's value is reset by the re-render.
+    const from = e.target.value;
+    if (!from) return;
+    const field = prompt(`which $out field of ${from}?`, 'result');
+    if (field) { (act.reads = act.reads || []).push(`$out:${from}.${field.trim()}`); dirty(); }
+    else renderInspector();
+  };
+  form.appendChild(frow('reads', chips, el('div', { class: 'adders' }, addRole, addOut)));
+
+  // ---- writes ----
+  const wr = el('div', {});
+  for (const r of roles) {
+    wr.appendChild(el('div', { class: 'check' },
+      el('input', { type: 'checkbox', checked: (act.writes || []).includes(r),
+        onchange: e => {
+          act.writes = act.writes || [];
+          if (e.target.checked) act.writes.push(r);
+          else act.writes = act.writes.filter(x => x !== r);
+          dirty();
+        } }),
+      r + ' ', el('span', { class: 'muted' }, '→ ' + flow.roles[r])));
+  }
+  wr.appendChild(el('div', { class: 'adders' },
+    el('button', { onclick: () => {
+      const r = prompt('new role name:'); if (!r) return;
+      const s = prompt('slot it is remembered in:', r); if (!s) return;
+      flow.roles[r.trim()] = s.trim();
+      (act.writes = act.writes || []).push(r.trim());
+      dirty();
+    } }, '+ new role')));
+  form.appendChild(frow('writes', wr));
+
+  form.appendChild(frow('write scope', el('select', { onchange: e => {
+    act.write_scope = e.target.value; dirty();
+  } }, ...['turn', 'flow', 'conversation', 'user', 'global'].map(s =>
+      el('option', { value: s, selected: act.write_scope === s }, s)))));
+
+  // ---- args ----
+  const at = el('table', {});
+  for (const [k, v] of Object.entries(act.args || {})) {
+    const tr = el('tr', {});
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: k,
+      onchange: e => { delete act.args[k]; act.args[e.target.value.trim()] = v; dirty(); } })));
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: v,
+      onchange: e => { act.args[k] = e.target.value; dirty(); } })));
+    tr.appendChild(el('td', {}, el('b', { class: 'chip', style: 'cursor:pointer;border:none',
+      onclick: () => { delete act.args[k]; dirty(); } }, '✕')));
+    at.appendChild(tr);
+  }
+  form.appendChild(frow('args (name → ref; refs must also be in reads)', at,
+    el('div', { class: 'adders' }, el('button', { onclick: () => {
+      const k = prompt('arg name:'); if (!k) return;
+      (act.args = act.args || {})[k.trim()] = '';
+      dirty();
+    } }, '+ arg'))));
+}
+
+function buildFastPathForm(form) {
+  const rule = flow.fast_path[sel.index];
+  if (!rule) return;
+  form.appendChild(frow('match on', el('input', { type: 'text', value: rule.match_on ?? '',
+    placeholder: 'empty = the message text',
+    onchange: e => { rule.match_on = e.target.value.trim() || null; dirty(); } })));
+  form.appendChild(frow('pattern', el('input', { type: 'text', value: rule.pattern ?? '',
+    onchange: e => { rule.pattern = e.target.value || null; dirty(); } })));
+  const st = el('table', {});
+  for (const [k, v] of Object.entries(rule.sets || {})) {
+    const tr = el('tr', {});
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: k,
+      onchange: e => { delete rule.sets[k]; rule.sets[e.target.value.trim()] = v; dirty(); } })));
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: JSON.stringify(v),
+      onchange: e => { try { rule.sets[k] = JSON.parse(e.target.value); dirty(); }
+        catch { report({ errors: ['value must be JSON, e.g. "text" or 42'], warnings: [] }); } } })));
+    tr.appendChild(el('td', {}, el('b', { class: 'chip', style: 'cursor:pointer;border:none',
+      onclick: () => { delete rule.sets[k]; dirty(); } }, '✕')));
+    st.appendChild(tr);
+  }
+  form.appendChild(frow('sets (role → JSON value)', st,
+    el('div', { class: 'adders' }, el('button', { onclick: () => {
+      const k = prompt('role:'); if (!k) return;
+      (rule.sets = rule.sets || {})[k.trim()] = '';
+      dirty();
+    } }, '+ set'))));
+  form.appendChild(frow('reply template', el('select', { onchange: e => {
+    rule.reply_template = e.target.value; dirty();
+  } }, el('option', { value: '', selected: rule.reply_template === '' }, '(silent — absorb the event)'),
+     ...Object.keys(flow.templates).map(k =>
+      el('option', { value: k, selected: rule.reply_template === k }, k)),
+     ...(flow.templates[rule.reply_template] === undefined && rule.reply_template
+        ? [el('option', { value: rule.reply_template, selected: true },
+            rule.reply_template + ' (missing!)')] : []))));
+}
+
+function buildRolesForm(form) {
+  const rt = el('table', {});
+  for (const [r, s] of Object.entries(flow.roles)) {
+    const tr = el('tr', {});
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: r,
+      onchange: e => { const v = flow.roles[r]; delete flow.roles[r];
+        flow.roles[e.target.value.trim()] = v; dirty(); } })));
+    tr.appendChild(el('td', {}, el('input', { type: 'text', value: s,
+      onchange: e => { flow.roles[r] = e.target.value.trim(); dirty(); } })));
+    tr.appendChild(el('td', {}, el('b', { class: 'chip', style: 'cursor:pointer;border:none',
+      onclick: () => { delete flow.roles[r]; dirty(); } }, '✕')));
+    rt.appendChild(tr);
+  }
+  form.appendChild(frow('role → slot', rt, el('div', { class: 'adders' },
+    el('button', { onclick: () => {
+      const r = prompt('role (what the classifier hears):'); if (!r) return;
+      const s = prompt('slot (where it is remembered):', r); if (!s) return;
+      flow.roles[r.trim()] = s.trim(); dirty();
+    } }, '+ role'))));
+}
+
+function buildRequiredForm(form) {
+  const d = el('div', {});
+  for (const r of Object.keys(flow.roles)) {
+    d.appendChild(el('div', { class: 'check' },
+      el('input', { type: 'checkbox', checked: flow.required_roles.includes(r),
+        onchange: e => {
+          if (e.target.checked) flow.required_roles.push(r);
+          else flow.required_roles = flow.required_roles.filter(x => x !== r);
+          dirty();
+        } }),
+      r));
+  }
+  if (!Object.keys(flow.roles).length)
+    d.appendChild(el('span', { class: 'muted' }, 'no roles declared yet'));
+  form.appendChild(frow('roles that must be filled before actions run', d));
+}
+
+function buildReplyForm(form) {
+  const rt = flow.reply_template;
+  const isOut = rt != null && rt.startsWith('$out:');
+  const opts = [
+    el('option', { value: '::model', selected: rt == null }, '(generate with the model)'),
+    el('option', { value: '::silent', selected: rt === '' }, '(silent — say nothing)'),
+    ...Object.keys(flow.templates).map(k =>
+      el('option', { value: '::t:' + k, selected: rt === k }, 'template: ' + k)),
+  ];
+  if (isOut) opts.push(el('option', { value: '::out', selected: true }, 'from action: ' + rt));
+  form.appendChild(frow('default reply', el('select', { onchange: e => {
+    const v = e.target.value;
+    if (v === '::model') flow.reply_template = null;
+    else if (v === '::silent') flow.reply_template = '';
+    else if (v === '::out') return;   // already set; nothing to change
+    else flow.reply_template = v.slice(4);
+    dirty();
+  } }, ...opts)));
+  form.appendChild(el('div', { class: 'hint' },
+    'to feed the reply from an action, drag the action\'s port onto the green reply node — ' +
+    'its output field becomes the message. If that action\'s guard is off on some turn, ' +
+    'the model answers instead.'));
+}
+
+function buildFollowupForm(form) {
+  const on = flow.follow_up_ms != null;
+  form.appendChild(frow('follow-up timer',
+    el('div', { class: 'check' },
+      el('input', { type: 'checkbox', checked: on, onchange: e => {
+        flow.follow_up_ms = e.target.checked ? 60000 : null; dirty();
+      } }),
+      'enabled'),
+    on ? el('input', { type: 'number', value: flow.follow_up_ms, min: '1000', step: '1000',
+      onchange: e => { flow.follow_up_ms = Number(e.target.value); dirty(); } })
+       : el('span', {}, '')));
+}
+
+function applyObj() {
+  if (!sel) return;
+  const raw = $('objedit').value;
+  let v;
+  const isText = sel.kind === 'template';
+  if (isText) v = raw;
+  else {
+    try { v = JSON.parse(raw); }
+    catch (e) { report({ errors: ['does not parse: ' + e.message], warnings: [] }); return; }
+  }
+  switch (sel.kind) {
+    case 'root':
+      flow = v; break;
+    case 'action': {
+      const i = flow.actions.findIndex(a => a.name === sel.name);
+      if (i < 0) return;
+      if (v.name !== sel.name) {
+        layout[v.name] = layout[sel.name]; delete layout[sel.name]; saveLayout();
+        sel = { kind: 'action', name: v.name };
+      }
+      flow.actions[i] = v; break;
+    }
+    case 'template': flow.templates[sel.key] = v; break;
+    case 'fastpath': flow.fast_path[sel.index] = v; break;
+    case 'roles': flow.roles = v; break;
+    case 'required': flow.required_roles = v; break;
+    case 'reply': flow.reply_template = v; break;
+    case 'followup': flow.follow_up_ms = v; break;
+  }
+  dirty();
+  report({ errors: [], warnings: [] }, 'applied — not yet saved');
+}
+
+function deleteObj() {
+  if (!sel) return;
+  if (sel.kind === 'action') removeAction(sel.name);
+  else if (sel.kind === 'template') {
+    delete flow.templates[sel.key];
+    if (flow.reply_template === sel.key) flow.reply_template = null;
+    sel = null; dirty();
+  } else if (sel.kind === 'fastpath') {
+    flow.fast_path.splice(sel.index, 1);
+    sel = null; dirty();
+  }
+}
+
+// ================= view: pan, zoom, fit =================
+function applyView() {
+  $('world').style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.z})`;
+  $('zoomlvl').textContent = Math.round(view.z * 100) + '%';
+  layout['·view·'] = view; saveLayout();
+}
+
+function toWorld(cx, cy) {
+  return { x: (cx - view.x) / view.z, y: (cy - view.y) / view.z };
+}
+
+function zoomAt(cx, cy, factor) {
+  const w = toWorld(cx, cy);
+  view.z = Math.min(2.5, Math.max(0.15, view.z * factor));
+  view.x = cx - w.x * view.z;
+  view.y = cy - w.y * view.z;
+  applyView();
+}
+
+function zoomBy(factor) {
+  zoomAt(window.innerWidth / 2, window.innerHeight / 2, factor);
+}
+
+/// Fit every node into the window, with room for the side panels.
+function fitView() {
+  const names = flow ? flow.actions.map(a => a.name)
+    .concat(flow.actions.length || flow.reply_template != null ? [MEMORY, REPLY] : []) : [];
+  const margin = { left: 290, right: 400, top: 70, bottom: 40 };
+  const vw = window.innerWidth - margin.left - margin.right;
+  const vh = window.innerHeight - margin.top - margin.bottom;
+  if (!names.length) { view = { x: margin.left + 40, y: margin.top + 40, z: 1 }; applyView(); return; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of names) {
+    const p = layout[n] || { x: 0, y: 0 };
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + 220); maxY = Math.max(maxY, p.y + 110);
+  }
+  const bw = maxX - minX, bh = maxY - minY;
+  view.z = Math.min(1.25, Math.max(0.15, Math.min(vw / bw, vh / bh)));
+  view.x = margin.left + (vw - bw * view.z) / 2 - minX * view.z;
+  view.y = margin.top + (vh - bh * view.z) / 2 - minY * view.z;
+  applyView();
+}
+
+// Paste lands where the cursor last was on the canvas.
+$('viewport').addEventListener('pointermove', (e) => {
+  lastMouse = toWorld(e.clientX, e.clientY);
+});
+
+// Wheel = zoom at the cursor.
+$('viewport').addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+}, { passive: false });
+
+// Drag on empty canvas = pan.
+$('viewport').addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 && e.button !== 1) return;
+  if (e.target.closest('.node')) return;
+  e.preventDefault();
+  hideCtx();
+  const startX = e.clientX, startY = e.clientY;
+  const orig = { x: view.x, y: view.y };
+  $('viewport').classList.add('panning');
+  function move(ev) {
+    view.x = orig.x + (ev.clientX - startX);
+    view.y = orig.y + (ev.clientY - startY);
+    applyView();
+  }
+  function up() {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    $('viewport').classList.remove('panning');
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+});
+
+// ================= context menu =================
+function hideCtx() { $('ctx').hidden = true; }
+window.addEventListener('click', hideCtx);
+window.addEventListener('blur', hideCtx);
+
+function showCtx(x, y, items) {
+  const c = $('ctx');
+  c.innerHTML = '';
+  for (const it of items) {
+    if (it === 'hr') { c.appendChild(document.createElement('hr')); continue; }
+    const d = document.createElement('div');
+    d.className = it.h ? 'h' : 'i' + (it.danger ? ' danger' : '');
+    d.textContent = it.label ?? it.h;
+    if (it.fn) d.onclick = () => { hideCtx(); it.fn(); };
+    c.appendChild(d);
+  }
+  c.hidden = false;
+  // Keep it on screen.
+  c.style.left = Math.min(x, window.innerWidth - c.offsetWidth - 8) + 'px';
+  c.style.top = Math.min(y, window.innerHeight - c.offsetHeight - 8) + 'px';
+}
+
+$('viewport').addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (!flow) return;
+  const nodeEl = e.target.closest('.node');
+  if (!nodeEl) { canvasCtx(e); return; }
+  const name = nodeEl.dataset.name;
+  if (name === MEMORY) memoryCtx(e);
+  else if (name === REPLY) replyCtx(e);
+  else nodeCtx(e, name);
+});
+
+function memoryCtx(e) {
+  showCtx(e.clientX, e.clientY, [
+    { h: 'memory / classifier' },
+    { label: 'connect role → (pick an action)', fn: () => {
+        pendingConnect = MEMORY;
+        report({ errors: [], warnings: ['click the action that should read a role — Esc cancels'] });
+      } },
+    { label: 'edit roles → slots', fn: () => select({ kind: 'roles' }) },
+    { label: 'edit required roles', fn: () => select({ kind: 'required' }) },
+  ]);
+}
+
+function replyCtx(e) {
+  const items = [
+    { h: 'reply' },
+    { label: 'edit reply setting', fn: () => select({ kind: 'reply' }) },
+  ];
+  if (flow.reply_template != null) {
+    items.push({ label: `edit template "${flow.reply_template}"`,
+      fn: () => select({ kind: 'template', key: flow.reply_template }) });
+  }
+  showCtx(e.clientX, e.clientY, items);
+}
+
+function canvasCtx(e) {
+  const w = toWorld(e.clientX, e.clientY);
+  showCtx(e.clientX, e.clientY, [
+    { h: flow.id },
+    { label: '+ action here', fn: () => addAction(w) },
+    { label: '+ template', fn: addTemplatePrompt },
+    { label: '+ fast-path rule', fn: addFastPathRule },
+    'hr',
+    { label: 'fit view', fn: fitView },
+    { label: 'auto-layout', fn: () => { autoLayout(true); fitView(); } },
+    { label: 'edit whole document', fn: () => select({ kind: 'root' }) },
+  ]);
+}
+
+function nodeCtx(e, name) {
+  const act = flow.actions.find(a => a.name === name);
+  if (!act) return;
+  showCtx(e.clientX, e.clientY, [
+    { h: name },
+    { label: 'edit', fn: () => select({ kind: 'action', name }) },
+    { label: 'rename…', fn: () => {
+        const n2 = prompt('new name:', name);
+        if (!n2 || n2 === name) return;
+        if (flow.actions.some(a => a.name === n2)) { alert('name already used'); return; }
+        // Follow every $out ref that points at the old name.
+        for (const a of flow.actions) {
+          a.reads = (a.reads || []).map(r =>
+            r.replace(new RegExp(`^\\$out:${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`), `$out:${n2}.`));
+        }
+        act.name = n2;
+        layout[n2] = layout[name]; delete layout[name]; saveLayout();
+        if (sel && sel.kind === 'action' && sel.name === name) sel = { kind: 'action', name: n2 };
+        dirty();
+      } },
+    { label: 'set component…', fn: () => {
+        const c = prompt('component name (must be registered in the server):', act.component);
+        if (c === null) return;
+        act.component = c.trim(); dirty();
+      } },
+    'hr',
+    { label: 'connect → (pick a target)', fn: () => {
+        pendingConnect = name;
+        report({ errors: [], warnings: [`click the node that should read ${name}'s $out — Esc cancels`] });
+      } },
+    { label: 'add read…', fn: () => {
+        const r = prompt('read (a role name, or $out:action.field):');
+        if (!r) return;
+        (act.reads = act.reads || []).push(r.trim()); dirty();
+      } },
+    { label: 'add write…', fn: () => {
+        const w = prompt('role this action writes:');
+        if (!w) return;
+        (act.writes = act.writes || []).push(w.trim()); dirty();
+      } },
+    { label: 'set guard…', fn: () => {
+        const g = prompt('guard JSON:', JSON.stringify(act.when ?? { when: 'always' }));
+        if (!g) return;
+        try { act.when = JSON.parse(g); dirty(); }
+        catch (err) { report({ errors: ['guard does not parse: ' + err.message], warnings: [] }); }
+      } },
+    'hr',
+    { label: 'duplicate', fn: () => {
+        let n2 = name + '-copy', i = 2;
+        while (flow.actions.some(a => a.name === n2)) n2 = name + '-copy' + i++;
+        const copy = JSON.parse(JSON.stringify(act));
+        copy.name = n2;
+        flow.actions.push(copy);
+        const p = layout[name] || { x: 0, y: 0 };
+        layout[n2] = { x: p.x + 40, y: p.y + 130 }; saveLayout();
+        dirty(); select({ kind: 'action', name: n2 });
+      } },
+    { label: 'delete', danger: true, fn: () => removeAction(name) },
+  ]);
+}
+
+// ================= clipboard =================
+function uniqueActionName(base) {
+  if (!flow.actions.some(a => a.name === base)) return base;
+  let n = base + '-copy', i = 2;
+  while (flow.actions.some(a => a.name === n)) n = base + '-copy' + i++;
+  return n;
+}
+
+function copySel(cut) {
+  if (!sel) { report({ errors: [], warnings: ['nothing selected to copy'] }); return; }
+  const resolved = resolveSel(sel);
+  if (!resolved) return;
+  clipboardObj = { kind: sel.kind, key: sel.key, data: JSON.parse(JSON.stringify(
+    sel.kind === 'template' ? resolved[0] : resolved[0])) };
+  // Best effort: put the JSON on the system clipboard too, so it can be
+  // pasted into another browser or a file. Reading it back is not attempted —
+  // the internal clipboard is the paste source.
+  try {
+    navigator.clipboard.writeText(
+      typeof clipboardObj.data === 'string' ? clipboardObj.data
+        : JSON.stringify(clipboardObj.data, null, 2));
+  } catch {}
+  const what = sel.kind === 'action' ? `action ${sel.name}`
+    : sel.kind === 'template' ? `template ${sel.key}` : sel.kind;
+  if (cut) { deleteObj(); report({ errors: [], warnings: [] }, `cut ${what}`); }
+  else report({ errors: [], warnings: [] }, `copied ${what}`);
+}
+
+function pasteClip() {
+  if (!clipboardObj || !flow) { report({ errors: [], warnings: ['clipboard is empty'] }); return; }
+  const c = clipboardObj;
+  switch (c.kind) {
+    case 'action': {
+      const copy = JSON.parse(JSON.stringify(c.data));
+      copy.name = uniqueActionName(copy.name);
+      flow.actions.push(copy);
+      layout[copy.name] = { x: lastMouse.x, y: lastMouse.y };
+      saveLayout();
+      dirty(); select({ kind: 'action', name: copy.name });
+      break;
+    }
+    case 'template': {
+      let k = c.key || 'pasted', i = 2;
+      while (k in flow.templates) k = (c.key || 'pasted') + '-' + i++;
+      flow.templates[k] = c.data;
+      dirty(); select({ kind: 'template', key: k });
+      break;
+    }
+    case 'fastpath': {
+      flow.fast_path.push(JSON.parse(JSON.stringify(c.data)));
+      dirty(); select({ kind: 'fastpath', index: flow.fast_path.length - 1 });
+      break;
+    }
+    default:
+      report({ errors: [], warnings: [`only actions, templates and fast-path rules paste — clipboard holds "${c.kind}"`] });
+      return;
+  }
+  report({ errors: [], warnings: [] }, 'pasted — Ctrl+Z undoes');
+}
+
+// ================= keyboard =================
+window.addEventListener('keydown', (e) => {
+  // Never hijack keys while the user is typing.
+  const t = e.target;
+  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+
+  if (e.key === 'Escape') {
+    if (pendingConnect) { pendingConnect = null; report({ errors: [], warnings: [] }); }
+    hideCtx();
+    return;
+  }
+  if (typing || !flow) return;
+
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if (mod && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+    e.preventDefault(); redo();
+  }
+  else if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); copySel(false); }
+  else if (mod && e.key.toLowerCase() === 'x') { e.preventDefault(); copySel(true); }
+  else if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClip(); }
+  else if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+  else if (mod && e.key.toLowerCase() === 'd' && sel && sel.kind === 'action') {
+    e.preventDefault();
+    const act = flow.actions.find(a => a.name === sel.name);
+    if (!act) return;
+    const copy = JSON.parse(JSON.stringify(act));
+    copy.name = uniqueActionName(copy.name);
+    flow.actions.push(copy);
+    const p = layout[sel.name] || lastMouse;
+    layout[copy.name] = { x: p.x + 40, y: p.y + 130 }; saveLayout();
+    dirty(); select({ kind: 'action', name: copy.name });
+  }
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
+    e.preventDefault(); deleteObj();
+  }
+});
+
+// ================= graph =================
+function layoutKey() { return 'layout:' + selectedId; }
+function loadLayout() {
+  try { layout = JSON.parse(localStorage.getItem(layoutKey())) || {}; }
+  catch { layout = {}; }
+  view = layout['·view·'] || { x: 300, y: 80, z: 1 };
+  applyView();
+}
+function saveLayout() {
+  try { localStorage.setItem(layoutKey(), JSON.stringify(layout)); } catch {}
+}
+
+const MEMORY = '·memory·';
+const REPLY = '·reply·';
+
+/// The reply is not an ActionDecl — it is the "speak" half of the neural
+/// seam, rendered after the DAG settles — but it IS a data consumer: a
+/// template's {placeholders} name slots, and slots trace back to the actions
+/// (or the classifier) that write them. Drawing it as the terminal node makes
+/// the whole flow read left to right: ears → work → mouth.
+function replyEdges() {
+  const edges = [];
+  if (!flow.actions.length && flow.reply_template == null) return edges;
+  const rt = flow.reply_template;
+  if (rt === '') return edges;   // silent: nothing flows to the mouth
+  const writers = {};
+  for (const a of flow.actions) for (const r of a.writes || []) writers[r] = a.name;
+  const slotToRole = {};
+  for (const [role, slot] of Object.entries(flow.roles)) slotToRole[slot] = role;
+  if (rt != null && rt.startsWith('$out:')) {
+    // The reply IS an action's output — the green edge is removable.
+    const m = /^\$out:([^.]+)\.(.+)$/.exec(rt);
+    if (m && flow.actions.some(a => a.name === m[1])) {
+      edges.push({ kind: 'replyout', from: m[1], to: REPLY, label: m[2] });
+    } else {
+      edges.push({ kind: 'mem', from: MEMORY, to: REPLY, label: rt + ' (missing!)' });
+    }
+  } else if (rt != null) {
+    const body = flow.templates[rt] || '';
+    const seen = new Set();
+    for (const m of body.matchAll(/\{([a-zA-Z0-9_.:$-]+)\}/g)) {
+      const slot = m[1];
+      if (seen.has(slot)) continue;
+      seen.add(slot);
+      const role = slotToRole[slot];
+      const writer = role && writers[role];
+      edges.push({ kind: writer ? 'role' : 'mem', from: writer || MEMORY,
+                   to: REPLY, label: slot });
+    }
+    if (!seen.size) edges.push({ kind: 'mem', from: MEMORY, to: REPLY, label: '' });
+  } else {
+    // Model-generated replies are grounded in the whole memory frame.
+    edges.push({ kind: 'mem', from: MEMORY, to: REPLY, label: 'grounded facts' });
+  }
+  return edges;
+}
+
+function edgesOf() {
+  const edges = [];
+  const writers = {};
+  for (const a of flow.actions) for (const r of a.writes || []) writers[r] = a.name;
+  for (const a of flow.actions) {
+    (a.reads || []).forEach((read, i) => {
+      const m = /^\$out:([^.]+)\.(.+)$/.exec(read);
+      if (m) edges.push({ kind: 'out', from: m[1], to: a.name, label: m[2], readIndex: i });
+      else if (writers[read]) edges.push({ kind: 'role', from: writers[read], to: a.name, label: read });
+      else edges.push({ kind: 'mem', from: MEMORY, to: a.name, label: read });
+    });
+  }
+  return edges;
+}
+
+function autoLayout(force) {
+  const depth = {};
+  const edges = edgesOf().filter(e => e.kind !== 'mem');
+  const dependsOn = {};
+  for (const a of flow.actions) dependsOn[a.name] = [];
+  for (const e of edges) if (dependsOn[e.to]) dependsOn[e.to].push(e.from);
+  const seen = new Set();
+  function d(n) {
+    if (depth[n] !== undefined) return depth[n];
+    if (seen.has(n)) return 0;
+    seen.add(n);
+    const parents = (dependsOn[n] || []).filter(p => p !== MEMORY);
+    depth[n] = parents.length ? 1 + Math.max(...parents.map(d)) : 0;
+    return depth[n];
+  }
+  const byLevel = {};
+  for (const a of flow.actions) {
+    const lv = d(a.name);
+    (byLevel[lv] = byLevel[lv] || []).push(a.name);
+  }
+  for (const [lv, names] of Object.entries(byLevel)) {
+    names.forEach((n, i) => {
+      if (force || !layout[n]) layout[n] = { x: 200 + lv * 270, y: 60 + i * 135 };
+    });
+  }
+  if (force) { saveLayout(); drawGraph(); }
+}
+
+function drawGraph() {
+  if (!flow) return;
+  const world = $('world');
+  world.querySelectorAll('.node').forEach(n => n.remove());
+  autoLayout(false);
+
+  if (!layout[MEMORY]) layout[MEMORY] = { x: 20, y: 60 };
+  if (flow.actions.length || flow.reply_template != null) {
+    world.appendChild(nodeDiv(MEMORY, 'memory / classifier', '', 'roles arrive here', true));
+  }
+  for (const a of flow.actions) {
+    const guard = a.when ? (a.when.when + (a.when.value !== undefined ? `: ${JSON.stringify(a.when.value)}` : '')) : '';
+    const writes = (a.writes || []).length ? '→ ' + a.writes.join(', ') : '';
+    world.appendChild(nodeDiv(a.name, a.name, a.component, guard, false, writes));
+  }
+  // The terminal node: what the user hears.
+  if (flow.actions.length || flow.reply_template != null) {
+    if (!layout[REPLY]) {
+      const maxX = Math.max(20, ...flow.actions.map(a => (layout[a.name] || {}).x || 0));
+      layout[REPLY] = { x: maxX + 270, y: 60 };
+    }
+    const rt = flow.reply_template;
+    const label = rt == null ? 'model-generated'
+      : rt === '' ? 'silent — says nothing'
+      : rt.startsWith('$out:') ? 'from ' + rt
+      : 'template: ' + rt;
+    const rn = nodeDiv(REPLY, 'reply', '', label, true);
+    rn.classList.add('replynode');
+    rn.onclick = () => {
+      if (pendingConnect && pendingConnect !== MEMORY) {
+        connectReply(pendingConnect); return;
+      }
+      select({ kind: 'reply' });
+    };
+    world.appendChild(rn);
+  }
+  drawEdges();
+}
+
+function nodeDiv(name, title, comp, guard, pseudo, writes) {
+  const div = document.createElement('div');
+  div.className = 'node' + (pseudo ? ' pseudo' : '') +
+    (sel && sel.kind === 'action' && sel.name === name ? ' sel' : '');
+  div.dataset.name = name;
+  const pos = layout[name] || { x: 0, y: 0 };
+  div.style.left = pos.x + 'px';
+  div.style.top = pos.y + 'px';
+  div.innerHTML = `<h4>${title}</h4>` +
+    (comp ? `<div class="comp">${comp}</div>` : '') +
+    (guard ? `<div class="guard">when ${guard}</div>` : '') +
+    (writes ? `<div class="writes">${writes}</div>` : '');
+  if (!pseudo) {
+    const outp = document.createElement('div');
+    outp.className = 'port outp';
+    outp.title = 'drag onto another node: it will read this action\'s $out';
+    outp.onpointerdown = e => startConnect(e, name);
+    const inp = document.createElement('div');
+    inp.className = 'port inp';
+    div.appendChild(outp); div.appendChild(inp);
+    div.onpointerdown = e => startDrag(e, div, name);
+    div.onclick = () => {
+      if (dragMoved) return;
+      if (pendingConnect && pendingConnect !== name) { finishConnect(pendingConnect, name); return; }
+      select({ kind: 'action', name });
+    };
+  } else {
+    div.onpointerdown = e => startDrag(e, div, name);
+    if (name === MEMORY) {
+      // The neural part is a source like any other: dragging from here gives
+      // an action a role read — what the classifier hears becomes its input.
+      const outp = document.createElement('div');
+      outp.className = 'port outp';
+      outp.title = 'drag onto an action: it will read a role the classifier fills';
+      outp.onpointerdown = e => startConnect(e, MEMORY);
+    div.appendChild(outp);
+    }
+  }
+  return div;
+}
+
+let dragMoved = false;
+function startDrag(e, div, name) {
+  if (e.target.classList.contains('port')) return;
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  dragMoved = false;
+  const startX = e.clientX, startY = e.clientY;
+  const orig = { ...(layout[name] || { x: 0, y: 0 }) };
+  function move(ev) {
+    const dx = (ev.clientX - startX) / view.z, dy = (ev.clientY - startY) / view.z;
+    if (Math.abs(dx) + Math.abs(dy) > 3) dragMoved = true;
+    layout[name] = { x: orig.x + dx, y: orig.y + dy };
+    div.style.left = layout[name].x + 'px';
+    div.style.top = layout[name].y + 'px';
+    drawEdges();
+  }
+  function up() {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    saveLayout();
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
+
+function finishConnect(fromName, toName) {
+  pendingConnect = null;
+  report({ errors: [], warnings: [] });
+  const act = flow.actions.find(a => a.name === toName);
+  if (!act) return;
+  if (fromName === MEMORY) {
+    // From the neural part: the action reads a role the classifier fills.
+    const declared = Object.keys(flow.roles);
+    const role = prompt(
+      `${toName} will read a role from the classifier/memory.\n` +
+      (declared.length ? `Declared roles: ${declared.join(', ')}\n` : '') +
+      `Role name (an undeclared one is declared on the spot):`);
+    if (!role) return;
+    const r = role.trim();
+    if (!(r in flow.roles)) {
+      const slot = prompt(`"${r}" is new — which slot is it remembered in?`, r);
+      if (!slot) return;
+      flow.roles[r] = slot.trim();
+    }
+    act.reads = act.reads || [];
+    if (!act.reads.includes(r)) act.reads.push(r);
+    dirty(); select({ kind: 'action', name: toName });
+    return;
+  }
+  const field = prompt(
+    `${toName} will read an output of ${fromName}.\n` +
+    `Which $out field? (the component's output key, e.g. "found")`);
+  if (!field) return;
+  act.reads = act.reads || [];
+  act.reads.push(`$out:${fromName}.${field.trim()}`);
+  dirty(); select({ kind: 'action', name: toName });
+}
+
+function startConnect(e, fromName) {
+  e.preventDefault(); e.stopPropagation();
+  function up(ev) {
+    window.removeEventListener('pointerup', up);
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    const target = el && el.closest('.node');
+    if (!target || target.dataset.name === fromName || target.dataset.name === MEMORY) return;
+    if (target.dataset.name === REPLY) {
+      if (fromName === MEMORY) {
+        report({ errors: [], warnings: [
+          'a template reply reads {placeholders} in its text — memory feeds it through those, ' +
+          'or wire an action into the reply instead'] });
+        return;
+      }
+      connectReply(fromName);
+      return;
+    }
+    finishConnect(fromName, target.dataset.name);
+  }
+  window.addEventListener('pointerup', up);
+}
+
+/// Wiring an action into the reply node: the turn's reply becomes that
+/// action's output — reply_template carries the same $out grammar reads use.
+function connectReply(fromName) {
+  pendingConnect = null;
+  const field = prompt(
+    `The reply will BE an output of ${fromName}.\n` +
+    `Which $out field holds the text? (e.g. "text")`, 'text');
+  if (!field) return;
+  flow.reply_template = `$out:${fromName}.${field.trim()}`;
+  dirty(); select({ kind: 'reply' });
+  report({ errors: [], warnings: [] },
+    `reply is now fed by ${fromName} — if its guard is off on a turn, the model answers instead`);
+}
+
+function nodeRect(name) {
+  const el = document.querySelector(`.node[data-name="${CSS.escape(name)}"]`);
+  if (!el) return null;
+  return { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+}
+
+function drawEdges() {
+  const svg = $('edges');
+  svg.innerHTML = '';
+  for (const e of edgesOf().concat(replyEdges())) {
+    const a = nodeRect(e.from), b = nodeRect(e.to);
+    if (!a || !b) continue;
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2;
+    const x2 = b.x, y2 = b.y + b.h / 2;
+    const mx = (x1 + x2) / 2;
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+    p.setAttribute('class', e.kind);
+    if (e.kind === 'out' || e.kind === 'replyout') {
+      p.addEventListener('click', () => {
+        if (e.kind === 'replyout') {
+          flow.reply_template = null;
+          dirty();
+          report({ errors: [], warnings: [] },
+            'reply no longer fed by an action — back to model-generated. Ctrl+Z undoes');
+          return;
+        }
+        const act = flow.actions.find(x => x.name === e.to);
+        act.reads.splice(e.readIndex, 1);
+        dirty();
+        report({ errors: [], warnings: [] },
+          `removed: ${e.to} no longer reads $out:${e.from}.${e.label} — Ctrl+Z undoes`);
+      });
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = 'click to remove this dependency';
+      p.appendChild(title);
+    }
+    svg.appendChild(p);
+    const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    t.setAttribute('x', mx); t.setAttribute('y', (y1 + y2) / 2 - 6);
+    t.setAttribute('text-anchor', 'middle');
+    t.textContent = e.label;
+    svg.appendChild(t);
+  }
+}
+
+function addAction(at) {
+  if (!flow) return;
+  const name = prompt('action name:');
+  if (!name) return;
+  if (flow.actions.some(a => a.name === name)) { alert('name already used'); return; }
+  flow.actions.push({
+    name, component: '', reads: [], writes: [],
+    write_scope: 'conversation', args: {}, when: { when: 'always' },
+  });
+  layout[name] = at ? { x: at.x, y: at.y }
+                    : { x: 200, y: 60 + flow.actions.length * 70 };
+  saveLayout();
+  dirty(); select({ kind: 'action', name });
+}
+
+function removeAction(name) {
+  const i = flow.actions.findIndex(a => a.name === name);
+  if (i < 0) return;
+  flow.actions.splice(i, 1);
+  delete layout[name]; saveLayout();
+  if (sel && sel.kind === 'action' && sel.name === name) sel = null;
+  dirty();
+  report({ errors: [], warnings: [] },
+    `deleted action ${name} — Ctrl+Z undoes; reads pointing at its $out now dangle (the validator names them)`);
+}
+
+// ================= validate & save =================
+let reportTimer = null;
+function report(r, okMsg) {
+  const el = $('report'); el.innerHTML = '';
+  if (!r) return;
+  for (const e of r.errors || []) {
+    const d = document.createElement('div'); d.className = 'e'; d.textContent = e;
+    el.appendChild(d);
+  }
+  for (const w of r.warnings || []) {
+    const d = document.createElement('div'); d.className = 'w'; d.textContent = w;
+    el.appendChild(d);
+  }
+  if (!(r.errors || []).length && okMsg) {
+    const d = document.createElement('div'); d.className = 'k'; d.textContent = okMsg;
+    el.appendChild(d);
+  }
+  clearTimeout(reportTimer);
+  if (!(r.errors || []).length && !(r.warnings || []).length) {
+    reportTimer = setTimeout(() => { el.innerHTML = ''; }, 4000);
+  }
+}
+
+async function runValidate() {
+  const { body } = await api('/api/validate-flow',
+    { method: 'POST', body: JSON.stringify(flow) });
+  report(body, 'valid — no errors');
+}
+
+async function save() {
+  flow.version = latest === null ? flow.version : latest + 1;
+  const { status, body } = await api(`/api/flows/${flow.id}`,
+    { method: 'POST', body: JSON.stringify(flow) });
+  if (status === 200) {
+    report({ errors: [], warnings: body.warnings }, `saved as v${body.saved.version} — restart ns-app to run it`);
+    open(flow.id);
+  } else if (status === 409) {
+    latest = body.latest_version;
+    report({ errors: [body.error + ' — press Save again to save as v' + (latest + 1)],
+             warnings: [] });
+  } else {
+    report(body || { errors: ['save failed (' + status + ')'], warnings: [] });
+  }
+}
+
+$('settingslink').href = '/#token=' + encodeURIComponent(TOKEN);
+boot();
+</script>
+</body>
+</html>

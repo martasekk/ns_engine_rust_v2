@@ -166,7 +166,7 @@ pub(crate) enum TenantError {
     /// rather than a file being absent.
     MissingFromLibrary {
         tenant: String,
-        /// "persona" or "module", for the message.
+        /// "persona", "module" or "flow", for the message.
         kind: &'static str,
         name: String,
         /// The file it should have been.
@@ -177,6 +177,12 @@ pub(crate) enum TenantError {
         tenant: String,
         name: String,
         path: String,
+        detail: String,
+    },
+    /// A flow the company names that does not load or does not validate.
+    MalformedFlow {
+        tenant: String,
+        name: String,
         detail: String,
     },
     /// A library name that is not usable as a file name. Refused before it
@@ -248,6 +254,11 @@ impl std::fmt::Display for TenantError {
                 path,
                 detail,
             } => write!(f, "tenant {tenant:?}: module {name:?}: {path}: {detail}"),
+            Self::MalformedFlow {
+                tenant,
+                name,
+                detail,
+            } => write!(f, "tenant {tenant:?}: flow {name:?}: {detail}"),
             Self::BadLibraryName { tenant, kind, name } => write!(
                 f,
                 "tenant {tenant:?}: {name:?} is not usable as a {kind} name — letters, \
@@ -476,6 +487,47 @@ fn resolve_library(
             }
         }
     }
+    if let Some(name) = app.library.flow.clone() {
+        if !valid_library_name(&name) {
+            return Err(TenantError::BadLibraryName {
+                tenant: id.to_string(),
+                kind: "flow",
+                name,
+            });
+        }
+        let flow = match crate::flowlib::load(root, &name, None) {
+            Err(detail) => {
+                return Err(TenantError::MalformedFlow {
+                    tenant: id.to_string(),
+                    name,
+                    detail,
+                })
+            }
+            Ok(None) => {
+                return Err(TenantError::MissingFromLibrary {
+                    tenant: id.to_string(),
+                    kind: "flow",
+                    path: crate::flowlib::flow_dir(root, &name).display().to_string(),
+                    name,
+                })
+            }
+            Ok(Some(flow)) => flow,
+        };
+        let errors = flow.validate();
+        if !errors.is_empty() {
+            let detail = errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(TenantError::MalformedFlow {
+                tenant: id.to_string(),
+                name,
+                detail,
+            });
+        }
+        app.resolved_flow = Some(flow);
+    }
     Ok(())
 }
 
@@ -700,6 +752,68 @@ mod tests {
             beta.app.persona.text, "beta says it its own way",
             "an inline persona beats the reference"
         );
+    }
+
+    /// A flow with the given required roles and no roles filled in.
+    fn a_flow(version: u32, required_roles: &[&str]) -> nscore::flow::FlowDef {
+        serde_json::from_value(serde_json::json!({
+            "id": "trip", "version": version, "roles": {},
+            "required_roles": required_roles, "actions": [], "fast_path": [],
+            "reply_template": null
+        }))
+        .expect("test flow")
+    }
+
+    fn with_flow(name: &str) -> String {
+        format!("{BASE}\n[library]\nflow = \"{name}\"\n")
+    }
+
+    /// Chunk 5. `[library] flow` names the newest version and it reaches the config.
+    #[test]
+    fn a_company_flow_is_loaded_into_its_config() {
+        let root = tempfile::tempdir().expect("tempdir");
+        crate::flowlib::put(root.path(), &a_flow(1, &[])).expect("v1");
+        crate::flowlib::put(root.path(), &a_flow(2, &[])).expect("v2");
+        let set = load_base(&with_flow("trip"), root.path(), "local").expect("the base loads");
+        let flow = set.app.resolved_flow.expect("the flow is resolved");
+        assert_eq!(flow.version, 2, "the newest version runs");
+    }
+
+    /// Chunk 5. A flow named but not on disk stops the company, as a missing persona does.
+    #[test]
+    fn a_missing_flow_stops_the_company() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let err = load_base(&with_flow("nope"), root.path(), "local")
+            .err()
+            .expect("a missing flow is refused");
+        assert!(
+            matches!(err, TenantError::MissingFromLibrary { kind: "flow", .. }),
+            "got {err}"
+        );
+    }
+
+    /// Chunk 5. A flow that fails `validate` stops the company and the detail names the problem.
+    #[test]
+    fn an_invalid_flow_stops_the_company_with_its_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        crate::flowlib::put(root.path(), &a_flow(1, &["ghost"])).expect("v1");
+        let err = load_base(&with_flow("trip"), root.path(), "local")
+            .err()
+            .expect("an invalid flow is refused");
+        match err {
+            TenantError::MalformedFlow { detail, .. } => {
+                assert!(detail.contains("ghost"), "detail was {detail:?}")
+            }
+            other => panic!("expected MalformedFlow, got {other}"),
+        }
+    }
+
+    /// Chunk 5. A company that names no flow has none.
+    #[test]
+    fn no_flow_named_means_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let set = load_base(BASE, root.path(), "local").expect("the base loads");
+        assert!(set.app.resolved_flow.is_none());
     }
 
     /// D5. Modules add; they do not replace. A company keeps the components

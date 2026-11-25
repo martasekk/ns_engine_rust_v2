@@ -5,6 +5,7 @@ mod clients;
 mod config;
 mod eval;
 mod factory;
+mod flowlib;
 mod grade;
 mod models;
 mod registry;

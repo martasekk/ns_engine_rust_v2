@@ -646,6 +646,7 @@ pub(crate) async fn build_engine(
         exemplars_max: cfg.memory.exemplars_max,
         // M12 T6.1: no ceiling unless this run asked for one.
         max_requests,
+        flow: cfg.resolved_flow.clone().map(Arc::new),
     };
     let engine = Arc::new(Engine::new(parts, engine_cfg));
     println!("ns-harness — {}", emitter_target.describe());

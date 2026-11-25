@@ -235,6 +235,9 @@ pub struct EngineConfig {
     /// one, so a run stops between turns rather than mid-flight with a tool
     /// called and nothing said about it.
     pub max_requests: Option<u32>,
+    /// The company's flow (docs/flows-spec.md): narrows which registered tools are offered and names the
+    /// details still to collect. `None` — every config without `[library] flow` — changes nothing.
+    pub flow: Option<std::sync::Arc<nscore::flow::FlowDef>>,
 }
 
 impl Default for EngineConfig {
@@ -288,6 +291,7 @@ impl Default for EngineConfig {
             recall_hybrid: false,
             exemplars_max: 0,
             max_requests: None,
+            flow: None,
         }
     }
 }

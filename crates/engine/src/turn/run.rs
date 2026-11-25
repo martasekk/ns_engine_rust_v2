@@ -169,6 +169,26 @@ impl Engine {
                     }
             };
 
+        // The flow's view of this turn (docs/flows-spec.md). Asked once before the loop and held, like the
+        // two store questions above, and it fails open the same way: a store error leaves the turn un-narrowed.
+        // shortcut: a fact remembered mid-turn counts from the next turn; recompute per iteration if a flow
+        // ever needs it sooner.
+        let flow_offer: Option<nscore::flow::FlowOffer> = match &self.cfg.flow {
+            Some(flow) => match self.parts.memory.facts(&scope, "").await {
+                Ok(facts) => {
+                    let filled: std::collections::BTreeSet<String> =
+                        facts.into_iter().map(|f| f.key).collect();
+                    Some(flow.offer(&filled))
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let flow_note: Option<String> = match (&self.cfg.flow, &flow_offer) {
+            (Some(flow), Some(offer)) => flow.note(offer),
+            _ => None,
+        };
+
         // What this turn accumulates as it goes: the refusals the emitter is
         // shown, the actions it may no longer propose, the calls that really
         // ran (see `builtins::Bookkeeping`).
@@ -230,6 +250,7 @@ impl Engine {
                 recall_applies,
                 scope_holds_facts,
                 active_pending: active_pending.is_some(),
+                flow_tools: flow_offer.as_ref().map(|o| &o.tools),
             });
 
             // b. emitter context: what the model is shown, and the manifest
@@ -252,6 +273,7 @@ impl Engine {
                     turn,
                     tier,
                     active_pending: active_pending.is_some(),
+                    flow_note: flow_note.as_deref(),
                 })
                 .await;
 
