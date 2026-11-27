@@ -808,6 +808,18 @@ impl SqliteStore {
     }
 }
 
+/// What a write did to the text a fact's vector is made from.
+///
+/// A fact is embedded as `fact_text(key, value)`, so a write that moves only
+/// a counter, a timestamp or the state leaves the vector right as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactText {
+    /// A new version, or a write in place with another value.
+    Changed,
+    /// A write in place with the same value.
+    Unchanged,
+}
+
 /// The fact write path's two halves (M11 T1.1), in their own inherent block
 /// because a trait impl takes only the trait's own methods.
 impl SqliteStore {
@@ -816,11 +828,11 @@ impl SqliteStore {
     ///
     /// The split is the point: `put_fact` is now "write, then embed", and the
     /// embed must not be able to hold the lock or fail the write.
-    async fn write_fact(&self, fact: &Fact) -> Result<(), StoreError> {
+    async fn write_fact(&self, fact: &Fact) -> Result<FactText, StoreError> {
         let conn = self.conn.lock().await;
-        let exists: Option<i64> = conn
+        let stored_value: Option<String> = conn
             .query_row(
-                "SELECT 1 FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                "SELECT value_json FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
                 rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
                 |r| r.get(0),
             )
@@ -828,7 +840,11 @@ impl SqliteStore {
             .map_err(io_err)?;
         let value_json = serde_json::to_string(&fact.value).map_err(io_err)?;
         let prov_json = serde_json::to_string(&fact.prov).map_err(io_err)?;
-        if exists.is_some() {
+        if let Some(stored_value) = stored_value {
+            // Compared as values, not as strings: a row written by another
+            // serializer may order or space its JSON differently.
+            let unchanged = serde_json::from_str::<serde_json::Value>(&stored_value)
+                .is_ok_and(|v| v == fact.value);
             conn.execute(
                 "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
                      uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12,
@@ -852,7 +868,11 @@ impl SqliteStore {
                 ],
             )
             .map_err(io_err)?;
-            return Ok(());
+            return Ok(if unchanged {
+                FactText::Unchanged
+            } else {
+                FactText::Changed
+            });
         }
         conn.execute(
             "UPDATE facts SET state = 'superseded', valid_to = ?3
@@ -883,7 +903,7 @@ impl SqliteStore {
             ],
         )
         .map_err(io_err)?;
-        Ok(())
+        Ok(FactText::Changed)
     }
 
     /// M11 T1.1: one vector for the fact just written, best effort.
@@ -900,7 +920,19 @@ impl SqliteStore {
     /// Only a live version is embedded. A superseded or forgotten row is a
     /// value the engine has stopped believing, and a vector for it would be a
     /// retriever able to return what `facts()` will not.
-    async fn embed_fact(&self, fact: &Fact) {
+    ///
+    /// A write that left the text as it was sends nothing when the row
+    /// already has a vector for this model: counting a use on the five facts
+    /// a reply showed is five SQL updates, not five round trips. A row with
+    /// no vector for this model — written while the service was down, or
+    /// before a change of model — gets one on its next write of any kind.
+    ///
+    /// Known limit: a write in place with another value whose embedding
+    /// fails keeps the old vector, and a later unchanged write does not
+    /// replace it. The old vector is kept on purpose, so the fact stays
+    /// reachable by the vector arm; a new version is a new row and is not
+    /// affected.
+    async fn embed_fact(&self, fact: &Fact, text: FactText) {
         let Some(enc) = self.encoder.clone() else {
             return;
         };
@@ -908,20 +940,26 @@ impl SqliteStore {
             return;
         }
         let model = enc.model().to_string();
-        let row_id: Option<i64> = {
+        let row: Option<(i64, bool)> = {
             let conn = self.conn.lock().await;
             conn.query_row(
-                "SELECT rowid FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
-                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
-                |r| r.get(0),
+                "SELECT f.rowid, EXISTS (
+                     SELECT 1 FROM embeddings em
+                     WHERE em.kind = 'fact' AND em.row_id = f.rowid AND em.model = ?4)
+                 FROM facts f WHERE f.scope = ?1 AND f.key = ?2 AND f.valid_from = ?3",
+                rusqlite::params![fact.scope, fact.key, fact.valid_from.0, model],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .ok()
             .flatten()
         };
-        let Some(row_id) = row_id else {
+        let Some((row_id, has_vector)) = row else {
             return;
         };
+        if text == FactText::Unchanged && has_vector {
+            return;
+        }
         let text = fact_text(&fact.key, &fact.value);
         let Ok(vectors) = enc.embed(&[text], "passage").await else {
             return;
@@ -1467,7 +1505,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError> {
-        self.write_fact(&fact).await?;
+        let text = self.write_fact(&fact).await?;
         // M11 T1.1: the write-time vector, best effort and after the lock is
         // gone. A fact write that failed because the embedder was unreachable
         // would be a memory lost to a retrieval optimisation, so this can
@@ -1475,7 +1513,7 @@ impl MemoryStore for SqliteStore {
         // connection across the round trip. The pass's backfill is what
         // catches whatever this misses, which is what makes it safe to be
         // best effort.
-        self.embed_fact(&fact).await;
+        self.embed_fact(&fact, text).await;
         Ok(())
     }
 
@@ -2771,5 +2809,139 @@ mod tests {
         assert!(live
             .iter()
             .any(|(f, _)| f.key == "campaign.budget" && f.valid_from == Timestamp(9)));
+    }
+
+    // ----- RC-1: a write that keeps the text is not embedded again --------
+
+    fn embeds(enc: &ScriptedEncoder) -> usize {
+        enc.embeds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn live_vector(store: &SqliteStore, model: &str, key: &str) -> Option<Vec<f32>> {
+        store
+            .fact_vectors("global", model)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(f, _)| f.key == key)
+            .map(|(_, v)| v)
+    }
+
+    /// What the reply does to every fact it showed: a use counted, nothing
+    /// else. The text a vector is made from did not move, so no request.
+    #[tokio::test]
+    async fn a_write_that_only_counts_a_use_is_not_embedded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+        assert_eq!(embeds(&enc), 3);
+
+        let mut f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        f.uses += 1;
+        f.last_used = Timestamp(99);
+        f.confidence = 0.5;
+        f.last_validated = Timestamp(99);
+        f.exposures += 1;
+        f.state = FactState::Cold;
+        store.put_fact(f.clone()).await.unwrap();
+
+        assert_eq!(embeds(&enc), 3, "a counter write sent a request");
+        let stored = store.facts("global", "campaign.budget").await.unwrap();
+        assert_eq!(stored[0].uses, 1, "the write itself still lands");
+        assert_eq!(
+            live_vector(&store, "bge-m3", "campaign.budget").await,
+            Some(ScriptedEncoder::vector(&fact_text(&f.key, &f.value)))
+        );
+    }
+
+    /// A new value is a new text, whether it is written in place or as a
+    /// new version, and its vector replaces the old one.
+    #[tokio::test]
+    async fn a_changed_value_is_embedded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+
+        // In place: the same version, another value.
+        let mut f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        f.value = serde_json::json!("the money is due on friday");
+        store.put_fact(f.clone()).await.unwrap();
+        assert_eq!(embeds(&enc), 4);
+        assert_eq!(
+            live_vector(&store, "bge-m3", "campaign.budget").await,
+            Some(ScriptedEncoder::vector(&fact_text(&f.key, &f.value))),
+            "the vector is the new text's"
+        );
+
+        // As a new version.
+        let g = a_fact("user.name", "who is called Jana", 9);
+        store.put_fact(g.clone()).await.unwrap();
+        assert_eq!(embeds(&enc), 5);
+        assert_eq!(
+            live_vector(&store, "bge-m3", "user.name").await,
+            Some(ScriptedEncoder::vector(&fact_text(&g.key, &g.value)))
+        );
+    }
+
+    /// The vector check is per model: a fact written while the service was
+    /// down, or before a change of model, gets its vector on the next write
+    /// even when that write leaves the text as it was.
+    #[tokio::test]
+    async fn a_fact_with_no_vector_for_this_model_gets_one_on_its_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.sqlite");
+        {
+            let down = std::sync::Arc::new(ScriptedEncoder {
+                down: true,
+                ..ScriptedEncoder::new("bge-m3")
+            });
+            let store = SqliteStore::open(&path).unwrap().with_encoder(down);
+            seed_facts(&store).await;
+            assert!(store
+                .fact_vectors("global", "bge-m3")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        let count_a_use = |mut f: Fact| {
+            f.uses += 1;
+            f
+        };
+
+        let up = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&path).unwrap().with_encoder(up.clone());
+        let f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        store.put_fact(count_a_use(f)).await.unwrap();
+        assert_eq!(
+            embeds(&up),
+            1,
+            "written with the service down: embedded now"
+        );
+        assert!(live_vector(&store, "bge-m3", "campaign.budget")
+            .await
+            .is_some());
+        drop(store);
+
+        let other = std::sync::Arc::new(ScriptedEncoder::new("e5-small"));
+        let store = SqliteStore::open(&path)
+            .unwrap()
+            .with_encoder(other.clone());
+        let f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        store.put_fact(count_a_use(f)).await.unwrap();
+        assert_eq!(
+            embeds(&other),
+            1,
+            "a vector for bge-m3 is not one for e5-small"
+        );
+        assert!(live_vector(&store, "e5-small", "campaign.budget")
+            .await
+            .is_some());
     }
 }

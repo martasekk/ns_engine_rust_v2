@@ -262,7 +262,7 @@ async fn probe_a_task_turn_that_answers_at_once() {
         Counts {
             queries: 2,
             reranks: 2,
-            passages: 5
+            passages: 0
         },
         "{:?}",
         calls.lock().unwrap()
@@ -286,34 +286,42 @@ async fn probe_a_task_turn_with_one_tool_call() {
         Counts {
             queries: 3,
             reranks: 3,
-            passages: 5
+            passages: 0
         },
         "{:?}",
         calls.lock().unwrap()
     );
 }
 
-/// A Chat-tier turn, with `[recall] hybrid` on and off: no search reaches the
-/// encoder, and the reply's use count still does.
+/// RC-1: the reply counts a use on every fact it showed, and a write that
+/// keeps the text sends no request, on any tier. On the Chat tier, with
+/// `[recall] hybrid` on or off, the turn reaches the encoder not at all.
 #[tokio::test]
-async fn probe_a_chat_turn() {
-    for hybrid in [true, false] {
+async fn a_turn_embeds_no_fact_whose_text_did_not_change() {
+    for (tier, hybrid) in [(Tier::Task, true), (Tier::Chat, true), (Tier::Chat, false)] {
         let dir = tempfile::tempdir().unwrap();
         let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
-        ask(&engine(store.clone(), Tier::Chat, hybrid, vec![]), "s").await;
+        ask(&engine(store.clone(), tier, hybrid, vec![]), "s").await;
 
-        let shown = used(&store).await;
-        assert_eq!(shown, 5, "hybrid = {hybrid}");
+        assert_eq!(used(&store).await, 5, "{tier:?}, hybrid = {hybrid}");
+        let c = counts(&calls);
         assert_eq!(
-            counts(&calls),
-            Counts {
-                queries: 0,
-                reranks: 0,
-                passages: 5
-            },
-            "hybrid = {hybrid}: {:?}",
+            c.passages,
+            0,
+            "{tier:?}, hybrid = {hybrid}: {:?}",
             calls.lock().unwrap()
         );
+        if tier == Tier::Chat {
+            assert_eq!(
+                c,
+                Counts {
+                    queries: 0,
+                    reranks: 0,
+                    passages: 0
+                },
+                "hybrid = {hybrid}"
+            );
+        }
     }
 }
 
@@ -344,28 +352,23 @@ async fn probe_a_deep_turn_with_history() {
         Counts {
             queries: 3,
             reranks: 3,
-            passages: 5
+            passages: 0
         },
         "{:?}",
         calls.lock().unwrap()
     );
 }
 
-/// The store alone: a write that only moves a counter is embedded again.
+/// RC-1, the store alone: a write that only moves a counter sends nothing.
 #[tokio::test]
-async fn probe_put_fact_embeds_a_write_that_only_moves_a_counter() {
+async fn a_write_that_only_moves_a_counter_sends_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
     let mut f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
     f.uses += 1;
     f.last_used = Timestamp(99);
     store.put_fact(f).await.unwrap();
-    assert_eq!(
-        *calls.lock().unwrap(),
-        vec![Call::Passages(vec![
-            "campaign budget 2000 crowns for the whole campaign".into()
-        ])]
-    );
+    assert_eq!(*calls.lock().unwrap(), vec![]);
 }
 
 /// Not one of the three costs, found while reading: a live fact with no

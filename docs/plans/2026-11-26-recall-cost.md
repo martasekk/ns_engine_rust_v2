@@ -1,7 +1,6 @@
 # Recall cost: three places where a turn pays the encoder for nothing
 
-**Date:** 2026-11-26. **State:** the three costs are confirmed by tests; the plan waits for the owner's go-ahead;
-no fix is written. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
+**Date:** 2026-11-26. **State:** approved 2026-11-27 with D1 to D4 as recommended; RC-1 done, RC-2 and RC-3 in progress. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
 **Step ids:** `RC-<n>`. **Branch for the work:** `recall-cost`, in the worktree
 `.claude/worktrees/exciting-williamson-2b97b6` (commit per step after its gates pass; no push, no merge).
 **Related:** `2026-11-26-retrieval-split-eval.md` (main checkout, uncommitted) measured these costs and only
@@ -22,7 +21,7 @@ are the eval's own estimate from per-call times.
 
 ## 1. What was confirmed
 
-Seven probe tests in `crates/engine/tests/recall_cost.rs` (new file, not committed yet) run whole turns against
+Seven probe tests in `crates/engine/tests/recall_cost.rs` (committed with this plan in `aef7324`) run whole turns against
 `SqliteStore` with an encoder that records every call. The store holds six facts, all with a vector; five are shown.
 All seven pass on `cbdc0ae`, so the numbers in the "today" columns are what the shipped code does.
 
@@ -195,3 +194,15 @@ these commits.
   the two crates, target folder `C:/Users/Acemagic/cargo-targets/recall-cost`: `cargo test -p ns-memory-sqlite -p
   ns-engine` green (29 in the store; 74, 10, 4 and 96 in the engine, plus the 7 probes); format and clippy red in
   older code as D4 lists. Not run: the tests of `ns-testkit`, `ns-evolution` and `ns-app`.
+- 2026-11-27: the owner approved D1 to D4 as recommended. **RC-1 done.** `write_fact` returns `FactText`
+  (in-place writes compare the stored and the new value as JSON values); `embed_fact` skips an unchanged text when
+  the row has a vector for the encoder's model. New store tests: `a_write_that_only_counts_a_use_is_not_embedded_again`,
+  `a_changed_value_is_embedded_again`, `a_fact_with_no_vector_for_this_model_gets_one_on_its_next_write`. In
+  `recall_cost.rs`: the Chat probe became `a_turn_embeds_no_fact_whose_text_did_not_change` (Task and Chat tiers),
+  `probe_put_fact_embeds_a_write_that_only_moves_a_counter` became its inverse
+  `a_write_that_only_moves_a_counter_sends_nothing`, and the Task and Deep probes' fact count went from 5 to 0 (their
+  question and rerank counts are unchanged until RC-2). Known limit, written on `embed_fact`: a write in place with
+  another value whose embedding fails keeps the old vector, and a later unchanged write does not replace it (a new
+  version is a new row and is not affected). Gates: `cargo test -p ns-memory-sqlite -p ns-engine` green (32 in the
+  store; 74, 10, 4, 7 and 96 in the engine); format still 14 and 6 places, none in new code; clippy reports only
+  `turn_loop.rs:3866`.
