@@ -83,6 +83,141 @@ struct TurnVector {
     vector: Vec<f32>,
 }
 
+/// How many answers of each kind [`MemoEncoder`] keeps.
+const MEMO_ENTRIES: usize = 32;
+
+/// RC-2: the encoder a store was given, with its last answers kept.
+///
+/// One turn searches the same facts with the same question once for every
+/// emitter call and once more for the reply, and a Deep turn embeds that
+/// question again for its turn search. Every one of those searches asked the
+/// service the same thing. This keeps the last [`MEMO_ENTRIES`] question
+/// vectors and the last [`MEMO_ENTRIES`] rerank answers, in memory only, and
+/// answers a repeat from them.
+///
+/// A rerank answer is found again only for the same question, the same
+/// documents in the same order and the same `k`; the documents are kept as
+/// a hash, not as text. A fact written between two searches changes the
+/// documents, so the rerank is asked again. Passage embeddings — the
+/// backfill and the write path — go straight through, and a failed call is
+/// never kept.
+struct MemoEncoder {
+    inner: std::sync::Arc<dyn nscore::TextEncoder>,
+    memo: std::sync::Mutex<Memo>,
+}
+
+#[derive(Default)]
+struct Memo {
+    queries: std::collections::VecDeque<(String, Vec<f32>)>,
+    reranks: std::collections::VecDeque<(RerankKey, Vec<(usize, f32)>)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RerankKey {
+    query: String,
+    docs_hash: u64,
+    docs_len: usize,
+    k: usize,
+}
+
+impl RerankKey {
+    fn new(query: &str, docs: &[String], k: usize) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        docs.hash(&mut h);
+        Self {
+            query: query.to_string(),
+            docs_hash: h.finish(),
+            docs_len: docs.len(),
+            k,
+        }
+    }
+}
+
+/// The kept answer for `key`, moved to the newest end.
+fn memo_get<K: PartialEq, V: Clone>(
+    list: &mut std::collections::VecDeque<(K, V)>,
+    key: &K,
+) -> Option<V> {
+    let at = list.iter().position(|(k, _)| k == key)?;
+    let entry = list.remove(at)?;
+    let value = entry.1.clone();
+    list.push_back(entry);
+    Some(value)
+}
+
+/// Keep `value` for `key` as the newest answer, dropping the oldest past
+/// [`MEMO_ENTRIES`].
+fn memo_put<K: PartialEq, V>(list: &mut std::collections::VecDeque<(K, V)>, key: K, value: V) {
+    if let Some(at) = list.iter().position(|(k, _)| *k == key) {
+        list.remove(at);
+    }
+    list.push_back((key, value));
+    while list.len() > MEMO_ENTRIES {
+        list.pop_front();
+    }
+}
+
+impl MemoEncoder {
+    fn new(inner: std::sync::Arc<dyn nscore::TextEncoder>) -> Self {
+        Self {
+            inner,
+            memo: Default::default(),
+        }
+    }
+
+    /// The lock is never held across an await. A panic while it was held
+    /// leaves at worst a stale list, which is still a valid one.
+    fn memo(&self) -> std::sync::MutexGuard<'_, Memo> {
+        self.memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl nscore::TextEncoder for MemoEncoder {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    async fn embed(&self, texts: &[String], kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+        let [text] = texts else {
+            return self.inner.embed(texts, kind).await;
+        };
+        if kind != "query" {
+            return self.inner.embed(texts, kind).await;
+        }
+        let kept = memo_get(&mut self.memo().queries, text);
+        if let Some(v) = kept {
+            return Ok(vec![v]);
+        }
+        let out = self.inner.embed(texts, kind).await?;
+        if let [v] = out.as_slice() {
+            if !v.is_empty() {
+                memo_put(&mut self.memo().queries, text.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, StoreError> {
+        let key = RerankKey::new(query, docs, k);
+        let kept = memo_get(&mut self.memo().reranks, &key);
+        if let Some(ranked) = kept {
+            return Ok(ranked);
+        }
+        let out = self.inner.rerank(query, docs, k).await?;
+        memo_put(&mut self.memo().reranks, key, out.clone());
+        Ok(out)
+    }
+}
+
 /// What a digest is embedded as: the same three fields its FTS index covers,
 /// and nothing else. Not the JSON — an index over a blob also matches on
 /// field names, and a vector over one would put two digests near each other
@@ -254,8 +389,11 @@ impl SqliteStore {
 
     /// M8 T3.1/T3.2: run the hybrid path with this encoder. Without one the
     /// store behaves exactly as it did before Phase 3 existed.
+    ///
+    /// The encoder is kept behind [`MemoEncoder`], so a question asked again
+    /// is not embedded again and a list reranked again is not sent again.
     pub fn with_encoder(mut self, encoder: std::sync::Arc<dyn nscore::TextEncoder>) -> Self {
-        self.encoder = Some(encoder);
+        self.encoder = Some(std::sync::Arc::new(MemoEncoder::new(encoder)));
         self
     }
 
@@ -2361,6 +2499,13 @@ mod tests {
         delay_ms: u64,
         /// When set, every call fails the way an unreachable service does.
         down: bool,
+        /// Reranks answered, as `embeds` counts embeddings.
+        reranks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// This many calls fail before any succeeds.
+        failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Added to `delay_ms` for an embedding only, or a rerank only.
+        embed_delay_ms: u64,
+        rerank_delay_ms: u64,
     }
 
     const CONCEPTS: &[&[&str]] = &[
@@ -2376,7 +2521,21 @@ mod tests {
                 embeds: Default::default(),
                 delay_ms: 0,
                 down: false,
+                reranks: Default::default(),
+                failures: Default::default(),
+                embed_delay_ms: 0,
+                rerank_delay_ms: 0,
             }
+        }
+        /// One failure off `failures`, if any are left.
+        fn fails_now(&self) -> bool {
+            self.failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
         }
         fn vector(text: &str) -> Vec<f32> {
             let tokens = nscore::query_tokens(text);
@@ -2405,11 +2564,12 @@ mod tests {
             &self.model
         }
         async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
-            if self.down {
+            if self.down || self.fails_now() {
                 return Err(StoreError::Io("connection refused".into()));
             }
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let delay = self.delay_ms + self.embed_delay_ms;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             self.embeds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2421,12 +2581,15 @@ mod tests {
             docs: &[String],
             k: usize,
         ) -> Result<Vec<(usize, f32)>, StoreError> {
-            if self.down {
+            if self.down || self.fails_now() {
                 return Err(StoreError::Io("connection refused".into()));
             }
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let delay = self.delay_ms + self.rerank_delay_ms;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
+            self.reranks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let q = Self::vector(query);
             let mut scored: Vec<(usize, f32)> = docs
                 .iter()
@@ -2943,5 +3106,142 @@ mod tests {
         assert!(live_vector(&store, "e5-small", "campaign.budget")
             .await
             .is_some());
+    }
+
+    // ----- RC-2: one embedding and one rerank for one question ------------
+
+    fn reranks(enc: &ScriptedEncoder) -> usize {
+        enc.reranks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A turn searches the same facts with the same question for every
+    /// emitter call and for the reply: the question is embedded once.
+    #[tokio::test]
+    async fn the_same_question_is_embedded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+        let sid = SessionId("s".into());
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        let before = embeds(&enc);
+
+        let q = "how much money";
+        let first = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let second = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(embeds(&enc), before + 1);
+        // The turn search of a Deep turn asks the same question.
+        store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            embeds(&enc),
+            before + 1,
+            "the turn search embedded it again"
+        );
+        // Another question is another request.
+        store
+            .search_facts_hybrid("global", "deadline friday", 5)
+            .await
+            .unwrap();
+        assert_eq!(embeds(&enc), before + 2);
+    }
+
+    /// The same documents in the same order are reranked once; a fact
+    /// written between two searches changes them, and the rerank is asked
+    /// again and sees the new value.
+    #[tokio::test]
+    async fn the_same_list_is_reranked_once_and_a_changed_fact_is_reranked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+
+        let q = "how much money";
+        let first = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let second = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(reranks(&enc), 1);
+
+        store
+            .put_fact(a_fact("campaign.budget", "4000 crowns of money", 9))
+            .await
+            .unwrap();
+        let third = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(reranks(&enc), 2, "the documents changed");
+        assert_eq!(
+            third.first().map(|f| f.value.clone()),
+            Some(serde_json::json!("4000 crowns of money"))
+        );
+    }
+
+    /// A call that failed is asked again next time, and its later answer is
+    /// the one kept.
+    #[tokio::test]
+    async fn a_failed_call_is_not_kept() {
+        let inner = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let memo = MemoEncoder::new(inner.clone());
+        let q = vec!["how much money".to_string()];
+        let docs = vec![
+            "campaign budget 2000 crowns".to_string(),
+            "user name".to_string(),
+        ];
+
+        inner
+            .failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(memo.embed(&q, "query").await.is_err());
+        let v = memo.embed(&q, "query").await.unwrap();
+        assert_eq!(
+            embeds(&inner),
+            1,
+            "the failure was not answered from memory"
+        );
+        assert_eq!(memo.embed(&q, "query").await.unwrap(), v);
+        assert_eq!(embeds(&inner), 1, "the answer after it was kept");
+
+        inner
+            .failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(memo.rerank(&q[0], &docs, 2).await.is_err());
+        let ranked = memo.rerank(&q[0], &docs, 2).await.unwrap();
+        assert_eq!(reranks(&inner), 1);
+        assert_eq!(memo.rerank(&q[0], &docs, 2).await.unwrap(), ranked);
+        assert_eq!(reranks(&inner), 1);
+
+        // Passages are never kept: the backfill and the write path count
+        // their own requests.
+        memo.embed(&q, "passage").await.unwrap();
+        memo.embed(&q, "passage").await.unwrap();
+        assert_eq!(embeds(&inner), 3);
+    }
+
+    /// The memory is bounded: past [`MEMO_ENTRIES`] newer questions, the
+    /// oldest is asked again.
+    #[tokio::test]
+    async fn the_memo_keeps_the_last_answers_only() {
+        let inner = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let memo = MemoEncoder::new(inner.clone());
+        for i in 0..=MEMO_ENTRIES {
+            memo.embed(&[format!("question {i}")], "query")
+                .await
+                .unwrap();
+        }
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 1);
+        memo.embed(&[format!("question {MEMO_ENTRIES}")], "query")
+            .await
+            .unwrap();
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 1, "the newest is kept");
+        memo.embed(&["question 0".to_string()], "query")
+            .await
+            .unwrap();
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 2, "the oldest was dropped");
     }
 }

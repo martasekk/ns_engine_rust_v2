@@ -245,52 +245,36 @@ async fn ask(e: &Engine, session: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Probes: what the shipped path does today (2026-11-26), before any fix.
+// What one turn sends. The probes of 2026-11-26 counted, on `cbdc0ae`:
+// Task answering at once 2 questions, 2 reranks, 5 facts; Task with one tool
+// call 3, 3, 5; Deep with history 3, 3, 5; Chat 0, 0, 5. RC-1 to RC-3 turned
+// them into the tests below.
 // ---------------------------------------------------------------------------
 
-/// A Task-tier turn that answers at once: one prompt, one reply.
+/// RC-2: a Task-tier turn searches once for every emitter call and once for
+/// the reply, all with the same question over the same facts. The question
+/// is embedded once and the list reranked once, answering at once (one
+/// prompt, one reply) or after one tool call (two prompts, one reply).
 #[tokio::test]
-async fn probe_a_task_turn_that_answers_at_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
-    ask(&engine(store.clone(), Tier::Task, true, vec![]), "s").await;
+async fn a_task_turn_embeds_the_question_once_and_reranks_once() {
+    for script in [vec![], vec![echo("hi")]] {
+        let steps = script.len();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
+        ask(&engine(store.clone(), Tier::Task, true, script), "s").await;
 
-    let shown = used(&store).await;
-    assert_eq!(shown, 5, "relevant_max facts were shown");
-    assert_eq!(
-        counts(&calls),
-        Counts {
-            queries: 2,
-            reranks: 2,
-            passages: 0
-        },
-        "{:?}",
-        calls.lock().unwrap()
-    );
-}
-
-/// A Task-tier turn that calls one tool and then answers: two prompts.
-#[tokio::test]
-async fn probe_a_task_turn_with_one_tool_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
-    ask(
-        &engine(store.clone(), Tier::Task, true, vec![echo("hi")]),
-        "s",
-    )
-    .await;
-
-    assert_eq!(used(&store).await, 5);
-    assert_eq!(
-        counts(&calls),
-        Counts {
-            queries: 3,
-            reranks: 3,
-            passages: 0
-        },
-        "{:?}",
-        calls.lock().unwrap()
-    );
+        assert_eq!(used(&store).await, 5, "relevant_max facts were shown");
+        assert_eq!(
+            counts(&calls),
+            Counts {
+                queries: 1,
+                reranks: 1,
+                passages: 0
+            },
+            "{steps} tool calls: {:?}",
+            calls.lock().unwrap()
+        );
+    }
 }
 
 /// RC-1: the reply counts a use on every fact it showed, and a write that
@@ -325,10 +309,11 @@ async fn a_turn_embeds_no_fact_whose_text_did_not_change() {
     }
 }
 
-/// A Deep-tier turn with older turns to recall: the turn search embeds the
-/// same question a third time.
+/// RC-2: a Deep-tier turn with older turns to recall. The turn search asks
+/// the facts' question once more; it is embedded once, and the two lists,
+/// facts and turns, are reranked once each.
 #[tokio::test]
-async fn probe_a_deep_turn_with_history() {
+async fn a_deep_turn_embeds_the_question_once() {
     let dir = tempfile::tempdir().unwrap();
     let (store, calls) = seeded(&dir, RecordingEncoder::default(), Recall::default()).await;
     let sid = SessionId("s".into());
@@ -350,8 +335,8 @@ async fn probe_a_deep_turn_with_history() {
     assert_eq!(
         counts(&calls),
         Counts {
-            queries: 3,
-            reranks: 3,
+            queries: 1,
+            reranks: 2,
             passages: 0
         },
         "{:?}",

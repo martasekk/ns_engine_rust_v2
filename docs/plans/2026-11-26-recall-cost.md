@@ -1,6 +1,6 @@
 # Recall cost: three places where a turn pays the encoder for nothing
 
-**Date:** 2026-11-26. **State:** approved 2026-11-27 with D1 to D4 as recommended; RC-1 done, RC-2 and RC-3 in progress. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
+**Date:** 2026-11-26. **State:** approved 2026-11-27 with D1 to D4 as recommended; RC-1 and RC-2 done, RC-3 in progress. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
 **Step ids:** `RC-<n>`. **Branch for the work:** `recall-cost`, in the worktree
 `.claude/worktrees/exciting-williamson-2b97b6` (commit per step after its gates pass; no push, no merge).
 **Related:** `2026-11-26-retrieval-split-eval.md` (main checkout, uncommitted) measured these costs and only
@@ -206,3 +206,13 @@ these commits.
   version is a new row and is not affected). Gates: `cargo test -p ns-memory-sqlite -p ns-engine` green (32 in the
   store; 74, 10, 4, 7 and 96 in the engine); format still 14 and 6 places, none in new code; clippy reports only
   `turn_loop.rs:3866`.
+- 2026-11-27: **RC-2 done.** `with_encoder` wraps the encoder in the private `MemoEncoder`: the last 32 query
+  vectors (a single-text `embed(.., "query")`) and the last 32 rerank answers (keyed by question, a hash and the count
+  of the documents in order, and `k`), in memory, oldest dropped first; passages and failed calls go straight through.
+  New store tests: `the_same_question_is_embedded_once`,
+  `the_same_list_is_reranked_once_and_a_changed_fact_is_reranked_again`, `a_failed_call_is_not_kept`,
+  `the_memo_keeps_the_last_answers_only`; the test encoder gained a rerank counter, a fail-next count and separate
+  embed and rerank delays (new fields; no existing assertion changed). In `recall_cost.rs` the two Task probes became
+  `a_task_turn_embeds_the_question_once_and_reranks_once` (at once and with one tool call: 1, 1, 0) and the Deep probe
+  became `a_deep_turn_embeds_the_question_once` (1, 2, 0). Gates: tests green (36 in the store; 74, 10, 4, 6 and 96 in
+  the engine); format 14 and 6; clippy only `turn_loop.rs:3866`.
