@@ -83,6 +83,26 @@ struct TurnVector {
     vector: Vec<f32>,
 }
 
+/// RC-3: run one encoder call on its own task and wait for it until
+/// `deadline`, no later.
+///
+/// The call is not cancelled when the wait ends. It finishes on its own and
+/// ends by the client's own timeout, so the local client still sees every
+/// call it made and its two-failures rule still holds, and [`MemoEncoder`]
+/// keeps a late answer for the next search of the same question. An encoder
+/// that panics costs the search its hybrid result, not the turn.
+async fn within<T: Send + 'static>(
+    deadline: tokio::time::Instant,
+    what: &'static str,
+    call: impl std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout_at(deadline, tokio::spawn(call)).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => Err(StoreError::Io(format!("{what} did not finish: {e}"))),
+        Err(_) => Err(StoreError::Io(format!("{what} over budget"))),
+    }
+}
+
 /// How many answers of each kind [`MemoEncoder`] keeps.
 const MEMO_ENTRIES: usize = 32;
 
@@ -791,14 +811,13 @@ impl SqliteStore {
     /// `(kind, row_id, model)` and only a rowid is unique across scopes.
     async fn hybrid_fact_hits(
         &self,
-        enc: &dyn nscore::TextEncoder,
+        enc: &std::sync::Arc<dyn nscore::TextEncoder>,
         scope: &str,
         query: &str,
         k: usize,
     ) -> Result<Option<Vec<Fact>>, StoreError> {
-        let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
-        let over = |msg: &str| StoreError::Io(format!("fact recall over budget: {msg}"));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.recall.rerank_budget_ms);
 
         let stored = self.fact_vectors(scope, enc.model()).await?;
         if stored.is_empty() {
@@ -820,10 +839,13 @@ impl SqliteStore {
         .map(key_of)
         .collect();
 
-        let q = enc.embed(&[query.to_string()], "query").await?;
-        if started.elapsed() > budget {
-            return Err(over("embed"));
-        }
+        let q = {
+            let (enc, texts) = (enc.clone(), vec![query.to_string()]);
+            within(deadline, "fact recall embed", async move {
+                enc.embed(&texts, "query").await
+            })
+            .await?
+        };
         let q = q.into_iter().next().unwrap_or_default();
 
         let mut scored: Vec<((String, u64), f32)> = stored
@@ -854,10 +876,13 @@ impl SqliteStore {
         }
 
         let docs: Vec<String> = rows.iter().map(|f| fact_text(&f.key, &f.value)).collect();
-        let ranked = enc.rerank(query, &docs, k).await?;
-        if started.elapsed() > budget {
-            return Err(over("rerank"));
-        }
+        let ranked = {
+            let (enc, query) = (enc.clone(), query.to_string());
+            within(deadline, "fact recall rerank", async move {
+                enc.rerank(&query, &docs, k).await
+            })
+            .await?
+        };
         Ok(Some(
             ranked
                 .into_iter()
@@ -872,14 +897,13 @@ impl SqliteStore {
     /// included, is an `Err` the caller turns back into the lexical list.
     async fn hybrid_hits(
         &self,
-        enc: &dyn nscore::TextEncoder,
+        enc: &std::sync::Arc<dyn nscore::TextEncoder>,
         sessions: &[SessionId],
         query: &str,
         k: usize,
     ) -> Result<Option<Vec<nscore::TurnHit>>, StoreError> {
-        let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
-        let over = |msg: &str| StoreError::Io(format!("recall over budget: {msg}"));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.recall.rerank_budget_ms);
 
         let stored = self.turn_vectors(sessions, enc.model()).await?;
         if stored.is_empty() {
@@ -888,10 +912,13 @@ impl SqliteStore {
         let coarse = self.recall.coarse_k.max(k);
         let lexical = self.lexical_rows(sessions, query, coarse).await?;
 
-        let q = enc.embed(&[query.to_string()], "query").await?;
-        if started.elapsed() > budget {
-            return Err(over("embed"));
-        }
+        let q = {
+            let (enc, texts) = (enc.clone(), vec![query.to_string()]);
+            within(deadline, "recall embed", async move {
+                enc.embed(&texts, "query").await
+            })
+            .await?
+        };
         let q = q.into_iter().next().unwrap_or_default();
 
         let mut scored: Vec<(i64, f32)> = stored
@@ -924,10 +951,13 @@ impl SqliteStore {
         }
 
         let docs: Vec<String> = rows.iter().map(|t| t.text.clone()).collect();
-        let ranked = enc.rerank(query, &docs, k).await?;
-        if started.elapsed() > budget {
-            return Err(over("rerank"));
-        }
+        let ranked = {
+            let (enc, query) = (enc.clone(), query.to_string());
+            within(deadline, "recall rerank", async move {
+                enc.rerank(&query, &docs, k).await
+            })
+            .await?
+        };
         Ok(Some(
             ranked
                 .into_iter()
@@ -1307,7 +1337,7 @@ impl MemoryStore for SqliteStore {
         if k == 0 || sessions.is_empty() {
             return Ok(lexical);
         }
-        match self.hybrid_hits(enc.as_ref(), sessions, query, k).await {
+        match self.hybrid_hits(&enc, sessions, query, k).await {
             Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
             // Both the "nothing stored" and the "service said no" branches
             // land here, and both mean the same thing to a caller: the
@@ -1731,7 +1761,7 @@ impl MemoryStore for SqliteStore {
         if k == 0 {
             return Ok(lexical);
         }
-        match self.hybrid_fact_hits(enc.as_ref(), scope, query, k).await {
+        match self.hybrid_fact_hits(&enc, scope, query, k).await {
             Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
             _ => Ok(lexical),
         }
@@ -3243,5 +3273,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(embeds(&inner), MEMO_ENTRIES + 2, "the oldest was dropped");
+    }
+
+    // ----- RC-3: a search stops waiting when its budget is spent ----------
+
+    /// Facts and turns, embedded by a fast encoder, then reopened with
+    /// `slow` on a 50 ms budget: the only slow calls are the searches' own.
+    async fn slow_store(
+        slow: ScriptedEncoder,
+    ) -> (
+        tempfile::TempDir,
+        SqliteStore,
+        SessionId,
+        std::sync::Arc<ScriptedEncoder>,
+    ) {
+        let (dir, store, sid) =
+            corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new("bge-m3"))));
+        seed_facts(&store).await;
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        drop(store);
+        let slow = std::sync::Arc::new(slow);
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(slow.clone())
+            .with_recall(Recall {
+                coarse_k: 10,
+                rerank_budget_ms: 50,
+            });
+        (dir, store, sid, slow)
+    }
+
+    /// A 2 s call on a 50 ms budget, for both searches: each is back well
+    /// under a second with the word-match list.
+    async fn assert_back_within_budget(slow: ScriptedEncoder, what: &str) {
+        let (_d, store, sid, _enc) = slow_store(slow).await;
+        let q = "what is our budget for the campaign";
+
+        let lexical = store.search_facts("global", q, 5).await.unwrap();
+        let started = std::time::Instant::now();
+        let hybrid = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(hybrid, lexical, "slow {what}, facts: the word-match list");
+        assert!(took.as_millis() < 1000, "slow {what}, facts: {took:?}");
+
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        let started = std::time::Instant::now();
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(hybrid, lexical, "slow {what}, turns: the word-match list");
+        assert!(took.as_millis() < 1000, "slow {what}, turns: {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_embedding_does_not_hold_a_search_past_its_budget() {
+        assert_back_within_budget(
+            ScriptedEncoder {
+                embed_delay_ms: 2000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            "embedding",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_rerank_does_not_hold_a_search_past_its_budget() {
+        assert_back_within_budget(
+            ScriptedEncoder {
+                rerank_delay_ms: 2000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            "rerank",
+        )
+        .await;
+    }
+
+    /// The late call is not cancelled: it finishes after the search gave up,
+    /// and the next search of the same question uses its answer.
+    #[tokio::test]
+    async fn a_late_answer_is_kept_for_the_next_search() {
+        let (_d, store, sid, enc) = slow_store(ScriptedEncoder {
+            embed_delay_ms: 300,
+            ..ScriptedEncoder::new("bge-m3")
+        })
+        .await;
+        let q = "how much money are we allowed to spend";
+        let target = "our budget for the whole campaign is 2000 crowns";
+
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        let first = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(first, lexical, "the embedding was late");
+        assert_eq!(embeds(&enc), 0, "and had not answered yet");
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(embeds(&enc), 1, "the late call finished on its own");
+
+        let second = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(embeds(&enc), 1, "the second search used the kept answer");
+        assert_eq!(second.first().map(|h| h.text.as_str()), Some(target));
     }
 }

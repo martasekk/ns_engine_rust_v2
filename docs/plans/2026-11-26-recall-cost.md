@@ -1,6 +1,6 @@
 # Recall cost: three places where a turn pays the encoder for nothing
 
-**Date:** 2026-11-26. **State:** approved 2026-11-27 with D1 to D4 as recommended; RC-1 and RC-2 done, RC-3 in progress. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
+**Date:** 2026-11-26. **State:** approved 2026-11-27 with D1 to D4 as recommended; RC-1, RC-2 and RC-3 done and committed on `recall-cost`; not pushed, not merged. **Base:** `main` at `cbdc0ae`. **Rules:** `~/.claude/CLAUDE.md`, `~/.claude/rules/rust.md`.
 **Step ids:** `RC-<n>`. **Branch for the work:** `recall-cost`, in the worktree
 `.claude/worktrees/exciting-williamson-2b97b6` (commit per step after its gates pass; no push, no merge).
 **Related:** `2026-11-26-retrieval-split-eval.md` (main checkout, uncommitted) measured these costs and only
@@ -216,3 +216,13 @@ these commits.
   `a_task_turn_embeds_the_question_once_and_reranks_once` (at once and with one tool call: 1, 1, 0) and the Deep probe
   became `a_deep_turn_embeds_the_question_once` (1, 2, 0). Gates: tests green (36 in the store; 74, 10, 4, 6 and 96 in
   the engine); format 14 and 6; clippy only `turn_loop.rs:3866`.
+- 2026-11-27: **RC-3 done.** `hybrid_fact_hits` and `hybrid_hits` take `&Arc<dyn TextEncoder>` and set a
+  `tokio::time::Instant` deadline at their start; each embed and rerank runs through the new private `within`, which
+  spawns the call and waits until the deadline. The two `started.elapsed() > budget` checks are gone. New store tests:
+  `a_slow_embedding_does_not_hold_a_search_past_its_budget`, `a_slow_rerank_does_not_hold_a_search_past_its_budget`
+  (facts and turns each, a 2 s call on a 50 ms budget, back under 1 s), `a_late_answer_is_kept_for_the_next_search`.
+  `a_recall_over_the_rerank_budget_falls_back_to_lexical` is unchanged and passes. In `recall_cost.rs`
+  `probe_a_slow_call_holds_the_search_past_its_budget` became its inverse
+  `a_slow_call_does_not_hold_the_search_past_its_budget` (2 s call, back under 1 s). The only probe left as it was is
+  `probe_a_fact_with_no_vector_is_missing_from_a_hybrid_result` (section 5). Gates: tests green (39 in the store; 74,
+  10, 4, 6 and 96 in the engine); format 14 and 6; clippy only `turn_loop.rs:3866`.

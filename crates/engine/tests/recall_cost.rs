@@ -388,11 +388,12 @@ async fn probe_a_fact_with_no_vector_is_missing_from_a_hybrid_result() {
     );
 }
 
-/// The store alone: the budget is read after the call returns, so a slow
-/// call holds the search for as long as the call takes.
+/// RC-3, the store alone: a slow call no longer holds the search. On
+/// `cbdc0ae` a 400 ms call on a 50 ms budget held it for 400 ms; now a 2 s
+/// call is left to finish on its own and the search is back at the budget.
 #[tokio::test]
-async fn probe_a_slow_call_holds_the_search_past_its_budget() {
-    let slow = Duration::from_millis(400);
+async fn a_slow_call_does_not_hold_the_search_past_its_budget() {
+    let slow = Duration::from_secs(2);
     let recall = Recall {
         coarse_k: 10,
         rerank_budget_ms: 50,
@@ -437,7 +438,7 @@ async fn probe_a_slow_call_holds_the_search_past_its_budget() {
             "slow {name}: over budget is the word-match list"
         );
         assert!(
-            took >= slow,
+            took < Duration::from_secs(1),
             "slow {name}: the search waited {took:?} on a 50 ms budget"
         );
         let c = counts(&calls);
