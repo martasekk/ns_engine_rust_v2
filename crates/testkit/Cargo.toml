@@ -24,5 +24,10 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 
+[dev-dependencies]
+# Parses `fixtures/routes.toml` in `tests/route_baseline.rs` (classifier-router
+# JR-1). Already a workspace dependency, so nothing new is locked.
+toml = { workspace = true }
+
 [lints]
 workspace = true
