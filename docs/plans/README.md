@@ -11,7 +11,7 @@ live plans for one topic: extend the existing one.
 | Plan | What it is | State | Left |
 |---|---|---|---|
 | `2026-11-24-rules-rebuild.md` | Brings the code in line with the coding rules (structure, contract first, determinism, property/Miri/loom tests) and adds the project `CLAUDE.md` (step RR-0) | Planned and reviewed 24 Nov, fixes applied (`2026-11-24-rules-rebuild-review.md`); nothing started | All steps, gate zero (RR-G0) first; 8 open questions for the user (Q0-Q7); RR-14b may need a re-plan; see the plan's "How to run it" |
-| `2026-11-26-recall-cost.md` | Three places where a turn pays the encoder for nothing: every counted use of a fact is embedded again, the same hybrid search runs two or three times a turn, and the search budget does not end a slow call | Confirmed by seven probe tests on 26 Nov (branch `recall-cost`); the plan waits for the owner's go-ahead; no fix written | RC-1, RC-2, RC-3; four decisions (D1-D4) |
+| `2026-11-26-recall-cost.md` | Three places where a turn pays the encoder for nothing: every counted use of a fact is embedded again, the same hybrid search runs two or three times a turn, and the search budget does not end a slow call | Approved 27 Nov; RC-1 to RC-3 built and committed on branch `recall-cost` (not merged) | Left: the items of section 5; a before-and-after eval run needs `remote-encoder` |
 
 ## Not in this folder yet
 
