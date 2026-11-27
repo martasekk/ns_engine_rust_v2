@@ -83,6 +83,161 @@ struct TurnVector {
     vector: Vec<f32>,
 }
 
+/// RC-3: run one encoder call on its own task and wait for it until
+/// `deadline`, no later.
+///
+/// The call is not cancelled when the wait ends. It finishes on its own and
+/// ends by the client's own timeout, so the local client still sees every
+/// call it made and its two-failures rule still holds, and [`MemoEncoder`]
+/// keeps a late answer for the next search of the same question. An encoder
+/// that panics costs the search its hybrid result, not the turn.
+async fn within<T: Send + 'static>(
+    deadline: tokio::time::Instant,
+    what: &'static str,
+    call: impl std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout_at(deadline, tokio::spawn(call)).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => Err(StoreError::Io(format!("{what} did not finish: {e}"))),
+        Err(_) => Err(StoreError::Io(format!("{what} over budget"))),
+    }
+}
+
+/// How many answers of each kind [`MemoEncoder`] keeps.
+const MEMO_ENTRIES: usize = 32;
+
+/// RC-2: the encoder a store was given, with its last answers kept.
+///
+/// One turn searches the same facts with the same question once for every
+/// emitter call and once more for the reply, and a Deep turn embeds that
+/// question again for its turn search. Every one of those searches asked the
+/// service the same thing. This keeps the last [`MEMO_ENTRIES`] question
+/// vectors and the last [`MEMO_ENTRIES`] rerank answers, in memory only, and
+/// answers a repeat from them.
+///
+/// A rerank answer is found again only for the same question, the same
+/// documents in the same order and the same `k`; the documents are kept as
+/// a hash, not as text. A fact written between two searches changes the
+/// documents, so the rerank is asked again. Passage embeddings — the
+/// backfill and the write path — go straight through, and a failed call is
+/// never kept.
+struct MemoEncoder {
+    inner: std::sync::Arc<dyn nscore::TextEncoder>,
+    memo: std::sync::Mutex<Memo>,
+}
+
+#[derive(Default)]
+struct Memo {
+    queries: std::collections::VecDeque<(String, Vec<f32>)>,
+    reranks: std::collections::VecDeque<(RerankKey, Vec<(usize, f32)>)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RerankKey {
+    query: String,
+    docs_hash: u64,
+    docs_len: usize,
+    k: usize,
+}
+
+impl RerankKey {
+    fn new(query: &str, docs: &[String], k: usize) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        docs.hash(&mut h);
+        Self {
+            query: query.to_string(),
+            docs_hash: h.finish(),
+            docs_len: docs.len(),
+            k,
+        }
+    }
+}
+
+/// The kept answer for `key`, moved to the newest end.
+fn memo_get<K: PartialEq, V: Clone>(
+    list: &mut std::collections::VecDeque<(K, V)>,
+    key: &K,
+) -> Option<V> {
+    let at = list.iter().position(|(k, _)| k == key)?;
+    let entry = list.remove(at)?;
+    let value = entry.1.clone();
+    list.push_back(entry);
+    Some(value)
+}
+
+/// Keep `value` for `key` as the newest answer, dropping the oldest past
+/// [`MEMO_ENTRIES`].
+fn memo_put<K: PartialEq, V>(list: &mut std::collections::VecDeque<(K, V)>, key: K, value: V) {
+    if let Some(at) = list.iter().position(|(k, _)| *k == key) {
+        list.remove(at);
+    }
+    list.push_back((key, value));
+    while list.len() > MEMO_ENTRIES {
+        list.pop_front();
+    }
+}
+
+impl MemoEncoder {
+    fn new(inner: std::sync::Arc<dyn nscore::TextEncoder>) -> Self {
+        Self {
+            inner,
+            memo: Default::default(),
+        }
+    }
+
+    /// The lock is never held across an await. A panic while it was held
+    /// leaves at worst a stale list, which is still a valid one.
+    fn memo(&self) -> std::sync::MutexGuard<'_, Memo> {
+        self.memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl nscore::TextEncoder for MemoEncoder {
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    async fn embed(&self, texts: &[String], kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+        let [text] = texts else {
+            return self.inner.embed(texts, kind).await;
+        };
+        if kind != "query" {
+            return self.inner.embed(texts, kind).await;
+        }
+        let kept = memo_get(&mut self.memo().queries, text);
+        if let Some(v) = kept {
+            return Ok(vec![v]);
+        }
+        let out = self.inner.embed(texts, kind).await?;
+        if let [v] = out.as_slice() {
+            if !v.is_empty() {
+                memo_put(&mut self.memo().queries, text.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        k: usize,
+    ) -> Result<Vec<(usize, f32)>, StoreError> {
+        let key = RerankKey::new(query, docs, k);
+        let kept = memo_get(&mut self.memo().reranks, &key);
+        if let Some(ranked) = kept {
+            return Ok(ranked);
+        }
+        let out = self.inner.rerank(query, docs, k).await?;
+        memo_put(&mut self.memo().reranks, key, out.clone());
+        Ok(out)
+    }
+}
+
 /// What a digest is embedded as: the same three fields its FTS index covers,
 /// and nothing else. Not the JSON — an index over a blob also matches on
 /// field names, and a vector over one would put two digests near each other
@@ -254,8 +409,11 @@ impl SqliteStore {
 
     /// M8 T3.1/T3.2: run the hybrid path with this encoder. Without one the
     /// store behaves exactly as it did before Phase 3 existed.
+    ///
+    /// The encoder is kept behind [`MemoEncoder`], so a question asked again
+    /// is not embedded again and a list reranked again is not sent again.
     pub fn with_encoder(mut self, encoder: std::sync::Arc<dyn nscore::TextEncoder>) -> Self {
-        self.encoder = Some(encoder);
+        self.encoder = Some(std::sync::Arc::new(MemoEncoder::new(encoder)));
         self
     }
 
@@ -653,14 +811,13 @@ impl SqliteStore {
     /// `(kind, row_id, model)` and only a rowid is unique across scopes.
     async fn hybrid_fact_hits(
         &self,
-        enc: &dyn nscore::TextEncoder,
+        enc: &std::sync::Arc<dyn nscore::TextEncoder>,
         scope: &str,
         query: &str,
         k: usize,
     ) -> Result<Option<Vec<Fact>>, StoreError> {
-        let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
-        let over = |msg: &str| StoreError::Io(format!("fact recall over budget: {msg}"));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.recall.rerank_budget_ms);
 
         let stored = self.fact_vectors(scope, enc.model()).await?;
         if stored.is_empty() {
@@ -682,10 +839,13 @@ impl SqliteStore {
         .map(key_of)
         .collect();
 
-        let q = enc.embed(&[query.to_string()], "query").await?;
-        if started.elapsed() > budget {
-            return Err(over("embed"));
-        }
+        let q = {
+            let (enc, texts) = (enc.clone(), vec![query.to_string()]);
+            within(deadline, "fact recall embed", async move {
+                enc.embed(&texts, "query").await
+            })
+            .await?
+        };
         let q = q.into_iter().next().unwrap_or_default();
 
         let mut scored: Vec<((String, u64), f32)> = stored
@@ -716,10 +876,13 @@ impl SqliteStore {
         }
 
         let docs: Vec<String> = rows.iter().map(|f| fact_text(&f.key, &f.value)).collect();
-        let ranked = enc.rerank(query, &docs, k).await?;
-        if started.elapsed() > budget {
-            return Err(over("rerank"));
-        }
+        let ranked = {
+            let (enc, query) = (enc.clone(), query.to_string());
+            within(deadline, "fact recall rerank", async move {
+                enc.rerank(&query, &docs, k).await
+            })
+            .await?
+        };
         Ok(Some(
             ranked
                 .into_iter()
@@ -734,14 +897,13 @@ impl SqliteStore {
     /// included, is an `Err` the caller turns back into the lexical list.
     async fn hybrid_hits(
         &self,
-        enc: &dyn nscore::TextEncoder,
+        enc: &std::sync::Arc<dyn nscore::TextEncoder>,
         sessions: &[SessionId],
         query: &str,
         k: usize,
     ) -> Result<Option<Vec<nscore::TurnHit>>, StoreError> {
-        let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(self.recall.rerank_budget_ms);
-        let over = |msg: &str| StoreError::Io(format!("recall over budget: {msg}"));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.recall.rerank_budget_ms);
 
         let stored = self.turn_vectors(sessions, enc.model()).await?;
         if stored.is_empty() {
@@ -750,10 +912,13 @@ impl SqliteStore {
         let coarse = self.recall.coarse_k.max(k);
         let lexical = self.lexical_rows(sessions, query, coarse).await?;
 
-        let q = enc.embed(&[query.to_string()], "query").await?;
-        if started.elapsed() > budget {
-            return Err(over("embed"));
-        }
+        let q = {
+            let (enc, texts) = (enc.clone(), vec![query.to_string()]);
+            within(deadline, "recall embed", async move {
+                enc.embed(&texts, "query").await
+            })
+            .await?
+        };
         let q = q.into_iter().next().unwrap_or_default();
 
         let mut scored: Vec<(i64, f32)> = stored
@@ -786,10 +951,13 @@ impl SqliteStore {
         }
 
         let docs: Vec<String> = rows.iter().map(|t| t.text.clone()).collect();
-        let ranked = enc.rerank(query, &docs, k).await?;
-        if started.elapsed() > budget {
-            return Err(over("rerank"));
-        }
+        let ranked = {
+            let (enc, query) = (enc.clone(), query.to_string());
+            within(deadline, "recall rerank", async move {
+                enc.rerank(&query, &docs, k).await
+            })
+            .await?
+        };
         Ok(Some(
             ranked
                 .into_iter()
@@ -808,6 +976,18 @@ impl SqliteStore {
     }
 }
 
+/// What a write did to the text a fact's vector is made from.
+///
+/// A fact is embedded as `fact_text(key, value)`, so a write that moves only
+/// a counter, a timestamp or the state leaves the vector right as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactText {
+    /// A new version, or a write in place with another value.
+    Changed,
+    /// A write in place with the same value.
+    Unchanged,
+}
+
 /// The fact write path's two halves (M11 T1.1), in their own inherent block
 /// because a trait impl takes only the trait's own methods.
 impl SqliteStore {
@@ -816,11 +996,11 @@ impl SqliteStore {
     ///
     /// The split is the point: `put_fact` is now "write, then embed", and the
     /// embed must not be able to hold the lock or fail the write.
-    async fn write_fact(&self, fact: &Fact) -> Result<(), StoreError> {
+    async fn write_fact(&self, fact: &Fact) -> Result<FactText, StoreError> {
         let conn = self.conn.lock().await;
-        let exists: Option<i64> = conn
+        let stored_value: Option<String> = conn
             .query_row(
-                "SELECT 1 FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
+                "SELECT value_json FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
                 rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
                 |r| r.get(0),
             )
@@ -828,7 +1008,11 @@ impl SqliteStore {
             .map_err(io_err)?;
         let value_json = serde_json::to_string(&fact.value).map_err(io_err)?;
         let prov_json = serde_json::to_string(&fact.prov).map_err(io_err)?;
-        if exists.is_some() {
+        if let Some(stored_value) = stored_value {
+            // Compared as values, not as strings: a row written by another
+            // serializer may order or space its JSON differently.
+            let unchanged = serde_json::from_str::<serde_json::Value>(&stored_value)
+                .is_ok_and(|v| v == fact.value);
             conn.execute(
                 "UPDATE facts SET valid_to = ?4, state = ?5, value_json = ?6, confidence = ?7,
                      uses = ?8, last_validated = ?9, prov_json = ?10, trust = ?11, last_used = ?12,
@@ -852,7 +1036,11 @@ impl SqliteStore {
                 ],
             )
             .map_err(io_err)?;
-            return Ok(());
+            return Ok(if unchanged {
+                FactText::Unchanged
+            } else {
+                FactText::Changed
+            });
         }
         conn.execute(
             "UPDATE facts SET state = 'superseded', valid_to = ?3
@@ -883,7 +1071,7 @@ impl SqliteStore {
             ],
         )
         .map_err(io_err)?;
-        Ok(())
+        Ok(FactText::Changed)
     }
 
     /// M11 T1.1: one vector for the fact just written, best effort.
@@ -900,7 +1088,19 @@ impl SqliteStore {
     /// Only a live version is embedded. A superseded or forgotten row is a
     /// value the engine has stopped believing, and a vector for it would be a
     /// retriever able to return what `facts()` will not.
-    async fn embed_fact(&self, fact: &Fact) {
+    ///
+    /// A write that left the text as it was sends nothing when the row
+    /// already has a vector for this model: counting a use on the five facts
+    /// a reply showed is five SQL updates, not five round trips. A row with
+    /// no vector for this model — written while the service was down, or
+    /// before a change of model — gets one on its next write of any kind.
+    ///
+    /// Known limit: a write in place with another value whose embedding
+    /// fails keeps the old vector, and a later unchanged write does not
+    /// replace it. The old vector is kept on purpose, so the fact stays
+    /// reachable by the vector arm; a new version is a new row and is not
+    /// affected.
+    async fn embed_fact(&self, fact: &Fact, text: FactText) {
         let Some(enc) = self.encoder.clone() else {
             return;
         };
@@ -908,20 +1108,26 @@ impl SqliteStore {
             return;
         }
         let model = enc.model().to_string();
-        let row_id: Option<i64> = {
+        let row: Option<(i64, bool)> = {
             let conn = self.conn.lock().await;
             conn.query_row(
-                "SELECT rowid FROM facts WHERE scope = ?1 AND key = ?2 AND valid_from = ?3",
-                rusqlite::params![fact.scope, fact.key, fact.valid_from.0],
-                |r| r.get(0),
+                "SELECT f.rowid, EXISTS (
+                     SELECT 1 FROM embeddings em
+                     WHERE em.kind = 'fact' AND em.row_id = f.rowid AND em.model = ?4)
+                 FROM facts f WHERE f.scope = ?1 AND f.key = ?2 AND f.valid_from = ?3",
+                rusqlite::params![fact.scope, fact.key, fact.valid_from.0, model],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .ok()
             .flatten()
         };
-        let Some(row_id) = row_id else {
+        let Some((row_id, has_vector)) = row else {
             return;
         };
+        if text == FactText::Unchanged && has_vector {
+            return;
+        }
         let text = fact_text(&fact.key, &fact.value);
         let Ok(vectors) = enc.embed(&[text], "passage").await else {
             return;
@@ -1131,7 +1337,7 @@ impl MemoryStore for SqliteStore {
         if k == 0 || sessions.is_empty() {
             return Ok(lexical);
         }
-        match self.hybrid_hits(enc.as_ref(), sessions, query, k).await {
+        match self.hybrid_hits(&enc, sessions, query, k).await {
             Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
             // Both the "nothing stored" and the "service said no" branches
             // land here, and both mean the same thing to a caller: the
@@ -1467,7 +1673,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn put_fact(&self, fact: Fact) -> Result<(), StoreError> {
-        self.write_fact(&fact).await?;
+        let text = self.write_fact(&fact).await?;
         // M11 T1.1: the write-time vector, best effort and after the lock is
         // gone. A fact write that failed because the embedder was unreachable
         // would be a memory lost to a retrieval optimisation, so this can
@@ -1475,7 +1681,7 @@ impl MemoryStore for SqliteStore {
         // connection across the round trip. The pass's backfill is what
         // catches whatever this misses, which is what makes it safe to be
         // best effort.
-        self.embed_fact(&fact).await;
+        self.embed_fact(&fact, text).await;
         Ok(())
     }
 
@@ -1555,7 +1761,7 @@ impl MemoryStore for SqliteStore {
         if k == 0 {
             return Ok(lexical);
         }
-        match self.hybrid_fact_hits(enc.as_ref(), scope, query, k).await {
+        match self.hybrid_fact_hits(&enc, scope, query, k).await {
             Ok(Some(hits)) if !hits.is_empty() => Ok(hits),
             _ => Ok(lexical),
         }
@@ -2323,6 +2529,13 @@ mod tests {
         delay_ms: u64,
         /// When set, every call fails the way an unreachable service does.
         down: bool,
+        /// Reranks answered, as `embeds` counts embeddings.
+        reranks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// This many calls fail before any succeeds.
+        failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Added to `delay_ms` for an embedding only, or a rerank only.
+        embed_delay_ms: u64,
+        rerank_delay_ms: u64,
     }
 
     const CONCEPTS: &[&[&str]] = &[
@@ -2338,7 +2551,21 @@ mod tests {
                 embeds: Default::default(),
                 delay_ms: 0,
                 down: false,
+                reranks: Default::default(),
+                failures: Default::default(),
+                embed_delay_ms: 0,
+                rerank_delay_ms: 0,
             }
+        }
+        /// One failure off `failures`, if any are left.
+        fn fails_now(&self) -> bool {
+            self.failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
         }
         fn vector(text: &str) -> Vec<f32> {
             let tokens = nscore::query_tokens(text);
@@ -2367,11 +2594,12 @@ mod tests {
             &self.model
         }
         async fn embed(&self, texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
-            if self.down {
+            if self.down || self.fails_now() {
                 return Err(StoreError::Io("connection refused".into()));
             }
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let delay = self.delay_ms + self.embed_delay_ms;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             self.embeds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2383,12 +2611,15 @@ mod tests {
             docs: &[String],
             k: usize,
         ) -> Result<Vec<(usize, f32)>, StoreError> {
-            if self.down {
+            if self.down || self.fails_now() {
                 return Err(StoreError::Io("connection refused".into()));
             }
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let delay = self.delay_ms + self.rerank_delay_ms;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
+            self.reranks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let q = Self::vector(query);
             let mut scored: Vec<(usize, f32)> = docs
                 .iter()
@@ -2771,5 +3002,440 @@ mod tests {
         assert!(live
             .iter()
             .any(|(f, _)| f.key == "campaign.budget" && f.valid_from == Timestamp(9)));
+    }
+
+    // ----- RC-1: a write that keeps the text is not embedded again --------
+
+    fn embeds(enc: &ScriptedEncoder) -> usize {
+        enc.embeds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn live_vector(store: &SqliteStore, model: &str, key: &str) -> Option<Vec<f32>> {
+        store
+            .fact_vectors("global", model)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(f, _)| f.key == key)
+            .map(|(_, v)| v)
+    }
+
+    /// What the reply does to every fact it showed: a use counted, nothing
+    /// else. The text a vector is made from did not move, so no request.
+    #[tokio::test]
+    async fn a_write_that_only_counts_a_use_is_not_embedded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+        assert_eq!(embeds(&enc), 3);
+
+        let mut f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        f.uses += 1;
+        f.last_used = Timestamp(99);
+        f.confidence = 0.5;
+        f.last_validated = Timestamp(99);
+        f.exposures += 1;
+        f.state = FactState::Cold;
+        store.put_fact(f.clone()).await.unwrap();
+
+        assert_eq!(embeds(&enc), 3, "a counter write sent a request");
+        let stored = store.facts("global", "campaign.budget").await.unwrap();
+        assert_eq!(stored[0].uses, 1, "the write itself still lands");
+        assert_eq!(
+            live_vector(&store, "bge-m3", "campaign.budget").await,
+            Some(ScriptedEncoder::vector(&fact_text(&f.key, &f.value)))
+        );
+    }
+
+    /// A new value is a new text, whether it is written in place or as a
+    /// new version, and its vector replaces the old one.
+    #[tokio::test]
+    async fn a_changed_value_is_embedded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+
+        // In place: the same version, another value.
+        let mut f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        f.value = serde_json::json!("the money is due on friday");
+        store.put_fact(f.clone()).await.unwrap();
+        assert_eq!(embeds(&enc), 4);
+        assert_eq!(
+            live_vector(&store, "bge-m3", "campaign.budget").await,
+            Some(ScriptedEncoder::vector(&fact_text(&f.key, &f.value))),
+            "the vector is the new text's"
+        );
+
+        // As a new version.
+        let g = a_fact("user.name", "who is called Jana", 9);
+        store.put_fact(g.clone()).await.unwrap();
+        assert_eq!(embeds(&enc), 5);
+        assert_eq!(
+            live_vector(&store, "bge-m3", "user.name").await,
+            Some(ScriptedEncoder::vector(&fact_text(&g.key, &g.value)))
+        );
+    }
+
+    /// The vector check is per model: a fact written while the service was
+    /// down, or before a change of model, gets its vector on the next write
+    /// even when that write leaves the text as it was.
+    #[tokio::test]
+    async fn a_fact_with_no_vector_for_this_model_gets_one_on_its_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.sqlite");
+        {
+            let down = std::sync::Arc::new(ScriptedEncoder {
+                down: true,
+                ..ScriptedEncoder::new("bge-m3")
+            });
+            let store = SqliteStore::open(&path).unwrap().with_encoder(down);
+            seed_facts(&store).await;
+            assert!(store
+                .fact_vectors("global", "bge-m3")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        let count_a_use = |mut f: Fact| {
+            f.uses += 1;
+            f
+        };
+
+        let up = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&path).unwrap().with_encoder(up.clone());
+        let f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        store.put_fact(count_a_use(f)).await.unwrap();
+        assert_eq!(
+            embeds(&up),
+            1,
+            "written with the service down: embedded now"
+        );
+        assert!(live_vector(&store, "bge-m3", "campaign.budget")
+            .await
+            .is_some());
+        drop(store);
+
+        let other = std::sync::Arc::new(ScriptedEncoder::new("e5-small"));
+        let store = SqliteStore::open(&path)
+            .unwrap()
+            .with_encoder(other.clone());
+        let f = store.facts("global", "campaign.budget").await.unwrap()[0].clone();
+        store.put_fact(count_a_use(f)).await.unwrap();
+        assert_eq!(
+            embeds(&other),
+            1,
+            "a vector for bge-m3 is not one for e5-small"
+        );
+        assert!(live_vector(&store, "e5-small", "campaign.budget")
+            .await
+            .is_some());
+    }
+
+    // ----- RC-2: one embedding and one rerank for one question ------------
+
+    fn reranks(enc: &ScriptedEncoder) -> usize {
+        enc.reranks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A turn searches the same facts with the same question for every
+    /// emitter call and for the reply: the question is embedded once.
+    #[tokio::test]
+    async fn the_same_question_is_embedded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+        let sid = SessionId("s".into());
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        let before = embeds(&enc);
+
+        let q = "how much money";
+        let first = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let second = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(embeds(&enc), before + 1);
+        // The turn search of a Deep turn asks the same question.
+        store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            embeds(&enc),
+            before + 1,
+            "the turn search embedded it again"
+        );
+        // Another question is another request.
+        store
+            .search_facts_hybrid("global", "deadline friday", 5)
+            .await
+            .unwrap();
+        assert_eq!(embeds(&enc), before + 2);
+    }
+
+    /// The same documents in the same order are reranked once; a fact
+    /// written between two searches changes them, and the rerank is asked
+    /// again and sees the new value.
+    #[tokio::test]
+    async fn the_same_list_is_reranked_once_and_a_changed_fact_is_reranked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let store = SqliteStore::open(&dir.path().join("f.sqlite"))
+            .unwrap()
+            .with_encoder(enc.clone());
+        seed_facts(&store).await;
+
+        let q = "how much money";
+        let first = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let second = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(reranks(&enc), 1);
+
+        store
+            .put_fact(a_fact("campaign.budget", "4000 crowns of money", 9))
+            .await
+            .unwrap();
+        let third = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        assert_eq!(reranks(&enc), 2, "the documents changed");
+        assert_eq!(
+            third.first().map(|f| f.value.clone()),
+            Some(serde_json::json!("4000 crowns of money"))
+        );
+    }
+
+    /// A call that failed is asked again next time, and its later answer is
+    /// the one kept.
+    #[tokio::test]
+    async fn a_failed_call_is_not_kept() {
+        let inner = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let memo = MemoEncoder::new(inner.clone());
+        let q = vec!["how much money".to_string()];
+        let docs = vec![
+            "campaign budget 2000 crowns".to_string(),
+            "user name".to_string(),
+        ];
+
+        inner
+            .failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(memo.embed(&q, "query").await.is_err());
+        let v = memo.embed(&q, "query").await.unwrap();
+        assert_eq!(
+            embeds(&inner),
+            1,
+            "the failure was not answered from memory"
+        );
+        assert_eq!(memo.embed(&q, "query").await.unwrap(), v);
+        assert_eq!(embeds(&inner), 1, "the answer after it was kept");
+
+        inner
+            .failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(memo.rerank(&q[0], &docs, 2).await.is_err());
+        let ranked = memo.rerank(&q[0], &docs, 2).await.unwrap();
+        assert_eq!(reranks(&inner), 1);
+        assert_eq!(memo.rerank(&q[0], &docs, 2).await.unwrap(), ranked);
+        assert_eq!(reranks(&inner), 1);
+
+        // Passages are never kept: the backfill and the write path count
+        // their own requests.
+        memo.embed(&q, "passage").await.unwrap();
+        memo.embed(&q, "passage").await.unwrap();
+        assert_eq!(embeds(&inner), 3);
+    }
+
+    /// The memory is bounded: past [`MEMO_ENTRIES`] newer questions, the
+    /// oldest is asked again.
+    #[tokio::test]
+    async fn the_memo_keeps_the_last_answers_only() {
+        let inner = std::sync::Arc::new(ScriptedEncoder::new("bge-m3"));
+        let memo = MemoEncoder::new(inner.clone());
+        for i in 0..=MEMO_ENTRIES {
+            memo.embed(&[format!("question {i}")], "query")
+                .await
+                .unwrap();
+        }
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 1);
+        memo.embed(&[format!("question {MEMO_ENTRIES}")], "query")
+            .await
+            .unwrap();
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 1, "the newest is kept");
+        memo.embed(&["question 0".to_string()], "query")
+            .await
+            .unwrap();
+        assert_eq!(embeds(&inner), MEMO_ENTRIES + 2, "the oldest was dropped");
+    }
+
+    // ----- RC-3: a search stops waiting when its budget is spent ----------
+
+    /// Facts and turns, embedded by a fast encoder, then reopened with
+    /// `slow` on a budget of `budget_ms`: the only slow calls are the
+    /// searches' own.
+    async fn slow_store(
+        slow: ScriptedEncoder,
+        budget_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        SqliteStore,
+        SessionId,
+        std::sync::Arc<ScriptedEncoder>,
+    ) {
+        let (dir, store, sid) =
+            corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new("bge-m3"))));
+        seed_facts(&store).await;
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        drop(store);
+        let slow = std::sync::Arc::new(slow);
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(slow.clone())
+            .with_recall(Recall {
+                coarse_k: 10,
+                rerank_budget_ms: budget_ms,
+            });
+        (dir, store, sid, slow)
+    }
+
+    /// A 2 s call on a 50 ms budget, for both searches: each is back well
+    /// under a second with the word-match list.
+    async fn assert_back_within_budget(slow: ScriptedEncoder, what: &str) {
+        let (_d, store, sid, _enc) = slow_store(slow, 50).await;
+        let q = "what is our budget for the campaign";
+
+        let lexical = store.search_facts("global", q, 5).await.unwrap();
+        let started = std::time::Instant::now();
+        let hybrid = store.search_facts_hybrid("global", q, 5).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(hybrid, lexical, "slow {what}, facts: the word-match list");
+        assert!(took.as_millis() < 1000, "slow {what}, facts: {took:?}");
+
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        let started = std::time::Instant::now();
+        let hybrid = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(hybrid, lexical, "slow {what}, turns: the word-match list");
+        assert!(took.as_millis() < 1000, "slow {what}, turns: {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_embedding_does_not_hold_a_search_past_its_budget() {
+        assert_back_within_budget(
+            ScriptedEncoder {
+                embed_delay_ms: 2000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            "embedding",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_rerank_does_not_hold_a_search_past_its_budget() {
+        assert_back_within_budget(
+            ScriptedEncoder {
+                rerank_delay_ms: 2000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            "rerank",
+        )
+        .await;
+    }
+
+    /// The late call is not cancelled: it finishes after the search gave up,
+    /// and the next search of the same question uses its answer. The budget
+    /// is 200 ms, not 50, because the second search has to finish inside it
+    /// to return the hybrid list.
+    #[tokio::test]
+    async fn a_late_answer_is_kept_for_the_next_search() {
+        let (_d, store, sid, enc) = slow_store(
+            ScriptedEncoder {
+                embed_delay_ms: 1000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            200,
+        )
+        .await;
+        let q = "how much money are we allowed to spend";
+        let target = "our budget for the whole campaign is 2000 crowns";
+
+        let lexical = store.search_turns(&sid, q, 5).await.unwrap();
+        let first = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(first, lexical, "the embedding was late");
+        assert_eq!(embeds(&enc), 0, "and had not answered yet");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(embeds(&enc), 1, "the late call finished on its own");
+
+        let second = store
+            .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+            .await
+            .unwrap();
+        assert_eq!(embeds(&enc), 1, "the second search used the kept answer");
+        assert_eq!(second.first().map(|h| h.text.as_str()), Some(target));
+    }
+
+    /// An encoder that panics on every call.
+    struct PanickingEncoder;
+
+    #[async_trait]
+    impl nscore::TextEncoder for PanickingEncoder {
+        fn model(&self) -> &str {
+            "bge-m3"
+        }
+        async fn embed(&self, _texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+            panic!("the encoder panicked")
+        }
+        async fn rerank(
+            &self,
+            _query: &str,
+            _docs: &[String],
+            _k: usize,
+        ) -> Result<Vec<(usize, f32)>, StoreError> {
+            panic!("the encoder panicked")
+        }
+    }
+
+    /// A panic inside the encoder costs the search its hybrid result, not the
+    /// caller: both searches return the word-match list.
+    #[tokio::test]
+    async fn an_encoder_that_panics_falls_back_to_the_word_match_list() {
+        let (dir, store, sid) =
+            corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new("bge-m3"))));
+        seed_facts(&store).await;
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        drop(store);
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(std::sync::Arc::new(PanickingEncoder));
+
+        let q = "what is our budget for the campaign";
+        assert_eq!(
+            store.search_facts_hybrid("global", q, 5).await.unwrap(),
+            store.search_facts("global", q, 5).await.unwrap()
+        );
+        assert_eq!(
+            store
+                .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+                .await
+                .unwrap(),
+            store.search_turns(&sid, q, 5).await.unwrap()
+        );
     }
 }
