@@ -25,7 +25,7 @@ Seven probe tests in `crates/engine/tests/recall_cost.rs` (committed with this p
 `SqliteStore` with an encoder that records every call. The store holds six facts, all with a vector; five are shown.
 All seven pass on `cbdc0ae`, so the numbers in the "today" columns are what the shipped code does.
 
-| Turn | Question embeddings today | Reranks today | Fact embeddings today | After RC-1 to RC-3 |
+| Turn | Question embeddings today | Reranks today | Fact embeddings today | After RC-1 to RC-3 (tested) |
 |---|---|---|---|---|
 | Task tier, answers at once | 2 | 2 | 5 | 1, 1, 0 |
 | Task tier, one tool call, then answers | 3 | 3 | 5 | 1, 1, 0 |
@@ -226,3 +226,10 @@ these commits.
   `a_slow_call_does_not_hold_the_search_past_its_budget` (2 s call, back under 1 s). The only probe left as it was is
   `probe_a_fact_with_no_vector_is_missing_from_a_hybrid_result` (section 5). Gates: tests green (39 in the store; 74,
   10, 4, 6 and 96 in the engine); format 14 and 6; clippy only `turn_loop.rs:3866`.
+- 2026-11-27: the plan's one run after RC-3, `cargo test -p ns-testkit -p ns-evolution -p ns-app` on `41c1be8`: green
+  (ns-app 236 with 1 ignored, e2e 4, tool_schemas 3; ns-evolution 92; ns-testkit 43, harness_eval 1). An independent
+  review of the three commits found nothing to fix in the code; on its two test points:
+  `a_late_answer_is_kept_for_the_next_search` now runs on a 200 ms budget with a 1 s call and a 1.5 s wait, so its
+  second search is not at the mercy of a 50 ms budget on a loaded machine, and the new
+  `an_encoder_that_panics_falls_back_to_the_word_match_list` covers the panic claim of `within`. Store tests 40, clippy
+  clean on the store, format 14.

@@ -3278,9 +3278,11 @@ mod tests {
     // ----- RC-3: a search stops waiting when its budget is spent ----------
 
     /// Facts and turns, embedded by a fast encoder, then reopened with
-    /// `slow` on a 50 ms budget: the only slow calls are the searches' own.
+    /// `slow` on a budget of `budget_ms`: the only slow calls are the
+    /// searches' own.
     async fn slow_store(
         slow: ScriptedEncoder,
+        budget_ms: u64,
     ) -> (
         tempfile::TempDir,
         SqliteStore,
@@ -3299,7 +3301,7 @@ mod tests {
             .with_encoder(slow.clone())
             .with_recall(Recall {
                 coarse_k: 10,
-                rerank_budget_ms: 50,
+                rerank_budget_ms: budget_ms,
             });
         (dir, store, sid, slow)
     }
@@ -3307,7 +3309,7 @@ mod tests {
     /// A 2 s call on a 50 ms budget, for both searches: each is back well
     /// under a second with the word-match list.
     async fn assert_back_within_budget(slow: ScriptedEncoder, what: &str) {
-        let (_d, store, sid, _enc) = slow_store(slow).await;
+        let (_d, store, sid, _enc) = slow_store(slow, 50).await;
         let q = "what is our budget for the campaign";
 
         let lexical = store.search_facts("global", q, 5).await.unwrap();
@@ -3353,13 +3355,18 @@ mod tests {
     }
 
     /// The late call is not cancelled: it finishes after the search gave up,
-    /// and the next search of the same question uses its answer.
+    /// and the next search of the same question uses its answer. The budget
+    /// is 200 ms, not 50, because the second search has to finish inside it
+    /// to return the hybrid list.
     #[tokio::test]
     async fn a_late_answer_is_kept_for_the_next_search() {
-        let (_d, store, sid, enc) = slow_store(ScriptedEncoder {
-            embed_delay_ms: 300,
-            ..ScriptedEncoder::new("bge-m3")
-        })
+        let (_d, store, sid, enc) = slow_store(
+            ScriptedEncoder {
+                embed_delay_ms: 1000,
+                ..ScriptedEncoder::new("bge-m3")
+            },
+            200,
+        )
         .await;
         let q = "how much money are we allowed to spend";
         let target = "our budget for the whole campaign is 2000 crowns";
@@ -3372,7 +3379,7 @@ mod tests {
         assert_eq!(first, lexical, "the embedding was late");
         assert_eq!(embeds(&enc), 0, "and had not answered yet");
 
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert_eq!(embeds(&enc), 1, "the late call finished on its own");
 
         let second = store
@@ -3381,5 +3388,54 @@ mod tests {
             .unwrap();
         assert_eq!(embeds(&enc), 1, "the second search used the kept answer");
         assert_eq!(second.first().map(|h| h.text.as_str()), Some(target));
+    }
+
+    /// An encoder that panics on every call.
+    struct PanickingEncoder;
+
+    #[async_trait]
+    impl nscore::TextEncoder for PanickingEncoder {
+        fn model(&self) -> &str {
+            "bge-m3"
+        }
+        async fn embed(&self, _texts: &[String], _kind: &str) -> Result<Vec<Vec<f32>>, StoreError> {
+            panic!("the encoder panicked")
+        }
+        async fn rerank(
+            &self,
+            _query: &str,
+            _docs: &[String],
+            _k: usize,
+        ) -> Result<Vec<(usize, f32)>, StoreError> {
+            panic!("the encoder panicked")
+        }
+    }
+
+    /// A panic inside the encoder costs the search its hybrid result, not the
+    /// caller: both searches return the word-match list.
+    #[tokio::test]
+    async fn an_encoder_that_panics_falls_back_to_the_word_match_list() {
+        let (dir, store, sid) =
+            corpus_store(Some(std::sync::Arc::new(ScriptedEncoder::new("bge-m3"))));
+        seed_facts(&store).await;
+        fill(&store, &sid).await;
+        store.backfill_embeddings(100).await.unwrap();
+        drop(store);
+        let store = SqliteStore::open(&dir.path().join("t.sqlite"))
+            .unwrap()
+            .with_encoder(std::sync::Arc::new(PanickingEncoder));
+
+        let q = "what is our budget for the campaign";
+        assert_eq!(
+            store.search_facts_hybrid("global", q, 5).await.unwrap(),
+            store.search_facts("global", q, 5).await.unwrap()
+        );
+        assert_eq!(
+            store
+                .search_turns_hybrid(std::slice::from_ref(&sid), q, 5)
+                .await
+                .unwrap(),
+            store.search_turns(&sid, q, 5).await.unwrap()
+        );
     }
 }
