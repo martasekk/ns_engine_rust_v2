@@ -814,6 +814,7 @@ dependencies = [
  "ns-evolution",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

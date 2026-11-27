@@ -1,0 +1,700 @@
+# Labelled route set (plan docs/plans/2026-11-26-classifier-router.md, JR-1).
+#
+# 100 customer messages, each with the class a person would give it. Everything here is invented: one
+# made-up shop that sells refurbished electronics and tools and repairs them ("Arvel" and "Kovar" are
+# made-up brands, "Vzorov" a made-up town, "DoDveří" and "Balíkobus" made-up carriers). No real person,
+# company, address, e-mail or phone.
+#
+# Composition: 80 Czech and 20 English; 25 per class (20 Czech, 5 English); 20 follow a turn that the
+# message cannot be read without (5 per class: 4 Czech, 1 English). Those carry `prev_user` and
+# `prev_reply`, the turn before. Some Czech messages are typed without diacritics, as customers type.
+#
+# The set was written before any classifier was tried and before the keyword router was run on it, and
+# is fixed from then on: a change goes into the plan's Log with the date.
+#
+# How a message was labelled, where two classes were possible:
+# - a question the turn before already answers is `chat`, even when it is about opening hours or a price;
+# - a question about the customer's own order (where it is, what state it is in) is `lookup`: it asks
+#   for information and changes nothing;
+# - "how do I return this?" is `lookup` (the policy); "return this for me" is `act`;
+# - a message that points at something said earlier that the turn before does not hold is `recall`,
+#   even in the middle of an order.
+version = 1
+
+# The default classes of the plan's section 2: the key, the tier it routes to, and the description
+# the classifier is sent.
+[[class]]
+key = "chat"
+tier = "chat"
+description = "Greeting, thanks, small talk, or a question answered by this conversation alone"
+
+[[class]]
+key = "lookup"
+tier = "task"
+description = "Needs information about the company: products, prices, availability, people, opening hours, policies"
+
+[[class]]
+key = "recall"
+tier = "deep"
+description = "Refers to something said earlier that is not in the recent messages"
+
+[[class]]
+key = "act"
+tier = "task"
+description = "Asks for something to be done or changed: an order, a booking, a message, a desktop action"
+
+# ---------------------------------------------------------------------------------------------------
+# chat
+# ---------------------------------------------------------------------------------------------------
+
+[[route]]
+id = "chat-01"
+lang = "cs"
+class = "chat"
+text = "Dobrý den!"
+
+[[route]]
+id = "chat-02"
+lang = "cs"
+class = "chat"
+text = "Ahoj, je tam někdo?"
+
+[[route]]
+id = "chat-03"
+lang = "cs"
+class = "chat"
+text = "Děkuji moc, to je všechno."
+
+[[route]]
+id = "chat-04"
+lang = "cs"
+class = "chat"
+text = "Díky za pomoc, mějte se hezky."
+
+[[route]]
+id = "chat-05"
+lang = "cs"
+class = "chat"
+text = "Jste člověk, nebo robot?"
+
+[[route]]
+id = "chat-06"
+lang = "cs"
+class = "chat"
+text = "Jak se dneska máte?"
+
+[[route]]
+id = "chat-07"
+lang = "cs"
+class = "chat"
+text = "Super, to mi stačí."
+
+[[route]]
+id = "chat-08"
+lang = "cs"
+class = "chat"
+text = "Na shledanou a hezký víkend."
+
+[[route]]
+id = "chat-09"
+lang = "cs"
+class = "chat"
+text = "Dobry vecer, jen jsem chtel pozdravit."
+
+[[route]]
+id = "chat-10"
+lang = "cs"
+class = "chat"
+text = "Haha, to se vám povedlo."
+
+[[route]]
+id = "chat-11"
+lang = "cs"
+class = "chat"
+text = "Omlouvám se, to byl překlep, toho si nevšímejte."
+
+[[route]]
+id = "chat-12"
+lang = "cs"
+class = "chat"
+text = "Jak se vlastně jmenujete?"
+
+[[route]]
+id = "chat-13"
+lang = "cs"
+class = "chat"
+text = "To je dneska ale zima, co?"
+
+[[route]]
+id = "chat-14"
+lang = "cs"
+class = "chat"
+text = "Vy jste ale rychlí, to se cení."
+
+[[route]]
+id = "chat-15"
+lang = "cs"
+class = "chat"
+text = "Aha, rozumím."
+
+[[route]]
+id = "chat-16"
+lang = "cs"
+class = "chat"
+text = "Moc hezky jste mi to vysvětlil, děkuju."
+
+[[route]]
+id = "chat-17"
+lang = "cs"
+class = "chat"
+prev_user = "Jak máte otevřeno přes týden?"
+prev_reply = "Od pondělí do pátku máme otevřeno 8–17, v sobotu 9–12 a v neděli je zavřeno."
+text = "Takže v neděli k vám nemá cenu jezdit, chápu to dobře?"
+
+[[route]]
+id = "chat-18"
+lang = "cs"
+class = "chat"
+prev_user = "Kolik stojí doprava kurýrem?"
+prev_reply = "Doprava kurýrem DoDveří stojí 129 Kč, při nákupu nad 2 000 Kč je zdarma."
+text = "A od kolika korun že je to zadarmo? Nějak mi to uteklo."
+
+[[route]]
+id = "chat-19"
+lang = "cs"
+class = "chat"
+prev_user = "Jak dlouho trvá oprava displeje?"
+prev_reply = "Obvykle tři až pět pracovních dnů od přijetí zařízení."
+text = "Takže když to přinesu v pondělí, do pátku by to mohlo být?"
+
+[[route]]
+id = "chat-20"
+lang = "cs"
+class = "chat"
+prev_user = "Děkuju za radu s tou baterií."
+prev_reply = "Není zač, ať vám notebook dobře slouží."
+text = "Bude, vy se taky mějte."
+
+[[route]]
+id = "chat-21"
+lang = "en"
+class = "chat"
+text = "Hi there!"
+
+[[route]]
+id = "chat-22"
+lang = "en"
+class = "chat"
+text = "Thanks a lot, that's all I needed."
+
+[[route]]
+id = "chat-23"
+lang = "en"
+class = "chat"
+text = "Are you a real person or a bot?"
+
+[[route]]
+id = "chat-24"
+lang = "en"
+class = "chat"
+text = "Have a nice day, bye!"
+
+[[route]]
+id = "chat-25"
+lang = "en"
+class = "chat"
+prev_user = "What is your warranty on refurbished phones?"
+prev_reply = "Refurbished phones come with a 24-month warranty."
+text = "So that's two years, right?"
+
+# ---------------------------------------------------------------------------------------------------
+# lookup
+# ---------------------------------------------------------------------------------------------------
+
+[[route]]
+id = "lookup-01"
+lang = "cs"
+class = "lookup"
+text = "Máte skladem nějaký repasovaný notebook do 8 000 Kč?"
+
+[[route]]
+id = "lookup-02"
+lang = "cs"
+class = "lookup"
+text = "Kolik stojí aku vrtačka Kovar 18 V?"
+
+[[route]]
+id = "lookup-03"
+lang = "cs"
+class = "lookup"
+text = "Máte v sobotu otevřeno?"
+
+[[route]]
+id = "lookup-04"
+lang = "cs"
+class = "lookup"
+text = "Jak dlouhá je záruka na repasované telefony?"
+
+[[route]]
+id = "lookup-05"
+lang = "cs"
+class = "lookup"
+text = "Do kdy můžu vrátit zboží bez udání důvodu?"
+
+[[route]]
+id = "lookup-06"
+lang = "cs"
+class = "lookup"
+text = "Kolik stojí doprava na Slovensko?"
+
+[[route]]
+id = "lookup-07"
+lang = "cs"
+class = "lookup"
+text = "Je ten monitor Arvel 27 ještě k dispozici?"
+
+[[route]]
+id = "lookup-08"
+lang = "cs"
+class = "lookup"
+text = "Kde máte prodejnu a dá se u vás parkovat?"
+
+[[route]]
+id = "lookup-09"
+lang = "cs"
+class = "lookup"
+text = "Kdo u vás řeší reklamace?"
+
+[[route]]
+id = "lookup-10"
+lang = "cs"
+class = "lookup"
+text = "mate nejakou uhlovou brusku s regulaci otacek?"
+
+[[route]]
+id = "lookup-11"
+lang = "cs"
+class = "lookup"
+text = "Dá se u vás platit kartou při převzetí?"
+
+[[route]]
+id = "lookup-12"
+lang = "cs"
+class = "lookup"
+text = "V jakém stavu je moje objednávka 2228?"
+
+[[route]]
+id = "lookup-13"
+lang = "cs"
+class = "lookup"
+text = "Prodáváte i náhradní baterie do aku nářadí Kovar?"
+
+[[route]]
+id = "lookup-14"
+lang = "cs"
+class = "lookup"
+text = "Jak rychle doručujete do Vzorova?"
+
+[[route]]
+id = "lookup-15"
+lang = "cs"
+class = "lookup"
+text = "Hledám tablet pro dítě, něco levného a odolného. Co byste doporučili?"
+
+[[route]]
+id = "lookup-16"
+lang = "cs"
+class = "lookup"
+text = "V kolik dneska zavíráte?"
+
+[[route]]
+id = "lookup-17"
+lang = "cs"
+class = "lookup"
+prev_user = "Máte bezdrátovou myš Arvel v černé?"
+prev_reply = "Ano, černá je skladem za 349 Kč."
+text = "A tu modrou?"
+
+[[route]]
+id = "lookup-18"
+lang = "cs"
+class = "lookup"
+prev_user = "Máte skladem vrtačku Kovar 18 V?"
+prev_reply = "Ano, máme 3 kusy, každý se dvěma bateriemi."
+text = "A kolik stojí?"
+
+[[route]]
+id = "lookup-19"
+lang = "cs"
+class = "lookup"
+prev_user = "Máte otevřeno v pátek odpoledne?"
+prev_reply = "V pátek máme otevřeno do 17 hodin."
+text = "A v sobotu?"
+
+[[route]]
+id = "lookup-20"
+lang = "cs"
+class = "lookup"
+prev_user = "Jaká je záruka na repasovaný notebook?"
+prev_reply = "Na repasované notebooky dáváme záruku 24 měsíců."
+text = "Platí to i pro baterii?"
+
+[[route]]
+id = "lookup-21"
+lang = "en"
+class = "lookup"
+text = "Do you ship to Germany, and how much is it?"
+
+[[route]]
+id = "lookup-22"
+lang = "en"
+class = "lookup"
+text = "What are your opening hours on weekends?"
+
+[[route]]
+id = "lookup-23"
+lang = "en"
+class = "lookup"
+text = "Is the Kovar cordless drill still in stock?"
+
+[[route]]
+id = "lookup-24"
+lang = "en"
+class = "lookup"
+text = "What's your return policy for used items?"
+
+[[route]]
+id = "lookup-25"
+lang = "en"
+class = "lookup"
+prev_user = "Do you have the Arvel 14 laptop with 16 GB of RAM?"
+prev_reply = "Yes, one piece is in stock for 9,490 CZK."
+text = "And with 32?"
+
+# ---------------------------------------------------------------------------------------------------
+# recall
+# ---------------------------------------------------------------------------------------------------
+
+[[route]]
+id = "recall-01"
+lang = "cs"
+class = "recall"
+text = "Minulý týden jsem se vás ptal na jednu vrtačku, která to byla?"
+
+[[route]]
+id = "recall-02"
+lang = "cs"
+class = "recall"
+text = "Jakou úhlopříčku jsem vám posledně říkal, že chci?"
+
+[[route]]
+id = "recall-03"
+lang = "cs"
+class = "recall"
+text = "Pamatujete si, na jakou adresu jsem chtěl posílat balíky?"
+
+[[route]]
+id = "recall-04"
+lang = "cs"
+class = "recall"
+text = "Co jsme spolu řešili, když jsem tu byl naposledy?"
+
+[[route]]
+id = "recall-05"
+lang = "cs"
+class = "recall"
+text = "Už jsem vám jednou psal číslo své objednávky, máte ho ještě?"
+
+[[route]]
+id = "recall-06"
+lang = "cs"
+class = "recall"
+text = "Který notebook jste mi doporučoval před pár dny?"
+
+[[route]]
+id = "recall-07"
+lang = "cs"
+class = "recall"
+text = "Jak se jmenoval ten model, o kterém jsme se bavili úplně na začátku?"
+
+[[route]]
+id = "recall-08"
+lang = "cs"
+class = "recall"
+text = "Kolik jsem říkal, že za tu brusku maximálně dám?"
+
+[[route]]
+id = "recall-09"
+lang = "cs"
+class = "recall"
+text = "Vraťme se k tomu, co jsem psal o reklamaci sluchátek. Jak to tehdy bylo?"
+
+[[route]]
+id = "recall-10"
+lang = "cs"
+class = "recall"
+text = "Psal jsem vám dřív svoje telefonní číslo, můžete mi ho zopakovat?"
+
+[[route]]
+id = "recall-11"
+lang = "cs"
+class = "recall"
+text = "na co jsem se to ptal vcera? uz si to nepamatuju"
+
+[[route]]
+id = "recall-12"
+lang = "cs"
+class = "recall"
+text = "Říkal jsem vám, pro koho ten dárek kupuju, vzpomenete si?"
+
+[[route]]
+id = "recall-13"
+lang = "cs"
+class = "recall"
+text = "Jaký rozpočet jsem zmiňoval, když jsme vybírali monitor?"
+
+[[route]]
+id = "recall-14"
+lang = "cs"
+class = "recall"
+text = "Připomeňte mi prosím, co jste mi slíbil ohledně slevy."
+
+[[route]]
+id = "recall-15"
+lang = "cs"
+class = "recall"
+text = "Minule jste mi radil nějakou nabíječku, která to byla?"
+
+[[route]]
+id = "recall-16"
+lang = "cs"
+class = "recall"
+text = "Co jsem vám říkal o svém starém notebooku?"
+
+[[route]]
+id = "recall-17"
+lang = "cs"
+class = "recall"
+prev_user = "Potřebuju poradit s výběrem brusky."
+prev_reply = "Rád poradím. Na jakou práci ji budete používat?"
+text = "Na to samé, co jsem vám popisoval posledně."
+
+[[route]]
+id = "recall-18"
+lang = "cs"
+class = "recall"
+prev_user = "Chtěl bych objednat ten notebook."
+prev_reply = "Dobře. Na jakou adresu ho máme poslat?"
+text = "Na tu, co jsem vám dával u první objednávky."
+
+[[route]]
+id = "recall-19"
+lang = "cs"
+class = "recall"
+prev_user = "Hledám nabíječku k telefonu."
+prev_reply = "Jaký máte model telefonu?"
+text = "Ten, co jsme řešili minulý měsíc kvůli displeji."
+
+[[route]]
+id = "recall-20"
+lang = "cs"
+class = "recall"
+prev_user = "Dobrý den, zase já."
+prev_reply = "Dobrý den, vítejte zpět. S čím mohu pomoci?"
+text = "Jak to dopadlo s tím, co jste mi měl zjistit?"
+
+[[route]]
+id = "recall-21"
+lang = "en"
+class = "recall"
+text = "What was the name of the drill you recommended to me last week?"
+
+[[route]]
+id = "recall-22"
+lang = "en"
+class = "recall"
+text = "Do you remember which address I asked you to use for deliveries?"
+
+[[route]]
+id = "recall-23"
+lang = "en"
+class = "recall"
+text = "Earlier I told you my budget for the laptop. What was it?"
+
+[[route]]
+id = "recall-24"
+lang = "en"
+class = "recall"
+text = "Which order number did I give you when we first talked?"
+
+[[route]]
+id = "recall-25"
+lang = "en"
+class = "recall"
+prev_user = "I'd like to book a repair."
+prev_reply = "Sure. Which device is it for?"
+text = "The same phone we talked about a couple of weeks ago."
+
+# ---------------------------------------------------------------------------------------------------
+# act
+# ---------------------------------------------------------------------------------------------------
+
+[[route]]
+id = "act-01"
+lang = "cs"
+class = "act"
+text = "Chci objednat dva kusy vrtačky Kovar 18 V."
+
+[[route]]
+id = "act-02"
+lang = "cs"
+class = "act"
+text = "Zrušte prosím moji objednávku číslo 2231."
+
+[[route]]
+id = "act-03"
+lang = "cs"
+class = "act"
+text = "Chtěl bych si rezervovat servis notebooku na úterý dopoledne."
+
+[[route]]
+id = "act-04"
+lang = "cs"
+class = "act"
+text = "Změňte mi doručovací adresu u objednávky 2240 na Vzorov, Lipová 12."
+
+[[route]]
+id = "act-05"
+lang = "cs"
+class = "act"
+text = "Pošlete mi prosím fakturu k objednávce 2218 na e-mail."
+
+[[route]]
+id = "act-06"
+lang = "cs"
+class = "act"
+text = "Přepojte mě prosím na někoho z prodejny."
+
+[[route]]
+id = "act-07"
+lang = "cs"
+class = "act"
+text = "Zarezervujte mi ten monitor Arvel 27 do zítřka, přijdu si pro něj."
+
+[[route]]
+id = "act-08"
+lang = "cs"
+class = "act"
+text = "Chci vrátit sluchátka z objednávky 2225, založte mi prosím vratku."
+
+[[route]]
+id = "act-09"
+lang = "cs"
+class = "act"
+text = "Přihlaste mě k odběru novinek na tenhle e-mail."
+
+[[route]]
+id = "act-10"
+lang = "cs"
+class = "act"
+text = "Potřebuju přesunout termín opravy z pátku na pondělí."
+
+[[route]]
+id = "act-11"
+lang = "cs"
+class = "act"
+text = "prosim o zmenu zpusobu platby na dobirku u obj 2236"
+
+[[route]]
+id = "act-12"
+lang = "cs"
+class = "act"
+text = "Vyřiďte prosím kolegovi ze servisu, že se zítra zastavím pro tablet."
+
+[[route]]
+id = "act-13"
+lang = "cs"
+class = "act"
+text = "Dejte mi vědět SMSkou, až bude ta bruska zase skladem."
+
+[[route]]
+id = "act-14"
+lang = "cs"
+class = "act"
+text = "Chci podat reklamaci na nabíječku, která přestala fungovat."
+
+[[route]]
+id = "act-15"
+lang = "cs"
+class = "act"
+text = "Objednejte mi prosím kurýra na svoz reklamovaného zboží."
+
+[[route]]
+id = "act-16"
+lang = "cs"
+class = "act"
+text = "Smažte prosím moje telefonní číslo z vaší evidence."
+
+[[route]]
+id = "act-17"
+lang = "cs"
+class = "act"
+prev_user = "Máte ještě ten notebook Arvel 14?"
+prev_reply = "Ano, poslední kus je skladem za 9 490 Kč."
+text = "Tak mi ho prosím odložte do zítřka."
+
+[[route]]
+id = "act-18"
+lang = "cs"
+class = "act"
+prev_user = "Jaké termíny máte tento týden na servis?"
+prev_reply = "Volno máme ve středu v 10:00 a ve čtvrtek ve 14:00."
+text = "Tak tu středu, zapište mě."
+
+[[route]]
+id = "act-19"
+lang = "cs"
+class = "act"
+prev_user = "Kolik stojí ta nabíječka?"
+prev_reply = "Nabíječka Arvel 65 W stojí 590 Kč. Mám vám ji přidat k objednávce?"
+text = "Ano, přidejte."
+
+[[route]]
+id = "act-20"
+lang = "cs"
+class = "act"
+prev_user = "Objednávka 2231 mi pořád nedorazila."
+prev_reply = "Omlouvám se, objednávka 2231 je u dopravce Balíkobus už pět dní bez pohybu."
+text = "Tak to u nich prosím urgujte."
+
+[[route]]
+id = "act-21"
+lang = "en"
+class = "act"
+text = "Please cancel my order 2233."
+
+[[route]]
+id = "act-22"
+lang = "en"
+class = "act"
+text = "I'd like to book a repair slot for my phone on Friday morning."
+
+[[route]]
+id = "act-23"
+lang = "en"
+class = "act"
+text = "Can you send the invoice for order 2219 to my email?"
+
+[[route]]
+id = "act-24"
+lang = "en"
+class = "act"
+text = "Change the delivery address on order 2241 to Lipová 12, Vzorov."
+
+[[route]]
+id = "act-25"
+lang = "en"
+class = "act"
+prev_user = "Is the Arvel 27 monitor still available?"
+prev_reply = "Yes, there are two left at 3,290 CZK."
+text = "Great, put one aside for me until tomorrow."
